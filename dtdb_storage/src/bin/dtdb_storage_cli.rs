@@ -35,7 +35,7 @@ fn main() {
     println!("  delete <key>        - Delete a key");
     println!("  scan                - Scan the entire database");
     println!("  scan <k1> <k2>      - Scan a range of keys [k1, k2] (inclusive)");
-    println!("  compact             - Run compaction manually");
+    println!("  flush               - Flush memtable to disk");
     println!("  exit / quit         - Exit the CLI\n");
 
     let mut stdout = io::stdout();
@@ -145,10 +145,10 @@ fn main() {
                     println!("Usage: scan  OR  scan <k1> <k2>");
                 }
             }
-            "compact" => {
-                println!("Running compaction...");
-                match engine.compact() {
-                    Ok(_) => println!("Compaction complete."),
+            "flush" => {
+                println!("Flushing memtable...");
+                match engine.flush_memtable() {
+                    Ok(_) => println!("Flush complete."),
                     Err(e) => println!("Error: {}", e),
                 }
             }
