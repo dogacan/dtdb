@@ -38,7 +38,7 @@ fn test_sql_ddl_and_crud() {
     let tx2 = Transaction::new(2, db.clone());
     let res = engine
         .execute(
-            "INSERT INTO users (id, name, score) VALUES (1, 'Alice', 95.5), (2, 'Bob', 80.0), (3, 'Charlie', 85.0)",
+            "INSERT INTO users (id, name, score) VALUES (1, \"Alice\", 95.5), (2, 'Bob', 80.0), (3, 'Charlie', 85.0)",
             &tx2,
         )
         .unwrap();

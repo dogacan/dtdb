@@ -339,7 +339,13 @@ impl LogicalPlanner {
 /// Helper to plan sqlparser scalar expression to custom Expr.
 pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
     match expr {
-        SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
+        SqlExpr::Identifier(ident) => {
+            if ident.quote_style == Some('"') {
+                Ok(Expr::Literal(DbValue::String(ident.value.clone())))
+            } else {
+                Ok(Expr::Column(ident.value.clone()))
+            }
+        }
         SqlExpr::CompoundIdentifier(parts) => {
             let name = parts
                 .iter()
