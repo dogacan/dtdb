@@ -167,3 +167,56 @@ impl LogicalPlan {
         }
     }
 }
+
+pub fn format_logical_plan(plan: &LogicalPlan) -> String {
+    let mut out = String::new();
+    format_logical_node(plan, 0, &mut out);
+    out
+}
+
+fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
+    let indent_str = "  ".repeat(indent);
+    match node {
+        LogicalPlan::Scan { table_name, range, .. } => {
+            let range_str = match range {
+                Some((s, e)) => format!("range=[{:?}, {:?}]", s, e),
+                None => "range=all".to_string(),
+            };
+            out.push_str(&format!("{}- Scan: table={}, {}\n", indent_str, table_name, range_str));
+        }
+        LogicalPlan::Filter { source, predicate } => {
+            out.push_str(&format!("{}- Filter: condition={:?}\n", indent_str, predicate));
+            format_logical_node(source, indent + 1, out);
+        }
+        LogicalPlan::Projection { source, field_names, .. } => {
+            out.push_str(&format!("{}- Projection: fields={:?}\n", indent_str, field_names));
+            format_logical_node(source, indent + 1, out);
+        }
+        LogicalPlan::Join { left, right, condition } => {
+            out.push_str(&format!("{}- HashJoin: condition={:?}\n", indent_str, condition));
+            out.push_str(&format!("{}  left:\n", indent_str));
+            format_logical_node(left, indent + 2, out);
+            out.push_str(&format!("{}  right:\n", indent_str));
+            format_logical_node(right, indent + 2, out);
+        }
+        LogicalPlan::Aggregate { source, group_by, aggrs, field_names } => {
+            out.push_str(&format!(
+                "{}- HashAggregate: group_by={:?}, aggregates={:?}, output_names={:?}\n",
+                indent_str, group_by, aggrs, field_names
+            ));
+            format_logical_node(source, indent + 1, out);
+        }
+        LogicalPlan::Sort { source, keys } => {
+            let keys_str: Vec<String> = keys
+                .iter()
+                .map(|(expr, asc)| format!("{:?} {}", expr, if *asc { "ASC" } else { "DESC" }))
+                .collect();
+            out.push_str(&format!("{}- Sort: keys={:?}\n", indent_str, keys_str));
+            format_logical_node(source, indent + 1, out);
+        }
+        LogicalPlan::Limit { source, limit } => {
+            out.push_str(&format!("{}- Limit: count={}\n", indent_str, limit));
+            format_logical_node(source, indent + 1, out);
+        }
+    }
+}

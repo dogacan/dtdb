@@ -4,7 +4,7 @@ use sqlparser::parser::Parser;
 use dtdb_storage::{DbKey, DbValue};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
 use crate::expr::{Expr, Operator};
-use crate::logical::LogicalPlan;
+use crate::logical::{LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::planner::{LogicalPlanner, SqlStatement};
 use crate::physical::{
@@ -124,6 +124,35 @@ impl SqlEngine {
                     schema: physical_op.schema().clone(),
                     rows: results,
                 })
+            }
+            SqlStatement::Explain(logical_plan) => {
+                // 1. Optimize the Logical Plan
+                let optimized_plan = Optimizer::new().optimize(logical_plan.clone());
+
+                // 2. Format logical plans as strings
+                let logical_str = format_logical_plan(&logical_plan);
+                let opt_logical_str = format_logical_plan(&optimized_plan);
+
+                // 3. Compile physical and explain it
+                let physical_op = self.compile_physical(optimized_plan, tx)?;
+                let mut physical_str = String::new();
+                physical_op.explain(0, &mut physical_str);
+
+                // 4. Wrap the result in a select output with "Query Plan" schema column
+                let schema = Schema::new(vec![dtdb_relational::Column {
+                    name: "Query Plan".to_string(),
+                    data_type: DataType::String,
+                    is_primary_key: false,
+                }]);
+
+                let plan_info = format!(
+                    "--- Logical Plan ---\n{}\n--- Optimized Plan ---\n{}\n--- Physical Plan ---\n{}",
+                    logical_str.trim_end(), opt_logical_str.trim_end(), physical_str.trim_end()
+                );
+
+                let rows = vec![Row::new(vec![DbValue::String(plan_info)])];
+
+                Ok(ExecutionResult::Select { schema, rows })
             }
         }
     }

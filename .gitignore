@@ -1,3 +1,4 @@
 /target
 /my_test_db
+/mytestdb*
 .DS_Store

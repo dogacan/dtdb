@@ -19,6 +19,7 @@ pub enum SqlStatement {
         rows: Vec<Vec<DbValue>>,
     },
     Query(LogicalPlan),
+    Explain(LogicalPlan),
 }
 
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
@@ -124,6 +125,13 @@ impl LogicalPlanner {
             Statement::Query(query) => {
                 let logical_plan = self.plan_query(query)?;
                 Ok(SqlStatement::Query(logical_plan))
+            }
+            Statement::Explain { statement, .. } => {
+                let inner = self.plan(statement)?;
+                match inner {
+                    SqlStatement::Query(plan) => Ok(SqlStatement::Explain(plan)),
+                    _ => Err("Can only EXPLAIN SELECT queries".to_string()),
+                }
             }
             other => Err(format!("Unsupported SQL statement: {:?}", other)),
         }

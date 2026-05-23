@@ -423,3 +423,37 @@ fn test_sql_optimizer_pushdown() {
         panic!("Expected Select");
     }
 }
+
+#[test]
+fn test_sql_explain() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    let res = engine
+        .execute("EXPLAIN SELECT name FROM users WHERE id = 10", &tx2)
+        .unwrap();
+
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(schema.columns[0].name, "Query Plan");
+        assert_eq!(rows.len(), 1);
+        let plan_text = match &rows[0].values[0] {
+            DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string plan text"),
+        };
+        assert!(plan_text.contains("--- Logical Plan ---"));
+        assert!(plan_text.contains("--- Optimized Plan ---"));
+        assert!(plan_text.contains("--- Physical Plan ---"));
+        assert!(plan_text.contains("PhysicalSeqScan"));
+    } else {
+        panic!("Expected EXPLAIN Select output");
+    }
+}
