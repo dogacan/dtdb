@@ -10,8 +10,9 @@ DuctTapeDB is organized as a layered, bottom-up architecture. Each layer communi
 
 ```mermaid
 graph TD
-    A[Layer 3: SQL Engine - dtdb_sql] -->|Read/Write Rows| B[Layer 2: Relational & Transactions - dtdb_relational]
-    B -->|Serialized Bytes| C[Layer 1: LSM-Tree Storage - dtdb_storage]
+    A[Layer 4: RPC Server & Client - dtdb_rpc] -->|SQL Query| B[Layer 3: SQL Engine - dtdb_sql]
+    B -->|Read/Write Rows| C[Layer 2: Relational & Transactions - dtdb_relational]
+    C -->|Serialized Bytes| D[Layer 1: LSM-Tree Storage - dtdb_storage]
 ```
 
 ### 1. Layer 1: Storage Engine (`dtdb_storage`)
@@ -33,6 +34,13 @@ Parses, plans, optimizes, and executes queries.
 * **Logical Planner**: Converts ASTs into a relational algebra `LogicalPlan` tree.
 * **Optimizer**: Optimizes plans using rules like **Filter Pushdown** and the **Primary Key Range Scanner** (converting filters like `id >= 10 AND id <= 20` into optimized storage scan bounds).
 * **Volcano Execution Pipeline**: Compiles logical nodes into a streaming physical iterator pipeline (`next()` interface), executing joins via `PhysicalHashJoin` and groupings via `PhysicalHashAggregate`.
+* **SQL Dialect**: For more details on the dialect, data types, expressions, operators, and functions supported, see the [SQL Support Reference](docs/sql_support.md).
+
+### 4. Layer 4: RPC Server & Client (`dtdb_rpc`)
+Exposes database resources over a remote network.
+* **Protobuf API**: Defines database creation/deletion and streaming query execution endpoints.
+* **gRPC Server**: Restores existing databases on boot, handles transaction lifecycles, and streams query rows back.
+* **gRPC Client & CLI**: Client library and interactive shell tool to query remote databases.
 
 ---
 
@@ -40,11 +48,14 @@ Parses, plans, optimizes, and executes queries.
 
 ```
 .
+├── docs/               # Architecture designs and SQL documentation
 ├── dtdb_storage/       # Layer 1: LSM-tree Storage Engine (memtable, WAL, SSTable, compaction)
 │   └── src/bin/        # dtdb_storage_cli: Interactive key-value CLI
 ├── dtdb_relational/    # Layer 2: Relational Schema metadata & Transaction boundaries
-└── dtdb_sql/           # Layer 3: SQL Query Planner, Optimizer, and Volcano execution
-    └── src/bin/        # dtdb_sql_cli: Interactive multi-line SQL shell
+├── dtdb_sql/           # Layer 3: SQL Query Planner, Optimizer, and Volcano execution
+│   └── src/bin/        # dtdb_sql_cli: Interactive multi-line SQL shell
+└── dtdb_rpc/           # Layer 4: gRPC Server, Client Library, and Remote Query Shell CLI
+    └── src/bin/        # dtdb_server (gRPC daemon) and dtdb_client_cli (Remote SQL prompt)
 ```
 
 ---
@@ -60,8 +71,26 @@ Execute the entire test suite across all workspace crates:
 cargo test
 ```
 
-### Running the interactive SQL CLI
-Launch the terminal SQL shell by specifying a database directory (it will be created if it does not exist):
+### Running the Remote gRPC Server & Client
+1. Launch the server by specifying a directory where all database folders will be managed:
+   ```bash
+   cargo run --bin dtdb_server -- ./data
+   ```
+2. Start the interactive remote client query shell:
+   ```bash
+   cargo run --bin dtdb_client_cli
+   ```
+3. Inside the client prompt, select, create, or query databases:
+   ```sql
+   create database mydb;
+   use mydb;
+   CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, score FLOAT);
+   INSERT INTO users (id, name, score) VALUES (1, "Alice", 95.5);
+   SELECT * FROM users;
+   ```
+
+### Running the local SQL CLI
+Launch the terminal SQL shell on a single database directory directly:
 ```bash
 cargo run --bin dtdb_sql_cli -- ./mydb
 ```
@@ -108,3 +137,4 @@ To keep the engine accessible and highly instructional, several compromises were
 * **Single-Threaded Execution**: Execution is serialized via transaction locks to prevent concurrency bugs from obscuring relational concepts.
 * **In-Memory Sorts**: Sorting and aggregations collect row lists in-memory rather than spilling sorted runs to temporary storage.
 * **Hash Joins**: Equality joins are performed via building temporary hash tables of the left stream and probing them from the right stream.
+
