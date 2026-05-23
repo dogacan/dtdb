@@ -51,3 +51,10 @@ pub enum DbValue {
     String(String),
     Bytes(Vec<u8>),
 }
+
+/// CompressionType represents the supported block compression algorithms in DuctTapeDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionType {
+    Uncompressed,
+    Lz4,
+}

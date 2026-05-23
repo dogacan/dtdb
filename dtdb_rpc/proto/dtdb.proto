@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package dtdb;
+
+service DuctTapeDbService {
+    rpc CreateDb (CreateDbRequest) returns (CreateDbResponse);
+    rpc DropDb (DropDbRequest) returns (DropDbResponse);
+    rpc ExecuteQuery (ExecuteQueryRequest) returns (stream ExecuteQueryResponse);
+}
+
+enum CompressionOption {
+    COMPRESSION_LZ4 = 0;
+    COMPRESSION_UNCOMPRESSED = 1;
+}
+
+message CreateDbRequest {
+    string db_name = 1;
+    CompressionOption compression = 2;
+}
+
+message CreateDbResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message DropDbRequest {
+    string db_name = 1;
+}
+
+message DropDbResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ExecuteQueryRequest {
+    string db_name = 1;
+    string sql_query = 2;
+}
+
+message ExecuteQueryResponse {
+    oneof payload {
+        Header header = 1;
+        Row row = 2;
+        string info_message = 3;
+    }
+}
+
+message Header {
+    repeated string column_names = 1;
+}
+
+message Row {
+    repeated string values = 1;
+}

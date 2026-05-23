@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, StorageEngine};
+use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType};
 use dtdb_storage::memtable::MemTable;
 use dtdb_storage::wal::Wal;
 use dtdb_storage::sstable::{SstableReader, SstableWriter};
@@ -80,7 +80,7 @@ fn test_sstable_write_read() {
 
     // Write to SSTable with small block size (e.g. 50 bytes) to force block splitting
     {
-        let mut writer = SstableWriter::create(&sst_path, 50).unwrap();
+        let mut writer = SstableWriter::create(&sst_path, 50, CompressionType::Lz4).unwrap();
         writer.append(k_int(1), Some(v_int(10))).unwrap();
         writer.append(k_int(2), Some(v_int(20))).unwrap();
         writer.append(k_int(3), None).unwrap(); // Tombstone

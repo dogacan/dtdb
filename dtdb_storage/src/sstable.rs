@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::Path;
 use serde::{Deserialize, Serialize};
-use crate::{DbKey, DbValue, Result, StorageError};
+use crate::{DbKey, DbValue, Result, StorageError, CompressionType};
 
 const MAGIC_NUMBER: &[u8; 8] = b"DTDB_SST";
 const FOOTER_SIZE: u64 = 24; // 8 bytes index_offset + 8 bytes index_len + 8 bytes magic number
@@ -18,6 +18,13 @@ pub struct IndexEntry {
     pub size: u64,
 }
 
+/// IndexBlock represents the index block at the end of the SSTable file, including metadata.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IndexBlock {
+    pub entries: Vec<IndexEntry>,
+    pub compression: CompressionType,
+}
+
 /// SstableWriter builds an SSTable file on disk.
 ///
 /// It collects key-value pairs in a block buffer. When the buffer size
@@ -29,11 +36,12 @@ pub struct SstableWriter {
     current_block: Vec<(DbKey, Option<DbValue>)>,
     current_block_uncompressed_bytes: usize,
     index: Vec<IndexEntry>,
+    compression: CompressionType,
 }
 
 impl SstableWriter {
     /// Creates a new SstableWriter writing to the file at the given path.
-    pub fn create(path: impl AsRef<Path>, block_size_limit: usize) -> Result<Self> {
+    pub fn create(path: impl AsRef<Path>, block_size_limit: usize, compression: CompressionType) -> Result<Self> {
         let file = File::create(path)?;
         Ok(Self {
             file,
@@ -42,6 +50,7 @@ impl SstableWriter {
             current_block: Vec::new(),
             current_block_uncompressed_bytes: 0,
             index: Vec::new(),
+            compression,
         })
     }
 
@@ -90,19 +99,22 @@ impl SstableWriter {
         // Serialize block
         let raw_bytes = bincode::serialize(&self.current_block)?;
 
-        // Compress block using lz4-flex
-        let compressed_bytes = lz4_flex::compress_prepend_size(&raw_bytes);
-        let compressed_len = compressed_bytes.len() as u64;
+        // Compress block if compression is Lz4
+        let block_bytes = match self.compression {
+            CompressionType::Lz4 => lz4_flex::compress_prepend_size(&raw_bytes),
+            CompressionType::Uncompressed => raw_bytes,
+        };
+        let block_len = block_bytes.len() as u64;
 
-        // Write compressed block to file
-        self.file.write_all(&compressed_bytes)?;
+        // Write block to file
+        self.file.write_all(&block_bytes)?;
 
-        // Update the last index entry with the correct compressed size
+        // Update the last index entry with the correct size
         if let Some(entry) = self.index.last_mut() {
-            entry.size = compressed_len;
+            entry.size = block_len;
         }
 
-        self.offset += compressed_len;
+        self.offset += block_len;
         self.current_block.clear();
         self.current_block_uncompressed_bytes = 0;
 
@@ -116,7 +128,11 @@ impl SstableWriter {
 
         // Write Index block (uncompressed for easy parsing during recovery/startup)
         let index_offset = self.offset;
-        let index_bytes = bincode::serialize(&self.index)?;
+        let index_block = IndexBlock {
+            entries: self.index,
+            compression: self.compression,
+        };
+        let index_bytes = bincode::serialize(&index_block)?;
         let index_len = index_bytes.len() as u64;
 
         self.file.write_all(&index_bytes)?;
@@ -136,6 +152,7 @@ impl SstableWriter {
 pub struct SstableReader {
     file: File,
     index: Vec<IndexEntry>,
+    pub compression: CompressionType,
 }
 
 impl SstableReader {
@@ -171,9 +188,23 @@ impl SstableReader {
         let mut index_bytes = vec![0u8; index_len as usize];
         file.read_exact(&mut index_bytes)?;
 
-        let index: Vec<IndexEntry> = bincode::deserialize(&index_bytes)?;
+        let index_block: IndexBlock = match bincode::deserialize(&index_bytes) {
+            Ok(ib) => ib,
+            Err(_) => {
+                // Fallback to old format: just Vec<IndexEntry> with Lz4 compression
+                let entries: Vec<IndexEntry> = bincode::deserialize(&index_bytes)?;
+                IndexBlock {
+                    entries,
+                    compression: CompressionType::Lz4,
+                }
+            }
+        };
 
-        Ok(Self { file, index })
+        Ok(Self {
+            file,
+            index: index_block.entries,
+            compression: index_block.compression,
+        })
     }
 
     /// Performs a point lookup for a key.
@@ -216,12 +247,14 @@ impl SstableReader {
         let entry = &self.index[idx];
         self.file.seek(SeekFrom::Start(entry.offset))?;
 
-        let mut compressed_bytes = vec![0u8; entry.size as usize];
-        self.file.read_exact(&mut compressed_bytes)?;
+        let mut block_bytes = vec![0u8; entry.size as usize];
+        self.file.read_exact(&mut block_bytes)?;
 
-        // Decompress using lz4-flex.
-        let raw_bytes = lz4_flex::decompress_size_prepended(&compressed_bytes)
-            .map_err(|e| StorageError::Compression(e.to_string()))?;
+        let raw_bytes = match self.compression {
+            CompressionType::Lz4 => lz4_flex::decompress_size_prepended(&block_bytes)
+                .map_err(|e| StorageError::Compression(e.to_string()))?,
+            CompressionType::Uncompressed => block_bytes,
+        };
 
         let block: Vec<(DbKey, Option<DbValue>)> = bincode::deserialize(&raw_bytes)?;
         Ok(block)

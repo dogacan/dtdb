@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use crate::{DbKey, DbValue, Result};
+use crate::{DbKey, DbValue, Result, CompressionType};
 use crate::memtable::MemTable;
 use crate::wal::{Wal, WalEntry};
 use crate::sstable::{SstableReader, SstableWriter};
@@ -33,6 +33,7 @@ pub struct StorageEngine {
     sstables: RwLock<Vec<Mutex<SstableReader>>>,
     memtable_size_limit: usize,
     block_size_limit: usize,
+    compression: CompressionType,
     write_mutex: Mutex<()>,
 }
 
@@ -48,6 +49,18 @@ impl StorageEngine {
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
+
+        // Load compression from options.bin or default to Lz4
+        let options_path = dir_path.join("options.bin");
+        let compression = if options_path.exists() {
+            let bytes = fs::read(&options_path)?;
+            bincode::deserialize(&bytes)?
+        } else {
+            let comp = CompressionType::Lz4;
+            let bytes = bincode::serialize(&comp)?;
+            fs::write(&options_path, bytes)?;
+            comp
+        };
 
         // 1. Discover all SSTable files in the directory.
         let mut sst_files = Vec::new();
@@ -90,7 +103,7 @@ impl StorageEngine {
             if memtable.byte_size() > 0 {
                 let next_id = sst_files.last().map(|(id, _)| id + 1).unwrap_or(1);
                 let sst_path = dir_path.join(format!("{:05}.sst", next_id));
-                let mut writer = SstableWriter::create(&sst_path, block_size_limit)?;
+                let mut writer = SstableWriter::create(&sst_path, block_size_limit, compression)?;
                 for (key, val) in memtable.entries() {
                     writer.append(key, val)?;
                 }
@@ -115,6 +128,7 @@ impl StorageEngine {
             sstables: RwLock::new(sstables),
             memtable_size_limit,
             block_size_limit,
+            compression,
             write_mutex: Mutex::new(()),
         })
     }
@@ -262,7 +276,7 @@ impl StorageEngine {
         // Since we are merging all SSTables in the database, we can safely discard tombstones (None),
         // because there are no older records that they need to shadow.
         let temp_sst_path = self.dir_path.join("compacted.tmp");
-        let mut writer = SstableWriter::create(&temp_sst_path, self.block_size_limit)?;
+        let mut writer = SstableWriter::create(&temp_sst_path, self.block_size_limit, self.compression)?;
         for (k, v) in merged_data {
             if let Some(val) = v {
                 writer.append(k, Some(val))?;
@@ -320,7 +334,7 @@ impl StorageEngine {
         let sst_path = self.dir_path.join(format!("{:05}.sst", next_id));
 
         // 2. Write MemTable entries to the new SSTable.
-        let mut writer = SstableWriter::create(&sst_path, self.block_size_limit)?;
+        let mut writer = SstableWriter::create(&sst_path, self.block_size_limit, self.compression)?;
         for (key, val) in entries {
             writer.append(key, val)?;
         }
