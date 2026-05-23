@@ -1,7 +1,7 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::Path;
-use dtdb_storage::{DbKey, DbValue, StorageEngine};
+use dtdb_storage::{DbKey, DbValue, StorageEngine, EngineOptions, CompressionType};
 
 fn main() {
     // 1. Parse CLI arguments
@@ -13,8 +13,14 @@ fn main() {
     let db_path = Path::new(&args[1]);
 
     println!("Opening database at: {:?}", db_path);
-    // Open storage engine with 1MB memtable size limit and 4KB block size limit
-    let engine = match StorageEngine::open(db_path, 1024 * 1024, 4096) {
+    // Open storage engine with 1MB memtable size limit, 4KB block size limit, and 32MB WAL limit
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+    };
+    let engine = match StorageEngine::open(db_path, options) {
         Ok(eng) => eng,
         Err(e) => {
             eprintln!("Failed to open database: {}", e);

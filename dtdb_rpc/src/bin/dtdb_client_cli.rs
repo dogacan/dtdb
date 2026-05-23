@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use futures_util::StreamExt;
 use dtdb_rpc::client::DuctTapeDbClient;
 use dtdb_storage::CompressionType;
+use dtdb_relational::DatabaseOptions;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,8 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nWelcome to DuctTapeDB gRPC SQL Client CLI!");
     println!("Commands:");
     println!("  use <database_name>;                                   - Switch database context");
-    println!("  create database <name> [compression=uncompressed|lz4]; - Create a new database");
+    println!("  create database <name> [options...];                   - Create a new database");
+    println!("       Options: compression=uncompressed|lz4");
+    println!("                memtable_size=<bytes>");
+    println!("                block_size=<bytes>");
+    println!("                wal_size=<bytes>");
+    println!("                flush_interval=<ms>");
     println!("  drop database <name>;                                  - Delete a database");
+    println!("  flush database [<name>];                               - Flush memory buffers to disk");
     println!("  <SQL Query>;                                           - Run SELECT/INSERT/CREATE TABLE/DROP TABLE");
     println!("  exit | quit;                                           - Exit shell");
     println!();
@@ -83,13 +90,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            // 2. Intercept "CREATE DATABASE <name> [compression=...]"
+            // 2. Intercept "CREATE DATABASE <name> [options...]"
             if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("create") && parts[1].eq_ignore_ascii_case("database") {
                 let db_name = parts[2];
                 let mut compression = CompressionType::Lz4;
+                let mut memtable_size_limit = 1024 * 1024;
+                let mut block_size_limit = 4096;
+                let mut wal_size_limit = 32 * 1024 * 1024;
+                let mut flush_interval_ms = None;
+
                 for part in &parts[3..] {
-                    if part.to_lowercase().starts_with("compression=") {
-                        let comp_val = part.split('=').nth(1).unwrap_or("").to_lowercase();
+                    let part_lower = part.to_lowercase();
+                    if part_lower.starts_with("compression=") {
+                        let comp_val = part_lower.split('=').nth(1).unwrap_or("");
                         if comp_val == "uncompressed" {
                             compression = CompressionType::Uncompressed;
                         } else if comp_val == "lz4" {
@@ -97,10 +110,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             println!("Warning: Unknown compression type '{}', defaulting to LZ4.", comp_val);
                         }
+                    } else if part_lower.starts_with("memtable_size=") {
+                        if let Ok(v) = part_lower.split('=').nth(1).unwrap_or("").parse::<usize>() {
+                            memtable_size_limit = v;
+                        } else {
+                            println!("Warning: Invalid memtable_size value.");
+                        }
+                    } else if part_lower.starts_with("block_size=") {
+                        if let Ok(v) = part_lower.split('=').nth(1).unwrap_or("").parse::<usize>() {
+                            block_size_limit = v;
+                        } else {
+                            println!("Warning: Invalid block_size value.");
+                        }
+                    } else if part_lower.starts_with("wal_size=") {
+                        if let Ok(v) = part_lower.split('=').nth(1).unwrap_or("").parse::<usize>() {
+                            wal_size_limit = v;
+                        } else {
+                            println!("Warning: Invalid wal_size value.");
+                        }
+                    } else if part_lower.starts_with("flush_interval=") {
+                        if let Ok(v) = part_lower.split('=').nth(1).unwrap_or("").parse::<u64>() {
+                            flush_interval_ms = Some(v);
+                        } else {
+                            println!("Warning: Invalid flush_interval value.");
+                        }
                     }
                 }
 
-                match client.create_db(db_name, compression).await {
+                let options = DatabaseOptions {
+                    compression,
+                    memtable_size_limit,
+                    block_size_limit,
+                    wal_size_limit,
+                    flush_interval_ms,
+                };
+
+                match client.create_db_with_options(db_name, options).await {
                     Ok(resp) => {
                         println!("{}", resp.message);
                     }
@@ -132,7 +177,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            // 4. Regular SQL execution
+            // 4. Intercept "FLUSH DATABASE [name]"
+            if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("flush") && parts[1].eq_ignore_ascii_case("database") {
+                let target_db = if parts.len() >= 3 {
+                    Some(parts[2].to_string())
+                } else {
+                    active_db.clone()
+                };
+
+                match target_db {
+                    Some(db) => {
+                        match client.flush_db(&db).await {
+                            Ok(resp) => {
+                                println!("{}", resp.message);
+                            }
+                            Err(e) => {
+                                println!("Error: {}", e.message());
+                            }
+                        }
+                    }
+                    None => {
+                        println!("Error: No database selected. Run 'USE <database_name>;' or specify database name.");
+                    }
+                }
+                println!();
+                continue;
+            }
+
+            // 5. Regular SQL execution
             let db_name = match &active_db {
                 Some(db) => db,
                 None => {

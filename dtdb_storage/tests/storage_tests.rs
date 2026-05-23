@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType};
+use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType, EngineOptions};
 use dtdb_storage::memtable::MemTable;
 use dtdb_storage::wal::Wal;
 use dtdb_storage::sstable::{SstableReader, SstableWriter};
@@ -114,7 +114,13 @@ fn test_sstable_write_read() {
 fn test_engine_crud() {
     let temp_dir = TempDir::new().unwrap();
     // Use very small memtable threshold (60 bytes) to force automatic flushes
-    let engine = StorageEngine::open(temp_dir.path(), 60, 4096).unwrap();
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 60,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+    };
+    let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
 
     engine.put(k_str("a"), v_str("val_a")).unwrap();
     engine.put(k_str("b"), v_str("val_b")).unwrap();
@@ -149,7 +155,13 @@ fn test_engine_crash_recovery() {
     // 1. Open engine, write some keys, and drop it.
     // Use a large memtable limit so entries stay in memtable/WAL and are not flushed.
     {
-        let engine = StorageEngine::open(&db_path, 1024 * 1024, 4096).unwrap();
+        let options = EngineOptions {
+            compression: CompressionType::Lz4,
+            memtable_size_limit: 1024 * 1024,
+            block_size_limit: 4096,
+            wal_size_limit: 32 * 1024 * 1024,
+        };
+        let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("one")).unwrap();
         engine.put(k_int(2), v_str("two")).unwrap();
         engine.delete(k_int(1)).unwrap();
@@ -158,7 +170,13 @@ fn test_engine_crash_recovery() {
 
     // 2. Re-open the engine and verify it recovered from WAL.
     {
-        let engine = StorageEngine::open(&db_path, 1024 * 1024, 4096).unwrap();
+        let options = EngineOptions {
+            compression: CompressionType::Lz4,
+            memtable_size_limit: 1024 * 1024,
+            block_size_limit: 4096,
+            wal_size_limit: 32 * 1024 * 1024,
+        };
+        let engine = StorageEngine::open(&db_path, options).unwrap();
         assert_eq!(engine.get(&k_int(1)).unwrap(), None); // Deleted
         assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_str("two"))); // Retained
 
@@ -185,7 +203,13 @@ fn test_engine_compaction() {
 
     // 1. Write overlapping values, forcing multiple flushes (small memtable threshold)
     {
-        let engine = StorageEngine::open(&db_path, 5, 4096).unwrap();
+        let options = EngineOptions {
+            compression: CompressionType::Lz4,
+            memtable_size_limit: 5,
+            block_size_limit: 4096,
+            wal_size_limit: 32 * 1024 * 1024,
+        };
+        let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("v1_old")).unwrap(); // Flushes
         engine.put(k_int(1), v_str("v1_new")).unwrap(); // Flushes
         engine.put(k_int(2), v_str("v2")).unwrap();     // Flushes

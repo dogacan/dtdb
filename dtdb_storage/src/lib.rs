@@ -58,3 +58,13 @@ pub enum CompressionType {
     Uncompressed,
     Lz4,
 }
+
+/// EngineOptions defines the configuration limits and parameters for a StorageEngine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineOptions {
+    pub compression: CompressionType,
+    pub memtable_size_limit: usize,
+    pub block_size_limit: usize,
+    pub wal_size_limit: usize,
+}
+

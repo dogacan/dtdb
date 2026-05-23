@@ -6,6 +6,7 @@ service DuctTapeDbService {
     rpc CreateDb (CreateDbRequest) returns (CreateDbResponse);
     rpc DropDb (DropDbRequest) returns (DropDbResponse);
     rpc ExecuteQuery (ExecuteQueryRequest) returns (stream ExecuteQueryResponse);
+    rpc FlushDb (FlushDbRequest) returns (FlushDbResponse);
 }
 
 enum CompressionOption {
@@ -16,6 +17,10 @@ enum CompressionOption {
 message CreateDbRequest {
     string db_name = 1;
     CompressionOption compression = 2;
+    optional uint64 memtable_size_limit = 3;
+    optional uint64 block_size_limit = 4;
+    optional uint64 wal_size_limit = 5;
+    optional uint64 flush_interval_ms = 6;
 }
 
 message CreateDbResponse {
@@ -28,6 +33,15 @@ message DropDbRequest {
 }
 
 message DropDbResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message FlushDbRequest {
+    string db_name = 1;
+}
+
+message FlushDbResponse {
     bool success = 1;
     string message = 2;
 }

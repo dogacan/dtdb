@@ -7,5 +7,5 @@ pub mod transaction;
 pub use error::{RelationalError, Result};
 pub use schema::{DataType, Column, Schema};
 pub use row::Row;
-pub use database::{Database, Table};
+pub use database::{Database, Table, DatabaseOptions};
 pub use transaction::Transaction;

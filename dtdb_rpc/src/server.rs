@@ -11,13 +11,14 @@ use futures_core::Stream;
 use tonic::{Request, Response, Status};
 
 use dtdb_storage::{CompressionType, DbValue};
-use dtdb_relational::{Database, Transaction};
+use dtdb_relational::{Database, Transaction, DatabaseOptions};
 use dtdb_sql::SqlEngine;
 
 use crate::proto::duct_tape_db_service_server::DuctTapeDbService;
 use crate::proto::{
     CreateDbRequest, CreateDbResponse, DropDbRequest, DropDbResponse,
     ExecuteQueryRequest, ExecuteQueryResponse, Header, Row, CompressionOption,
+    FlushDbRequest, FlushDbResponse,
 };
 
 pub struct DuctTapeDbServiceImpl {
@@ -61,6 +62,12 @@ impl DuctTapeDbServiceImpl {
                         println!("Restoring database: {}", db_name);
                         let database = Arc::new(Database::open(&path).map_err(|e| e.to_string())?);
                         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
+
+                        // Spawn periodic flush if configured
+                        if let Some(ms) = database.options.flush_interval_ms {
+                            Self::spawn_periodic_flush(database.clone(), ms);
+                        }
+
                         dbs.insert(
                             db_name.to_string(),
                             DbState {
@@ -73,6 +80,31 @@ impl DuctTapeDbServiceImpl {
             }
         }
         Ok(())
+    }
+
+    fn spawn_periodic_flush(database: Arc<Database>, interval_ms: u64) {
+        let db_weak = Arc::downgrade(&database);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            // First tick fires immediately, so skip it to wait for the interval
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                if let Some(db) = db_weak.upgrade() {
+                    let tables = db.list_tables();
+                    for table_name in tables {
+                        if let Ok(table) = db.get_table(&table_name) {
+                            if let Err(e) = table.engine.flush_memtable() {
+                                eprintln!("Periodic flush failed for table {}: {}", table_name, e);
+                            }
+                        }
+                    }
+                } else {
+                    break; // Database was dropped, exit loop
+                }
+            }
+        });
     }
 }
 
@@ -105,9 +137,23 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             CompressionOption::CompressionUncompressed => CompressionType::Uncompressed,
         };
 
-        let database = Arc::new(Database::open_with_options(&db_path, compression)
+        // Construct DatabaseOptions from gRPC request fields with sensible defaults
+        let options = DatabaseOptions {
+            compression,
+            memtable_size_limit: req.memtable_size_limit.unwrap_or(1024 * 1024) as usize,
+            block_size_limit: req.block_size_limit.unwrap_or(4096) as usize,
+            wal_size_limit: req.wal_size_limit.unwrap_or(32 * 1024 * 1024) as usize,
+            flush_interval_ms: req.flush_interval_ms,
+        };
+
+        let database = Arc::new(Database::open_with_options(&db_path, options.clone())
             .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?);
         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
+
+        // Spawn periodic flush task if flush_interval_ms is configured
+        if let Some(ms) = options.flush_interval_ms {
+            Self::spawn_periodic_flush(database.clone(), ms);
+        }
 
         dbs.insert(
             db_name.to_string(),
@@ -119,7 +165,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
 
         Ok(Response::new(CreateDbResponse {
             success: true,
-            message: format!("Database '{}' created with compression {:?}", db_name, compression),
+            message: format!("Database '{}' created with options: {:?}", db_name, options),
         }))
     }
 
@@ -164,6 +210,42 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                 message: format!("Database '{}' not found", db_name),
             }))
         }
+    }
+
+    async fn flush_db(
+        &self,
+        request: Request<FlushDbRequest>,
+    ) -> Result<Response<FlushDbResponse>, Status> {
+        let req = request.into_inner();
+        let db_name = req.db_name.trim();
+
+        if db_name.is_empty() {
+            return Err(Status::invalid_argument("Database name cannot be empty"));
+        }
+
+        let database = {
+            let dbs = self.databases.read().unwrap();
+            if let Some(state) = dbs.get(db_name) {
+                state.database.clone()
+            } else {
+                return Err(Status::not_found(format!("Database '{}' not found", db_name)));
+            }
+        };
+
+        let tables = database.list_tables();
+        let mut flushed_tables = Vec::new();
+        for table_name in tables {
+            if let Ok(table) = database.get_table(&table_name) {
+                table.engine.flush_memtable()
+                    .map_err(|e| Status::internal(format!("Failed to flush table {}: {}", table_name, e)))?;
+                flushed_tables.push(table_name);
+            }
+        }
+
+        Ok(Response::new(FlushDbResponse {
+            success: true,
+            message: format!("Flushed {} table(s) in database '{}': {:?}", flushed_tables.len(), db_name, flushed_tables),
+        }))
     }
 
     async fn execute_query(

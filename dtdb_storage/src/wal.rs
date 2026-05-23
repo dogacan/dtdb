@@ -116,4 +116,10 @@ impl Wal {
 
         Ok(entries)
     }
+
+    /// Returns the current size of the WAL file in bytes.
+    pub fn size(&self) -> Result<u64> {
+        let metadata = self.file.metadata()?;
+        Ok(metadata.len())
+    }
 }

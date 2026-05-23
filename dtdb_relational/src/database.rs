@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use dtdb_storage::{StorageEngine, CompressionType};
+use dtdb_storage::{StorageEngine, CompressionType, EngineOptions};
 use crate::error::{RelationalError, Result};
 use crate::schema::Schema;
 
@@ -21,11 +21,21 @@ pub struct Table {
     pub engine: Arc<StorageEngine>,
 }
 
+/// DatabaseOptions defines the configuration parameters for a Database.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct DatabaseOptions {
+    pub compression: CompressionType,
+    pub memtable_size_limit: usize,
+    pub block_size_limit: usize,
+    pub wal_size_limit: usize,
+    pub flush_interval_ms: Option<u64>,
+}
+
 /// Database represents a catalog of Tables stored in a base directory.
 pub struct Database {
     dir_path: PathBuf,
     tables: RwLock<HashMap<String, Table>>,
-    pub compression: CompressionType,
+    pub options: DatabaseOptions,
 }
 
 impl Database {
@@ -35,22 +45,28 @@ impl Database {
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         let db_options_path = dir_path.join("db_options.bin");
-        let compression = if db_options_path.exists() {
+        let options = if db_options_path.exists() {
             let bytes = fs::read(&db_options_path)?;
-            bincode::deserialize(&bytes).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?
+            bincode::deserialize::<DatabaseOptions>(&bytes).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?
         } else {
-            CompressionType::Lz4
+            DatabaseOptions {
+                compression: CompressionType::Lz4,
+                memtable_size_limit: 1024 * 1024,
+                block_size_limit: 4096,
+                wal_size_limit: 32 * 1024 * 1024,
+                flush_interval_ms: None,
+            }
         };
-        Self::open_with_options(dir_path, compression)
+        Self::open_with_options(dir_path, options)
     }
 
     /// Opens the database catalog directory with specified options and loads all tables.
-    pub fn open_with_options(dir_path: impl AsRef<Path>, compression: CompressionType) -> Result<Self> {
+    pub fn open_with_options(dir_path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
 
         let db_options_path = dir_path.join("db_options.bin");
-        let bytes = bincode::serialize(&compression).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+        let bytes = bincode::serialize(&options).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
         fs::write(&db_options_path, bytes)?;
 
         let mut tables = HashMap::new();
@@ -75,8 +91,13 @@ impl Database {
                     let schema = Schema::load_from_file(&schema_path)?;
 
                     // Open the underlying LSM engine.
-                    // We configure default sizes of 1MB memtable limit and 4KB block size limit.
-                    let engine = Arc::new(StorageEngine::open(&path, 1024 * 1024, 4096)?);
+                    let engine_opts = EngineOptions {
+                        compression: options.compression,
+                        memtable_size_limit: options.memtable_size_limit,
+                        block_size_limit: options.block_size_limit,
+                        wal_size_limit: options.wal_size_limit,
+                    };
+                    let engine = Arc::new(StorageEngine::open(&path, engine_opts)?);
 
                     tables.insert(
                         name.clone(),
@@ -93,7 +114,7 @@ impl Database {
         Ok(Self {
             dir_path,
             tables: RwLock::new(tables),
-            compression,
+            options,
         })
     }
 
@@ -109,17 +130,20 @@ impl Database {
         let table_path = self.dir_path.join(name);
         fs::create_dir_all(&table_path)?;
 
-        // Write the table configuration options.bin using the database's compression option
-        let options_path = table_path.join("options.bin");
-        let bytes = bincode::serialize(&self.compression).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
-        fs::write(&options_path, bytes)?;
-
         // Save schema configuration
         let schema_path = table_path.join("schema.bin");
         schema.save_to_file(&schema_path)?;
 
+        // Pass EngineOptions based on self.options
+        let engine_opts = EngineOptions {
+            compression: self.options.compression,
+            memtable_size_limit: self.options.memtable_size_limit,
+            block_size_limit: self.options.block_size_limit,
+            wal_size_limit: self.options.wal_size_limit,
+        };
+
         // Open the new Layer 1 storage engine
-        let engine = Arc::new(StorageEngine::open(&table_path, 1024 * 1024, 4096)?);
+        let engine = Arc::new(StorageEngine::open(&table_path, engine_opts)?);
 
         tables_guard.insert(
             name.to_string(),
