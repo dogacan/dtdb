@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "dtdb_storage",
+]
+resolver = "2"
