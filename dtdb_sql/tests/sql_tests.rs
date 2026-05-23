@@ -1,0 +1,425 @@
+use std::sync::Arc;
+use tempfile::TempDir;
+use dtdb_storage::DbValue;
+use dtdb_relational::{Database, Transaction};
+use dtdb_sql::{SqlEngine, ExecutionResult};
+
+// Helper function to setup database and SQL engine.
+fn setup_engine() -> (TempDir, Arc<Database>, SqlEngine) {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let engine = SqlEngine::new(db.clone());
+    (temp_dir, db, engine)
+}
+
+#[test]
+fn test_sql_ddl_and_crud() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. CREATE TABLE
+    let tx1 = Transaction::new(1, db.clone());
+    let res = engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING, score FLOAT)",
+            &tx1,
+        )
+        .unwrap();
+    assert!(matches!(res, ExecutionResult::CreateTable));
+    tx1.commit().unwrap();
+
+    // Verify metadata
+    {
+        let tables = db.list_tables();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0], "users");
+    }
+
+    // 2. INSERT INTO
+    let tx2 = Transaction::new(2, db.clone());
+    let res = engine
+        .execute(
+            "INSERT INTO users (id, name, score) VALUES (1, 'Alice', 95.5), (2, 'Bob', 80.0), (3, 'Charlie', 85.0)",
+            &tx2,
+        )
+        .unwrap();
+    assert_eq!(res, ExecutionResult::Insert { count: 3 });
+    tx2.commit().unwrap();
+
+    // 3. SELECT (all columns, filter, sorting, limit)
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute("SELECT id, name, score FROM users ORDER BY id ASC", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(schema.columns[0].name, "id");
+        assert_eq!(schema.columns[1].name, "name");
+        assert_eq!(schema.columns[2].name, "score");
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::Int(1),
+                DbValue::String("Alice".to_string()),
+                DbValue::Float(95.5)
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::Int(2),
+                DbValue::String("Bob".to_string()),
+                DbValue::Float(80.0)
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                DbValue::Int(3),
+                DbValue::String("Charlie".to_string()),
+                DbValue::Float(85.0)
+            ]
+        );
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // 4. SELECT with WHERE clause filter, DESC ordering, and LIMIT
+    let res = engine
+        .execute(
+            "SELECT name FROM users WHERE score > 82.0 ORDER BY score DESC LIMIT 1",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(schema.columns[0].name, "name");
+        assert_eq!(rows[0].values, vec![DbValue::String("Alice".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
+fn test_sql_joins() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create tables
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
+            &tx1,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    // 2. Insert data
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+            &tx2,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO orders (order_id, user_id, amount) VALUES (10, 1, 100.5), (20, 2, 250.0), (30, 1, 15.75)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // 3. Execute INNER JOIN query
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id ORDER BY orders.amount ASC",
+            &tx3,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(schema.columns[0].name, "users.name");
+        assert_eq!(schema.columns[1].name, "orders.amount");
+
+        // Row 0: Alice, 15.75
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("Alice".to_string()), DbValue::Float(15.75)]
+        );
+        // Row 1: Alice, 100.5
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("Alice".to_string()), DbValue::Float(100.5)]
+        );
+        // Row 2: Bob, 250.0
+        assert_eq!(
+            rows[2].values,
+            vec![DbValue::String("Bob".to_string()), DbValue::Float(250.0)]
+        );
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
+fn test_sql_aggregations() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, dept STRING, salary FLOAT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO employees (id, dept, salary) VALUES \
+             (1, 'Sales', 50000.0), \
+             (2, 'Sales', 60000.0), \
+             (3, 'Engineering', 90000.0), \
+             (4, 'Engineering', 110000.0), \
+             (5, 'HR', 45000.0)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // 1. Global Aggregation (no GROUP BY)
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT COUNT(salary), SUM(salary), MIN(salary), MAX(salary) FROM employees",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(schema.columns.len(), 4);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::Int(5),         // COUNT
+                DbValue::Float(355000.0), // SUM
+                DbValue::Float(45000.0),  // MIN
+                DbValue::Float(110000.0)  // MAX
+            ]
+        );
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // 2. Group By Aggregation
+    let res = engine
+        .execute(
+            "SELECT dept, COUNT(salary), SUM(salary) FROM employees GROUP BY dept ORDER BY dept ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(schema.columns[0].name, "dept");
+
+        // Engineering: count=2, sum=200000.0
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::String("Engineering".to_string()),
+                DbValue::Int(2),
+                DbValue::Float(200000.0)
+            ]
+        );
+        // HR: count=1, sum=45000.0
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::String("HR".to_string()),
+                DbValue::Int(1),
+                DbValue::Float(45000.0)
+            ]
+        );
+        // Sales: count=2, sum=110000.0
+        assert_eq!(
+            rows[2].values,
+            vec![
+                DbValue::String("Sales".to_string()),
+                DbValue::Int(2),
+                DbValue::Float(110000.0)
+            ]
+        );
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
+fn test_sql_like_wildcard() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE items (id INT PRIMARY KEY, code STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO items (id, code) VALUES \
+             (1, 'abc-123'), \
+             (2, 'def-456'), \
+             (3, 'abc-789'), \
+             (4, 'xyz-abc-999')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    // Find items starting with 'abc'
+    let res = engine
+        .execute(
+            "SELECT id, code FROM items WHERE code LIKE 'abc-%' ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[1], DbValue::String("abc-123".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::String("abc-789".to_string()));
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // Find items containing 'abc' anywhere
+    let res = engine
+        .execute(
+            "SELECT id, code FROM items WHERE code LIKE '%abc%' ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[1], DbValue::String("abc-123".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::String("abc-789".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::String("xyz-abc-999".to_string()));
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
+fn test_sql_transactions() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create table
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    // 2. Perform write and rollback
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (10, 'RollbackMe')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.rollback().unwrap();
+
+    // 3. Perform write and commit
+    let tx3 = Transaction::new(3, db.clone());
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (20, 'KeepMe')",
+            &tx3,
+        )
+        .unwrap();
+    tx3.commit().unwrap();
+
+    // 4. Verify contents in a new transaction
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine
+        .execute("SELECT id, name FROM users", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Int(20), DbValue::String("KeepMe".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
+fn test_sql_optimizer_pushdown() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE test_table (id INT PRIMARY KEY, name STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO test_table (id, name) VALUES \
+             (10, 'ten'), \
+             (20, 'twenty'), \
+             (30, 'thirty'), \
+             (40, 'forty')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+
+    // 1. Equal predicate: id = 20
+    let res = engine
+        .execute("SELECT name FROM test_table WHERE id = 20", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::String("twenty".to_string())]);
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 2. Range predicate: id >= 20 AND id <= 30
+    let res = engine
+        .execute(
+            "SELECT name FROM test_table WHERE id >= 20 AND id <= 30 ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values, vec![DbValue::String("twenty".to_string())]);
+        assert_eq!(rows[1].values, vec![DbValue::String("thirty".to_string())]);
+    } else {
+        panic!("Expected Select");
+    }
+}
