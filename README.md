@@ -175,7 +175,7 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 
 ## 📚 Educational Design Decisions
 To keep the engine accessible and highly instructional, several compromises were made:
-* **Single-Threaded Execution**: Execution is serialized via transaction locks to prevent concurrency bugs from obscuring relational concepts.
+* **Optimistic Concurrency Control (OCC)**: Transactions execute concurrently on top of a multi-threaded engine, using an OCC validation phase at commit time (checking read-write, write-write, and phantom conflicts) to guarantee isolation without coarse-grained locking.
 * **In-Memory Sorts**: Sorting and aggregations collect row lists in-memory rather than spilling sorted runs to temporary storage.
 * **Hash Joins**: Equality joins are performed via building temporary hash tables of the left stream and probing them from the right stream.
 * **Single-Statement Query Limitation**: Standard query execution (`execute()`) strictly rejects inputs containing multiple semicolon-separated statements. To run multiple queries atomically, users are required to use the explicit transaction interface (`run_in_transaction` or the gRPC transaction stream), ensuring transaction boundaries are clear and handled safely.
