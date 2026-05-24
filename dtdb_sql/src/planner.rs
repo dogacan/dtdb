@@ -246,7 +246,7 @@ impl LogicalPlanner {
             let group_exprs = select
                 .group_by
                 .iter()
-                .map(|e| plan_expr(e))
+                .map(plan_expr)
                 .collect::<Result<Vec<_>, String>>()?;
 
             let mut aggr_exprs = Vec::new();
@@ -264,14 +264,13 @@ impl LogicalPlanner {
             for item in &select.projection {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        if let Ok(planned) = plan_expr(expr) {
-                            if let Some(pos) = group_exprs.iter().position(|ge| ge == &planned) {
+                        if let Ok(planned) = plan_expr(expr)
+                            && let Some(pos) = group_exprs.iter().position(|ge| ge == &planned) {
                                 if let SelectItem::ExprWithAlias { alias, .. } = item {
                                     field_names[pos] = alias.value.clone();
                                 }
                                 continue;
                             }
-                        }
 
                         let alias = match item {
                             SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
@@ -523,11 +522,11 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             };
             let planned_conditions = conditions
                 .iter()
-                .map(|c| plan_expr(c))
+                .map(plan_expr)
                 .collect::<Result<Vec<_>, String>>()?;
             let planned_results = results
                 .iter()
-                .map(|r| plan_expr(r))
+                .map(plan_expr)
                 .collect::<Result<Vec<_>, String>>()?;
             let planned_else = match else_result {
                 Some(expr) => Some(Box::new(plan_expr(expr)?)),
@@ -568,11 +567,10 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
 /// Helper to check if select list contains aggregate functions.
 fn select_items_have_aggrs(projection: &[SelectItem]) -> bool {
     for item in projection {
-        if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
-            if has_aggregate_function(expr) {
+        if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item
+            && has_aggregate_function(expr) {
                 return true;
             }
-        }
     }
     false
 }

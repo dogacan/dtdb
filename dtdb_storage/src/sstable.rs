@@ -356,13 +356,11 @@ impl SstableReader {
 
             let block = self.read_block(block_idx)?;
             for (k, v) in block {
-                if k >= *start && k <= *end {
-                    if let Some(val) = v {
-                        if filter(&k, &val) {
+                if k >= *start && k <= *end
+                    && let Some(val) = v
+                        && filter(&k, &val) {
                             results.push((k, val));
                         }
-                    }
-                }
             }
         }
 

@@ -16,7 +16,7 @@ fn count_sst_files(dir: &std::path::Path) -> usize {
     let mut count = 0;
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().map_or(false, |ext| ext == "sst") {
+            if entry.path().extension().is_some_and(|ext| ext == "sst") {
                 count += 1;
             }
         }

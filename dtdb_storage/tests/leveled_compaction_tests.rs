@@ -23,20 +23,16 @@ fn count_sst_files_at_level(dir: &std::path::Path, target_level: usize) -> usize
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "sst") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem.starts_with('L') {
+            if path.extension().is_some_and(|ext| ext == "sst")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && stem.starts_with('L') {
                         let parts: Vec<&str> = stem[1..].split('_').collect();
-                        if parts.len() == 2 {
-                            if let Ok(level) = parts[0].parse::<usize>() {
-                                if level == target_level {
+                        if parts.len() == 2
+                            && let Ok(level) = parts[0].parse::<usize>()
+                                && level == target_level {
                                     count += 1;
                                 }
-                            }
-                        }
                     }
-                }
-            }
         }
     }
     count
@@ -222,7 +218,7 @@ fn test_deep_stress_and_consistency() {
         // Assert the key variant and value type are correct
         match (k, v) {
             (DbKey::Int(key_val), DbValue::Int(_)) => {
-                assert!(key_val >= 0 && key_val <= 9);
+                assert!((0..=9).contains(&key_val));
             }
             other => panic!("Unexpected scan result: {:?}", other),
         }

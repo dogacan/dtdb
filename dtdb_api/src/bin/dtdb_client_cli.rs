@@ -167,11 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let db_name = parts[2];
                 match client.drop_db(db_name).await {
                     Ok(resp) => {
-                        if resp.success {
-                            if Some(db_name.to_string()) == active_db {
+                        if resp.success
+                            && Some(db_name.to_string()) == active_db {
                                 active_db = None;
                             }
-                        }
                         println!("{}", resp.message);
                     }
                     Err(e) => {

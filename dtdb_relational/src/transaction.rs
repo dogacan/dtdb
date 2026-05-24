@@ -106,11 +106,10 @@ impl Transaction {
         // 1. Check transaction write buffer.
         {
             let buffer = self.write_buffer.lock().unwrap();
-            if let Some(table_buffer) = buffer.get(table_name) {
-                if let Some(buffered_val) = table_buffer.get(key) {
+            if let Some(table_buffer) = buffer.get(table_name)
+                && let Some(buffered_val) = table_buffer.get(key) {
                     return Ok(buffered_val.clone());
                 }
-            }
         }
 
         // 2. Fall back to underlying storage engine.

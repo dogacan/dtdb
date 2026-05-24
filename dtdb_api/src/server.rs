@@ -66,8 +66,8 @@ impl DuctTapeDbServiceImpl {
         for entry in fs::read_dir(&self.data_dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(db_name) = path.file_name().and_then(|s| s.to_str()) {
+            if path.is_dir()
+                && let Some(db_name) = path.file_name().and_then(|s| s.to_str()) {
                     // Check if db_options.bin exists
                     if path.join("db_options.bin").exists() {
                         println!("Restoring database: {}", db_name);
@@ -88,7 +88,6 @@ impl DuctTapeDbServiceImpl {
                         );
                     }
                 }
-            }
         }
         Ok(())
     }
@@ -105,11 +104,10 @@ impl DuctTapeDbServiceImpl {
                 if let Some(db) = db_weak.upgrade() {
                     let tables = db.list_tables();
                     for table_name in tables {
-                        if let Ok(table) = db.get_table(&table_name) {
-                            if let Err(e) = table.engine.flush_memtable() {
+                        if let Ok(table) = db.get_table(&table_name)
+                            && let Err(e) = table.engine.flush_memtable() {
                                 eprintln!("Periodic flush failed for table {}: {}", table_name, e);
                             }
-                        }
                     }
                 } else {
                     break; // Database was dropped, exit loop
@@ -290,14 +288,13 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
 
             // Clean up directory from disk
             let db_path = self.data_dir.join(db_name);
-            if db_path.exists() {
-                if let Err(e) = fs::remove_dir_all(&db_path) {
+            if db_path.exists()
+                && let Err(e) = fs::remove_dir_all(&db_path) {
                     return Ok(Response::new(DropDbResponse {
                         success: false,
                         message: format!("Database removed from catalog but failed to delete files: {}", e),
                     }));
                 }
-            }
 
             Ok(Response::new(DropDbResponse {
                 success: true,

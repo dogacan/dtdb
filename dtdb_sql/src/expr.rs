@@ -133,7 +133,7 @@ impl Expr {
                     Operator::Div => {
                         match r_val {
                             DbValue::Int(0) => Err("Division by zero".to_string()),
-                            DbValue::Float(f) if f == 0.0 => Err("Division by zero".to_string()),
+                            DbValue::Float(0.0) => Err("Division by zero".to_string()),
                             _ => eval_arithmetic(&l_val, &r_val, |a, b| a / b, |a, b| a / b),
                         }
                     }
@@ -173,12 +173,11 @@ impl Expr {
                     let op_val = op_expr.eval(row, schema)?;
                     for (i, cond_expr) in conditions.iter().enumerate() {
                         let cond_val = cond_expr.eval(row, schema)?;
-                        if let Ok(ordering) = compare_values(&op_val, &cond_val) {
-                            if ordering == std::cmp::Ordering::Equal {
+                        if let Ok(ordering) = compare_values(&op_val, &cond_val)
+                            && ordering == std::cmp::Ordering::Equal {
                                 matched_idx = Some(i);
                                 break;
                             }
-                        }
                     }
                 } else {
                     for (i, cond_expr) in conditions.iter().enumerate() {

@@ -9,8 +9,6 @@ pub mod manifest;
 pub use engine::StorageEngine;
 pub use wal::WalEntry;
 
-use std::sync::Arc;
-
 pub trait ThreadSpawner: Send + Sync + 'static {
     fn spawn(&self, f: Box<dyn FnOnce() + Send + 'static>);
 }

@@ -37,15 +37,14 @@ impl SqlEngine {
     /// Checks if the SQL string contains a DDL statement (CREATE TABLE or DROP TABLE).
     pub fn is_ddl(&self, sql: &str) -> bool {
         let dialect = GenericDialect {};
-        if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
-            if !statements.is_empty() {
+        if let Ok(statements) = Parser::parse_sql(&dialect, sql)
+            && !statements.is_empty() {
                 return matches!(
                     statements[0],
                     sqlparser::ast::Statement::CreateTable { .. }
                         | sqlparser::ast::Statement::Drop { .. }
                 );
             }
-        }
         false
     }
 

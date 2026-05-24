@@ -211,7 +211,7 @@ fn test_engine_crash_recovery() {
         let mut sst_count = 0;
         for entry in fs::read_dir(&db_path).unwrap() {
             let entry = entry.unwrap();
-            if entry.path().extension().map_or(false, |ext| ext == "sst") {
+            if entry.path().extension().is_some_and(|ext| ext == "sst") {
                 sst_count += 1;
             }
         }
@@ -247,7 +247,7 @@ fn test_engine_compaction() {
         let mut sst_count = 0;
         for entry in fs::read_dir(&db_path).unwrap() {
             let entry = entry.unwrap();
-            if entry.path().extension().map_or(false, |ext| ext == "sst") {
+            if entry.path().extension().is_some_and(|ext| ext == "sst") {
                 sst_count += 1;
             }
         }
@@ -261,7 +261,7 @@ fn test_engine_compaction() {
         let mut sst_path = None;
         for entry in fs::read_dir(&db_path).unwrap() {
             let entry = entry.unwrap();
-            if entry.path().extension().map_or(false, |ext| ext == "sst") {
+            if entry.path().extension().is_some_and(|ext| ext == "sst") {
                 sst_count += 1;
                 sst_path = Some(entry.path());
             }

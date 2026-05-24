@@ -163,11 +163,10 @@ impl PhysicalOperator for PhysicalLimit {
             self.skipped += 1;
         }
 
-        if let Some(lim) = self.limit {
-            if self.returned >= lim {
+        if let Some(lim) = self.limit
+            && self.returned >= lim {
                 return Ok(None);
             }
-        }
 
         if let Some(row) = self.source.next()? {
             self.returned += 1;
