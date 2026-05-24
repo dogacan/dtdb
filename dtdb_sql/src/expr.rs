@@ -1,6 +1,7 @@
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Operator represents binary operations in SQL WHERE conditions.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,44 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Recursively collects all column names referenced in this expression.
+    pub fn collect_columns(&self, columns: &mut HashSet<String>) {
+        match self {
+            Expr::Column(name) => {
+                columns.insert(name.clone());
+            }
+            Expr::Literal(_) => {}
+            Expr::BinaryOp { left, right, .. } => {
+                left.collect_columns(columns);
+                right.collect_columns(columns);
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    op.collect_columns(columns);
+                }
+                for cond in conditions {
+                    cond.collect_columns(columns);
+                }
+                for res in results {
+                    res.collect_columns(columns);
+                }
+                if let Some(el) = else_result {
+                    el.collect_columns(columns);
+                }
+            }
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    arg.collect_columns(columns);
+                }
+            }
+        }
+    }
+
     /// Evaluates the expression against a Row and its Schema.
     pub fn eval(&self, row: &Row, schema: &Schema) -> Result<DbValue, String> {
         match self {

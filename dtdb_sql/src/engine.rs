@@ -11,6 +11,7 @@ use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
 use dtdb_storage::{DbKey, DbValue};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Represents the tabular or DDL execution output of a SQL query.
@@ -180,7 +181,7 @@ impl SqlEngine {
                 };
 
                 let optimized_plan = Optimizer::new().optimize(plan);
-                let mut physical_op = self.compile_physical(optimized_plan, tx)?;
+                let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut delete_count = 0;
                 let pk_idx = table
@@ -233,7 +234,7 @@ impl SqlEngine {
                 };
 
                 let optimized_plan = Optimizer::new().optimize(plan);
-                let mut physical_op = self.compile_physical(optimized_plan, tx)?;
+                let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut update_count = 0;
                 let pk_idx = table
@@ -291,8 +292,13 @@ impl SqlEngine {
                 // 1. Optimize the Logical Plan
                 let optimized_plan = Optimizer::new().optimize(logical_plan);
 
+                // Collect referenced columns
+                let mut cols = HashSet::new();
+                optimized_plan.collect_columns(&mut cols);
+                let cols_vec: Vec<String> = cols.into_iter().collect();
+
                 // 2. Compile to Volcano Physical Plan
-                let mut physical_op = self.compile_physical(optimized_plan, tx)?;
+                let mut physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
 
                 // 3. Consume Volcano Iterator streaming rows
                 let mut results = Vec::new();
@@ -313,8 +319,13 @@ impl SqlEngine {
                 let logical_str = format_logical_plan(&logical_plan);
                 let opt_logical_str = format_logical_plan(&optimized_plan);
 
+                // Collect referenced columns
+                let mut cols = HashSet::new();
+                optimized_plan.collect_columns(&mut cols);
+                let cols_vec: Vec<String> = cols.into_iter().collect();
+
                 // 3. Compile physical and explain it
-                let physical_op = self.compile_physical(optimized_plan, tx)?;
+                let physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
                 let mut physical_str = String::new();
                 physical_op.explain(0, &mut physical_str);
 
@@ -324,6 +335,7 @@ impl SqlEngine {
                     data_type: DataType::String,
                     is_primary_key: false,
                     is_nullable: true,
+                    locality_group: None,
                 }]);
 
                 let plan_info = format!(
@@ -345,6 +357,7 @@ impl SqlEngine {
         &self,
         plan: LogicalPlan,
         tx: &Transaction,
+        columns: Option<&[String]>,
     ) -> Result<Box<dyn PhysicalOperator>, String> {
         match plan {
             LogicalPlan::Scan {
@@ -371,13 +384,13 @@ impl SqlEngine {
                 };
 
                 let rows = tx
-                    .filtered_scan(&table_name, &start, &end, |_| true)
+                    .filtered_scan_projected(&table_name, &start, &end, columns, |_| true)
                     .map_err(|e| e.to_string())?;
 
                 Ok(Box::new(PhysicalSeqScan::new(schema, rows)))
             }
             LogicalPlan::Filter { source, predicate } => {
-                let src_op = self.compile_physical(*source, tx)?;
+                let src_op = self.compile_physical(*source, tx, columns)?;
                 Ok(Box::new(PhysicalFilter::new(src_op, predicate)))
             }
             LogicalPlan::Projection {
@@ -385,7 +398,7 @@ impl SqlEngine {
                 expressions,
                 field_names,
             } => {
-                let src_op = self.compile_physical(*source, tx)?;
+                let src_op = self.compile_physical(*source, tx, columns)?;
                 let proj_schema = LogicalPlan::Projection {
                     source: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),
@@ -408,11 +421,11 @@ impl SqlEngine {
                 limit,
                 offset,
             } => {
-                let src_op = self.compile_physical(*source, tx)?;
+                let src_op = self.compile_physical(*source, tx, columns)?;
                 Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
             LogicalPlan::Sort { source, keys } => {
-                let src_op = self.compile_physical(*source, tx)?;
+                let src_op = self.compile_physical(*source, tx, columns)?;
                 Ok(Box::new(PhysicalSort::new(src_op, keys)))
             }
             LogicalPlan::Join {
@@ -421,8 +434,8 @@ impl SqlEngine {
                 condition,
                 join_type,
             } => {
-                let left_op = self.compile_physical(*left, tx)?;
-                let right_op = self.compile_physical(*right, tx)?;
+                let left_op = self.compile_physical(*left, tx, columns)?;
+                let right_op = self.compile_physical(*right, tx, columns)?;
 
                 // Extract left_on and right_on join keys from equality join condition
                 let (left_on, right_on) = match &condition {
@@ -470,7 +483,7 @@ impl SqlEngine {
                 aggrs,
                 field_names,
             } => {
-                let src_op = self.compile_physical(*source, tx)?;
+                let src_op = self.compile_physical(*source, tx, columns)?;
                 let aggr_schema = LogicalPlan::Aggregate {
                     source: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),

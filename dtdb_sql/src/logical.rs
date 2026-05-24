@@ -1,6 +1,7 @@
 use crate::expr::{Expr, Operator};
 use dtdb_relational::{Column, DataType, Schema};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
@@ -81,6 +82,7 @@ impl LogicalPlan {
                         data_type: dt,
                         is_primary_key: false,
                         is_nullable: true,
+                        locality_group: None,
                     });
                 }
                 Schema::new(cols)
@@ -120,6 +122,7 @@ impl LogicalPlan {
                         data_type: dt,
                         is_primary_key: false,
                         is_nullable: true,
+                        locality_group: None,
                     });
                 }
 
@@ -151,12 +154,73 @@ impl LogicalPlan {
                         data_type: dt,
                         is_primary_key: false,
                         is_nullable: true,
+                        locality_group: None,
                     });
                 }
 
                 Schema::new(cols)
             }
             LogicalPlan::Sort { source, .. } => source.schema(),
+        }
+    }
+
+    /// Recursively collects all column names referenced in this logical plan.
+    pub fn collect_columns(&self, columns: &mut HashSet<String>) {
+        match self {
+            LogicalPlan::Scan { .. } => {}
+            LogicalPlan::Filter { source, predicate } => {
+                predicate.collect_columns(columns);
+                source.collect_columns(columns);
+            }
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                ..
+            } => {
+                for expr in expressions {
+                    expr.collect_columns(columns);
+                }
+                source.collect_columns(columns);
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                ..
+            } => {
+                condition.collect_columns(columns);
+                left.collect_columns(columns);
+                right.collect_columns(columns);
+            }
+            LogicalPlan::Aggregate {
+                source,
+                group_by,
+                aggrs,
+                ..
+            } => {
+                for expr in group_by {
+                    expr.collect_columns(columns);
+                }
+                for aggr in aggrs {
+                    match aggr {
+                        AggregateExpr::Count(expr)
+                        | AggregateExpr::Sum(expr)
+                        | AggregateExpr::Min(expr)
+                        | AggregateExpr::Max(expr)
+                        | AggregateExpr::Avg(expr) => expr.collect_columns(columns),
+                    }
+                }
+                source.collect_columns(columns);
+            }
+            LogicalPlan::Sort { source, keys } => {
+                for (expr, _) in keys {
+                    expr.collect_columns(columns);
+                }
+                source.collect_columns(columns);
+            }
+            LogicalPlan::Limit { source, .. } => {
+                source.collect_columns(columns);
+            }
         }
     }
 }

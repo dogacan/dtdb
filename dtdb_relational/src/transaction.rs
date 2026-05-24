@@ -104,9 +104,19 @@ impl Transaction {
 
     /// Fetches a row by primary key.
     ///
-    /// Checks the transaction buffer first (Read-Your-Own-Writes),
+    /// Checks the transaction write buffer first (Read-Your-Own-Writes),
     /// falling back to the underlying StorageEngine.
     pub fn get(&self, table_name: &str, key: &DbKey) -> Result<Option<Row>> {
+        self.get_projected(table_name, key, None)
+    }
+
+    /// Fetches a row by primary key with optional column projection.
+    pub fn get_projected(
+        &self,
+        table_name: &str,
+        key: &DbKey,
+        columns: Option<&[String]>,
+    ) -> Result<Option<Row>> {
         let table = self.get_table(table_name)?;
 
         // 1. Check transaction write buffer.
@@ -129,19 +139,7 @@ impl Transaction {
                 .insert(key.clone());
         }
 
-        match table.engine.get(key)? {
-            Some(DbValue::Bytes(bytes)) => {
-                let row = Row::from_bytes(&bytes)?;
-                Ok(Some(row))
-            }
-            Some(other) => Err(RelationalError::Storage(
-                dtdb_storage::StorageError::Corruption(format!(
-                    "Expected serialized row bytes in storage, got {:?}",
-                    other
-                )),
-            )),
-            None => Ok(None),
-        }
+        table.get(key, columns)
     }
 
     /// Performs a range scan, merging storage engine data and transaction write-buffers.
@@ -152,6 +150,21 @@ impl Transaction {
         table_name: &str,
         start: &DbKey,
         end: &DbKey,
+        filter: F,
+    ) -> Result<Vec<Row>>
+    where
+        F: Fn(&Row) -> bool,
+    {
+        self.filtered_scan_projected(table_name, start, end, None, filter)
+    }
+
+    /// Performs a range scan with column projection, merging storage engine data and transaction write-buffers.
+    pub fn filtered_scan_projected<F>(
+        &self,
+        table_name: &str,
+        start: &DbKey,
+        end: &DbKey,
+        columns: Option<&[String]>,
         filter: F,
     ) -> Result<Vec<Row>>
     where
@@ -188,8 +201,8 @@ impl Transaction {
         }
 
         // 2. Scan underlying storage engine.
-        let engine_entries = table.engine.filtered_scan(start, end, |_, _| true)?;
-        for (k, v) in engine_entries {
+        let engine_entries = table.filtered_scan(start, end, columns)?;
+        for (k, row) in engine_entries {
             // Track the read key in our read set.
             {
                 let mut read_set = self.read_set.lock().unwrap();
@@ -201,20 +214,7 @@ impl Transaction {
 
             // Only add if not overridden by the active transaction write buffer.
             if !seen.contains(&k) {
-                match v {
-                    DbValue::Bytes(bytes) => {
-                        let row = Row::from_bytes(&bytes)?;
-                        merged.insert(k, row);
-                    }
-                    other => {
-                        return Err(RelationalError::Storage(
-                            dtdb_storage::StorageError::Corruption(format!(
-                                "Expected serialized row bytes in storage scan, got {:?}",
-                                other
-                            )),
-                        ));
-                    }
-                }
+                merged.insert(k, row);
             }
         }
 
@@ -308,7 +308,7 @@ impl Transaction {
         // 3. Write batches to respective table storage engines
         for (table_name, entries) in table_batches {
             let table = self.get_table(&table_name)?;
-            table.engine.write_batch(entries)?;
+            table.write_batch(entries)?;
         }
 
         // 4. Mark Committed & Truncate if clean

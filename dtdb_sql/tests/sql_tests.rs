@@ -1089,3 +1089,129 @@ fn test_sql_explicit_null() {
         panic!("Expected Select");
     }
 }
+
+#[test]
+fn test_locality_groups_end_to_end() {
+    let (temp_dir, db, engine) = setup_engine();
+
+    // 1. CREATE TABLE with WITH (locality_groups = '...')
+    let tx1 = Transaction::new(1, db.clone());
+    let res = engine
+        .execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name STRING, salary INT, department STRING) WITH (locality_groups = 'lg_name:name; lg_finance:salary')",
+            &tx1,
+        )
+        .unwrap();
+    assert!(matches!(res, ExecutionResult::CreateTable));
+    tx1.commit().unwrap();
+
+    // Verify Schema Columns
+    {
+        let table = db.get_table("employees").unwrap();
+        assert_eq!(table.schema.columns.len(), 4);
+
+        let id_col = &table.schema.columns[0];
+        assert_eq!(id_col.name, "id");
+        assert_eq!(id_col.locality_group, None);
+
+        let name_col = &table.schema.columns[1];
+        assert_eq!(name_col.name, "name");
+        assert_eq!(name_col.locality_group.as_deref(), Some("lg_name"));
+
+        let salary_col = &table.schema.columns[2];
+        assert_eq!(salary_col.name, "salary");
+        assert_eq!(salary_col.locality_group.as_deref(), Some("lg_finance"));
+
+        let dept_col = &table.schema.columns[3];
+        assert_eq!(dept_col.name, "department");
+        assert_eq!(dept_col.locality_group, None);
+    }
+
+    // 2. Insert values
+    let tx2 = Transaction::new(2, db.clone());
+    let res = engine
+        .execute(
+            "INSERT INTO employees (id, name, salary, department) VALUES (1, 'Alice', 100000, 'Engineering'), (2, 'Bob', 80000, 'HR')",
+            &tx2,
+        )
+        .unwrap();
+    assert_eq!(res, ExecutionResult::Insert { count: 2 });
+    tx2.commit().unwrap();
+
+    // 3. SELECT all columns
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT id, name, salary, department FROM employees ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::Int(1),
+                DbValue::String("Alice".to_string()),
+                DbValue::Int(100000),
+                DbValue::String("Engineering".to_string())
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::Int(2),
+                DbValue::String("Bob".to_string()),
+                DbValue::Int(80000),
+                DbValue::String("HR".to_string())
+            ]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 4. Update a row
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine
+        .execute("UPDATE employees SET salary = 110000 WHERE id = 1", &tx4)
+        .unwrap();
+    assert_eq!(res, ExecutionResult::Update { count: 1 });
+    tx4.commit().unwrap();
+
+    // 5. Select and verify update
+    let tx5 = Transaction::new(5, db.clone());
+    let res = engine
+        .execute("SELECT name, salary FROM employees ORDER BY id ASC", &tx5)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("Alice".to_string()), DbValue::Int(110000)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("Bob".to_string()), DbValue::Int(80000)]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 6. Verify directory structure to ensure locality groups were created as subdirectories
+    let table_path = temp_dir.path().join("employees");
+
+    // Default group directory should contain manifest and WAL
+    let default_dir = table_path.join("default");
+    assert!(default_dir.exists());
+    assert!(default_dir.join("manifest.bin").exists());
+
+    // lg_name directory should contain manifest and WAL
+    let lg_name_dir = table_path.join("lg_lg_name");
+    assert!(lg_name_dir.exists());
+    assert!(lg_name_dir.join("manifest.bin").exists());
+
+    // lg_finance directory should contain manifest and WAL
+    let lg_finance_dir = table_path.join("lg_lg_finance");
+    assert!(lg_finance_dir.exists());
+    assert!(lg_finance_dir.join("manifest.bin").exists());
+}

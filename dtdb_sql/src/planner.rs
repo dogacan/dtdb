@@ -48,9 +48,36 @@ impl LogicalPlanner {
     /// Plans a parsed sqlparser AST Statement.
     pub fn plan(&self, statement: &Statement) -> Result<SqlStatement, String> {
         match statement {
-            Statement::CreateTable { name, columns, .. } => {
+            Statement::CreateTable {
+                name,
+                columns,
+                with_options,
+                ..
+            } => {
                 let table_name = name.to_string();
                 let mut cols = Vec::new();
+
+                let mut locality_map = std::collections::HashMap::new();
+                for opt in with_options {
+                    if opt.name.value == "locality_groups"
+                        && let sqlparser::ast::Value::SingleQuotedString(ref val_str) = opt.value
+                    {
+                        for part in val_str.split(';') {
+                            let part = part.trim();
+                            if part.is_empty() {
+                                continue;
+                            }
+                            let sub_parts: Vec<&str> = part.split(':').collect();
+                            if sub_parts.len() == 2 {
+                                let group_name = sub_parts[0].trim().to_string();
+                                for col_name in sub_parts[1].split(',') {
+                                    let col_name = col_name.trim().to_string();
+                                    locality_map.insert(col_name, group_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
 
                 for col in columns {
                     let dt = match &col.data_type {
@@ -79,11 +106,14 @@ impl LogicalPlanner {
                             .iter()
                             .any(|opt| matches!(opt.option, ColumnOption::NotNull));
 
+                    let group = locality_map.get(&col.name.value).cloned();
+
                     cols.push(Column {
                         name: col.name.value.clone(),
                         data_type: dt,
                         is_primary_key: is_pk,
                         is_nullable,
+                        locality_group: group,
                     });
                 }
 

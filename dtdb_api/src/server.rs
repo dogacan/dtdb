@@ -108,7 +108,7 @@ impl DuctTapeDbServiceImpl {
                     let tables = db.list_tables();
                     for table_name in tables {
                         if let Ok(table) = db.get_table(&table_name)
-                            && let Err(e) = table.engine.flush_memtable()
+                            && let Err(e) = table.flush_memtable()
                         {
                             eprintln!("Periodic flush failed for table {}: {}", table_name, e);
                         }
@@ -358,7 +358,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let mut flushed_tables = Vec::new();
         for table_name in tables {
             if let Ok(table) = database.get_table(&table_name) {
-                table.engine.flush_memtable().map_err(|e| {
+                table.flush_memtable().map_err(|e| {
                     Status::internal(format!("Failed to flush table {}: {}", table_name, e))
                 })?;
                 flushed_tables.push(table_name);

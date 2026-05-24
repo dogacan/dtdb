@@ -2,6 +2,7 @@ use crate::error::{RelationalError, Result};
 use crate::row::Row;
 use dtdb_storage::{DbKey, DbValue};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// DataType represents the supported SQL data types in DuctTapeDB.
@@ -26,6 +27,8 @@ pub struct Column {
     pub is_primary_key: bool,
     #[serde(default = "default_nullable")]
     pub is_nullable: bool,
+    #[serde(default)]
+    pub locality_group: Option<String>,
 }
 
 /// Schema defines the set of columns and types of a relational table.
@@ -38,6 +41,57 @@ impl Schema {
     /// Creates a new Schema.
     pub fn new(columns: Vec<Column>) -> Self {
         Self { columns }
+    }
+
+    /// Returns the set of all unique locality group names in the table schema.
+    /// Columns without an explicit locality group are mapped to the default group `""`.
+    pub fn locality_groups(&self) -> HashSet<String> {
+        let mut groups = HashSet::new();
+        for col in &self.columns {
+            let group = col.locality_group.as_deref().unwrap_or("");
+            groups.insert(group.to_string());
+        }
+        if groups.is_empty() {
+            groups.insert("".to_string());
+        }
+        groups
+    }
+
+    /// Splits a full row into a sub-row containing only the columns belonging to the specified group.
+    pub fn split_row(&self, row: &Row, group: &str) -> Row {
+        let mut sub_values = Vec::new();
+        for col in &self.columns {
+            let col_group = col.locality_group.as_deref().unwrap_or("");
+            if col_group == group
+                && let Some(idx) = self.column_index(&col.name)
+            {
+                sub_values.push(row.values[idx].clone());
+            }
+        }
+        Row::new(sub_values)
+    }
+
+    /// Merges sub-rows from various locality groups back into a single full row.
+    /// Columns in groups that are missing/None in the input map will be populated with DbValue::Null.
+    pub fn merge_rows(&self, group_rows: &HashMap<String, Option<Row>>) -> Row {
+        let mut full_values = vec![DbValue::Null; self.columns.len()];
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            let group = col.locality_group.as_deref().unwrap_or("");
+            if let Some(Some(sub_row)) = group_rows.get(group) {
+                // Find the relative index of this column within the sub-row of the group.
+                let relative_idx = self
+                    .columns
+                    .iter()
+                    .filter(|c| c.locality_group.as_deref().unwrap_or("") == group)
+                    .position(|c| c.name == col.name);
+                if let Some(r_idx) = relative_idx
+                    && let Some(val) = sub_row.get_by_index(r_idx)
+                {
+                    full_values[col_idx] = val.clone();
+                }
+            }
+        }
+        Row::new(full_values)
     }
 
     /// Validates a Row against this Schema.

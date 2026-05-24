@@ -12,18 +12,21 @@ fn create_test_schema() -> Schema {
             data_type: DataType::Int,
             is_primary_key: true,
             is_nullable: false,
+            locality_group: None,
         },
         Column {
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
             is_nullable: true,
+            locality_group: None,
         },
         Column {
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
             is_nullable: true,
+            locality_group: None,
         },
     ])
 }
@@ -281,4 +284,100 @@ fn test_drop_table_stranded_cleanup_on_startup() {
 
     // 4. Verify the stranded directory was deleted.
     assert!(!stranded_path.exists());
+}
+
+#[test]
+fn test_locality_group_pruning_verification() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    // Schema with three distinct locality groups:
+    // 1. "" (default) for id
+    // 2. "lg_name" for name
+    // 3. "lg_score" for score
+    let schema = Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+        },
+        Column {
+            name: "name".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_name".to_string()),
+        },
+        Column {
+            name: "score".to_string(),
+            data_type: DataType::Float,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_score".to_string()),
+        },
+    ]);
+
+    db.create_table("users", schema).unwrap();
+    let table = db.get_table("users").unwrap();
+
+    // Insert row: (1, "Alice", 95.5)
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+    tx.commit().unwrap();
+
+    // Case 1: Query only "name" column.
+    // This should only scan "lg_name" group, leaving "id" and "score" as Null.
+    let scan1 = table
+        .filtered_scan(&k_int(1), &k_int(1), Some(&["name".to_string()]))
+        .unwrap();
+    assert_eq!(scan1.len(), 1);
+    assert_eq!(
+        scan1[0].1.values,
+        vec![
+            DbValue::Null,
+            DbValue::String("Alice".to_string()),
+            DbValue::Null
+        ]
+    );
+
+    // Case 2: Query only "score" column.
+    // This should only scan "lg_score" group, leaving "id" and "name" as Null.
+    let scan2 = table
+        .filtered_scan(&k_int(1), &k_int(1), Some(&["score".to_string()]))
+        .unwrap();
+    assert_eq!(scan2.len(), 1);
+    assert_eq!(
+        scan2[0].1.values,
+        vec![DbValue::Null, DbValue::Null, DbValue::Float(95.5)]
+    );
+
+    // Case 3: Query "id" and "score" columns.
+    // This should scan default ("") and "lg_score" groups, leaving "name" as Null.
+    let scan3 = table
+        .filtered_scan(
+            &k_int(1),
+            &k_int(1),
+            Some(&["id".to_string(), "score".to_string()]),
+        )
+        .unwrap();
+    assert_eq!(scan3.len(), 1);
+    assert_eq!(
+        scan3[0].1.values,
+        vec![DbValue::Int(1), DbValue::Null, DbValue::Float(95.5)]
+    );
+
+    // Case 4: Query all columns (None parameter).
+    // This should scan all groups and return the fully populated row.
+    let scan4 = table.filtered_scan(&k_int(1), &k_int(1), None).unwrap();
+    assert_eq!(scan4.len(), 1);
+    assert_eq!(
+        scan4[0].1.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Float(95.5)
+        ]
+    );
 }

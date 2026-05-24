@@ -11,12 +11,14 @@ fn create_user_schema() -> Schema {
             data_type: DataType::Int,
             is_primary_key: true,
             is_nullable: false,
+            locality_group: None,
         },
         Column {
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
             is_nullable: true,
+            locality_group: None,
         },
     ])
 }

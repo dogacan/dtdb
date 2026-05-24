@@ -1,6 +1,9 @@
 use crate::error::{RelationalError, Result};
+use crate::row::Row;
 use crate::schema::Schema;
-use dtdb_storage::{CompressionType, EngineOptions, StorageEngine, ThreadSpawner, WalEntry};
+use dtdb_storage::{
+    CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, ThreadSpawner, WalEntry,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
@@ -38,7 +41,202 @@ pub struct CommitRecord {
 pub struct Table {
     pub name: String,
     pub schema: Schema,
-    pub engine: Arc<StorageEngine>,
+    pub engines: HashMap<String, Arc<StorageEngine>>,
+}
+
+impl Table {
+    /// Helper to get the physical directory path for a locality group.
+    /// If the group is empty, we use a subdirectory named "default".
+    pub fn group_dir(table_path: &Path, group: &str) -> PathBuf {
+        if group.is_empty() {
+            table_path.join("default")
+        } else {
+            table_path.join(format!("lg_{}", group))
+        }
+    }
+
+    /// Performs a write batch of mutations to the table, splitting updates across locality groups.
+    pub fn write_batch(&self, entries: Vec<WalEntry>) -> Result<()> {
+        let mut group_batches: HashMap<String, Vec<WalEntry>> = HashMap::new();
+        for group in self.engines.keys() {
+            group_batches.insert(group.clone(), Vec::new());
+        }
+
+        for entry in entries {
+            match entry {
+                WalEntry::Put { key, value } => {
+                    let bytes = match value {
+                        DbValue::Bytes(b) => b,
+                        _ => {
+                            return Err(RelationalError::Storage(
+                                dtdb_storage::StorageError::Corruption(
+                                    "Expected bytes for row serialization".to_string(),
+                                ),
+                            ));
+                        }
+                    };
+                    let full_row = Row::from_bytes(&bytes)?;
+                    for (group, batch) in &mut group_batches {
+                        let sub_row = self.schema.split_row(&full_row, group);
+                        let sub_bytes = sub_row.to_bytes()?;
+                        batch.push(WalEntry::Put {
+                            key: key.clone(),
+                            value: DbValue::Bytes(sub_bytes),
+                        });
+                    }
+                }
+                WalEntry::Delete { key } => {
+                    for batch in group_batches.values_mut() {
+                        batch.push(WalEntry::Delete { key: key.clone() });
+                    }
+                }
+                WalEntry::Batch(_) => {}
+            }
+        }
+
+        for (group, batch) in group_batches {
+            if let Some(engine) = self.engines.get(&group) {
+                engine.write_batch(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flushes the memtables of all storage engines belonging to the table.
+    pub fn flush_memtable(&self) -> Result<()> {
+        for engine in self.engines.values() {
+            engine.flush_memtable()?;
+        }
+        Ok(())
+    }
+
+    /// Fetches a row by primary key, reading only the necessary locality group engines.
+    pub fn get(&self, key: &DbKey, columns: Option<&[String]>) -> Result<Option<Row>> {
+        let mut needed_groups = HashSet::new();
+        if let Some(cols) = columns {
+            for col_name in cols {
+                if let Some(col) = self.schema.columns.iter().find(|c| {
+                    &c.name == col_name
+                        || col_name.ends_with(&format!(".{}", c.name))
+                        || c.name.ends_with(&format!(".{}", col_name))
+                }) {
+                    needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
+                }
+            }
+            if needed_groups.is_empty() {
+                needed_groups.insert("".to_string());
+            }
+        } else {
+            for g in self.schema.locality_groups() {
+                needed_groups.insert(g);
+            }
+        }
+
+        let mut group_rows = HashMap::new();
+        let mut found_any = false;
+        for group in needed_groups {
+            if let Some(engine) = self.engines.get(&group) {
+                if let Some(DbValue::Bytes(bytes)) = engine.get(key)? {
+                    let sub_row = Row::from_bytes(&bytes)?;
+                    group_rows.insert(group, Some(sub_row));
+                    found_any = true;
+                } else {
+                    group_rows.insert(group, None);
+                }
+            }
+        }
+
+        if found_any {
+            Ok(Some(self.schema.merge_rows(&group_rows)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Performs a range scan across the necessary locality group engines, merge-joining the sorted streams.
+    pub fn filtered_scan(
+        &self,
+        start: &DbKey,
+        end: &DbKey,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<(DbKey, Row)>> {
+        let mut needed_groups = HashSet::new();
+        if let Some(cols) = columns {
+            for col_name in cols {
+                if let Some(col) = self.schema.columns.iter().find(|c| {
+                    &c.name == col_name
+                        || col_name.ends_with(&format!(".{}", c.name))
+                        || c.name.ends_with(&format!(".{}", col_name))
+                }) {
+                    needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
+                }
+            }
+            if needed_groups.is_empty() {
+                needed_groups.insert("".to_string());
+            }
+        } else {
+            for g in self.schema.locality_groups() {
+                needed_groups.insert(g);
+            }
+        }
+
+        let needed_groups_vec: Vec<String> = needed_groups.into_iter().collect();
+        let mut group_scans = HashMap::new();
+        for group in &needed_groups_vec {
+            let Some(engine) = self.engines.get(group) else {
+                continue;
+            };
+            let entries = engine.filtered_scan(start, end, |_, _| true)?;
+            let mut rows = Vec::new();
+            for (k, v) in entries {
+                if let DbValue::Bytes(bytes) = v {
+                    let r = Row::from_bytes(&bytes)?;
+                    rows.push((k, r));
+                }
+            }
+            group_scans.insert(group.clone(), rows);
+        }
+
+        let mut result = Vec::new();
+        let mut cursors: HashMap<String, usize> =
+            needed_groups_vec.iter().map(|g| (g.clone(), 0)).collect();
+
+        loop {
+            let mut min_key: Option<DbKey> = None;
+            for (group, &idx) in &cursors {
+                if let Some(entries) = group_scans.get(group)
+                    && idx < entries.len()
+                {
+                    let key = &entries[idx].0;
+                    if min_key.is_none() || key < min_key.as_ref().unwrap() {
+                        min_key = Some(key.clone());
+                    }
+                }
+            }
+
+            let Some(k) = min_key else {
+                break;
+            };
+
+            let mut row_parts = HashMap::new();
+            for group in &needed_groups_vec {
+                let idx = cursors.get_mut(group).unwrap();
+                if let Some(entries) = group_scans.get(group) {
+                    if *idx < entries.len() && entries[*idx].0 == k {
+                        row_parts.insert(group.clone(), Some(entries[*idx].1.clone()));
+                        *idx += 1;
+                    } else {
+                        row_parts.insert(group.clone(), None);
+                    }
+                }
+            }
+
+            let merged_row = self.schema.merge_rows(&row_parts);
+            result.push((k, merged_row));
+        }
+
+        Ok(result)
+    }
 }
 
 /// DatabaseOptions defines the configuration parameters for a Database.
@@ -176,18 +374,40 @@ impl Database {
                         level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
                         max_level: options.max_level.unwrap_or(7),
                     };
-                    let engine = Arc::new(StorageEngine::open_with_spawner(
-                        &path,
-                        engine_opts,
-                        spawner.clone(),
-                    )?);
+
+                    let mut engines = HashMap::new();
+                    let groups = schema.locality_groups();
+
+                    // Check for old table layout (backward compatibility)
+                    if groups.len() <= 1
+                        && groups.contains("")
+                        && (path.join("manifest.bin").exists() || path.join("wal.log").exists())
+                    {
+                        let engine = Arc::new(StorageEngine::open_with_spawner(
+                            &path,
+                            engine_opts,
+                            spawner.clone(),
+                        )?);
+                        engines.insert("".to_string(), engine);
+                    } else {
+                        // Multi-engine / new layout
+                        for group in groups {
+                            let g_path = Table::group_dir(&path, &group);
+                            let engine = Arc::new(StorageEngine::open_with_spawner(
+                                &g_path,
+                                engine_opts,
+                                spawner.clone(),
+                            )?);
+                            engines.insert(group, engine);
+                        }
+                    }
 
                     tables.insert(
                         name.clone(),
                         Table {
                             name,
                             schema,
-                            engine,
+                            engines,
                         },
                     );
                 }
@@ -251,19 +471,33 @@ impl Database {
             max_level: self.options.max_level.unwrap_or(7),
         };
 
-        // Open the new Layer 1 storage engine
-        let engine = Arc::new(StorageEngine::open_with_spawner(
-            &table_path,
-            engine_opts,
-            self.spawner.clone(),
-        )?);
+        let mut engines = HashMap::new();
+        let groups = schema.locality_groups();
+        if groups.len() <= 1 && groups.contains("") {
+            let engine = Arc::new(StorageEngine::open_with_spawner(
+                &table_path,
+                engine_opts,
+                self.spawner.clone(),
+            )?);
+            engines.insert("".to_string(), engine);
+        } else {
+            for group in groups {
+                let g_path = Table::group_dir(&table_path, &group);
+                let engine = Arc::new(StorageEngine::open_with_spawner(
+                    &g_path,
+                    engine_opts,
+                    self.spawner.clone(),
+                )?);
+                engines.insert(group, engine);
+            }
+        }
 
         tables_guard.insert(
             name.to_string(),
             Table {
                 name: name.to_string(),
                 schema,
-                engine,
+                engines,
             },
         );
 
@@ -290,9 +524,7 @@ impl Database {
         loop {
             let has_active_readers = {
                 let access = self.active_table_access.lock().unwrap();
-                access
-                    .get(name)
-                    .is_some_and(|readers| !readers.is_empty())
+                access.get(name).is_some_and(|readers| !readers.is_empty())
             };
             if !has_active_readers {
                 break;
@@ -426,7 +658,7 @@ impl Database {
                         "Rolling forward transaction {} for table {}",
                         tx_id, table_name
                     );
-                    table.engine.write_batch(entries)?;
+                    table.write_batch(entries)?;
                 }
             }
         }

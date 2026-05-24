@@ -199,3 +199,5 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 * **In-Memory Sorts**: Sorting and aggregations collect row lists in-memory rather than spilling sorted runs to temporary storage.
 * **Hash Joins**: Equality joins are performed via building temporary hash tables of the left stream and probing them from the right stream.
 * **Single-Statement Query Limitation**: Standard query execution (`execute()`) strictly rejects inputs containing multiple semicolon-separated statements. To run multiple queries atomically, users are required to use the explicit transaction interface (`run_in_transaction` or the gRPC transaction stream), ensuring transaction boundaries are clear and handled safely.
+* **Locality Groups & Column Storage**: Supports grouping table columns into separate physical locality groups stored in independent LSM-tree subdirectories. To guarantee 100% correct transactional updates without complex partial-row merges or concurrency anomalies, the database reads all columns during `UPDATE` operations while optimizing read paths (`SELECT` queries) using query-level column pruning to read only the needed locality groups.
+
