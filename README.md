@@ -38,9 +38,9 @@ Parses, plans, optimizes, and executes queries.
 
 ### 4. Layer 4: Client API & RPC Server (`dtdb_api`)
 Exposes database resources over a client API supporting both embedded (in-process) and client-server (gRPC) configurations.
-* **Protobuf API**: Defines database creation/deletion and streaming query execution endpoints.
-* **gRPC Server**: Restores existing databases on boot, handles transaction lifecycles, and streams query rows back.
-* **Client Library & CLI**: Unified client library to query databases either in-process or via gRPC, plus an interactive shell tool.
+* **Protobuf API**: Defines database creation/deletion, streaming query execution, and bidirectional streaming transaction endpoints.
+* **gRPC Server**: Restores existing databases on boot, implements stateful multi-statement transactions using a streaming RPC, and streams query rows back.
+* **Client Library**: A unified Rust client library (`DuctTapeDbClient`) that supports both in-process and remote gRPC execution, featuring an explicit transaction closure API (`run_in_transaction`).
 
 ---
 
@@ -121,6 +121,47 @@ EXPLAIN SELECT name FROM users WHERE id >= 1 AND id <= 2;
 exit
 ```
 
+### Using the Rust Client Library
+
+You can embed DuctTapeDB directly into your Rust application (in-process mode) or run a remote `dtdb_server` and connect to it over gRPC (remote mode) using the exact same API interface.
+
+Add `dtdb_api` as a dependency in your `Cargo.toml`. You'll also need `tokio` (with async runtime support) and `futures-util` (for stream processing):
+
+```rust
+use dtdb_api::client::DuctTapeDbClient;
+use dtdb_storage::CompressionType;
+use futures_util::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize the client (In-Process mode)
+    let mut client = DuctTapeDbClient::in_process("./data")?;
+
+    // Or connect to a remote server over gRPC (Remote mode):
+    // let mut client = DuctTapeDbClient::connect("http://127.0.0.1:50051").await?;
+
+    // 2. Create a database
+    client.create_db("mydb", CompressionType::Uncompressed).await?;
+
+    // 3. Execute queries (streams result rows)
+    let mut stream = client
+        .execute_query("mydb", "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);")
+        .await?;
+    while let Some(resp) = stream.next().await {
+        println!("{:?}", resp?);
+    }
+
+    // 4. Run multiple statements atomically in a transaction
+    client.run_in_transaction("mydb", |tx| async move {
+        tx.execute_query("INSERT INTO users (id, name) VALUES (1, 'Alice');").await?;
+        tx.execute_query("INSERT INTO users (id, name) VALUES (2, 'Bob');").await?;
+        Ok(())
+    }).await?;
+
+    Ok(())
+}
+```
+
 ---
 
 ## 🛠️ Diagnostics & Explain Plans
@@ -137,4 +178,5 @@ To keep the engine accessible and highly instructional, several compromises were
 * **Single-Threaded Execution**: Execution is serialized via transaction locks to prevent concurrency bugs from obscuring relational concepts.
 * **In-Memory Sorts**: Sorting and aggregations collect row lists in-memory rather than spilling sorted runs to temporary storage.
 * **Hash Joins**: Equality joins are performed via building temporary hash tables of the left stream and probing them from the right stream.
+* **Single-Statement Query Limitation**: Standard query execution (`execute()`) strictly rejects inputs containing multiple semicolon-separated statements. To run multiple queries atomically, users are required to use the explicit transaction interface (`run_in_transaction` or the gRPC transaction stream), ensuring transaction boundaries are clear and handled safely.
 
