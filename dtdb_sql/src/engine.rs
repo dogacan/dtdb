@@ -1,4 +1,3 @@
-use crate::SqlQuery;
 use crate::expr::{Expr, Operator};
 use crate::logical::{LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
@@ -48,16 +47,6 @@ impl SqlEngine {
             );
         }
         false
-    }
-
-    /// Executes a parameterized SqlQuery safely by interpolating bound parameters first.
-    pub fn execute_query(
-        &self,
-        query: &SqlQuery,
-        tx: &Transaction,
-    ) -> Result<ExecutionResult, String> {
-        let sql = query.interpolate()?;
-        self.execute(&sql, tx)
     }
 
     /// Parses, plans, optimizes, and executes a single SQL statement within the given transaction.

@@ -29,30 +29,49 @@ int main() {
         std::cout << "[C++] Creating table 'users'..." << std::endl;
         QueryResult create_res = client.execute_query(
             "demo_db",
-            "CREATE TABLE users (id INT PRIMARY KEY, name STRING, active INT);"
+            dtdb::SqlQuery("CREATE TABLE users (id INT PRIMARY KEY, name STRING, active INT);")
         );
         assert(create_res.success);
         std::cout << "[C++] Create table success: " << std::string(create_res.rows[0]) << std::endl;
 
-        // 4. Executing inserts inside an exception-safe transaction block
-        std::cout << "[C++] Executing inserts in run_in_transaction..." << std::endl;
+        // 4. Executing inserts inside an exception-safe transaction block using parameterized queries
+        std::cout << "[C++] Executing inserts in run_in_transaction using parameterized queries..." << std::endl;
         client.run_in_transaction("demo_db", [&](const CxxTransaction& tx) {
-            QueryResult insert1 = client.execute_tx_query(tx, "INSERT INTO users VALUES (1, 'Alice', 1);");
+            QueryResult insert1 = client.execute_tx_query(
+                tx,
+                dtdb::SqlQuery("INSERT INTO users (id, name, active) VALUES (@id, @name, @active);")
+                    .bind("id", "1")
+                    .bind("name", "Alice")
+                    .bind("active", "1")
+            );
             assert(insert1.success);
 
-            QueryResult insert2 = client.execute_tx_query(tx, "INSERT INTO users VALUES (2, 'Bob', 0);");
+            QueryResult insert2 = client.execute_tx_query(
+                tx,
+                dtdb::SqlQuery("INSERT INTO users (id, name, active) VALUES (@id, @name, @active);")
+                    .bind("id", "2")
+                    .bind("name", "Bob")
+                    .bind("active", "0")
+            );
             assert(insert2.success);
 
-            QueryResult insert3 = client.execute_tx_query(tx, "INSERT INTO users VALUES (3, 'Charlie', 1);");
+            QueryResult insert3 = client.execute_tx_query(
+                tx,
+                dtdb::SqlQuery("INSERT INTO users (id, name, active) VALUES (@id, @name, @active);")
+                    .bind("id", "3")
+                    .bind("name", "Charlie")
+                    .bind("active", "1")
+            );
             assert(insert3.success);
         });
         std::cout << "[C++] Transaction committed successfully!" << std::endl;
 
-        // 5. Query the inserted data
-        std::cout << "[C++] Querying all active users (active = 1)..." << std::endl;
+        // 5. Query the inserted data with parameterized filtering
+        std::cout << "[C++] Querying all active users (active = 1) using parameterized query..." << std::endl;
         QueryResult select_res = client.execute_query(
             "demo_db",
-            "SELECT id, name FROM users WHERE active = 1 ORDER BY id ASC;"
+            dtdb::SqlQuery("SELECT id, name FROM users WHERE active = @active ORDER BY id ASC;")
+                .bind("active", "1")
         );
         assert(select_res.success);
 
@@ -77,7 +96,7 @@ int main() {
         // 6. Test Error Handling (query non-existent table)
         std::cout << "[C++] Testing FFI error handling (should throw exception)..." << std::endl;
         try {
-            client.execute_query("demo_db", "SELECT * FROM non_existent;");
+            client.execute_query("demo_db", dtdb::SqlQuery("SELECT * FROM non_existent;"));
             std::cerr << "[C++] Error: Expected exception, but query succeeded!" << std::endl;
             return 1;
         } catch (const rust::Error& e) {

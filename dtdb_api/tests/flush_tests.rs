@@ -75,7 +75,9 @@ async fn test_wal_size_based_flush() {
         let mut stream = client
             .execute_query(
                 "db_wal",
-                "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));",
+                dtdb_api::sql_query!(
+                    "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));"
+                ),
             )
             .await
             .unwrap();
@@ -92,7 +94,7 @@ async fn test_wal_size_based_flush() {
         let mut stream = client
             .execute_query(
                 "db_wal",
-                "INSERT INTO TestTable (id, value) VALUES (1, 'This is a long string designed to exceed 100 bytes in the WAL, which should trigger an automatic flush to disk.');"
+                dtdb_api::sql_query!("INSERT INTO TestTable (id, value) VALUES (1, 'This is a long string designed to exceed 100 bytes in the WAL, which should trigger an automatic flush to disk.');"),
             )
             .await
             .unwrap();
@@ -158,7 +160,9 @@ async fn test_periodic_time_based_flush() {
         let mut stream = client
             .execute_query(
                 "db_periodic",
-                "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));",
+                dtdb_api::sql_query!(
+                    "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));"
+                ),
             )
             .await
             .unwrap();
@@ -175,7 +179,7 @@ async fn test_periodic_time_based_flush() {
         let mut stream = client
             .execute_query(
                 "db_periodic",
-                "INSERT INTO TestTable (id, value) VALUES (1, 'small');",
+                dtdb_api::sql_query!("INSERT INTO TestTable (id, value) VALUES (1, 'small');"),
             )
             .await
             .unwrap();
@@ -247,7 +251,9 @@ async fn test_manual_rpc_flush() {
         let mut stream = client
             .execute_query(
                 "db_manual",
-                "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));",
+                dtdb_api::sql_query!(
+                    "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));"
+                ),
             )
             .await
             .unwrap();
@@ -264,7 +270,7 @@ async fn test_manual_rpc_flush() {
         let mut stream = client
             .execute_query(
                 "db_manual",
-                "INSERT INTO TestTable (id, value) VALUES (1, 'small');",
+                dtdb_api::sql_query!("INSERT INTO TestTable (id, value) VALUES (1, 'small');"),
             )
             .await
             .unwrap();

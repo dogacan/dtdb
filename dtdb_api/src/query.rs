@@ -2,13 +2,13 @@ use dtdb_storage::DbValue;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlQuery {
-    text: &'static str,
+    text: String,
     bindings: Vec<(String, DbValue)>,
 }
 
 impl SqlQuery {
-    /// Creates a new SqlQuery with the given static text.
-    pub const fn new(text: &'static str) -> Self {
+    /// Creates a new SqlQuery with the given text.
+    pub fn new(text: String) -> Self {
         Self {
             text,
             bindings: Vec::new(),
@@ -88,8 +88,8 @@ impl SqlQuery {
     }
 
     /// Accessor for query text
-    pub fn text(&self) -> &'static str {
-        self.text
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// Accessor for query bindings

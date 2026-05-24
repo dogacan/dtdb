@@ -8,6 +8,16 @@ use tokio::runtime::Runtime;
 
 #[cxx::bridge]
 pub mod ffi {
+    struct QueryParam {
+        name: String,
+        value: String,
+    }
+
+    struct CxxSqlQuery {
+        text: String,
+        params: Vec<QueryParam>,
+    }
+
     // Flattened QueryResult to pass query data cleanly across FFI.
     // Memory layout is optimized using 1D vector rows where:
     // row_count = rows.len() / headers.len()
@@ -29,18 +39,63 @@ pub mod ffi {
         // Database operations
         fn create_db(self: &CxxClient, db_name: &str) -> Result<()>;
         fn drop_db(self: &CxxClient, db_name: &str) -> Result<()>;
-        fn execute_query(self: &CxxClient, db_name: &str, sql: &str) -> Result<QueryResult>;
+        fn execute_query(
+            self: &CxxClient,
+            db_name: &str,
+            query: CxxSqlQuery,
+        ) -> Result<QueryResult>;
 
         // Multi-statement Transaction support
         fn start_transaction(self: &CxxClient, db_name: &str) -> Result<Box<CxxTransaction>>;
         fn execute_tx_query(
             self: &CxxClient,
             tx: &CxxTransaction,
-            sql: &str,
+            query: CxxSqlQuery,
         ) -> Result<QueryResult>;
         fn commit_tx(self: &CxxClient, tx: Box<CxxTransaction>) -> Result<()>;
         fn rollback_tx(self: &CxxClient, tx: Box<CxxTransaction>) -> Result<()>;
     }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks_exact(2) {
+        let high = char::from(chunk[0]).to_digit(16)? as u8;
+        let low = char::from(chunk[1]).to_digit(16)? as u8;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+fn parse_cxx_value(val: &str) -> dtdb_storage::DbValue {
+    if val.eq_ignore_ascii_case("null") {
+        return dtdb_storage::DbValue::Null;
+    }
+    if let Ok(i) = val.parse::<i64>() {
+        return dtdb_storage::DbValue::Int(i);
+    }
+    if let Ok(f) = val.parse::<f64>() {
+        return dtdb_storage::DbValue::Float(f);
+    }
+    if (val.starts_with("x'") || val.starts_with("X'")) && val.ends_with('\'') && val.len() >= 3 {
+        let hex_str = &val[2..val.len() - 1];
+        if let Some(bytes) = decode_hex(hex_str) {
+            return dtdb_storage::DbValue::Bytes(bytes);
+        }
+    }
+    dtdb_storage::DbValue::String(val.to_string())
+}
+
+fn convert_cxx_query(cxx_query: ffi::CxxSqlQuery) -> dtdb_api::SqlQuery {
+    let mut query = dtdb_api::SqlQuery::new(cxx_query.text);
+    for p in cxx_query.params {
+        let val = parse_cxx_value(&p.value);
+        query = query.bind(p.name, val);
+    }
+    query
 }
 
 pub struct CxxClient {
@@ -50,7 +105,7 @@ pub struct CxxClient {
 
 enum TxRequest {
     Execute {
-        sql: String,
+        query: dtdb_api::SqlQuery,
         resp_tx: tokio::sync::oneshot::Sender<Result<ffi::QueryResult, String>>,
     },
     Commit {
@@ -111,11 +166,16 @@ impl CxxClient {
         Ok(())
     }
 
-    pub fn execute_query(&self, db_name: &str, sql: &str) -> Result<ffi::QueryResult, String> {
+    pub fn execute_query(
+        &self,
+        db_name: &str,
+        query: ffi::CxxSqlQuery,
+    ) -> Result<ffi::QueryResult, String> {
         let mut client = self.client.clone();
+        let rust_query = convert_cxx_query(query);
         self.runtime.block_on(async {
             let mut stream = client
-                .execute_query(db_name, sql)
+                .execute_query(db_name, rust_query)
                 .await
                 .map_err(|e| e.message().to_string())?;
 
@@ -166,8 +226,8 @@ impl CxxClient {
                 .run_in_transaction(&db_name, |tx_client| async move {
                     while let Some(req) = req_rx.recv().await {
                         match req {
-                            TxRequest::Execute { sql, resp_tx } => {
-                                let responses_result = tx_client.execute_query(&sql).await;
+                            TxRequest::Execute { query, resp_tx } => {
+                                let responses_result = tx_client.execute_query(query).await;
                                 let mapped = match responses_result {
                                     Ok(responses) => {
                                         let mut headers = Vec::new();
@@ -233,12 +293,13 @@ impl CxxClient {
     pub fn execute_tx_query(
         &self,
         tx: &CxxTransaction,
-        sql: &str,
+        query: ffi::CxxSqlQuery,
     ) -> Result<ffi::QueryResult, String> {
+        let rust_query = convert_cxx_query(query);
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         tx.req_tx
             .try_send(TxRequest::Execute {
-                sql: sql.to_string(),
+                query: rust_query,
                 resp_tx,
             })
             .map_err(|e| e.to_string())?;

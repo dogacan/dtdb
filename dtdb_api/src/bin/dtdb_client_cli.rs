@@ -236,7 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            match client.execute_query(db_name, &sql).await {
+            match client
+                .execute_query(db_name, dtdb_api::SqlQuery::new(sql))
+                .await
+            {
                 Ok(mut stream) => {
                     let mut columns = Vec::new();
                     let mut rows = Vec::new();

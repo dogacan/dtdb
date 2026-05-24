@@ -149,6 +149,7 @@ Add `dtdb_api` as a dependency in your `Cargo.toml`. You'll also need `tokio` (w
 
 ```rust
 use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::sql_query;
 use dtdb_storage::CompressionType;
 use futures_util::StreamExt;
 
@@ -165,16 +166,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Execute queries (streams result rows)
     let mut stream = client
-        .execute_query("mydb", "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);")
+        .execute_query("mydb", sql_query!("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);"))
         .await?;
     while let Some(resp) = stream.next().await {
         println!("{:?}", resp?);
     }
 
-    // 4. Run multiple statements atomically in a transaction
+    // 4. Run multiple statements atomically in a transaction using parameterized queries
     client.run_in_transaction("mydb", |tx| async move {
-        tx.execute_query("INSERT INTO users (id, name) VALUES (1, 'Alice');").await?;
-        tx.execute_query("INSERT INTO users (id, name) VALUES (2, 'Bob');").await?;
+        tx.execute_query(
+            sql_query!("INSERT INTO users (id, name) VALUES (@id, @name);")
+                .bind("id", 1i64)
+                .bind("name", "Alice")
+        ).await?;
+        tx.execute_query(
+            sql_query!("INSERT INTO users (id, name) VALUES (@id, @name);")
+                .bind("id", 2i64)
+                .bind("name", "Bob")
+        ).await?;
         Ok(())
     }).await?;
 

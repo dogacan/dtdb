@@ -56,7 +56,7 @@ async fn test_in_process_transaction_commit() {
         let mut stream = client
             .execute_query(
                 "test_db",
-                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
             .await
             .unwrap();
@@ -68,10 +68,14 @@ async fn test_in_process_transaction_commit() {
     // Run transaction
     let tx_res = client
         .run_in_transaction("test_db", |tx| async move {
-            tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');")
-                .await?;
-            tx.execute_query("INSERT INTO Users (id, name) VALUES (2, 'Bob');")
-                .await?;
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
+            ))
+            .await?;
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (2, 'Bob');"
+            ))
+            .await?;
             Ok("success_value")
         })
         .await;
@@ -80,7 +84,10 @@ async fn test_in_process_transaction_commit() {
 
     // Verify both rows exist
     let mut stream = client
-        .execute_query("test_db", "SELECT id, name FROM Users ORDER BY id ASC;")
+        .execute_query(
+            "test_db",
+            dtdb_api::sql_query!("SELECT id, name FROM Users ORDER BY id ASC;"),
+        )
         .await
         .unwrap();
 
@@ -113,7 +120,7 @@ async fn test_in_process_transaction_rollback() {
         let mut stream = client
             .execute_query(
                 "test_db",
-                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
             .await
             .unwrap();
@@ -125,8 +132,10 @@ async fn test_in_process_transaction_rollback() {
     // Run transaction and return error to trigger rollback
     let tx_res: Result<(), Status> = client
         .run_in_transaction("test_db", |tx| async move {
-            tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');")
-                .await?;
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
+            ))
+            .await?;
             Err(Status::aborted("abort transaction"))
         })
         .await;
@@ -136,7 +145,10 @@ async fn test_in_process_transaction_rollback() {
 
     // Verify table is empty
     let mut stream = client
-        .execute_query("test_db", "SELECT id, name FROM Users;")
+        .execute_query(
+            "test_db",
+            dtdb_api::sql_query!("SELECT id, name FROM Users;"),
+        )
         .await
         .unwrap();
 
@@ -171,7 +183,7 @@ async fn test_grpc_transaction_commit() {
         let mut stream = client
             .execute_query(
                 "test_db",
-                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
             .await
             .unwrap();
@@ -183,10 +195,14 @@ async fn test_grpc_transaction_commit() {
     // Run transaction
     let tx_res = client
         .run_in_transaction("test_db", |tx| async move {
-            tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');")
-                .await?;
-            tx.execute_query("INSERT INTO Users (id, name) VALUES (20, 'Dave');")
-                .await?;
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (10, 'Charlie');"
+            ))
+            .await?;
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (20, 'Dave');"
+            ))
+            .await?;
             Ok("success")
         })
         .await;
@@ -195,7 +211,10 @@ async fn test_grpc_transaction_commit() {
 
     // Verify rows exist
     let mut stream = client
-        .execute_query("test_db", "SELECT id, name FROM Users ORDER BY id ASC;")
+        .execute_query(
+            "test_db",
+            dtdb_api::sql_query!("SELECT id, name FROM Users ORDER BY id ASC;"),
+        )
         .await
         .unwrap();
 
@@ -234,7 +253,7 @@ async fn test_grpc_transaction_rollback() {
         let mut stream = client
             .execute_query(
                 "test_db",
-                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
             .await
             .unwrap();
@@ -246,8 +265,10 @@ async fn test_grpc_transaction_rollback() {
     // Run transaction and return error to trigger rollback
     let tx_res: Result<(), Status> = client
         .run_in_transaction("test_db", |tx| async move {
-            tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');")
-                .await?;
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (10, 'Charlie');"
+            ))
+            .await?;
             Err(Status::aborted("abort transaction"))
         })
         .await;
@@ -256,7 +277,10 @@ async fn test_grpc_transaction_rollback() {
 
     // Verify table is empty
     let mut stream = client
-        .execute_query("test_db", "SELECT id, name FROM Users;")
+        .execute_query(
+            "test_db",
+            dtdb_api::sql_query!("SELECT id, name FROM Users;"),
+        )
         .await
         .unwrap();
 
@@ -288,7 +312,9 @@ async fn test_multi_statement_rejection() {
     let err = client
         .execute_query(
             "test_db",
-            "CREATE TABLE Users (id int PRIMARY KEY); INSERT INTO Users (id) VALUES (1);",
+            dtdb_api::sql_query!(
+                "CREATE TABLE Users (id int PRIMARY KEY); INSERT INTO Users (id) VALUES (1);"
+            ),
         )
         .await
         .err()
@@ -492,7 +518,9 @@ async fn test_grpc_ddl_transaction_rejection() {
     let tx_res = client
         .run_in_transaction("test_db", |tx| async move {
             let _ = tx
-                .execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);")
+                .execute_query(dtdb_api::sql_query!(
+                    "CREATE TABLE Dummy (id int PRIMARY KEY);"
+                ))
                 .await?;
             Ok(())
         })
@@ -512,7 +540,9 @@ async fn test_grpc_ddl_transaction_rejection() {
     let ip_tx_res = ip_client
         .run_in_transaction("test_db_ip", |tx| async move {
             let _ = tx
-                .execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);")
+                .execute_query(dtdb_api::sql_query!(
+                    "CREATE TABLE Dummy (id int PRIMARY KEY);"
+                ))
                 .await?;
             Ok(())
         })
@@ -527,7 +557,7 @@ async fn test_grpc_ddl_transaction_rejection() {
         let mut stream = client
             .execute_query(
                 "test_db",
-                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
             .await
             .unwrap();

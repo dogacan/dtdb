@@ -4,8 +4,32 @@
 #include <functional>
 #include <type_traits>
 #include <string>
+#include <vector>
+#include <utility>
 
 namespace dtdb {
+
+class SqlQuery {
+public:
+    explicit SqlQuery(const std::string& text) : text_(text) {}
+    
+    SqlQuery& bind(const std::string& name, const std::string& value) {
+        params_.push_back({name, value});
+        return *this;
+    }
+    
+    // Conversion helper to bridge type
+    CxxSqlQuery to_bridge() const {
+        rust::Vec<QueryParam> bridge_params;
+        for (const auto& p : params_) {
+            bridge_params.push_back(QueryParam{p.first, p.second});
+        }
+        return CxxSqlQuery{text_, bridge_params};
+    }
+private:
+    std::string text_;
+    std::vector<std::pair<std::string, std::string>> params_;
+};
 
 class Client {
 public:
@@ -28,12 +52,12 @@ public:
         inner_->drop_db(db_name);
     }
 
-    QueryResult execute_query(const std::string& db_name, const std::string& sql) {
-        return inner_->execute_query(db_name, sql);
+    QueryResult execute_query(const std::string& db_name, const SqlQuery& query) {
+        return inner_->execute_query(db_name, query.to_bridge());
     }
 
-    QueryResult execute_tx_query(const CxxTransaction& tx, const std::string& sql) {
-        return inner_->execute_tx_query(tx, sql);
+    QueryResult execute_tx_query(const CxxTransaction& tx, const SqlQuery& query) {
+        return inner_->execute_tx_query(tx, query.to_bridge());
     }
 
     // Exception-safe counterpart to run_in_transaction

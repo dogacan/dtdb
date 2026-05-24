@@ -76,7 +76,7 @@ async fn test_grpc_client_server_integration() {
         let mut stream = client
             .execute_query(
                 "db_lz4",
-                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
             .await
             .unwrap();
@@ -100,7 +100,7 @@ async fn test_grpc_client_server_integration() {
         let mut stream = client
             .execute_query(
                 "db_lz4",
-                "INSERT INTO Users (id, name) VALUES (10, 'Alice');",
+                dtdb_api::sql_query!("INSERT INTO Users (id, name) VALUES (10, 'Alice');"),
             )
             .await
             .unwrap();
@@ -120,7 +120,10 @@ async fn test_grpc_client_server_integration() {
     // Select rows
     {
         let mut stream = client
-            .execute_query("db_lz4", "SELECT id, name FROM Users;")
+            .execute_query(
+                "db_lz4",
+                dtdb_api::sql_query!("SELECT id, name FROM Users;"),
+            )
             .await
             .unwrap();
         let mut payloads = Vec::new();

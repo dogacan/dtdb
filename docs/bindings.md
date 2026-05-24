@@ -39,17 +39,17 @@ int main() {
         client.create_db("mydb");
 
         // 3. Create a table
-        client.execute_query("mydb", "CREATE TABLE users (id INT PRIMARY KEY, name STRING);");
+        client.execute_query("mydb", dtdb::SqlQuery("CREATE TABLE users (id INT PRIMARY KEY, name STRING);"));
 
-        // 4. Run multiple statements atomically in a transaction block
+        // 4. Run multiple statements atomically in a transaction block using parameterized queries
         client.run_in_transaction("mydb", [&](const CxxTransaction& tx) {
-            client.execute_tx_query(tx, "INSERT INTO users VALUES (1, 'Alice');");
-            client.execute_tx_query(tx, "INSERT INTO users VALUES (2, 'Bob');");
+            client.execute_tx_query(tx, dtdb::SqlQuery("INSERT INTO users VALUES (@id, @name);").bind("id", "1").bind("name", "Alice"));
+            client.execute_tx_query(tx, dtdb::SqlQuery("INSERT INTO users VALUES (@id, @name);").bind("id", "2").bind("name", "Bob"));
         });
         std::cout << "Transaction committed successfully!" << std::endl;
 
         // 5. Query and decode rows
-        QueryResult res = client.execute_query("mydb", "SELECT * FROM users ORDER BY id ASC;");
+        QueryResult res = client.execute_query("mydb", dtdb::SqlQuery("SELECT * FROM users ORDER BY id ASC;"));
         size_t cols = res.headers.size();
         size_t rows = cols > 0 ? res.rows.size() / cols : 0;
 
@@ -123,11 +123,11 @@ func runDb() {
         let client = dtdb.Client.InProcess("./swift_db")
         
         try client.create_db("swift_demo")
-        try client.execute_query("swift_demo", "CREATE TABLE items (id INT PRIMARY KEY);")
+        try client.execute_query("swift_demo", dtdb.SqlQuery("CREATE TABLE items (id INT PRIMARY KEY);"))
         
         // Execute transaction block using Swift closure
         try client.run_in_transaction("swift_demo") { tx in
-            _ = try client.execute_tx_query(tx, "INSERT INTO items VALUES (1);")
+            _ = try client.execute_tx_query(tx, dtdb.SqlQuery("INSERT INTO items VALUES (@id);").bind("id", "1"))
         }
         
     } catch {

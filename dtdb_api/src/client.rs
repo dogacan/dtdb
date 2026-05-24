@@ -166,14 +166,15 @@ impl DuctTapeDbClient {
     pub async fn execute_query(
         &mut self,
         db_name: &str,
-        sql_query: &str,
+        query: crate::query::SqlQuery,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>,
         Status,
     > {
+        let sql = query.interpolate().map_err(Status::invalid_argument)?;
         let request = ExecuteQueryRequest {
             db_name: db_name.to_string(),
-            sql_query: sql_query.to_string(),
+            sql_query: sql,
         };
 
         match &mut self.inner {
@@ -203,9 +204,10 @@ impl DuctTapeDbClient {
     /// # Example
     ///
     /// ```ignore
+    /// use dtdb_api::sql_query;
     /// let result = client.run_in_transaction("my_db", |tx| async move {
-    ///     tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');").await?;
-    ///     tx.execute_query("INSERT INTO Users (id, name) VALUES (2, 'Bob');").await?;
+    ///     tx.execute_query(sql_query!("INSERT INTO Users (id, name) VALUES (1, 'Alice');")).await?;
+    ///     tx.execute_query(sql_query!("INSERT INTO Users (id, name) VALUES (2, 'Bob');")).await?;
     ///     Ok("inserted two users")
     /// }).await?;
     /// ```
@@ -373,16 +375,17 @@ impl TransactionClient {
     /// (headers, rows, info messages) for the executed statement.
     pub async fn execute_query(
         &self,
-        sql_query: &str,
+        query: crate::query::SqlQuery,
     ) -> Result<Vec<ExecuteQueryResponse>, Status> {
+        let sql = query.interpolate().map_err(Status::invalid_argument)?;
         match &self.mode {
             TransactionClientMode::InProcess { tx, sql_engine } => {
-                if sql_engine.is_ddl(sql_query) {
+                if sql_engine.is_ddl(&sql) {
                     return Err(Status::invalid_argument(
                         "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions.",
                     ));
                 }
-                match sql_engine.execute(sql_query, tx) {
+                match sql_engine.execute(&sql, tx) {
                     Ok(result) => Ok(crate::server::execution_result_to_responses(result)),
                     Err(e) => Err(Status::invalid_argument(format!("SQL Error: {}", e))),
                 }
@@ -395,9 +398,7 @@ impl TransactionClient {
                 req_tx
                     .send(TransactionRequest {
                         command: Some(crate::proto::transaction_request::Command::Execute(
-                            ExecuteTxQuery {
-                                sql_query: sql_query.to_string(),
-                            },
+                            ExecuteTxQuery { sql_query: sql },
                         )),
                     })
                     .await
