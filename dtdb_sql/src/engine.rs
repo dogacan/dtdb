@@ -19,6 +19,8 @@ pub enum ExecutionResult {
     CreateTable,
     DropTable,
     Insert { count: usize },
+    Delete { count: usize },
+    Update { count: usize },
     Select { schema: Schema, rows: Vec<Row> },
 }
 
@@ -142,6 +144,128 @@ impl SqlEngine {
 
                 Ok(ExecutionResult::Insert { count: insert_count })
             }
+            SqlStatement::Delete { table_name, filter } => {
+                let table = self
+                    .database
+                    .get_table(&table_name)
+                    .map_err(|e| e.to_string())?;
+
+                let scan_plan = LogicalPlan::Scan {
+                    table_name: table_name.clone(),
+                    schema: table.schema.clone(),
+                    range: None,
+                };
+
+                let plan = match filter {
+                    Some(pred) => LogicalPlan::Filter {
+                        source: Box::new(scan_plan),
+                        predicate: pred,
+                    },
+                    None => scan_plan,
+                };
+
+                let optimized_plan = Optimizer::new().optimize(plan);
+                let mut physical_op = self.compile_physical(optimized_plan, tx)?;
+
+                let mut delete_count = 0;
+                let pk_idx = table
+                    .schema
+                    .primary_key_index()
+                    .ok_or_else(|| "Primary key not defined".to_string())?;
+
+                let mut keys_to_delete = Vec::new();
+                while let Some(row) = physical_op.next()? {
+                    let pk_val = &row.values[pk_idx];
+                    let pk_key = match pk_val {
+                        DbValue::Int(v) => DbKey::Int(*v),
+                        DbValue::String(s) => DbKey::String(s.clone()),
+                        other => return Err(format!("Invalid primary key type: {:?}", other)),
+                    };
+                    keys_to_delete.push(pk_key);
+                }
+
+                for pk_key in keys_to_delete {
+                    tx.delete(&table_name, pk_key).map_err(|e| e.to_string())?;
+                    delete_count += 1;
+                }
+
+                Ok(ExecutionResult::Delete { count: delete_count })
+            }
+            SqlStatement::Update {
+                table_name,
+                assignments,
+                filter,
+            } => {
+                let table = self
+                    .database
+                    .get_table(&table_name)
+                    .map_err(|e| e.to_string())?;
+
+                let scan_plan = LogicalPlan::Scan {
+                    table_name: table_name.clone(),
+                    schema: table.schema.clone(),
+                    range: None,
+                };
+
+                let plan = match filter {
+                    Some(pred) => LogicalPlan::Filter {
+                        source: Box::new(scan_plan),
+                        predicate: pred,
+                    },
+                    None => scan_plan,
+                };
+
+                let optimized_plan = Optimizer::new().optimize(plan);
+                let mut physical_op = self.compile_physical(optimized_plan, tx)?;
+
+                let mut update_count = 0;
+                let pk_idx = table
+                    .schema
+                    .primary_key_index()
+                    .ok_or_else(|| "Primary key not defined".to_string())?;
+
+                let mut updates = Vec::new();
+                while let Some(row) = physical_op.next()? {
+                    let mut updated_values = row.values.clone();
+                    for (col_name, expr) in &assignments {
+                        let col_idx = table
+                            .schema
+                            .column_index(col_name)
+                            .ok_or_else(|| format!("Column '{}' not found in schema", col_name))?;
+                        let new_val = expr.eval(&row, &table.schema)?;
+                        updated_values[col_idx] = new_val;
+                    }
+
+                    let old_pk_val = &row.values[pk_idx];
+                    let old_pk_key = match old_pk_val {
+                        DbValue::Int(v) => DbKey::Int(*v),
+                        DbValue::String(s) => DbKey::String(s.clone()),
+                        other => return Err(format!("Invalid primary key type: {:?}", other)),
+                    };
+
+                    let new_pk_val = &updated_values[pk_idx];
+                    let new_pk_key = match new_pk_val {
+                        DbValue::Int(v) => DbKey::Int(*v),
+                        DbValue::String(s) => DbKey::String(s.clone()),
+                        other => return Err(format!("Invalid primary key type: {:?}", other)),
+                    };
+
+                    let updated_row = Row::new(updated_values);
+                    updates.push((old_pk_key, new_pk_key, updated_row));
+                }
+
+                for (old_pk, new_pk, updated_row) in updates {
+                    if old_pk != new_pk {
+                        tx.delete(&table_name, old_pk).map_err(|e| e.to_string())?;
+                        tx.put(&table_name, new_pk, updated_row).map_err(|e| e.to_string())?;
+                    } else {
+                        tx.put(&table_name, new_pk, updated_row).map_err(|e| e.to_string())?;
+                    }
+                    update_count += 1;
+                }
+
+                Ok(ExecutionResult::Update { count: update_count })
+            }
             SqlStatement::Query(logical_plan) => {
                 // 1. Optimize the Logical Plan
                 let optimized_plan = Optimizer::new().optimize(logical_plan);
@@ -255,9 +379,9 @@ impl SqlEngine {
                     proj_schema,
                 )))
             }
-            LogicalPlan::Limit { source, limit } => {
+            LogicalPlan::Limit { source, limit, offset } => {
                 let src_op = self.compile_physical(*source, tx)?;
-                Ok(Box::new(PhysicalLimit::new(src_op, limit)))
+                Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
             LogicalPlan::Sort { source, keys } => {
                 let src_op = self.compile_physical(*source, tx)?;
@@ -267,6 +391,7 @@ impl SqlEngine {
                 left,
                 right,
                 condition,
+                join_type,
             } => {
                 let left_op = self.compile_physical(*left, tx)?;
                 let right_op = self.compile_physical(*right, tx)?;
@@ -298,6 +423,7 @@ impl SqlEngine {
                         range: None,
                     }),
                     condition: condition.clone(),
+                    join_type,
                 }
                 .schema();
 
@@ -306,6 +432,7 @@ impl SqlEngine {
                     right_op,
                     *left_on,
                     *right_on,
+                    join_type,
                     joined_schema,
                 )))
             }

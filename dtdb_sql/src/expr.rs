@@ -14,6 +14,10 @@ pub enum Operator {
     And,
     Or,
     Like,
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// Expr represents a scalar expression in SQL (column names, literals, binary operations).
@@ -76,6 +80,22 @@ impl Expr {
                         let pattern = to_string_val(&r_val)?;
                         let matched = like_match(&text, &pattern);
                         Ok(DbValue::Int(if matched { 1 } else { 0 }))
+                    }
+                    Operator::Add => {
+                        eval_arithmetic(&l_val, &r_val, |a, b| a + b, |a, b| a + b)
+                    }
+                    Operator::Sub => {
+                        eval_arithmetic(&l_val, &r_val, |a, b| a - b, |a, b| a - b)
+                    }
+                    Operator::Mul => {
+                        eval_arithmetic(&l_val, &r_val, |a, b| a * b, |a, b| a * b)
+                    }
+                    Operator::Div => {
+                        match r_val {
+                            DbValue::Int(0) => Err("Division by zero".to_string()),
+                            DbValue::Float(f) if f == 0.0 => Err("Division by zero".to_string()),
+                            _ => eval_arithmetic(&l_val, &r_val, |a, b| a / b, |a, b| a / b),
+                        }
                     }
                     other_op => {
                         let ordering = compare_values(&l_val, &r_val)?;
@@ -177,3 +197,35 @@ fn like_match_recursive(t: &[char], p: &[char], t_idx: usize, p_idx: usize) -> b
 
     false
 }
+
+/// Helper to evaluate arithmetic operations on DbValues with promotion logic.
+fn eval_arithmetic<FI, FF>(
+    l: &DbValue,
+    r: &DbValue,
+    int_op: FI,
+    float_op: FF,
+) -> Result<DbValue, String>
+where
+    FI: FnOnce(i64, i64) -> i64,
+    FF: FnOnce(f64, f64) -> f64,
+{
+    match (l, r) {
+        (DbValue::Int(lv), DbValue::Int(rv)) => {
+            Ok(DbValue::Int(int_op(*lv, *rv)))
+        }
+        (DbValue::Float(lv), DbValue::Float(rv)) => {
+            Ok(DbValue::Float(float_op(*lv, *rv)))
+        }
+        (DbValue::Int(lv), DbValue::Float(rv)) => {
+            Ok(DbValue::Float(float_op(*lv as f64, *rv)))
+        }
+        (DbValue::Float(lv), DbValue::Int(rv)) => {
+            Ok(DbValue::Float(float_op(*lv, *rv as f64)))
+        }
+        (expected, actual) => Err(format!(
+            "Cannot perform arithmetic on non-numeric types: {:?} and {:?}",
+            expected, actual
+        )),
+    }
+}
+

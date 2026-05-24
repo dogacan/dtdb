@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use dtdb_storage::DbValue;
 use dtdb_relational::{Row, Schema};
 use crate::expr::Expr;
-use crate::logical::AggregateExpr;
+use crate::logical::{AggregateExpr, JoinType};
 
 /// PhysicalOperator defines the Volcano Iterator interface for query execution.
 pub trait PhysicalOperator {
@@ -135,27 +135,42 @@ impl PhysicalOperator for PhysicalProjection {
 // ==========================================
 pub struct PhysicalLimit {
     source: Box<dyn PhysicalOperator>,
-    limit: usize,
-    count: usize,
+    limit: Option<usize>,
+    offset: usize,
+    skipped: usize,
+    returned: usize,
 }
 
 impl PhysicalLimit {
-    pub fn new(source: Box<dyn PhysicalOperator>, limit: usize) -> Self {
+    pub fn new(source: Box<dyn PhysicalOperator>, limit: Option<usize>, offset: usize) -> Self {
         Self {
             source,
             limit,
-            count: 0,
+            offset,
+            skipped: 0,
+            returned: 0,
         }
     }
 }
 
 impl PhysicalOperator for PhysicalLimit {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        if self.count >= self.limit {
-            return Ok(None);
+        // Skip offset rows first
+        while self.skipped < self.offset {
+            if self.source.next()?.is_none() {
+                return Ok(None);
+            }
+            self.skipped += 1;
         }
+
+        if let Some(lim) = self.limit {
+            if self.returned >= lim {
+                return Ok(None);
+            }
+        }
+
         if let Some(row) = self.source.next()? {
-            self.count += 1;
+            self.returned += 1;
             Ok(Some(row))
         } else {
             Ok(None)
@@ -167,7 +182,16 @@ impl PhysicalOperator for PhysicalLimit {
     }
 
     fn explain(&self, indent: usize, out: &mut String) {
-        out.push_str(&format!("{}- PhysicalLimit: limit={}\n", "  ".repeat(indent), self.limit));
+        let limit_str = match self.limit {
+            Some(l) => l.to_string(),
+            None => "none".to_string(),
+        };
+        out.push_str(&format!(
+            "{}- PhysicalLimit: limit={}, offset={}\n",
+            "  ".repeat(indent),
+            limit_str,
+            self.offset
+        ));
         self.source.explain(indent + 1, out);
     }
 }
@@ -266,8 +290,9 @@ pub struct PhysicalHashJoin {
     right: Box<dyn PhysicalOperator>,
     left_on: Expr,
     right_on: Expr,
+    join_type: JoinType,
     schema: Schema,
-    // Build phase hash map: string representation of join key -> Left Rows
+    // Build phase hash map: string representation of join key -> Right Rows
     hash_table: Option<HashMap<String, Vec<Row>>>,
     // Buffer to hold joined rows from the current probe row
     join_buffer: Vec<Row>,
@@ -279,6 +304,7 @@ impl PhysicalHashJoin {
         right: Box<dyn PhysicalOperator>,
         left_on: Expr,
         right_on: Expr,
+        join_type: JoinType,
         schema: Schema,
     ) -> Self {
         Self {
@@ -286,6 +312,7 @@ impl PhysicalHashJoin {
             right,
             left_on,
             right_on,
+            join_type,
             schema,
             hash_table: None,
             join_buffer: Vec::new(),
@@ -300,12 +327,12 @@ impl PhysicalOperator for PhysicalHashJoin {
             return Ok(Some(self.join_buffer.remove(0)));
         }
 
-        // Build phase: read all left rows into the hash table
+        // Build phase: read all right rows into the hash table
         if self.hash_table.is_none() {
             let mut table = HashMap::new();
-            let left_schema = self.left.schema().clone();
-            while let Some(row) = self.left.next()? {
-                let key_val = self.left_on.eval(&row, &left_schema)?;
+            let right_schema = self.right.schema().clone();
+            while let Some(row) = self.right.next()? {
+                let key_val = self.right_on.eval(&row, &right_schema)?;
                 let hash_key = hash_value_to_string(&key_val);
                 table.entry(hash_key).or_insert_with(Vec::new).push(row);
             }
@@ -313,24 +340,38 @@ impl PhysicalOperator for PhysicalHashJoin {
         }
 
         let hash_table = self.hash_table.as_ref().unwrap();
+        let left_schema = self.left.schema().clone();
         let right_schema = self.right.schema().clone();
 
-        // Probe phase: stream right rows one by one
-        while let Some(right_row) = self.right.next()? {
-            let key_val = self.right_on.eval(&right_row, &right_schema)?;
+        // Probe phase: stream left rows one by one
+        while let Some(left_row) = self.left.next()? {
+            let key_val = self.left_on.eval(&left_row, &left_schema)?;
             let hash_key = hash_value_to_string(&key_val);
 
-            if let Some(left_rows) = hash_table.get(&hash_key) {
+            if let Some(right_rows) = hash_table.get(&hash_key) {
                 // Generate joined rows: combine left row fields + right row fields
-                for left_row in left_rows {
+                for right_row in right_rows {
                     let mut merged_values = left_row.values.clone();
                     merged_values.extend(right_row.values.clone());
                     self.join_buffer.push(Row::new(merged_values));
                 }
-
-                if !self.join_buffer.is_empty() {
-                    return Ok(Some(self.join_buffer.remove(0)));
+            } else if self.join_type == JoinType::Left {
+                // Left outer join mismatch: pad right columns with default values
+                let mut merged_values = left_row.values.clone();
+                for col in &right_schema.columns {
+                    let default_val = match col.data_type {
+                        dtdb_relational::DataType::Int => DbValue::Int(0),
+                        dtdb_relational::DataType::Float => DbValue::Float(0.0),
+                        dtdb_relational::DataType::String => DbValue::String("".to_string()),
+                        dtdb_relational::DataType::Bytes => DbValue::Bytes(Vec::new()),
+                    };
+                    merged_values.push(default_val);
                 }
+                self.join_buffer.push(Row::new(merged_values));
+            }
+
+            if !self.join_buffer.is_empty() {
+                return Ok(Some(self.join_buffer.remove(0)));
             }
         }
 
@@ -343,8 +384,9 @@ impl PhysicalOperator for PhysicalHashJoin {
 
     fn explain(&self, indent: usize, out: &mut String) {
         out.push_str(&format!(
-            "{}- PhysicalHashJoin: left_on={:?}, right_on={:?}\n",
+            "{}- PhysicalHashJoin: type={:?}, left_on={:?}, right_on={:?}\n",
             "  ".repeat(indent),
+            self.join_type,
             self.left_on,
             self.right_on
         ));
@@ -412,6 +454,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
                             AggregateExpr::Sum(_) => Accumulator::Sum { sum: 0.0 },
                             AggregateExpr::Min(_) => Accumulator::Min { min: None },
                             AggregateExpr::Max(_) => Accumulator::Max { max: None },
+                            AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
                         })
                         .collect();
                     (group_vals, accs)
@@ -423,7 +466,8 @@ impl PhysicalOperator for PhysicalHashAggregate {
                         AggregateExpr::Count(expr)
                         | AggregateExpr::Sum(expr)
                         | AggregateExpr::Min(expr)
-                        | AggregateExpr::Max(expr) => expr.eval(&row, &source_schema)?,
+                        | AggregateExpr::Max(expr)
+                        | AggregateExpr::Avg(expr) => expr.eval(&row, &source_schema)?,
                     };
                     accumulators[idx].update(&val)?;
                 }
@@ -468,6 +512,7 @@ enum Accumulator {
     Sum { sum: f64 },
     Min { min: Option<DbValue> },
     Max { max: Option<DbValue> },
+    Avg { sum: f64, count: i64 },
 }
 
 impl Accumulator {
@@ -499,6 +544,14 @@ impl Accumulator {
                 }
                 None => *max = Some(val.clone()),
             },
+            Accumulator::Avg { sum, count } => {
+                match val {
+                    DbValue::Int(v) => *sum += *v as f64,
+                    DbValue::Float(v) => *sum += *v,
+                    other => return Err(format!("Cannot compute AVG on non-numeric value {:?}", other)),
+                }
+                *count += 1;
+            }
         }
         Ok(())
     }
@@ -509,6 +562,13 @@ impl Accumulator {
             Accumulator::Sum { sum } => DbValue::Float(*sum),
             Accumulator::Min { min } => min.clone().unwrap_or(DbValue::Int(0)),
             Accumulator::Max { max } => max.clone().unwrap_or(DbValue::Int(0)),
+            Accumulator::Avg { sum, count } => {
+                if *count == 0 {
+                    DbValue::Float(0.0)
+                } else {
+                    DbValue::Float(*sum / (*count as f64))
+                }
+            }
         }
     }
 }

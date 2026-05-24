@@ -145,6 +145,20 @@ pub(crate) fn execution_result_to_responses(result: dtdb_sql::ExecutionResult) -
                 )),
             }]
         }
+        dtdb_sql::ExecutionResult::Delete { count } => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    format!("Deleted {} row(s).", count),
+                )),
+            }]
+        }
+        dtdb_sql::ExecutionResult::Update { count } => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    format!("Updated {} row(s).", count),
+                )),
+            }]
+        }
         dtdb_sql::ExecutionResult::Select { schema, rows } => {
             let mut responses = Vec::new();
 

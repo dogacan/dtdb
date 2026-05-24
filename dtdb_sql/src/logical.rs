@@ -2,13 +2,20 @@ use serde::{Deserialize, Serialize};
 use dtdb_relational::{Column, DataType, Schema};
 use crate::expr::Expr;
 
-/// AggregateExpr represents aggregate functions (COUNT, SUM, MIN, MAX).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+}
+
+/// AggregateExpr represents aggregate functions (COUNT, SUM, MIN, MAX, AVG).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum AggregateExpr {
     Count(Expr),
     Sum(Expr),
     Min(Expr),
     Max(Expr),
+    Avg(Expr),
 }
 
 /// LogicalPlan represents relational algebra logical operations.
@@ -33,6 +40,7 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         condition: Expr,
+        join_type: JoinType,
     },
     Aggregate {
         source: Box<LogicalPlan>,
@@ -46,7 +54,8 @@ pub enum LogicalPlan {
     },
     Limit {
         source: Box<LogicalPlan>,
-        limit: usize,
+        limit: Option<usize>,
+        offset: usize,
     },
 }
 
@@ -137,7 +146,7 @@ impl LogicalPlan {
                 for (idx, aggr) in aggrs.iter().enumerate() {
                     let dt = match aggr {
                         AggregateExpr::Count(_) => DataType::Int,
-                        AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
+                        AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) | AggregateExpr::Avg(expr) => {
                             match expr {
                                 Expr::Column(col_name) => {
                                     let pos = source_schema.columns.iter().position(|col| {
@@ -192,8 +201,8 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{}- Projection: fields={:?}\n", indent_str, field_names));
             format_logical_node(source, indent + 1, out);
         }
-        LogicalPlan::Join { left, right, condition } => {
-            out.push_str(&format!("{}- HashJoin: condition={:?}\n", indent_str, condition));
+        LogicalPlan::Join { left, right, condition, join_type } => {
+            out.push_str(&format!("{}- HashJoin: type={:?}, condition={:?}\n", indent_str, join_type, condition));
             out.push_str(&format!("{}  left:\n", indent_str));
             format_logical_node(left, indent + 2, out);
             out.push_str(&format!("{}  right:\n", indent_str));
@@ -214,8 +223,12 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{}- Sort: keys={:?}\n", indent_str, keys_str));
             format_logical_node(source, indent + 1, out);
         }
-        LogicalPlan::Limit { source, limit } => {
-            out.push_str(&format!("{}- Limit: count={}\n", indent_str, limit));
+        LogicalPlan::Limit { source, limit, offset } => {
+            let limit_str = match limit {
+                Some(lim) => lim.to_string(),
+                None => "none".to_string(),
+            };
+            out.push_str(&format!("{}- Limit: count={}, offset={}\n", indent_str, limit_str, offset));
             format_logical_node(source, indent + 1, out);
         }
     }

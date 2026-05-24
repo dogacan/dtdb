@@ -73,10 +73,12 @@ impl Optimizer {
                 left,
                 right,
                 condition,
+                join_type,
             } => LogicalPlan::Join {
                 left: Box::new(self.optimize_node(*left)),
                 right: Box::new(self.optimize_node(*right)),
                 condition,
+                join_type,
             },
             LogicalPlan::Aggregate {
                 source,
@@ -93,9 +95,10 @@ impl Optimizer {
                 source: Box::new(self.optimize_node(*source)),
                 keys,
             },
-            LogicalPlan::Limit { source, limit } => LogicalPlan::Limit {
+            LogicalPlan::Limit { source, limit, offset } => LogicalPlan::Limit {
                 source: Box::new(self.optimize_node(*source)),
                 limit,
+                offset,
             },
             other => other,
         }

@@ -101,6 +101,12 @@ fn display_result(res: ExecutionResult) {
         ExecutionResult::Insert { count } => {
             println!("Inserted {} row(s).", count);
         }
+        ExecutionResult::Delete { count } => {
+            println!("Deleted {} row(s).", count);
+        }
+        ExecutionResult::Update { count } => {
+            println!("Updated {} row(s).", count);
+        }
         ExecutionResult::Select { schema, rows } => {
             if rows.is_empty() {
                 println!("Empty set.");

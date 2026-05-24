@@ -7,7 +7,7 @@ use sqlparser::ast::{
 use dtdb_storage::DbValue;
 use dtdb_relational::{Column, DataType, Database, Schema};
 use crate::expr::{Expr, Operator};
-use crate::logical::{AggregateExpr, LogicalPlan};
+use crate::logical::{AggregateExpr, LogicalPlan, JoinType};
 
 /// Represents a parsed and planned SQL statement.
 pub enum SqlStatement {
@@ -17,6 +17,15 @@ pub enum SqlStatement {
         table_name: String,
         columns: Vec<String>,
         rows: Vec<Vec<DbValue>>,
+    },
+    Delete {
+        table_name: String,
+        filter: Option<Expr>,
+    },
+    Update {
+        table_name: String,
+        assignments: Vec<(String, Expr)>,
+        filter: Option<Expr>,
     },
     Query(LogicalPlan),
     Explain(LogicalPlan),
@@ -122,6 +131,49 @@ impl LogicalPlanner {
                     rows,
                 })
             }
+            Statement::Delete { from, selection, .. } => {
+                if from.is_empty() {
+                    return Err("DELETE statement requires a table name".to_string());
+                }
+                let name_str = match &from[0].relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    other => return Err(format!("Unsupported table factor in DELETE: {:?}", other)),
+                };
+                let filter = match selection {
+                    Some(expr) => Some(plan_expr(expr)?),
+                    None => None,
+                };
+                Ok(SqlStatement::Delete {
+                    table_name: name_str,
+                    filter,
+                })
+            }
+            Statement::Update { table, assignments, selection, .. } => {
+                let name_str = match &table.relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    other => return Err(format!("Unsupported table factor in UPDATE: {:?}", other)),
+                };
+                let mut my_assignments = Vec::new();
+                for assign in assignments {
+                    let col_name = assign
+                        .id
+                        .iter()
+                        .map(|i| i.value.clone())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let planned_expr = plan_expr(&assign.value)?;
+                    my_assignments.push((col_name, planned_expr));
+                }
+                let filter = match selection {
+                    Some(expr) => Some(plan_expr(expr)?),
+                    None => None,
+                };
+                Ok(SqlStatement::Update {
+                    table_name: name_str,
+                    assignments: my_assignments,
+                    filter,
+                })
+            }
             Statement::Query(query) => {
                 let logical_plan = self.plan_query(query)?;
                 Ok(SqlStatement::Query(logical_plan))
@@ -152,9 +204,12 @@ impl LogicalPlanner {
             let relation = &select.from[0];
             for join in &relation.joins {
                 let right_scan = self.plan_table_factor(&join.relation)?;
-                let join_cond = match &join.join_operator {
+                let (join_cond, join_type) = match &join.join_operator {
                     sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr)) => {
-                        plan_expr(expr)?
+                        (plan_expr(expr)?, JoinType::Inner)
+                    }
+                    sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr)) => {
+                        (plan_expr(expr)?, JoinType::Left)
                     }
                     other => return Err(format!("Unsupported join type: {:?}", other)),
                 };
@@ -162,6 +217,7 @@ impl LogicalPlanner {
                     left: Box::new(plan),
                     right: Box::new(right_scan),
                     condition: join_cond,
+                    join_type,
                 };
             }
         }
@@ -299,15 +355,31 @@ impl LogicalPlanner {
             };
         }
 
-        // 7. Plan LIMIT
-        if let Some(limit_expr) = &query.limit {
-            let limit = match limit_expr {
+        // 7. Plan LIMIT and OFFSET
+        let limit = if let Some(limit_expr) = &query.limit {
+            let l = match limit_expr {
                 SqlExpr::Value(SqlValue::Number(s, _)) => s.parse::<usize>().map_err(|e| e.to_string())?,
                 other => return Err(format!("Unsupported limit expression: {:?}", other)),
             };
+            Some(l)
+        } else {
+            None
+        };
+
+        let offset = if let Some(offset_val) = &query.offset {
+            match &offset_val.value {
+                SqlExpr::Value(SqlValue::Number(s, _)) => s.parse::<usize>().map_err(|e| e.to_string())?,
+                other => return Err(format!("Unsupported offset expression: {:?}", other)),
+            }
+        } else {
+            0
+        };
+
+        if limit.is_some() || offset > 0 {
             plan = LogicalPlan::Limit {
                 source: Box::new(plan),
                 limit,
+                offset,
             };
         }
 
@@ -399,6 +471,10 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                 BinaryOperator::NotEq => Operator::NotEq,
                 BinaryOperator::And => Operator::And,
                 BinaryOperator::Or => Operator::Or,
+                BinaryOperator::Plus => Operator::Add,
+                BinaryOperator::Minus => Operator::Sub,
+                BinaryOperator::Multiply => Operator::Mul,
+                BinaryOperator::Divide => Operator::Div,
                 other => return Err(format!("Unsupported operator: {:?}", other)),
             };
             Ok(Expr::BinaryOp {
@@ -428,7 +504,7 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::Function(func) => {
             let name = func.name.to_string().to_uppercase();
-            matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX")
+            matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
         }
         SqlExpr::BinaryOp { left, right, .. } => {
             has_aggregate_function(left) || has_aggregate_function(right)
@@ -463,6 +539,7 @@ fn extract_aggregates(
                 "SUM" => AggregateExpr::Sum(arg_expr),
                 "MIN" => AggregateExpr::Min(arg_expr),
                 "MAX" => AggregateExpr::Max(arg_expr),
+                "AVG" => AggregateExpr::Avg(arg_expr),
                 other => return Err(format!("Unsupported aggregate function: {}", other)),
             };
 

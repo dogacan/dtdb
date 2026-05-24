@@ -538,3 +538,223 @@ fn test_sql_query_execution_end_to_end() {
     }
 }
 
+#[test]
+fn test_sql_delete() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')", &tx2).unwrap();
+    tx2.commit().unwrap();
+
+    // Delete single row
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute("DELETE FROM users WHERE id = 2", &tx3).unwrap();
+    assert_eq!(res, ExecutionResult::Delete { count: 1 });
+    tx3.commit().unwrap();
+
+    // Verify row 2 is deleted
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine.execute("SELECT id, name FROM users ORDER BY id ASC", &tx4).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // Delete all remaining rows
+    let res = engine.execute("DELETE FROM users", &tx4).unwrap();
+    assert_eq!(res, ExecutionResult::Delete { count: 2 });
+    tx4.commit().unwrap();
+
+    // Verify empty
+    let tx5 = Transaction::new(5, db.clone());
+    let res = engine.execute("SELECT id FROM users", &tx5).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert!(rows.is_empty());
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_update() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING, score FLOAT)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute("INSERT INTO users (id, name, score) VALUES (1, 'Alice', 90.0), (2, 'Bob', 80.0)", &tx2).unwrap();
+    tx2.commit().unwrap();
+
+    // Update non-pk columns
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute("UPDATE users SET name = 'AliceUpdated', score = 95.5 WHERE id = 1", &tx3).unwrap();
+    assert_eq!(res, ExecutionResult::Update { count: 1 });
+    tx3.commit().unwrap();
+
+    // Verify update
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine.execute("SELECT name, score FROM users WHERE id = 1", &tx4).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::String("AliceUpdated".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::Float(95.5));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // Update pk column (causes delete + put)
+    let tx5 = Transaction::new(5, db.clone());
+    let res = engine.execute("UPDATE users SET id = id + 10 WHERE id = 2", &tx5).unwrap();
+    assert_eq!(res, ExecutionResult::Update { count: 1 });
+    tx5.commit().unwrap();
+
+    // Verify old pk is gone and new pk exists
+    let tx6 = Transaction::new(6, db.clone());
+    let res = engine.execute("SELECT id, name FROM users ORDER BY id ASC", &tx6).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1)); // Alice
+        assert_eq!(rows[1].values[0], DbValue::Int(12)); // Bob (2 + 10)
+        assert_eq!(rows[1].values[1], DbValue::String("Bob".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_left_join() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1).unwrap();
+    engine.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')", &tx2).unwrap();
+    engine.execute("INSERT INTO orders (order_id, user_id, amount) VALUES (10, 1, 99.9), (20, 2, 199.9)", &tx2).unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute(
+        "SELECT users.name, orders.amount FROM users LEFT JOIN orders ON users.id = orders.user_id ORDER BY users.id ASC",
+        &tx3
+    ).unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        // Alice: matched
+        assert_eq!(rows[0].values[0], DbValue::String("Alice".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::Float(99.9));
+        // Bob: matched
+        assert_eq!(rows[1].values[0], DbValue::String("Bob".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::Float(199.9));
+        // Charlie: unmatched (padded with default Float 0.0)
+        assert_eq!(rows[2].values[0], DbValue::String("Charlie".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::Float(0.0));
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_limit_offset() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE users (id INT PRIMARY KEY)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute("INSERT INTO users (id) VALUES (10), (20), (30), (40), (50)", &tx2).unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute("SELECT id FROM users ORDER BY id ASC LIMIT 2 OFFSET 2", &tx3).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(30));
+        assert_eq!(rows[1].values[0], DbValue::Int(40));
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_avg_aggregate() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE employees (id INT PRIMARY KEY, dept STRING, salary FLOAT)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute(
+        "INSERT INTO employees (id, dept, salary) VALUES \
+         (1, 'Sales', 50.0), \
+         (2, 'Sales', 150.0), \
+         (3, 'Eng', 100.0), \
+         (4, 'Eng', 300.0)",
+        &tx2
+    ).unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute(
+        "SELECT dept, AVG(salary) FROM employees GROUP BY dept ORDER BY dept ASC",
+        &tx3
+    ).unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        // Eng
+        assert_eq!(rows[0].values[0], DbValue::String("Eng".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::Float(200.0)); // (100+300)/2
+        // Sales
+        assert_eq!(rows[1].values[0], DbValue::String("Sales".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::Float(100.0)); // (50+150)/2
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_arithmetic_expressions() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE items (id INT PRIMARY KEY, val INT, factor FLOAT)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute("INSERT INTO items (id, val, factor) VALUES (1, 10, 2.5)", &tx2).unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute(
+        "SELECT val + 5, val - 3, val * 2, val / 4, val * factor, factor / 0.5 FROM items WHERE id = 1",
+        &tx3
+    ).unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(15));
+        assert_eq!(rows[0].values[1], DbValue::Int(7));
+        assert_eq!(rows[0].values[2], DbValue::Int(20));
+        assert_eq!(rows[0].values[3], DbValue::Int(2)); // integer division: 10 / 4 = 2
+        assert_eq!(rows[0].values[4], DbValue::Float(25.0)); // 10 * 2.5 = 25.0
+        assert_eq!(rows[0].values[5], DbValue::Float(5.0)); // 2.5 / 0.5 = 5.0
+    } else {
+        panic!("Expected Select");
+    }
+}
+
