@@ -5,6 +5,7 @@ pub mod memtable;
 pub mod wal;
 pub mod sstable;
 pub mod engine;
+pub mod manifest;
 pub use engine::StorageEngine;
 pub use wal::WalEntry;
 

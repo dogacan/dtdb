@@ -66,6 +66,10 @@ impl Wal {
         let len = bytes.len() as u32;
         self.file.write_all(&len.to_le_bytes())?;
 
+        // Calculate and write checksum of the serialized payload
+        let checksum = compute_checksum(&bytes);
+        self.file.write_all(&checksum.to_le_bytes())?;
+
         // Write the serialized data.
         self.file.write_all(&bytes)?;
 
@@ -90,7 +94,7 @@ impl Wal {
         let mut entries = Vec::new();
 
         loop {
-            // Read the 4-byte length prefix.
+            // 1. Read the 4-byte length prefix.
             let mut len_bytes = [0u8; 4];
             match std::io::Read::read_exact(&mut reader, &mut len_bytes) {
                 Ok(_) => {}
@@ -102,22 +106,46 @@ impl Wal {
             }
             let len = u32::from_le_bytes(len_bytes) as usize;
 
-            // Read exactly `len` bytes of serialized payload.
+            // 2. Read the 4-byte checksum.
+            let mut checksum_bytes = [0u8; 4];
+            match std::io::Read::read_exact(&mut reader, &mut checksum_bytes) {
+                Ok(_) => {}
+                // Truncated checksum: trailing corruption, stop recovery
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    eprintln!("Warning: WAL ended with truncated checksum. Stopping recovery.");
+                    break;
+                }
+                Err(e) => return Err(StorageError::Io(e)),
+            }
+            let expected_checksum = u32::from_le_bytes(checksum_bytes);
+
+            // 3. Read exactly `len` bytes of serialized payload.
             let mut bytes = vec![0u8; len];
             match std::io::Read::read_exact(&mut reader, &mut bytes) {
                 Ok(_) => {}
-                // If we get an EOF here, the file was truncated (a crash happened mid-write).
+                // Truncated payload: trailing corruption, stop recovery
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Err(StorageError::Corruption(format!(
-                        "WAL file was corrupted or truncated: expected {} bytes, hit EOF",
-                        len
-                    )));
+                    eprintln!("Warning: WAL ended with truncated payload. Stopping recovery.");
+                    break;
                 }
                 Err(e) => return Err(StorageError::Io(e)),
             }
 
-            // Deserialize the binary format back into our Rust enum.
-            let entry: WalEntry = bincode::deserialize(&bytes)?;
+            // 4. Verify checksum.
+            let actual_checksum = compute_checksum(&bytes);
+            if actual_checksum != expected_checksum {
+                eprintln!("Warning: WAL checksum mismatch. Stopping recovery.");
+                break;
+            }
+
+            // 5. Deserialize the binary format back into our Rust enum.
+            let entry: WalEntry = match bincode::deserialize(&bytes) {
+                Ok(ent) => ent,
+                Err(e) => {
+                    eprintln!("Warning: Deserialization failed for WAL entry: {}. Stopping recovery.", e);
+                    break;
+                }
+            };
             entries.push(entry);
         }
 
@@ -129,4 +157,11 @@ impl Wal {
         let metadata = self.file.metadata()?;
         Ok(metadata.len())
     }
+}
+
+fn compute_checksum(data: &[u8]) -> u32 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(data);
+    hasher.finish() as u32
 }

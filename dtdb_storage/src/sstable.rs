@@ -30,27 +30,41 @@ pub struct IndexBlock {
 /// It collects key-value pairs in a block buffer. When the buffer size
 /// exceeds a threshold, it compresses the block using LZ4 and writes it to disk.
 pub struct SstableWriter {
-    file: File,
+    file: Option<File>,
     offset: u64,
     block_size_limit: usize,
     current_block: Vec<(DbKey, Option<DbValue>)>,
     current_block_uncompressed_bytes: usize,
     index: Vec<IndexEntry>,
     compression: CompressionType,
+    final_path: std::path::PathBuf,
+    temp_path: std::path::PathBuf,
 }
 
 impl SstableWriter {
     /// Creates a new SstableWriter writing to the file at the given path.
     pub fn create(path: impl AsRef<Path>, block_size_limit: usize, compression: CompressionType) -> Result<Self> {
-        let file = File::create(path)?;
+        let final_path = path.as_ref().to_path_buf();
+        let mut temp_path = final_path.clone();
+        if let Some(ext) = temp_path.extension() {
+            let mut new_ext = ext.to_os_string();
+            new_ext.push(".tmp");
+            temp_path.set_extension(new_ext);
+        } else {
+            temp_path.set_extension("tmp");
+        }
+
+        let file = File::create(&temp_path)?;
         Ok(Self {
-            file,
+            file: Some(file),
             offset: 0,
             block_size_limit,
             current_block: Vec::new(),
             current_block_uncompressed_bytes: 0,
             index: Vec::new(),
             compression,
+            final_path,
+            temp_path,
         })
     }
 
@@ -107,7 +121,7 @@ impl SstableWriter {
         let block_len = block_bytes.len() as u64;
 
         // Write block to file
-        self.file.write_all(&block_bytes)?;
+        self.file.as_mut().unwrap().write_all(&block_bytes)?;
 
         // Update the last index entry with the correct size
         if let Some(entry) = self.index.last_mut() {
@@ -123,27 +137,45 @@ impl SstableWriter {
 
     /// Flushes any pending blocks and writes the index block and footer to disk, finishing the file.
     pub fn finish(mut self) -> Result<()> {
+        let res = self.finish_internal();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+        res
+    }
+
+    fn finish_internal(&mut self) -> Result<()> {
         // Flush remaining elements in current block
         self.flush_block()?;
+
+        // Take the file out of Option to close it after writing
+        let mut file = self.file.take().ok_or_else(|| {
+            StorageError::Corruption("SSTable writer already finished".to_string())
+        })?;
 
         // Write Index block (uncompressed for easy parsing during recovery/startup)
         let index_offset = self.offset;
         let index_block = IndexBlock {
-            entries: self.index,
+            entries: self.index.clone(),
             compression: self.compression,
         };
         let index_bytes = bincode::serialize(&index_block)?;
         let index_len = index_bytes.len() as u64;
 
-        self.file.write_all(&index_bytes)?;
+        file.write_all(&index_bytes)?;
         self.offset += index_len;
 
         // Write Footer: [index_offset (u64)][index_len (u64)][magic (8 bytes)]
-        self.file.write_all(&index_offset.to_le_bytes())?;
-        self.file.write_all(&index_len.to_le_bytes())?;
-        self.file.write_all(MAGIC_NUMBER)?;
+        file.write_all(&index_offset.to_le_bytes())?;
+        file.write_all(&index_len.to_le_bytes())?;
+        file.write_all(MAGIC_NUMBER)?;
 
-        self.file.sync_all()?;
+        file.sync_all()?;
+        drop(file);
+
+        // Rename the temporary file atomically to final path
+        std::fs::rename(&self.temp_path, &self.final_path)?;
+
         Ok(())
     }
 }

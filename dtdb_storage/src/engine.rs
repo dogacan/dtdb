@@ -1,6 +1,7 @@
 use crate::memtable::MemTable;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
+use crate::manifest::Manifest;
 use crate::{DbKey, DbValue, EngineOptions, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -55,12 +56,51 @@ impl StorageEngine {
             options
         };
 
-        // 1. Discover all SSTable files in the directory.
+        // 1. Load or initialize/migrate the Manifest.
+        let manifest_path = dir_path.join("manifest.bin");
+        let manifest = if manifest_path.exists() {
+            Manifest::load(&manifest_path)?
+        } else {
+            // Scan directory for existing SSTables to build the initial manifest (backward compatibility)
+            let mut active_sstables = HashSet::new();
+            for entry in fs::read_dir(&dir_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "sst") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if stem.starts_with('L') {
+                            let parts: Vec<&str> = stem[1..].split('_').collect();
+                            if parts.len() == 2 {
+                                if let (Ok(level), Ok(id)) =
+                                    (parts[0].parse::<usize>(), parts[1].parse::<u64>())
+                                {
+                                    active_sstables.insert((level, id));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let m = Manifest { active_sstables };
+            m.save(&manifest_path)?;
+            m
+        };
+
+        // 2. Discover active SSTables and clean up orphan/garbage files.
         let mut max_id = 0;
         let mut discovered_ssts = Vec::new();
+        let mut files_to_delete = Vec::new();
+
         for entry in fs::read_dir(&dir_path)? {
             let entry = entry?;
             let path = entry.path();
+            
+            // Clean up any stray temp files left behind by crashes
+            if path.extension().map_or(false, |ext| ext == "tmp") {
+                files_to_delete.push(path);
+                continue;
+            }
+
             if path.extension().map_or(false, |ext| ext == "sst") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if stem.starts_with('L') {
@@ -69,13 +109,23 @@ impl StorageEngine {
                             if let (Ok(level), Ok(id)) =
                                 (parts[0].parse::<usize>(), parts[1].parse::<u64>())
                             {
-                                max_id = max_id.max(id);
-                                discovered_ssts.push((level, id, path));
+                                if manifest.active_sstables.contains(&(level, id)) {
+                                    max_id = max_id.max(id);
+                                    discovered_ssts.push((level, id, path));
+                                } else {
+                                    // Orphaned SSTable (e.g., failed compaction output), delete it
+                                    files_to_delete.push(path);
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Delete orphan/garbage files
+        for p in files_to_delete {
+            let _ = fs::remove_file(p);
         }
 
         let mut sstables_map: BTreeMap<usize, Vec<Mutex<SstableReader>>> = BTreeMap::new();
@@ -718,6 +768,21 @@ impl StorageEngine {
             new_sstables.push(Mutex::new(reader));
         }
 
+        // Update manifest.bin
+        let manifest_path = self.dir_path.join("manifest.bin");
+        let mut manifest = Manifest::load(&manifest_path)?;
+        // Remove old files
+        for f in source_files.iter().chain(overlapping_target_files.iter()) {
+            let reader = f.lock().unwrap();
+            manifest.active_sstables.remove(&(reader.level, reader.id));
+        }
+        // Add new files
+        for f in &new_sstables {
+            let reader = f.lock().unwrap();
+            manifest.active_sstables.insert((reader.level, reader.id));
+        }
+        manifest.save(&manifest_path)?;
+
         // 4. Update the active sstables map and delete old files
         {
             let mut sstables_guard = self.sstables.write().unwrap();
@@ -774,6 +839,12 @@ impl StorageEngine {
             writer.append(key, val)?;
         }
         writer.finish()?;
+
+        // Update manifest.bin
+        let manifest_path = self.dir_path.join("manifest.bin");
+        let mut manifest = Manifest::load(&manifest_path)?;
+        manifest.active_sstables.insert((0, next_id));
+        manifest.save(&manifest_path)?;
 
         // 3. Register the new SSTable Reader (inserted at the beginning of L0).
         let reader = SstableReader::open(&sst_path, next_id, 0)?;
