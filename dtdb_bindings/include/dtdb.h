@@ -11,9 +11,11 @@ namespace dtdb {
 
 class SqlQuery {
 public:
-    explicit SqlQuery(const std::string& text) : text_(text) {}
+    template <size_t N>
+    explicit SqlQuery(const char (&text)[N]) : text_(text) {}
     
-    SqlQuery& bind(const std::string& name, const std::string& value) {
+    template <size_t N>
+    SqlQuery& bind(const char (&name)[N], const std::string& value) {
         params_.push_back({name, value});
         return *this;
     }
