@@ -457,3 +457,84 @@ fn test_sql_explain() {
         panic!("Expected EXPLAIN Select output");
     }
 }
+
+#[test]
+fn test_sql_query_macro_and_interpolation() {
+    use dtdb_sql::sql_query;
+
+    // 1. Test basic bindings and escaping
+    let query = sql_query!("SELECT * FROM users WHERE id = @id AND name = @name AND details = @details")
+        .bind("id", 42i64)
+        .bind("name", "Alice's Laptop")
+        .bind("details", "Some 'escaped' \"value\" @not_a_param");
+
+    let interpolated = query.interpolate().unwrap();
+    assert_eq!(
+        interpolated,
+        "SELECT * FROM users WHERE id = 42 AND name = 'Alice''s Laptop' AND details = 'Some ''escaped'' \"value\" @not_a_param'"
+    );
+
+    // 2. Test raw bytes binding
+    let query = sql_query!("SELECT * FROM items WHERE hash = @hash")
+        .bind("hash", vec![1u8, 2u8, 255u8]);
+    assert_eq!(
+        query.interpolate().unwrap(),
+        "SELECT * FROM items WHERE hash = x'0102ff'"
+    );
+
+    // 3. Verify that quotes protect placeholders from replacement
+    let query = sql_query!("SELECT * FROM users WHERE email = 'support@id.com' AND id = @id")
+        .bind("id", 10i64);
+    assert_eq!(
+        query.interpolate().unwrap(),
+        "SELECT * FROM users WHERE email = 'support@id.com' AND id = 10"
+    );
+
+    // 4. Verify unbound parameter results in an error
+    let query = sql_query!("SELECT * FROM users WHERE id = @id AND age = @age")
+        .bind("id", 10i64);
+    assert!(query.interpolate().is_err());
+}
+
+#[test]
+fn test_sql_query_execution_end_to_end() {
+    use dtdb_sql::sql_query;
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name STRING, score FLOAT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    // Insert using SqlQuery
+    let insert_query = sql_query!("INSERT INTO employees (id, name, score) VALUES (@id, @name, @score)")
+        .bind("id", 1i64)
+        .bind("name", "Bob's Team")
+        .bind("score", 95.5f64);
+
+    let res = engine.execute_query(&insert_query, &tx2).unwrap();
+    assert_eq!(res, ExecutionResult::Insert { count: 1 });
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    // Select using SqlQuery
+    let select_query = sql_query!("SELECT id, name, score FROM employees WHERE name = @name AND score >= @min_score")
+        .bind("name", "Bob's Team")
+        .bind("min_score", 90.0f64);
+
+    let select_res = engine.execute_query(&select_query, &tx3).unwrap();
+    if let ExecutionResult::Select { rows, .. } = select_res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[0].values[1], DbValue::String("Bob's Team".to_string()));
+        assert_eq!(rows[0].values[2], DbValue::Float(95.5));
+    } else {
+        panic!("Expected SELECT results");
+    }
+}
+

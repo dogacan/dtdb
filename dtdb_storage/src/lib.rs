@@ -73,3 +73,39 @@ pub struct EngineOptions {
     pub max_level: usize,
 }
 
+impl From<i64> for DbValue {
+    fn from(v: i64) -> Self {
+        DbValue::Int(v)
+    }
+}
+
+impl From<f64> for DbValue {
+    fn from(v: f64) -> Self {
+        DbValue::Float(v)
+    }
+}
+
+impl From<String> for DbValue {
+    fn from(v: String) -> Self {
+        DbValue::String(v)
+    }
+}
+
+impl<'a> From<&'a str> for DbValue {
+    fn from(v: &'a str) -> Self {
+        DbValue::String(v.to_string())
+    }
+}
+
+impl From<Vec<u8>> for DbValue {
+    fn from(v: Vec<u8>) -> Self {
+        DbValue::Bytes(v)
+    }
+}
+
+impl<'a> From<&'a [u8]> for DbValue {
+    fn from(v: &'a [u8]) -> Self {
+        DbValue::Bytes(v.to_vec())
+    }
+}
+

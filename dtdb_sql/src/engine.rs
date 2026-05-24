@@ -2,6 +2,7 @@ use std::sync::Arc;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use dtdb_storage::{DbKey, DbValue};
+use crate::SqlQuery;
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
 use crate::expr::{Expr, Operator};
 use crate::logical::{LogicalPlan, format_logical_plan};
@@ -29,6 +30,12 @@ pub struct SqlEngine {
 impl SqlEngine {
     pub fn new(database: Arc<Database>) -> Self {
         Self { database }
+    }
+
+    /// Executes a parameterized SqlQuery safely by interpolating bound parameters first.
+    pub fn execute_query(&self, query: &SqlQuery, tx: &Transaction) -> Result<ExecutionResult, String> {
+        let sql = query.interpolate()?;
+        self.execute(&sql, tx)
     }
 
     /// Parses, plans, optimizes, and executes a SQL query within the given transaction.
