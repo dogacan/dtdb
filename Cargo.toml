@@ -4,5 +4,6 @@ members = [
     "dtdb_relational",
     "dtdb_sql",
     "dtdb_api",
+    "dtdb_bindings",
 ]
 resolver = "2"

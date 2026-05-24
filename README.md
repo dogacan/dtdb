@@ -62,6 +62,7 @@ Exposes database resources over a client API supporting both embedded (in-proces
 ├── dtdb_relational/    # Layer 2: Relational Schema metadata & Transaction boundaries
 ├── dtdb_sql/           # Layer 3: SQL Query Planner, Optimizer, and Volcano execution
 │   └── src/bin/        # dtdb_sql_cli: Interactive multi-line SQL shell
+├── dtdb_bindings/      # C++ and Swift FFI bindings (cxx bridge, dtdb::Client wrapper)
 └── dtdb_api/           # Layer 4: Client API (In-Process/Remote), gRPC Server, and SQL CLI
     └── src/bin/        # dtdb_server (gRPC daemon) and dtdb_client_cli (SQL prompt)
 ```
@@ -180,6 +181,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### C++ & Swift Bindings
+
+DuctTapeDB provides FFI bindings in the `dtdb_bindings` crate, allowing you to embed the database or connect to a gRPC server from C++ and Swift natively. 
+
+It exposes a clean, synchronous client wrapper (`dtdb::Client`) featuring an exception-safe counterpart to `run_in_transaction`. For a complete guide on how to build, link, and use the C++ and Swift API, see the [C++ & Swift Bindings Guide](docs/bindings.md).
 
 ---
 
