@@ -401,3 +401,53 @@ async fn test_grpc_protocol_misuse() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_grpc_ddl_transaction_rejection() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let (port, server_handle) = start_test_server(&data_path).await;
+
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+
+    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+
+    // 1. Remote transaction rejection of DDL
+    let tx_res = client.run_in_transaction("test_db", |tx| async move {
+        let _ = tx.execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);").await?;
+        Ok(())
+    }).await;
+
+    assert!(tx_res.is_err());
+    let err_msg = tx_res.unwrap_err().message().to_string();
+    assert!(err_msg.contains("DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions."));
+
+    // 2. In-process transaction rejection of DDL
+    let mut ip_client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    ip_client.create_db("test_db_ip", CompressionType::Uncompressed).await.unwrap();
+
+    let ip_tx_res = ip_client.run_in_transaction("test_db_ip", |tx| async move {
+        let _ = tx.execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);").await?;
+        Ok(())
+    }).await;
+
+    assert!(ip_tx_res.is_err());
+    let ip_err_msg = ip_tx_res.unwrap_err().message().to_string();
+    assert!(ip_err_msg.contains("DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions."));
+
+    // 3. Confirm DDL still works fine outside explicit transaction (auto-committed)
+    {
+        let mut stream = client
+            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    server_handle.abort();
+}
+

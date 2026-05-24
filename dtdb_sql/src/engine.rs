@@ -34,6 +34,21 @@ impl SqlEngine {
         Self { database }
     }
 
+    /// Checks if the SQL string contains a DDL statement (CREATE TABLE or DROP TABLE).
+    pub fn is_ddl(&self, sql: &str) -> bool {
+        let dialect = GenericDialect {};
+        if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
+            if !statements.is_empty() {
+                return matches!(
+                    statements[0],
+                    sqlparser::ast::Statement::CreateTable { .. }
+                        | sqlparser::ast::Statement::Drop { .. }
+                );
+            }
+        }
+        false
+    }
+
     /// Executes a parameterized SqlQuery safely by interpolating bound parameters first.
     pub fn execute_query(&self, query: &SqlQuery, tx: &Transaction) -> Result<ExecutionResult, String> {
         let sql = query.interpolate()?;

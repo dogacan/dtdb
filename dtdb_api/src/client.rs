@@ -351,6 +351,11 @@ impl TransactionClient {
     ) -> Result<Vec<ExecuteQueryResponse>, Status> {
         match &self.mode {
             TransactionClientMode::InProcess { tx, sql_engine } => {
+                if sql_engine.is_ddl(sql_query) {
+                    return Err(Status::invalid_argument(
+                        "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions."
+                    ));
+                }
                 match sql_engine.execute(sql_query, tx) {
                     Ok(result) => {
                         Ok(crate::server::execution_result_to_responses(result))
