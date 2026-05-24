@@ -1,12 +1,10 @@
-use std::sync::Arc;
+use dtdb_relational::{Column, DataType, Database, Row, Schema, Transaction, TransactionRecord};
+use dtdb_storage::{DbKey, DbValue, WalEntry};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, WalEntry};
-use dtdb_relational::{
-    Column, DataType, Database, Row, Schema, Transaction, TransactionRecord
-};
 
 // Helper to create a user schema
 fn create_user_schema() -> Schema {
@@ -57,7 +55,10 @@ fn r_user(id: i64, name: &str) -> Row {
 }
 
 fn r_product(sku: &str, price: f64) -> Row {
-    Row::new(vec![DbValue::String(sku.to_string()), DbValue::Float(price)])
+    Row::new(vec![
+        DbValue::String(sku.to_string()),
+        DbValue::Float(price),
+    ])
 }
 
 #[test]
@@ -69,11 +70,13 @@ fn test_multi_table_normal_commit() {
     {
         let db = Arc::new(Database::open(&db_path).unwrap());
         db.create_table("users", create_user_schema()).unwrap();
-        db.create_table("products", create_product_schema()).unwrap();
+        db.create_table("products", create_product_schema())
+            .unwrap();
 
         let tx = Transaction::new(1, db);
         tx.put("users", k_int(101), r_user(101, "Alice")).unwrap();
-        tx.put("products", k_str("BOOK-01"), r_product("BOOK-01", 29.99)).unwrap();
+        tx.put("products", k_str("BOOK-01"), r_product("BOOK-01", 29.99))
+            .unwrap();
         tx.commit().unwrap();
     }
 
@@ -82,8 +85,14 @@ fn test_multi_table_normal_commit() {
         let db = Arc::new(Database::open(&db_path).unwrap());
         let tx = Transaction::new(2, db);
 
-        assert_eq!(tx.get("users", &k_int(101)).unwrap(), Some(r_user(101, "Alice")));
-        assert_eq!(tx.get("products", &k_str("BOOK-01")).unwrap(), Some(r_product("BOOK-01", 29.99)));
+        assert_eq!(
+            tx.get("users", &k_int(101)).unwrap(),
+            Some(r_user(101, "Alice"))
+        );
+        assert_eq!(
+            tx.get("products", &k_str("BOOK-01")).unwrap(),
+            Some(r_product("BOOK-01", 29.99))
+        );
     }
 }
 
@@ -94,15 +103,23 @@ fn test_multi_table_rollback() {
 
     let db = Arc::new(Database::open(&db_path).unwrap());
     db.create_table("users", create_user_schema()).unwrap();
-    db.create_table("products", create_product_schema()).unwrap();
+    db.create_table("products", create_product_schema())
+        .unwrap();
 
     let tx = Transaction::new(1, db);
     tx.put("users", k_int(101), r_user(101, "Alice")).unwrap();
-    tx.put("products", k_str("BOOK-01"), r_product("BOOK-01", 29.99)).unwrap();
-    
+    tx.put("products", k_str("BOOK-01"), r_product("BOOK-01", 29.99))
+        .unwrap();
+
     // Check uncommitted local reads work
-    assert_eq!(tx.get("users", &k_int(101)).unwrap(), Some(r_user(101, "Alice")));
-    assert_eq!(tx.get("products", &k_str("BOOK-01")).unwrap(), Some(r_product("BOOK-01", 29.99)));
+    assert_eq!(
+        tx.get("users", &k_int(101)).unwrap(),
+        Some(r_user(101, "Alice"))
+    );
+    assert_eq!(
+        tx.get("products", &k_str("BOOK-01")).unwrap(),
+        Some(r_product("BOOK-01", 29.99))
+    );
 
     // Rollback
     tx.rollback().unwrap();
@@ -121,7 +138,8 @@ fn test_crash_recovery_roll_forward() {
     {
         let db = Database::open(&db_path).unwrap();
         db.create_table("users", create_user_schema()).unwrap();
-        db.create_table("products", create_product_schema()).unwrap();
+        db.create_table("products", create_product_schema())
+            .unwrap();
     }
 
     // 2. Simulate a crash right after PREPARED log write
@@ -166,8 +184,14 @@ fn test_crash_recovery_roll_forward() {
         let tx = Transaction::new(1000, db);
 
         // Verify the data has been successfully rolled forward!
-        assert_eq!(tx.get("users", &k_int(42)).unwrap(), Some(r_user(42, "Douglas Adams")));
-        assert_eq!(tx.get("products", &k_str("TOWEL")).unwrap(), Some(r_product("TOWEL", 42.0)));
+        assert_eq!(
+            tx.get("users", &k_int(42)).unwrap(),
+            Some(r_user(42, "Douglas Adams"))
+        );
+        assert_eq!(
+            tx.get("products", &k_str("TOWEL")).unwrap(),
+            Some(r_product("TOWEL", 42.0))
+        );
 
         // Verify that the transactions.log has been truncated to 0 bytes
         let log_path = db_path.join("transactions.log");
@@ -194,7 +218,8 @@ fn test_crash_recovery_ignore_corrupt_log() {
         // Write invalid length prefix and random bytes
         let len = 100u32;
         file.write_all(&len.to_le_bytes()).unwrap();
-        file.write_all(b"corrupt payload bytes that do not deserialize").unwrap();
+        file.write_all(b"corrupt payload bytes that do not deserialize")
+            .unwrap();
         file.sync_all().unwrap();
     }
 

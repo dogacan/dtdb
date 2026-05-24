@@ -1,7 +1,7 @@
+use dtdb_relational::{Column, DataType, Database, RelationalError, Row, Schema, Transaction};
+use dtdb_storage::{DbKey, DbValue};
 use std::sync::Arc;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue};
-use dtdb_relational::{Column, DataType, Database, RelationalError, Row, Schema, Transaction};
 
 // Helper to create a test schema:
 // Users table: id (Int, PK), name (String), active (Bytes - using Bytes as boolean placeholder)
@@ -100,7 +100,11 @@ fn test_schema_validations() {
 
     // 4. Primary key validation: Key type mismatch (DbKey::String instead of DbKey::Int)
     assert!(matches!(
-        tx.put("users", DbKey::String("1".to_string()), r_user(1, "alice", 95.5)),
+        tx.put(
+            "users",
+            DbKey::String("1".to_string()),
+            r_user(1, "alice", 95.5)
+        ),
         Err(RelationalError::SchemaMismatch(_))
     ));
 
@@ -121,7 +125,10 @@ fn test_transaction_rollback() {
     tx.put("users", k_int(1), r_user(1, "alice", 95.5)).unwrap();
 
     // Check we can read our own writes
-    assert_eq!(tx.get("users", &k_int(1)).unwrap(), Some(r_user(1, "alice", 95.5)));
+    assert_eq!(
+        tx.get("users", &k_int(1)).unwrap(),
+        Some(r_user(1, "alice", 95.5))
+    );
 
     // Rollback
     tx.rollback().unwrap();
@@ -151,8 +158,14 @@ fn test_transaction_commit_and_persistence() {
         let db = Arc::new(Database::open(&db_path).unwrap());
         let tx = Transaction::new(2, db);
 
-        assert_eq!(tx.get("users", &k_int(1)).unwrap(), Some(r_user(1, "alice", 95.5)));
-        assert_eq!(tx.get("users", &k_int(2)).unwrap(), Some(r_user(2, "bob", 80.0)));
+        assert_eq!(
+            tx.get("users", &k_int(1)).unwrap(),
+            Some(r_user(1, "alice", 95.5))
+        );
+        assert_eq!(
+            tx.get("users", &k_int(2)).unwrap(),
+            Some(r_user(2, "bob", 80.0))
+        );
         assert_eq!(tx.get("users", &k_int(3)).unwrap(), None);
     }
 }
@@ -165,18 +178,23 @@ fn test_transaction_scans_and_merges() {
 
     // 1. Write some initial data to disk
     let tx1 = Transaction::new(1, db.clone());
-    tx1.put("users", k_int(10), r_user(10, "ten", 10.0)).unwrap();
-    tx1.put("users", k_int(20), r_user(20, "twenty", 20.0)).unwrap();
-    tx1.put("users", k_int(30), r_user(30, "thirty", 30.0)).unwrap();
+    tx1.put("users", k_int(10), r_user(10, "ten", 10.0))
+        .unwrap();
+    tx1.put("users", k_int(20), r_user(20, "twenty", 20.0))
+        .unwrap();
+    tx1.put("users", k_int(30), r_user(30, "thirty", 30.0))
+        .unwrap();
     tx1.commit().unwrap();
 
     // 2. Open a new transaction, modify data, delete data, and scan
     let tx2 = Transaction::new(2, db);
-    
+
     // Update key 20, delete key 10, add key 25 inside tx buffer
-    tx2.put("users", k_int(20), r_user(20, "twenty_new", 22.0)).unwrap();
+    tx2.put("users", k_int(20), r_user(20, "twenty_new", 22.0))
+        .unwrap();
     tx2.delete("users", k_int(10)).unwrap();
-    tx2.put("users", k_int(25), r_user(25, "twentyfive", 25.0)).unwrap();
+    tx2.put("users", k_int(25), r_user(25, "twentyfive", 25.0))
+        .unwrap();
 
     // Scan range [10, 30]
     // Expect:
@@ -185,14 +203,16 @@ fn test_transaction_scans_and_merges() {
     // - key 25: new value
     // - key 30: unchanged value
     // Output must be sorted by key (10 < 20 < 25 < 30)
-    let scan_res = tx2.filtered_scan("users", &k_int(10), &k_int(35), |row| {
-        // Filter: only get users with score >= 20.0
-        let val = row.get_by_name(&create_test_schema(), "score").unwrap();
-        match val {
-            DbValue::Float(f) => *f >= 20.0,
-            _ => false,
-        }
-    }).unwrap();
+    let scan_res = tx2
+        .filtered_scan("users", &k_int(10), &k_int(35), |row| {
+            // Filter: only get users with score >= 20.0
+            let val = row.get_by_name(&create_test_schema(), "score").unwrap();
+            match val {
+                DbValue::Float(f) => *f >= 20.0,
+                _ => false,
+            }
+        })
+        .unwrap();
 
     assert_eq!(scan_res.len(), 3);
     assert_eq!(scan_res[0], r_user(20, "twenty_new", 22.0));

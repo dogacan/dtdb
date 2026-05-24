@@ -421,6 +421,20 @@ impl Database {
                         }
                     }
                 }
+
+                // Check write-write conflict: Did the committed record modify a key we want to write?
+                for (table_name, w_keys) in write_keys {
+                    if let Some(committed_keys) = record.keys.get(table_name) {
+                        for k in w_keys {
+                            if committed_keys.contains(k) {
+                                return Err(RelationalError::TransactionConflict(format!(
+                                    "Conflict detected: Key {:?} in table {} was modified by a concurrent transaction (tx_id: {})",
+                                    k, table_name, tx_id
+                                )));
+                            }
+                        }
+                    }
+                }
             }
         }
 
