@@ -41,7 +41,15 @@ impl DuctTapeDbClient {
 
     /// Creates an in-process DuctTapeDB client using the specified data directory.
     pub fn in_process(data_dir: impl AsRef<Path>) -> Result<Self, String> {
-        let service = crate::server::DuctTapeDbServiceImpl::new(data_dir)?;
+        Self::in_process_with_spawner(data_dir, Arc::new(dtdb_storage::DefaultSpawner))
+    }
+
+    /// Creates an in-process DuctTapeDB client using the specified data directory and a custom ThreadSpawner.
+    pub fn in_process_with_spawner(
+        data_dir: impl AsRef<Path>,
+        spawner: Arc<dyn dtdb_storage::ThreadSpawner>,
+    ) -> Result<Self, String> {
+        let service = crate::server::DuctTapeDbServiceImpl::new_with_spawner(data_dir, spawner)?;
         Ok(Self {
             inner: ClientMode::InProcess(Arc::new(service)),
         })

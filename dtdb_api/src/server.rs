@@ -27,6 +27,7 @@ pub struct DuctTapeDbServiceImpl {
     data_dir: PathBuf,
     databases: Arc<RwLock<HashMap<String, DbState>>>,
     next_tx_id: Arc<AtomicU64>,
+    spawner: Arc<dyn dtdb_storage::ThreadSpawner>,
 }
 
 struct DbState {
@@ -36,6 +37,13 @@ struct DbState {
 
 impl DuctTapeDbServiceImpl {
     pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, String> {
+        Self::new_with_spawner(data_dir, Arc::new(dtdb_storage::DefaultSpawner))
+    }
+
+    pub fn new_with_spawner(
+        data_dir: impl AsRef<Path>,
+        spawner: Arc<dyn dtdb_storage::ThreadSpawner>,
+    ) -> Result<Self, String> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
@@ -44,6 +52,7 @@ impl DuctTapeDbServiceImpl {
             data_dir: data_dir.clone(),
             databases,
             next_tx_id: Arc::new(AtomicU64::new(1)),
+            spawner,
         };
 
         // Scan and restore databases
@@ -62,7 +71,7 @@ impl DuctTapeDbServiceImpl {
                     // Check if db_options.bin exists
                     if path.join("db_options.bin").exists() {
                         println!("Restoring database: {}", db_name);
-                        let database = Arc::new(Database::open(&path).map_err(|e| e.to_string())?);
+                        let database = Arc::new(Database::open_with_spawner(&path, self.spawner.clone()).map_err(|e| e.to_string())?);
                         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
 
                         // Spawn periodic flush if configured
@@ -236,7 +245,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             max_level: None,
         };
 
-        let database = Arc::new(Database::open_with_options(&db_path, options.clone())
+        let database = Arc::new(Database::open_with_options_and_spawner(&db_path, options.clone(), self.spawner.clone())
             .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?);
         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
 

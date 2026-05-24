@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock, Mutex};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
-use dtdb_storage::{StorageEngine, CompressionType, EngineOptions, WalEntry};
+use dtdb_storage::{StorageEngine, CompressionType, EngineOptions, WalEntry, ThreadSpawner};
 use crate::error::{RelationalError, Result};
 use crate::schema::Schema;
 
@@ -66,6 +66,7 @@ pub struct Database {
     global_commit_version: std::sync::atomic::AtomicU64,
     occ_active_transactions: Mutex<HashMap<u64, u64>>,
     commit_history: Mutex<Vec<CommitRecord>>,
+    spawner: Arc<dyn ThreadSpawner>,
 }
 
 impl Database {
@@ -73,6 +74,13 @@ impl Database {
     ///
     /// It scans the base directory for table subdirectories containing `schema.bin`.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_spawner(dir_path, Arc::new(dtdb_storage::DefaultSpawner))
+    }
+
+    pub fn open_with_spawner(
+        dir_path: impl AsRef<Path>,
+        spawner: Arc<dyn ThreadSpawner>,
+    ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         let db_options_path = dir_path.join("db_options.bin");
         let options = if db_options_path.exists() {
@@ -92,11 +100,20 @@ impl Database {
                 max_level: None,
             }
         };
-        Self::open_with_options(dir_path, options)
+        Self::open_with_options_and_spawner(dir_path, options, spawner)
     }
 
     /// Opens the database catalog directory with specified options and loads all tables.
     pub fn open_with_options(dir_path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
+        Self::open_with_options_and_spawner(dir_path, options, Arc::new(dtdb_storage::DefaultSpawner))
+    }
+
+    /// Opens the database catalog directory with specified options and a custom ThreadSpawner, and loads all tables.
+    pub fn open_with_options_and_spawner(
+        dir_path: impl AsRef<Path>,
+        options: DatabaseOptions,
+        spawner: Arc<dyn ThreadSpawner>,
+    ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
 
@@ -137,7 +154,7 @@ impl Database {
                         level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
                         max_level: options.max_level.unwrap_or(7),
                     };
-                    let engine = Arc::new(StorageEngine::open(&path, engine_opts)?);
+                    let engine = Arc::new(StorageEngine::open_with_spawner(&path, engine_opts, spawner.clone())?);
 
                     tables.insert(
                         name.clone(),
@@ -166,6 +183,7 @@ impl Database {
             global_commit_version,
             occ_active_transactions,
             commit_history,
+            spawner,
         };
 
         db.recover_transactions()?;
@@ -203,7 +221,7 @@ impl Database {
         };
 
         // Open the new Layer 1 storage engine
-        let engine = Arc::new(StorageEngine::open(&table_path, engine_opts)?);
+        let engine = Arc::new(StorageEngine::open_with_spawner(&table_path, engine_opts, self.spawner.clone())?);
 
         tables_guard.insert(
             name.to_string(),

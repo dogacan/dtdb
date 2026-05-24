@@ -9,6 +9,20 @@ pub mod manifest;
 pub use engine::StorageEngine;
 pub use wal::WalEntry;
 
+use std::sync::Arc;
+
+pub trait ThreadSpawner: Send + Sync + 'static {
+    fn spawn(&self, f: Box<dyn FnOnce() + Send + 'static>);
+}
+
+#[derive(Clone)]
+pub struct DefaultSpawner;
+impl ThreadSpawner for DefaultSpawner {
+    fn spawn(&self, f: Box<dyn FnOnce() + Send + 'static>) {
+        std::thread::spawn(f);
+    }
+}
+
 /// Result type wrapper for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
 

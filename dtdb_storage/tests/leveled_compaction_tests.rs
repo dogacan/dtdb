@@ -70,9 +70,16 @@ fn test_l0_to_l1_auto_compaction() {
     // it triggers L0 -> L1 compaction automatically!
     engine.put(k_int(2), v_str("val2")).unwrap();
     
-    // Auto compaction should run and merge both L0 files into Level 1
-    assert_eq!(count_sst_files_at_level(&db_path, 0), 0);
-    assert_eq!(count_sst_files_at_level(&db_path, 1), 1);
+    // Auto compaction runs asynchronously. Let's poll for up to 1 second for it to complete.
+    let mut success = false;
+    for _ in 0..100 {
+        if count_sst_files_at_level(&db_path, 0) == 0 && count_sst_files_at_level(&db_path, 1) == 1 {
+            success = true;
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(success, "Compaction L0 -> L1 did not complete in time");
 
     // Verify consistency
     assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_str("val1")));
