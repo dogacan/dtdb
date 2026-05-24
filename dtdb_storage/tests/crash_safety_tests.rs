@@ -1,9 +1,9 @@
+use dtdb_storage::sstable::SstableWriter;
+use dtdb_storage::wal::{Wal, WalEntry};
+use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType, EngineOptions};
-use dtdb_storage::wal::{Wal, WalEntry};
-use dtdb_storage::sstable::SstableWriter;
 
 // Helper to create keys and values
 fn k_int(val: i64) -> DbKey {
@@ -42,10 +42,7 @@ fn test_wal_tolerant_recovery() {
 
     // 2. Corrupt/truncate the end of the WAL file
     {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&wal_path)
-            .unwrap();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
         // Write a truncated length prefix (only 2 bytes instead of 4)
         file.write_all(&[42u8, 0u8]).unwrap();
         file.sync_all().unwrap();
@@ -81,7 +78,8 @@ fn test_atomic_sstable_write() {
 
     // 1. Start writing but crash (drop without finish)
     {
-        let mut writer = SstableWriter::create(&sst_path, 100, CompressionType::Uncompressed).unwrap();
+        let mut writer =
+            SstableWriter::create(&sst_path, 100, CompressionType::Uncompressed).unwrap();
         writer.append(k_int(1), Some(v_str("apple"))).unwrap();
         // Dropped here, simulated crash
     }
@@ -95,7 +93,8 @@ fn test_atomic_sstable_write() {
 
     // 2. Write and successfully finish
     {
-        let mut writer = SstableWriter::create(&sst_path, 100, CompressionType::Uncompressed).unwrap();
+        let mut writer =
+            SstableWriter::create(&sst_path, 100, CompressionType::Uncompressed).unwrap();
         writer.append(k_int(1), Some(v_str("apple"))).unwrap();
         writer.finish().unwrap();
     }
@@ -120,23 +119,35 @@ fn test_compaction_crash_garbage_collection() {
     }
 
     // Verify sstable files exist on disk
-    let files_before = fs::read_dir(temp_dir.path()).unwrap()
+    let files_before = fs::read_dir(temp_dir.path())
+        .unwrap()
         .map(|r| r.unwrap().path())
         .collect::<Vec<_>>();
-    assert!(files_before.iter().any(|p| p.file_name().unwrap() == "manifest.bin"));
+    assert!(
+        files_before
+            .iter()
+            .any(|p| p.file_name().unwrap() == "manifest.bin")
+    );
 
     // 2. Simulate a compaction crash by creating a dummy garbage SSTable on disk
     // which is not registered in the manifest
     let garbage_sst_path = temp_dir.path().join("L0_99999.sst");
-    fs::write(&garbage_sst_path, b"garbage data from interrupted compaction").unwrap();
+    fs::write(
+        &garbage_sst_path,
+        b"garbage data from interrupted compaction",
+    )
+    .unwrap();
     assert!(garbage_sst_path.exists());
 
     // 3. Reopen the StorageEngine. It should scan the directory, detect
     // the unregistered SSTable, and delete it automatically.
     {
         let _engine = StorageEngine::open(temp_dir.path(), options).unwrap();
-        
+
         // The garbage SSTable should have been deleted!
-        assert!(!garbage_sst_path.exists(), "Garbage SSTable file was not cleaned up!");
+        assert!(
+            !garbage_sst_path.exists(),
+            "Garbage SSTable file was not cleaned up!"
+        );
     }
 }

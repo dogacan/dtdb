@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use dtdb_storage::DbValue;
 use crate::error::Result;
 use crate::schema::Schema;
+use dtdb_storage::DbValue;
+use serde::{Deserialize, Serialize};
 
 /// Row represents a tuple/record in a relational table.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

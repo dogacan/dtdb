@@ -1,9 +1,9 @@
+use crate::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
-use crate::Result;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manifest {

@@ -1,23 +1,22 @@
-use std::pin::Pin;
-use std::sync::Arc;
-use std::path::Path;
-use tonic::transport::Channel;
-use tonic::Status;
 use futures_core::Stream;
 use futures_util::StreamExt;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use tonic::Status;
+use tonic::transport::Channel;
 
-use dtdb_storage::CompressionType;
-use dtdb_relational::{Transaction, DatabaseOptions};
-use dtdb_sql::SqlEngine;
 use crate::proto::duct_tape_db_service_client::DuctTapeDbServiceClient;
 use crate::proto::duct_tape_db_service_server::DuctTapeDbService;
 use crate::proto::{
-    CreateDbRequest, CreateDbResponse, DropDbRequest, DropDbResponse,
-    ExecuteQueryRequest, ExecuteQueryResponse, CompressionOption,
-    FlushDbRequest, FlushDbResponse,
-    TransactionRequest, TransactionResponse,
-    StartTransaction, ExecuteTxQuery, CommitTransaction, RollbackTransaction,
+    CommitTransaction, CompressionOption, CreateDbRequest, CreateDbResponse, DropDbRequest,
+    DropDbResponse, ExecuteQueryRequest, ExecuteQueryResponse, ExecuteTxQuery, FlushDbRequest,
+    FlushDbResponse, RollbackTransaction, StartTransaction, TransactionRequest,
+    TransactionResponse,
 };
+use dtdb_relational::{DatabaseOptions, Transaction};
+use dtdb_sql::SqlEngine;
+use dtdb_storage::CompressionType;
 
 #[derive(Clone)]
 pub enum ClientMode {
@@ -168,7 +167,10 @@ impl DuctTapeDbClient {
         &mut self,
         db_name: &str,
         sql_query: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>, Status> {
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>,
+        Status,
+    > {
         let request = ExecuteQueryRequest {
             db_name: db_name.to_string(),
             sql_query: sql_query.to_string(),
@@ -220,8 +222,10 @@ impl DuctTapeDbClient {
             ClientMode::InProcess(service) => {
                 // In-process mode: directly create a Transaction and SqlEngine,
                 // execute the closure, and commit or rollback.
-                let (database, sql_engine) = service.get_db_and_engine(db_name)
-                    .ok_or_else(|| Status::not_found(format!("Database '{}' not found", db_name)))?;
+                let (database, sql_engine) =
+                    service.get_db_and_engine(db_name).ok_or_else(|| {
+                        Status::not_found(format!("Database '{}' not found", db_name))
+                    })?;
 
                 let tx_id = service.next_tx_id();
                 let tx = Transaction::new(tx_id, database);
@@ -245,12 +249,14 @@ impl DuctTapeDbClient {
                         // remaining Arc reference, try_unwrap should succeed.
                         match Arc::try_unwrap(tx_arc) {
                             Ok(tx) => {
-                                tx.commit().map_err(|e| Status::aborted(format!("Commit failed: {}", e)))?;
+                                tx.commit().map_err(|e| {
+                                    Status::aborted(format!("Commit failed: {}", e))
+                                })?;
                                 Ok(value)
                             }
-                            Err(_) => {
-                                Err(Status::internal("Failed to acquire exclusive transaction ownership for commit"))
-                            }
+                            Err(_) => Err(Status::internal(
+                                "Failed to acquire exclusive transaction ownership for commit",
+                            )),
                         }
                     }
                     Err(e) => {
@@ -268,11 +274,16 @@ impl DuctTapeDbClient {
                 let (req_tx, req_rx) = tokio::sync::mpsc::channel::<TransactionRequest>(32);
 
                 // Send StartTransaction.
-                req_tx.send(TransactionRequest {
-                    command: Some(crate::proto::transaction_request::Command::Start(
-                        StartTransaction { db_name: db_name.to_string() },
-                    )),
-                }).await.map_err(|_| Status::internal("Failed to send StartTransaction"))?;
+                req_tx
+                    .send(TransactionRequest {
+                        command: Some(crate::proto::transaction_request::Command::Start(
+                            StartTransaction {
+                                db_name: db_name.to_string(),
+                            },
+                        )),
+                    })
+                    .await
+                    .map_err(|_| Status::internal("Failed to send StartTransaction"))?;
 
                 // Open the bidirectional stream.
                 let req_stream = tokio_stream::wrappers::ReceiverStream::new(req_rx);
@@ -292,11 +303,14 @@ impl DuctTapeDbClient {
                 match func(tx_client.clone()).await {
                     Ok(value) => {
                         // Send CommitTransaction.
-                        req_tx.send(TransactionRequest {
-                            command: Some(crate::proto::transaction_request::Command::Commit(
-                                CommitTransaction {},
-                            )),
-                        }).await.map_err(|_| Status::internal("Failed to send CommitTransaction"))?;
+                        req_tx
+                            .send(TransactionRequest {
+                                command: Some(crate::proto::transaction_request::Command::Commit(
+                                    CommitTransaction {},
+                                )),
+                            })
+                            .await
+                            .map_err(|_| Status::internal("Failed to send CommitTransaction"))?;
 
                         // Read the CommitResult from the response stream.
                         let commit_result = tx_client.read_commit_result().await?;
@@ -309,11 +323,15 @@ impl DuctTapeDbClient {
                     Err(e) => {
                         // Send RollbackTransaction. Best-effort — if the channel is
                         // already closed (e.g. due to a stream error), we just ignore it.
-                        let _ = req_tx.send(TransactionRequest {
-                            command: Some(crate::proto::transaction_request::Command::Rollback(
-                                RollbackTransaction {},
-                            )),
-                        }).await;
+                        let _ = req_tx
+                            .send(TransactionRequest {
+                                command: Some(
+                                    crate::proto::transaction_request::Command::Rollback(
+                                        RollbackTransaction {},
+                                    ),
+                                ),
+                            })
+                            .await;
                         Err(e)
                     }
                 }
@@ -361,31 +379,41 @@ impl TransactionClient {
             TransactionClientMode::InProcess { tx, sql_engine } => {
                 if sql_engine.is_ddl(sql_query) {
                     return Err(Status::invalid_argument(
-                        "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions."
+                        "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions.",
                     ));
                 }
                 match sql_engine.execute(sql_query, tx) {
-                    Ok(result) => {
-                        Ok(crate::server::execution_result_to_responses(result))
-                    }
+                    Ok(result) => Ok(crate::server::execution_result_to_responses(result)),
                     Err(e) => Err(Status::invalid_argument(format!("SQL Error: {}", e))),
                 }
             }
-            TransactionClientMode::Remote { req_tx, resp_stream } => {
+            TransactionClientMode::Remote {
+                req_tx,
+                resp_stream,
+            } => {
                 // Send the ExecuteTxQuery command.
-                req_tx.send(TransactionRequest {
-                    command: Some(crate::proto::transaction_request::Command::Execute(
-                        ExecuteTxQuery { sql_query: sql_query.to_string() },
-                    )),
-                }).await.map_err(|_| Status::internal("Failed to send ExecuteTxQuery"))?;
+                req_tx
+                    .send(TransactionRequest {
+                        command: Some(crate::proto::transaction_request::Command::Execute(
+                            ExecuteTxQuery {
+                                sql_query: sql_query.to_string(),
+                            },
+                        )),
+                    })
+                    .await
+                    .map_err(|_| Status::internal("Failed to send ExecuteTxQuery"))?;
 
                 // Collect all query_result responses until we see query_finished.
                 let mut results = Vec::new();
                 let mut stream = resp_stream.lock().await;
                 loop {
-                    let resp = stream.next().await
+                    let resp = stream
+                        .next()
+                        .await
                         .ok_or_else(|| Status::internal("Transaction stream ended unexpectedly"))?
-                        .map_err(|e| Status::internal(format!("Transaction stream error: {}", e)))?;
+                        .map_err(|e| {
+                            Status::internal(format!("Transaction stream error: {}", e))
+                        })?;
 
                     match resp.payload {
                         Some(crate::proto::transaction_response::Payload::QueryResult(qr)) => {
@@ -400,7 +428,9 @@ impl TransactionClient {
                             return Err(Status::internal(msg));
                         }
                         _ => {
-                            return Err(Status::internal("Unexpected response during query execution"));
+                            return Err(Status::internal(
+                                "Unexpected response during query execution",
+                            ));
                         }
                     }
                 }
@@ -414,7 +444,9 @@ impl TransactionClient {
     async fn wait_for_query_finished(&self) -> Result<(), Status> {
         if let TransactionClientMode::Remote { resp_stream, .. } = &self.mode {
             let mut stream = resp_stream.lock().await;
-            let resp = stream.next().await
+            let resp = stream
+                .next()
+                .await
                 .ok_or_else(|| Status::internal("Transaction stream ended unexpectedly"))?
                 .map_err(|e| Status::internal(format!("Transaction stream error: {}", e)))?;
 
@@ -434,7 +466,9 @@ impl TransactionClient {
     async fn read_commit_result(&self) -> Result<crate::proto::CommitResult, Status> {
         if let TransactionClientMode::Remote { resp_stream, .. } = &self.mode {
             let mut stream = resp_stream.lock().await;
-            let resp = stream.next().await
+            let resp = stream
+                .next()
+                .await
                 .ok_or_else(|| Status::internal("Transaction stream ended unexpectedly"))?
                 .map_err(|e| Status::internal(format!("Transaction stream error: {}", e)))?;
 
@@ -446,7 +480,9 @@ impl TransactionClient {
                 _ => Err(Status::internal("Expected CommitResult")),
             }
         } else {
-            Err(Status::internal("read_commit_result called on non-remote client"))
+            Err(Status::internal(
+                "read_commit_result called on non-remote client",
+            ))
         }
     }
 }

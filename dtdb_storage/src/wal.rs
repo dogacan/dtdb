@@ -1,8 +1,8 @@
+use crate::{DbKey, DbValue, Result, StorageError};
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
-use crate::{DbKey, DbValue, Result, StorageError};
 
 /// Represents an operation entry in the Write-Ahead Log (WAL).
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -26,10 +26,7 @@ impl Wal {
     /// Opens an existing WAL file or creates a new one in append-only mode.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         Ok(Self { file, path })
     }
@@ -142,7 +139,10 @@ impl Wal {
             let entry: WalEntry = match bincode::deserialize(&bytes) {
                 Ok(ent) => ent,
                 Err(e) => {
-                    eprintln!("Warning: Deserialization failed for WAL entry: {}. Stopping recovery.", e);
+                    eprintln!(
+                        "Warning: Deserialization failed for WAL entry: {}. Stopping recovery.",
+                        e
+                    );
                     break;
                 }
             };

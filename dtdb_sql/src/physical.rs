@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use dtdb_storage::DbValue;
-use dtdb_relational::{Row, Schema};
 use crate::expr::Expr;
 use crate::logical::{AggregateExpr, JoinType};
+use dtdb_relational::{Row, Schema};
+use dtdb_storage::DbValue;
+use std::collections::HashMap;
 
 /// PhysicalOperator defines the Volcano Iterator interface for query execution.
 pub trait PhysicalOperator {
@@ -43,7 +43,11 @@ impl PhysicalOperator for PhysicalSeqScan {
     }
 
     fn explain(&self, indent: usize, out: &mut String) {
-        out.push_str(&format!("{}- PhysicalSeqScan: schema={:?}\n", "  ".repeat(indent), self.schema));
+        out.push_str(&format!(
+            "{}- PhysicalSeqScan: schema={:?}\n",
+            "  ".repeat(indent),
+            self.schema
+        ));
     }
 }
 
@@ -78,7 +82,11 @@ impl PhysicalOperator for PhysicalFilter {
     }
 
     fn explain(&self, indent: usize, out: &mut String) {
-        out.push_str(&format!("{}- PhysicalFilter: predicate={:?}\n", "  ".repeat(indent), self.predicate));
+        out.push_str(&format!(
+            "{}- PhysicalFilter: predicate={:?}\n",
+            "  ".repeat(indent),
+            self.predicate
+        ));
         self.source.explain(indent + 1, out);
     }
 }
@@ -93,11 +101,7 @@ pub struct PhysicalProjection {
 }
 
 impl PhysicalProjection {
-    pub fn new(
-        source: Box<dyn PhysicalOperator>,
-        expressions: Vec<Expr>,
-        schema: Schema,
-    ) -> Self {
+    pub fn new(source: Box<dyn PhysicalOperator>, expressions: Vec<Expr>, schema: Schema) -> Self {
         Self {
             source,
             expressions,
@@ -125,7 +129,11 @@ impl PhysicalOperator for PhysicalProjection {
     }
 
     fn explain(&self, indent: usize, out: &mut String) {
-        out.push_str(&format!("{}- PhysicalProjection: expressions={:?}\n", "  ".repeat(indent), self.expressions));
+        out.push_str(&format!(
+            "{}- PhysicalProjection: expressions={:?}\n",
+            "  ".repeat(indent),
+            self.expressions
+        ));
         self.source.explain(indent + 1, out);
     }
 }
@@ -164,9 +172,10 @@ impl PhysicalOperator for PhysicalLimit {
         }
 
         if let Some(lim) = self.limit
-            && self.returned >= lim {
-                return Ok(None);
-            }
+            && self.returned >= lim
+        {
+            return Ok(None);
+        }
 
         if let Some(row) = self.source.next()? {
             self.returned += 1;
@@ -272,11 +281,16 @@ impl PhysicalOperator for PhysicalSort {
     }
 
     fn explain(&self, indent: usize, out: &mut String) {
-        let keys_str: Vec<String> = self.keys
+        let keys_str: Vec<String> = self
+            .keys
             .iter()
             .map(|(expr, asc)| format!("{:?} {}", expr, if *asc { "ASC" } else { "DESC" }))
             .collect();
-        out.push_str(&format!("{}- PhysicalSort: keys={:?}\n", "  ".repeat(indent), keys_str));
+        out.push_str(&format!(
+            "{}- PhysicalSort: keys={:?}\n",
+            "  ".repeat(indent),
+            keys_str
+        ));
         self.source.explain(indent + 1, out);
     }
 }
@@ -433,8 +447,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
     fn next(&mut self) -> Result<Option<Row>, String> {
         if self.aggregated_rows.is_none() {
             // Blocking phase: group and accumulate aggregates for all source rows
-            let mut groups: HashMap<Vec<String>, (Vec<DbValue>, Vec<Accumulator>)> =
-                HashMap::new();
+            let mut groups: HashMap<Vec<String>, (Vec<DbValue>, Vec<Accumulator>)> = HashMap::new();
 
             let source_schema = self.source.schema().clone();
 
@@ -533,7 +546,12 @@ impl Accumulator {
                 match val {
                     DbValue::Int(v) => *s += *v as f64,
                     DbValue::Float(v) => *s += *v,
-                    other => return Err(format!("Cannot compute SUM on non-numeric value {:?}", other)),
+                    other => {
+                        return Err(format!(
+                            "Cannot compute SUM on non-numeric value {:?}",
+                            other
+                        ));
+                    }
                 }
             }
             Accumulator::Min { min } => match min {
@@ -558,7 +576,12 @@ impl Accumulator {
                 match val {
                     DbValue::Int(v) => *sum += *v as f64,
                     DbValue::Float(v) => *sum += *v,
-                    other => return Err(format!("Cannot compute AVG on non-numeric value {:?}", other)),
+                    other => {
+                        return Err(format!(
+                            "Cannot compute AVG on non-numeric value {:?}",
+                            other
+                        ));
+                    }
                 }
                 *count += 1;
             }
@@ -603,15 +626,15 @@ fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String
         (DbValue::Null, _) => Ok(std::cmp::Ordering::Less),
         (_, DbValue::Null) => Ok(std::cmp::Ordering::Greater),
         (DbValue::Int(lv), DbValue::Int(rv)) => Ok(lv.cmp(rv)),
-        (DbValue::Float(lv), DbValue::Float(rv)) => {
-            lv.partial_cmp(rv).ok_or_else(|| "NaN float comparison".to_string())
-        }
-        (DbValue::Int(lv), DbValue::Float(rv)) => {
-            (*lv as f64).partial_cmp(rv).ok_or_else(|| "NaN float comparison".to_string())
-        }
-        (DbValue::Float(lv), DbValue::Int(rv)) => {
-            lv.partial_cmp(&(*rv as f64)).ok_or_else(|| "NaN float comparison".to_string())
-        }
+        (DbValue::Float(lv), DbValue::Float(rv)) => lv
+            .partial_cmp(rv)
+            .ok_or_else(|| "NaN float comparison".to_string()),
+        (DbValue::Int(lv), DbValue::Float(rv)) => (*lv as f64)
+            .partial_cmp(rv)
+            .ok_or_else(|| "NaN float comparison".to_string()),
+        (DbValue::Float(lv), DbValue::Int(rv)) => lv
+            .partial_cmp(&(*rv as f64))
+            .ok_or_else(|| "NaN float comparison".to_string()),
         (DbValue::String(lv), DbValue::String(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Bytes(lv), DbValue::Bytes(rv)) => Ok(lv.cmp(rv)),
         (expected, actual) => Err(format!(

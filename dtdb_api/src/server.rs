@@ -1,26 +1,25 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use futures_core::Stream;
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use dtdb_storage::{CompressionType, DbValue};
-use dtdb_relational::{Database, Transaction, DatabaseOptions};
+use dtdb_relational::{Database, DatabaseOptions, Transaction};
 use dtdb_sql::SqlEngine;
+use dtdb_storage::{CompressionType, DbValue};
 
 use crate::proto::duct_tape_db_service_server::DuctTapeDbService;
 use crate::proto::{
-    CreateDbRequest, CreateDbResponse, DropDbRequest, DropDbResponse,
-    ExecuteQueryRequest, ExecuteQueryResponse, Header, Row, CompressionOption,
-    FlushDbRequest, FlushDbResponse,
-    TransactionRequest, TransactionResponse, CommitResult,
+    CommitResult, CompressionOption, CreateDbRequest, CreateDbResponse, DropDbRequest,
+    DropDbResponse, ExecuteQueryRequest, ExecuteQueryResponse, FlushDbRequest, FlushDbResponse,
+    Header, Row, TransactionRequest, TransactionResponse,
 };
 
 pub struct DuctTapeDbServiceImpl {
@@ -67,27 +66,31 @@ impl DuctTapeDbServiceImpl {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.is_dir()
-                && let Some(db_name) = path.file_name().and_then(|s| s.to_str()) {
-                    // Check if db_options.bin exists
-                    if path.join("db_options.bin").exists() {
-                        println!("Restoring database: {}", db_name);
-                        let database = Arc::new(Database::open_with_spawner(&path, self.spawner.clone()).map_err(|e| e.to_string())?);
-                        let sql_engine = Arc::new(SqlEngine::new(database.clone()));
+                && let Some(db_name) = path.file_name().and_then(|s| s.to_str())
+            {
+                // Check if db_options.bin exists
+                if path.join("db_options.bin").exists() {
+                    println!("Restoring database: {}", db_name);
+                    let database = Arc::new(
+                        Database::open_with_spawner(&path, self.spawner.clone())
+                            .map_err(|e| e.to_string())?,
+                    );
+                    let sql_engine = Arc::new(SqlEngine::new(database.clone()));
 
-                        // Spawn periodic flush if configured
-                        if let Some(ms) = database.options.flush_interval_ms {
-                            Self::spawn_periodic_flush(database.clone(), ms);
-                        }
-
-                        dbs.insert(
-                            db_name.to_string(),
-                            DbState {
-                                database,
-                                sql_engine,
-                            },
-                        );
+                    // Spawn periodic flush if configured
+                    if let Some(ms) = database.options.flush_interval_ms {
+                        Self::spawn_periodic_flush(database.clone(), ms);
                     }
+
+                    dbs.insert(
+                        db_name.to_string(),
+                        DbState {
+                            database,
+                            sql_engine,
+                        },
+                    );
                 }
+            }
         }
         Ok(())
     }
@@ -105,9 +108,10 @@ impl DuctTapeDbServiceImpl {
                     let tables = db.list_tables();
                     for table_name in tables {
                         if let Ok(table) = db.get_table(&table_name)
-                            && let Err(e) = table.engine.flush_memtable() {
-                                eprintln!("Periodic flush failed for table {}: {}", table_name, e);
-                            }
+                            && let Err(e) = table.engine.flush_memtable()
+                        {
+                            eprintln!("Periodic flush failed for table {}: {}", table_name, e);
+                        }
                     }
                 } else {
                     break; // Database was dropped, exit loop
@@ -119,7 +123,8 @@ impl DuctTapeDbServiceImpl {
     /// Returns the database and SQL engine for the given database name, if it exists.
     pub fn get_db_and_engine(&self, db_name: &str) -> Option<(Arc<Database>, Arc<SqlEngine>)> {
         let dbs = self.databases.read().unwrap();
-        dbs.get(db_name).map(|state| (state.database.clone(), state.sql_engine.clone()))
+        dbs.get(db_name)
+            .map(|state| (state.database.clone(), state.sql_engine.clone()))
     }
 
     /// Allocates the next unique transaction ID.
@@ -129,7 +134,9 @@ impl DuctTapeDbServiceImpl {
 }
 
 /// Helper: converts an `ExecutionResult` into a sequence of `ExecuteQueryResponse` messages.
-pub(crate) fn execution_result_to_responses(result: dtdb_sql::ExecutionResult) -> Vec<ExecuteQueryResponse> {
+pub(crate) fn execution_result_to_responses(
+    result: dtdb_sql::ExecutionResult,
+) -> Vec<ExecuteQueryResponse> {
     match result {
         dtdb_sql::ExecutionResult::CreateTable => {
             vec![ExecuteQueryResponse {
@@ -172,20 +179,24 @@ pub(crate) fn execution_result_to_responses(result: dtdb_sql::ExecutionResult) -
             // Header
             let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
             responses.push(ExecuteQueryResponse {
-                payload: Some(crate::proto::execute_query_response::Payload::Header(Header {
-                    column_names,
-                })),
+                payload: Some(crate::proto::execute_query_response::Payload::Header(
+                    Header { column_names },
+                )),
             });
 
             // Rows
             for row in rows {
-                let values = row.values.iter().map(|val| match val {
-                    DbValue::Int(v) => v.to_string(),
-                    DbValue::Float(v) => v.to_string(),
-                    DbValue::String(s) => s.clone(),
-                    DbValue::Bytes(b) => format!("{:?}", b),
-                    DbValue::Null => "NULL".to_string(),
-                }).collect();
+                let values = row
+                    .values
+                    .iter()
+                    .map(|val| match val {
+                        DbValue::Int(v) => v.to_string(),
+                        DbValue::Float(v) => v.to_string(),
+                        DbValue::String(s) => s.clone(),
+                        DbValue::Bytes(b) => format!("{:?}", b),
+                        DbValue::Null => "NULL".to_string(),
+                    })
+                    .collect();
 
                 responses.push(ExecuteQueryResponse {
                     payload: Some(crate::proto::execute_query_response::Payload::Row(Row {
@@ -201,8 +212,10 @@ pub(crate) fn execution_result_to_responses(result: dtdb_sql::ExecutionResult) -
 
 #[tonic::async_trait]
 impl DuctTapeDbService for DuctTapeDbServiceImpl {
-    type ExecuteQueryStream = Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>;
-    type TransactionStream = Pin<Box<dyn Stream<Item = Result<TransactionResponse, Status>> + Send + 'static>>;
+    type ExecuteQueryStream =
+        Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>;
+    type TransactionStream =
+        Pin<Box<dyn Stream<Item = Result<TransactionResponse, Status>> + Send + 'static>>;
 
     async fn create_db(
         &self,
@@ -243,8 +256,14 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             max_level: None,
         };
 
-        let database = Arc::new(Database::open_with_options_and_spawner(&db_path, options.clone(), self.spawner.clone())
-            .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?);
+        let database = Arc::new(
+            Database::open_with_options_and_spawner(
+                &db_path,
+                options.clone(),
+                self.spawner.clone(),
+            )
+            .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?,
+        );
         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
 
         // Spawn periodic flush task if flush_interval_ms is configured
@@ -289,12 +308,16 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             // Clean up directory from disk
             let db_path = self.data_dir.join(db_name);
             if db_path.exists()
-                && let Err(e) = fs::remove_dir_all(&db_path) {
-                    return Ok(Response::new(DropDbResponse {
-                        success: false,
-                        message: format!("Database removed from catalog but failed to delete files: {}", e),
-                    }));
-                }
+                && let Err(e) = fs::remove_dir_all(&db_path)
+            {
+                return Ok(Response::new(DropDbResponse {
+                    success: false,
+                    message: format!(
+                        "Database removed from catalog but failed to delete files: {}",
+                        e
+                    ),
+                }));
+            }
 
             Ok(Response::new(DropDbResponse {
                 success: true,
@@ -324,7 +347,10 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             if let Some(state) = dbs.get(db_name) {
                 state.database.clone()
             } else {
-                return Err(Status::not_found(format!("Database '{}' not found", db_name)));
+                return Err(Status::not_found(format!(
+                    "Database '{}' not found",
+                    db_name
+                )));
             }
         };
 
@@ -332,15 +358,21 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let mut flushed_tables = Vec::new();
         for table_name in tables {
             if let Ok(table) = database.get_table(&table_name) {
-                table.engine.flush_memtable()
-                    .map_err(|e| Status::internal(format!("Failed to flush table {}: {}", table_name, e)))?;
+                table.engine.flush_memtable().map_err(|e| {
+                    Status::internal(format!("Failed to flush table {}: {}", table_name, e))
+                })?;
                 flushed_tables.push(table_name);
             }
         }
 
         Ok(Response::new(FlushDbResponse {
             success: true,
-            message: format!("Flushed {} table(s) in database '{}': {:?}", flushed_tables.len(), db_name, flushed_tables),
+            message: format!(
+                "Flushed {} table(s) in database '{}': {:?}",
+                flushed_tables.len(),
+                db_name,
+                flushed_tables
+            ),
         }))
     }
 
@@ -358,7 +390,10 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             if let Some(state) = dbs.get(db_name) {
                 (state.database.clone(), state.sql_engine.clone())
             } else {
-                return Err(Status::not_found(format!("Database '{}' not found", db_name)));
+                return Err(Status::not_found(format!(
+                    "Database '{}' not found",
+                    db_name
+                )));
             }
         };
 
@@ -432,11 +467,15 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         if let Some((tx, _)) = tx_state.take() {
                             let _ = tx.rollback();
                         }
-                        let _ = tx_chan.send(Ok(TransactionResponse {
-                            payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
-                                format!("Stream error: {}", e),
-                            )),
-                        })).await;
+                        let _ = tx_chan
+                            .send(Ok(TransactionResponse {
+                                payload: Some(
+                                    crate::proto::transaction_response::Payload::ErrorMessage(
+                                        format!("Stream error: {}", e),
+                                    ),
+                                ),
+                            }))
+                            .await;
                         return;
                     }
                 };
@@ -444,23 +483,33 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                 let command = match msg.command {
                     Some(c) => c,
                     None => {
-                        let _ = tx_chan.send(Ok(TransactionResponse {
-                            payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
-                                "Empty transaction request (no command specified)".to_string(),
-                            )),
-                        })).await;
+                        let _ = tx_chan
+                            .send(Ok(TransactionResponse {
+                                payload: Some(
+                                    crate::proto::transaction_response::Payload::ErrorMessage(
+                                        "Empty transaction request (no command specified)"
+                                            .to_string(),
+                                    ),
+                                ),
+                            }))
+                            .await;
                         continue;
                     }
                 };
 
                 // Guard: reject all commands after commit/rollback.
                 if finished {
-                    let _ = tx_chan.send(Ok(TransactionResponse {
-                        payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
-                            "Transaction already completed (committed or rolled back). \
-                             No further commands are accepted.".to_string(),
-                        )),
-                    })).await;
+                    let _ = tx_chan
+                        .send(Ok(TransactionResponse {
+                            payload: Some(
+                                crate::proto::transaction_response::Payload::ErrorMessage(
+                                    "Transaction already completed (committed or rolled back). \
+                             No further commands are accepted."
+                                        .to_string(),
+                                ),
+                            ),
+                        }))
+                        .await;
                     continue;
                 }
 
@@ -469,19 +518,25 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                     crate::proto::transaction_request::Command::Start(start) => {
                         // Guard: reject duplicate StartTransaction.
                         if tx_state.is_some() {
-                            let _ = tx_chan.send(Ok(TransactionResponse {
-                                payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
-                                    "Protocol error: StartTransaction already received. \
-                                     Only one StartTransaction is allowed per stream.".to_string(),
-                                )),
-                            })).await;
+                            let _ = tx_chan
+                                .send(Ok(TransactionResponse {
+                                    payload: Some(
+                                        crate::proto::transaction_response::Payload::ErrorMessage(
+                                            "Protocol error: StartTransaction already received. \
+                                     Only one StartTransaction is allowed per stream."
+                                                .to_string(),
+                                        ),
+                                    ),
+                                }))
+                                .await;
                             continue;
                         }
 
                         let db_name = start.db_name.trim();
                         let lookup = {
                             let dbs = databases.read().unwrap();
-                            dbs.get(db_name).map(|state| (state.database.clone(), state.sql_engine.clone()))
+                            dbs.get(db_name)
+                                .map(|state| (state.database.clone(), state.sql_engine.clone()))
                         };
                         let (database, sql_engine) = match lookup {
                             Some(pair) => pair,
@@ -500,9 +555,15 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         tx_state = Some((tx, sql_engine));
 
                         // Acknowledge the transaction start.
-                        let _ = tx_chan.send(Ok(TransactionResponse {
-                            payload: Some(crate::proto::transaction_response::Payload::QueryFinished(true)),
-                        })).await;
+                        let _ = tx_chan
+                            .send(Ok(TransactionResponse {
+                                payload: Some(
+                                    crate::proto::transaction_response::Payload::QueryFinished(
+                                        true,
+                                    ),
+                                ),
+                            }))
+                            .await;
                     }
 
                     // --- ExecuteTxQuery ---
@@ -527,9 +588,15 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                     "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions.".to_string(),
                                 )),
                             })).await;
-                            let _ = tx_chan.send(Ok(TransactionResponse {
-                                payload: Some(crate::proto::transaction_response::Payload::QueryFinished(true)),
-                            })).await;
+                            let _ = tx_chan
+                                .send(Ok(TransactionResponse {
+                                    payload: Some(
+                                        crate::proto::transaction_response::Payload::QueryFinished(
+                                            true,
+                                        ),
+                                    ),
+                                }))
+                                .await;
                             continue;
                         }
                         match sql_engine.execute(sql_query, tx) {
@@ -591,9 +658,15 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             },
                         };
 
-                        let _ = tx_chan.send(Ok(TransactionResponse {
-                            payload: Some(crate::proto::transaction_response::Payload::CommitResult(commit_result)),
-                        })).await;
+                        let _ = tx_chan
+                            .send(Ok(TransactionResponse {
+                                payload: Some(
+                                    crate::proto::transaction_response::Payload::CommitResult(
+                                        commit_result,
+                                    ),
+                                ),
+                            }))
+                            .await;
                         finished = true;
                     }
 
@@ -613,12 +686,18 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         };
 
                         let _ = tx.rollback();
-                        let _ = tx_chan.send(Ok(TransactionResponse {
-                            payload: Some(crate::proto::transaction_response::Payload::CommitResult(CommitResult {
-                                success: true,
-                                message: "Transaction rolled back.".to_string(),
-                            })),
-                        })).await;
+                        let _ = tx_chan
+                            .send(Ok(TransactionResponse {
+                                payload: Some(
+                                    crate::proto::transaction_response::Payload::CommitResult(
+                                        CommitResult {
+                                            success: true,
+                                            message: "Transaction rolled back.".to_string(),
+                                        },
+                                    ),
+                                ),
+                            }))
+                            .await;
                         finished = true;
                     }
                 }

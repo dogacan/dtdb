@@ -1,13 +1,13 @@
+use crate::manifest::Manifest;
 use crate::memtable::MemTable;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
-use crate::manifest::Manifest;
 use crate::{DbKey, DbValue, EngineOptions, Result, ThreadSpawner};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
@@ -46,7 +46,9 @@ impl StorageEngine {
         spawner: Arc<dyn ThreadSpawner>,
     ) -> Result<Self> {
         let inner = EngineInner::open(dir_path, options, spawner)?;
-        Ok(Self { inner: Arc::new(inner) })
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     pub fn put(&self, key: DbKey, value: DbValue) -> Result<()> {
@@ -65,7 +67,12 @@ impl StorageEngine {
         self.inner.get(key)
     }
 
-    pub fn filtered_scan<F>(&self, start: &DbKey, end: &DbKey, filter: F) -> Result<Vec<(DbKey, DbValue)>>
+    pub fn filtered_scan<F>(
+        &self,
+        start: &DbKey,
+        end: &DbKey,
+        filter: F,
+    ) -> Result<Vec<(DbKey, DbValue)>>
     where
         F: Fn(&DbKey, &DbValue) -> bool,
     {
@@ -116,15 +123,16 @@ impl EngineInner {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "sst")
                     && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                        && stem.starts_with('L') {
-                            let parts: Vec<&str> = stem[1..].split('_').collect();
-                            if parts.len() == 2
-                                && let (Ok(level), Ok(id)) =
-                                    (parts[0].parse::<usize>(), parts[1].parse::<u64>())
-                                {
-                                    active_sstables.insert((level, id));
-                                }
-                        }
+                    && stem.starts_with('L')
+                {
+                    let parts: Vec<&str> = stem[1..].split('_').collect();
+                    if parts.len() == 2
+                        && let (Ok(level), Ok(id)) =
+                            (parts[0].parse::<usize>(), parts[1].parse::<u64>())
+                    {
+                        active_sstables.insert((level, id));
+                    }
+                }
             }
             let m = Manifest { active_sstables };
             m.save(&manifest_path)?;
@@ -146,20 +154,21 @@ impl EngineInner {
 
             if path.extension().is_some_and(|ext| ext == "sst")
                 && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                    && stem.starts_with('L') {
-                        let parts: Vec<&str> = stem[1..].split('_').collect();
-                        if parts.len() == 2
-                            && let (Ok(level), Ok(id)) =
-                                (parts[0].parse::<usize>(), parts[1].parse::<u64>())
-                            {
-                                if manifest.active_sstables.contains(&(level, id)) {
-                                    max_id = max_id.max(id);
-                                    discovered_ssts.push((level, id, path));
-                                } else {
-                                    files_to_delete.push(path);
-                                }
-                            }
+                && stem.starts_with('L')
+            {
+                let parts: Vec<&str> = stem[1..].split('_').collect();
+                if parts.len() == 2
+                    && let (Ok(level), Ok(id)) =
+                        (parts[0].parse::<usize>(), parts[1].parse::<u64>())
+                {
+                    if manifest.active_sstables.contains(&(level, id)) {
+                        max_id = max_id.max(id);
+                        discovered_ssts.push((level, id, path));
+                    } else {
+                        files_to_delete.push(path);
                     }
+                }
+            }
         }
 
         // Delete orphan/garbage files
@@ -420,7 +429,12 @@ impl EngineInner {
         Ok(None)
     }
 
-    pub fn filtered_scan<F>(&self, start: &DbKey, end: &DbKey, filter: F) -> Result<Vec<(DbKey, DbValue)>>
+    pub fn filtered_scan<F>(
+        &self,
+        start: &DbKey,
+        end: &DbKey,
+        filter: F,
+    ) -> Result<Vec<(DbKey, DbValue)>>
     where
         F: Fn(&DbKey, &DbValue) -> bool,
     {
@@ -433,9 +447,10 @@ impl EngineInner {
                 if k >= *start && k <= *end {
                     seen.insert(k.clone());
                     if let Some(val) = v
-                        && filter(&k, &val) {
-                            results.insert(k, val);
-                        }
+                        && filter(&k, &val)
+                    {
+                        results.insert(k, val);
+                    }
                 }
             }
         }
@@ -449,9 +464,10 @@ impl EngineInner {
                 for (k, v) in entries {
                     if seen.insert(k.clone())
                         && let Some(val) = v
-                            && filter(&k, &val) {
-                                results.insert(k, val);
-                            }
+                        && filter(&k, &val)
+                    {
+                        results.insert(k, val);
+                    }
                 }
             }
         }
@@ -462,7 +478,9 @@ impl EngineInner {
             }
             for sstable in ssts.iter() {
                 let mut reader = sstable.lock().unwrap();
-                let f_key = reader.first_key().expect("Level 1+ SSTable must not be empty");
+                let f_key = reader
+                    .first_key()
+                    .expect("Level 1+ SSTable must not be empty");
                 let l_key = reader.last_key();
                 if f_key > end || l_key < start {
                     continue;
@@ -472,9 +490,10 @@ impl EngineInner {
                 for (k, v) in entries {
                     if seen.insert(k.clone())
                         && let Some(val) = v
-                            && filter(&k, &val) {
-                                results.insert(k, val);
-                            }
+                        && filter(&k, &val)
+                    {
+                        results.insert(k, val);
+                    }
                 }
             }
         }
@@ -529,9 +548,10 @@ impl EngineInner {
         let sstables = self.sstables.read().unwrap();
 
         if let Some(l0_ssts) = sstables.get(&0)
-            && l0_ssts.len() >= self.options.l0_compaction_threshold {
-                return Some(0);
-            }
+            && l0_ssts.len() >= self.options.l0_compaction_threshold
+        {
+            return Some(0);
+        }
 
         for level in 1..self.options.max_level {
             if let Some(ssts) = sstables.get(&level) {
@@ -577,9 +597,10 @@ impl EngineInner {
                     source_files = list.clone();
                 }
             } else if let Some(list) = sstables_guard.get(&source_level)
-                && !list.is_empty() {
-                    source_files.push(list[0].clone());
-                }
+                && !list.is_empty()
+            {
+                source_files.push(list[0].clone());
+            }
 
             if source_files.is_empty() {
                 return Ok(());
@@ -590,9 +611,10 @@ impl EngineInner {
             for sstable in &source_files {
                 let reader = sstable.lock().unwrap();
                 if let Some(fk) = reader.first_key()
-                    && min_key.as_ref().is_none_or(|k| fk < k) {
-                        min_key = Some(fk.clone());
-                    }
+                    && min_key.as_ref().is_none_or(|k| fk < k)
+                {
+                    min_key = Some(fk.clone());
+                }
                 let lk = reader.last_key();
                 if max_key.as_ref().is_none_or(|k| lk > k) {
                     max_key = Some(lk.clone());
@@ -600,19 +622,22 @@ impl EngineInner {
             }
 
             if let (Some(min_k), Some(max_k)) = (min_key, max_key)
-                && let Some(target_list) = sstables_guard.get(&target_level) {
-                    for sstable in target_list {
-                        let overlaps = {
-                            let reader = sstable.lock().unwrap();
-                            let fk = reader.first_key().expect("Target SSTable must not be empty");
-                            let lk = reader.last_key();
-                            fk <= &max_k && lk >= &min_k
-                        };
-                        if overlaps {
-                            overlapping_target_files.push(sstable.clone());
-                        }
+                && let Some(target_list) = sstables_guard.get(&target_level)
+            {
+                for sstable in target_list {
+                    let overlaps = {
+                        let reader = sstable.lock().unwrap();
+                        let fk = reader
+                            .first_key()
+                            .expect("Target SSTable must not be empty");
+                        let lk = reader.last_key();
+                        fk <= &max_k && lk >= &min_k
+                    };
+                    if overlaps {
+                        overlapping_target_files.push(sstable.clone());
                     }
                 }
+            }
         }
 
         // 2. Merge-sort all selected files (locks released)
@@ -663,13 +688,15 @@ impl EngineInner {
                                 (r.first_key().cloned(), r.last_key().clone())
                             };
                             if let Some(fk_val) = fk
-                                && k >= fk_val && k <= lk {
-                                    let mut r_mut = sst.lock().unwrap();
-                                    if let Ok(Some(_)) = r_mut.get(&k) {
-                                        exists_below = true;
-                                        break;
-                                    }
+                                && k >= fk_val
+                                && k <= lk
+                            {
+                                let mut r_mut = sst.lock().unwrap();
+                                if let Ok(Some(_)) = r_mut.get(&k) {
+                                    exists_below = true;
+                                    break;
                                 }
+                            }
                         }
                     }
                     if exists_below {
@@ -683,7 +710,9 @@ impl EngineInner {
 
             if current_writer.is_none() {
                 current_id = self.get_next_id();
-                let path = self.dir_path.join(format!("L{}_{:05}.sst", target_level, current_id));
+                let path = self
+                    .dir_path
+                    .join(format!("L{}_{:05}.sst", target_level, current_id));
                 current_path = Some(path.clone());
                 current_writer = Some(SstableWriter::create(
                     &path,
@@ -712,14 +741,16 @@ impl EngineInner {
             if current_writer_uncompressed_bytes >= self.options.sstable_target_size {
                 let writer = current_writer.take().unwrap();
                 writer.finish()?;
-                let reader = SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
+                let reader =
+                    SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
                 new_sstables.push(Arc::new(Mutex::new(reader)));
             }
         }
 
         if let Some(writer) = current_writer.take() {
             writer.finish()?;
-            let reader = SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
+            let reader =
+                SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
             new_sstables.push(Arc::new(Mutex::new(reader)));
         }
 
@@ -743,12 +774,16 @@ impl EngineInner {
         {
             let mut sstables_guard = self.sstables.write().unwrap();
 
-            let source_ids: HashSet<u64> = source_files.iter().map(|f| f.lock().unwrap().id).collect();
+            let source_ids: HashSet<u64> =
+                source_files.iter().map(|f| f.lock().unwrap().id).collect();
             if let Some(source_list) = sstables_guard.get_mut(&source_level) {
                 source_list.retain(|f| !source_ids.contains(&f.lock().unwrap().id));
             }
 
-            let target_ids: HashSet<u64> = overlapping_target_files.iter().map(|f| f.lock().unwrap().id).collect();
+            let target_ids: HashSet<u64> = overlapping_target_files
+                .iter()
+                .map(|f| f.lock().unwrap().id)
+                .collect();
             let target_list = sstables_guard.entry(target_level).or_default();
             target_list.retain(|f| !target_ids.contains(&f.lock().unwrap().id));
             target_list.extend(new_sstables);
@@ -810,7 +845,9 @@ impl EngineInner {
         let reader = SstableReader::open(&sst_path, next_id, 0)?;
         {
             let mut ssts = self.sstables.write().unwrap();
-            ssts.entry(0).or_default().insert(0, Arc::new(Mutex::new(reader)));
+            ssts.entry(0)
+                .or_default()
+                .insert(0, Arc::new(Mutex::new(reader)));
         }
 
         let temp_wal_path = self.dir_path.join("active.wal.tmp");

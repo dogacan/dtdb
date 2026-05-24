@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub mod memtable;
-pub mod wal;
-pub mod sstable;
 pub mod engine;
 pub mod manifest;
+pub mod memtable;
+pub mod sstable;
+pub mod wal;
 pub use engine::StorageEngine;
 pub use wal::WalEntry;
 
@@ -123,4 +123,3 @@ impl<'a> From<&'a [u8]> for DbValue {
         DbValue::Bytes(v.to_vec())
     }
 }
-

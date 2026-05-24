@@ -1,14 +1,14 @@
+use futures_util::StreamExt;
+use std::fs;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use futures_util::StreamExt;
-use std::fs;
 
-use dtdb_storage::CompressionType;
 use dtdb_api::client::DuctTapeDbClient;
-use dtdb_api::server::DuctTapeDbServiceImpl;
 use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::server::DuctTapeDbServiceImpl;
+use dtdb_storage::CompressionType;
 
 #[tokio::test]
 async fn test_grpc_client_server_integration() {
@@ -38,7 +38,10 @@ async fn test_grpc_client_server_integration() {
     let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
 
     // 3. Test CreateDb with Lz4
-    let create_lz4_resp = client.create_db("db_lz4", CompressionType::Lz4).await.unwrap();
+    let create_lz4_resp = client
+        .create_db("db_lz4", CompressionType::Lz4)
+        .await
+        .unwrap();
     assert!(create_lz4_resp.success);
     assert!(create_lz4_resp.message.contains("Lz4"));
 
@@ -52,7 +55,10 @@ async fn test_grpc_client_server_integration() {
     assert_eq!(lz4_comp, CompressionType::Lz4);
 
     // 4. Test CreateDb with Uncompressed
-    let create_uncompressed_resp = client.create_db("db_raw", CompressionType::Uncompressed).await.unwrap();
+    let create_uncompressed_resp = client
+        .create_db("db_raw", CompressionType::Uncompressed)
+        .await
+        .unwrap();
     assert!(create_uncompressed_resp.success);
 
     // Check directory layout & db_options.bin
@@ -68,7 +74,10 @@ async fn test_grpc_client_server_integration() {
     // Create Table
     {
         let mut stream = client
-            .execute_query("db_lz4", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "db_lz4",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
 
@@ -89,7 +98,10 @@ async fn test_grpc_client_server_integration() {
     // Insert rows
     {
         let mut stream = client
-            .execute_query("db_lz4", "INSERT INTO Users (id, name) VALUES (10, 'Alice');")
+            .execute_query(
+                "db_lz4",
+                "INSERT INTO Users (id, name) VALUES (10, 'Alice');",
+            )
             .await
             .unwrap();
         let mut payloads = Vec::new();

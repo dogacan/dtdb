@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use dtdb_storage::{DbKey, DbValue, WalEntry};
-use crate::database::{Database, TransactionRecord, Table};
+use crate::database::{Database, Table, TransactionRecord};
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
 use crate::schema::DataType;
+use dtdb_storage::{DbKey, DbValue, WalEntry};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 /// Transaction represents a client connection transaction session.
 ///
@@ -113,9 +113,10 @@ impl Transaction {
         {
             let buffer = self.write_buffer.lock().unwrap();
             if let Some(table_buffer) = buffer.get(table_name)
-                && let Some(buffered_val) = table_buffer.get(key) {
-                    return Ok(buffered_val.clone());
-                }
+                && let Some(buffered_val) = table_buffer.get(key)
+            {
+                return Ok(buffered_val.clone());
+            }
         }
 
         // 2. Fall back to underlying storage engine.
@@ -218,10 +219,7 @@ impl Transaction {
         }
 
         // 3. Filter the merged and sorted rows.
-        let results: Vec<Row> = merged
-            .into_values()
-            .filter(|row| filter(row))
-            .collect();
+        let results: Vec<Row> = merged.into_values().filter(|row| filter(row)).collect();
 
         Ok(results)
     }
@@ -244,9 +242,7 @@ impl Transaction {
                         });
                     }
                     None => {
-                        entries.push(WalEntry::Delete {
-                            key: key.clone(),
-                        });
+                        entries.push(WalEntry::Delete { key: key.clone() });
                     }
                 }
             }

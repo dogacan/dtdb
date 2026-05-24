@@ -1,8 +1,8 @@
-use std::fs::File;
-use std::io::{Read, Write, Seek, SeekFrom};
-use std::path::Path;
+use crate::{CompressionType, DbKey, DbValue, Result, StorageError};
 use serde::{Deserialize, Serialize};
-use crate::{DbKey, DbValue, Result, StorageError, CompressionType};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const MAGIC_NUMBER: &[u8; 8] = b"DTDB_SST";
 const FOOTER_SIZE: u64 = 24; // 8 bytes index_offset + 8 bytes index_len + 8 bytes magic number
@@ -43,7 +43,11 @@ pub struct SstableWriter {
 
 impl SstableWriter {
     /// Creates a new SstableWriter writing to the file at the given path.
-    pub fn create(path: impl AsRef<Path>, block_size_limit: usize, compression: CompressionType) -> Result<Self> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        block_size_limit: usize,
+        compression: CompressionType,
+    ) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let mut temp_path = final_path.clone();
         if let Some(ext) = temp_path.extension() {
@@ -201,7 +205,7 @@ impl SstableReader {
 
         if file_len < FOOTER_SIZE {
             return Err(StorageError::Corruption(
-                "SSTable file size too small to contain footer".to_string()
+                "SSTable file size too small to contain footer".to_string(),
             ));
         }
 
@@ -217,7 +221,7 @@ impl SstableReader {
 
         if magic != MAGIC_NUMBER {
             return Err(StorageError::Corruption(
-                "Invalid SSTable magic number (file might not be a dtdb sstable)".to_string()
+                "Invalid SSTable magic number (file might not be a dtdb sstable)".to_string(),
             ));
         }
 
@@ -286,7 +290,10 @@ impl SstableReader {
         // 1. Binary search the index to locate the block containing the key.
         // We find the insertion point. The block that contains the key is the one
         // whose `first_key` is the largest key that is <= our search key.
-        let block_idx = match self.index.binary_search_by(|entry| entry.first_key.cmp(key)) {
+        let block_idx = match self
+            .index
+            .binary_search_by(|entry| entry.first_key.cmp(key))
+        {
             Ok(idx) => idx, // Exact match on first key of block.
             Err(idx) => {
                 if idx == 0 {
@@ -326,7 +333,12 @@ impl SstableReader {
     }
 
     /// Performs a range scan between `start` and `end` (both inclusive) matching the filter.
-    pub fn scan<F>(&mut self, start: &DbKey, end: &DbKey, filter: F) -> Result<Vec<(DbKey, DbValue)>>
+    pub fn scan<F>(
+        &mut self,
+        start: &DbKey,
+        end: &DbKey,
+        filter: F,
+    ) -> Result<Vec<(DbKey, DbValue)>>
     where
         F: Fn(&DbKey, &DbValue) -> bool,
     {
@@ -336,7 +348,10 @@ impl SstableReader {
         }
 
         // 1. Locate the block where the range scan should start.
-        let start_block_idx = match self.index.binary_search_by(|entry| entry.first_key.cmp(start)) {
+        let start_block_idx = match self
+            .index
+            .binary_search_by(|entry| entry.first_key.cmp(start))
+        {
             Ok(idx) => idx,
             Err(idx) => {
                 if idx == 0 {
@@ -356,11 +371,13 @@ impl SstableReader {
 
             let block = self.read_block(block_idx)?;
             for (k, v) in block {
-                if k >= *start && k <= *end
+                if k >= *start
+                    && k <= *end
                     && let Some(val) = v
-                        && filter(&k, &val) {
-                            results.push((k, val));
-                        }
+                    && filter(&k, &val)
+                {
+                    results.push((k, val));
+                }
             }
         }
 
@@ -368,13 +385,20 @@ impl SstableReader {
     }
 
     /// Performs a raw range scan returning all entries (including tombstones) in the range.
-    pub fn scan_raw(&mut self, start: &DbKey, end: &DbKey) -> Result<Vec<(DbKey, Option<DbValue>)>> {
+    pub fn scan_raw(
+        &mut self,
+        start: &DbKey,
+        end: &DbKey,
+    ) -> Result<Vec<(DbKey, Option<DbValue>)>> {
         let mut results = Vec::new();
         if self.index.is_empty() {
             return Ok(results);
         }
 
-        let start_block_idx = match self.index.binary_search_by(|entry| entry.first_key.cmp(start)) {
+        let start_block_idx = match self
+            .index
+            .binary_search_by(|entry| entry.first_key.cmp(start))
+        {
             Ok(idx) => idx,
             Err(idx) => {
                 if idx == 0 {
@@ -412,4 +436,3 @@ impl SstableReader {
         Ok(entries)
     }
 }
-

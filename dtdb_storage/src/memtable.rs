@@ -1,6 +1,6 @@
+use crate::{DbKey, DbValue};
 use std::collections::BTreeMap;
 use std::sync::RwLock;
-use crate::{DbKey, DbValue};
 
 /// MemTable is an in-memory sorted write buffer.
 ///

@@ -1,8 +1,8 @@
+use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine};
 use std::fs;
 use std::sync::Arc;
 use std::thread;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType, EngineOptions};
 
 // Helper to create keys and values easily
 fn k_int(val: i64) -> DbKey {
@@ -25,14 +25,16 @@ fn count_sst_files_at_level(dir: &std::path::Path, target_level: usize) -> usize
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "sst")
                 && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                    && stem.starts_with('L') {
-                        let parts: Vec<&str> = stem[1..].split('_').collect();
-                        if parts.len() == 2
-                            && let Ok(level) = parts[0].parse::<usize>()
-                                && level == target_level {
-                                    count += 1;
-                                }
-                    }
+                && stem.starts_with('L')
+            {
+                let parts: Vec<&str> = stem[1..].split('_').collect();
+                if parts.len() == 2
+                    && let Ok(level) = parts[0].parse::<usize>()
+                    && level == target_level
+                {
+                    count += 1;
+                }
+            }
         }
     }
     count
@@ -65,11 +67,12 @@ fn test_l0_to_l1_auto_compaction() {
     // 2. Write second key -> triggers 2nd L0 flush. Since threshold = 2,
     // it triggers L0 -> L1 compaction automatically!
     engine.put(k_int(2), v_str("val2")).unwrap();
-    
+
     // Auto compaction runs asynchronously. Let's poll for up to 1 second for it to complete.
     let mut success = false;
     for _ in 0..100 {
-        if count_sst_files_at_level(&db_path, 0) == 0 && count_sst_files_at_level(&db_path, 1) == 1 {
+        if count_sst_files_at_level(&db_path, 0) == 0 && count_sst_files_at_level(&db_path, 1) == 1
+        {
             success = true;
             break;
         }
@@ -122,9 +125,18 @@ fn test_sstable_splitting_by_target_size() {
     assert!(l1_count >= 2);
 
     // Verify all keys are still fully queryable
-    assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_str("value1_large_data")));
-    assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_str("value2_large_data")));
-    assert_eq!(engine.get(&k_int(3)).unwrap(), Some(v_str("value3_large_data")));
+    assert_eq!(
+        engine.get(&k_int(1)).unwrap(),
+        Some(v_str("value1_large_data"))
+    );
+    assert_eq!(
+        engine.get(&k_int(2)).unwrap(),
+        Some(v_str("value2_large_data"))
+    );
+    assert_eq!(
+        engine.get(&k_int(3)).unwrap(),
+        Some(v_str("value3_large_data"))
+    );
 }
 
 #[test]
@@ -180,12 +192,12 @@ fn test_deep_stress_and_consistency() {
         level_size_multiplier: 2,
         max_level: 4,
     };
-    
+
     let engine = Arc::new(StorageEngine::open(&db_path, options).unwrap());
-    
+
     // We will do concurrent read/write and compaction operations
     let writer_engine = engine.clone();
-    
+
     let writer_handle = thread::spawn(move || {
         for i in 0..100 {
             // Write key
@@ -213,7 +225,9 @@ fn test_deep_stress_and_consistency() {
     engine.compact().unwrap();
 
     // Scan everything and make sure there are no out-of-order reads or crashes
-    let scan_res = engine.filtered_scan(&k_int(0), &k_int(9), |_, _| true).unwrap();
+    let scan_res = engine
+        .filtered_scan(&k_int(0), &k_int(9), |_, _| true)
+        .unwrap();
     for (k, v) in scan_res {
         // Assert the key variant and value type are correct
         match (k, v) {

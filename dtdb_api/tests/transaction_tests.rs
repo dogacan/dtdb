@@ -1,22 +1,22 @@
+use futures_util::StreamExt;
+use std::path::Path;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
 use tonic::Status;
-use futures_util::StreamExt;
-use std::path::Path;
+use tonic::transport::Server;
 
-use dtdb_storage::CompressionType;
 use dtdb_api::client::DuctTapeDbClient;
-use dtdb_api::server::DuctTapeDbServiceImpl;
-use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
 use dtdb_api::proto::duct_tape_db_service_client::DuctTapeDbServiceClient;
-use dtdb_api::proto::{
-    TransactionRequest, StartTransaction, ExecuteTxQuery, CommitTransaction, RollbackTransaction,
-};
+use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::proto::execute_query_response::Payload as EqPayload;
 use dtdb_api::proto::transaction_request::Command;
 use dtdb_api::proto::transaction_response::Payload as TxPayload;
-use dtdb_api::proto::execute_query_response::Payload as EqPayload;
+use dtdb_api::proto::{
+    CommitTransaction, ExecuteTxQuery, RollbackTransaction, StartTransaction, TransactionRequest,
+};
+use dtdb_api::server::DuctTapeDbServiceImpl;
+use dtdb_storage::CompressionType;
 
 // Helper to spin up a gRPC server on a random port
 async fn start_test_server(data_path: &Path) -> (u16, tokio::task::JoinHandle<()>) {
@@ -46,12 +46,18 @@ async fn test_in_process_transaction_commit() {
     let data_path = temp_dir.path().to_path_buf();
 
     let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
-    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
     // Create table first
     {
         let mut stream = client
-            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "test_db",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -60,11 +66,15 @@ async fn test_in_process_transaction_commit() {
     }
 
     // Run transaction
-    let tx_res = client.run_in_transaction("test_db", |tx| async move {
-        tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');").await?;
-        tx.execute_query("INSERT INTO Users (id, name) VALUES (2, 'Bob');").await?;
-        Ok("success_value")
-    }).await;
+    let tx_res = client
+        .run_in_transaction("test_db", |tx| async move {
+            tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');")
+                .await?;
+            tx.execute_query("INSERT INTO Users (id, name) VALUES (2, 'Bob');")
+                .await?;
+            Ok("success_value")
+        })
+        .await;
 
     assert_eq!(tx_res.unwrap(), "success_value");
 
@@ -93,12 +103,18 @@ async fn test_in_process_transaction_rollback() {
     let data_path = temp_dir.path().to_path_buf();
 
     let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
-    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
     // Create table first
     {
         let mut stream = client
-            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "test_db",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -107,10 +123,13 @@ async fn test_in_process_transaction_rollback() {
     }
 
     // Run transaction and return error to trigger rollback
-    let tx_res: Result<(), Status> = client.run_in_transaction("test_db", |tx| async move {
-        tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');").await?;
-        Err(Status::aborted("abort transaction"))
-    }).await;
+    let tx_res: Result<(), Status> = client
+        .run_in_transaction("test_db", |tx| async move {
+            tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');")
+                .await?;
+            Err(Status::aborted("abort transaction"))
+        })
+        .await;
 
     assert!(tx_res.is_err());
     assert_eq!(tx_res.unwrap_err().code(), tonic::Code::Aborted);
@@ -142,12 +161,18 @@ async fn test_grpc_transaction_commit() {
     let client_addr = format!("http://127.0.0.1:{}", port);
     let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
 
-    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
     // Create table
     {
         let mut stream = client
-            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "test_db",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -156,11 +181,15 @@ async fn test_grpc_transaction_commit() {
     }
 
     // Run transaction
-    let tx_res = client.run_in_transaction("test_db", |tx| async move {
-        tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');").await?;
-        tx.execute_query("INSERT INTO Users (id, name) VALUES (20, 'Dave');").await?;
-        Ok("success")
-    }).await;
+    let tx_res = client
+        .run_in_transaction("test_db", |tx| async move {
+            tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');")
+                .await?;
+            tx.execute_query("INSERT INTO Users (id, name) VALUES (20, 'Dave');")
+                .await?;
+            Ok("success")
+        })
+        .await;
 
     assert_eq!(tx_res.unwrap(), "success");
 
@@ -195,12 +224,18 @@ async fn test_grpc_transaction_rollback() {
     let client_addr = format!("http://127.0.0.1:{}", port);
     let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
 
-    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
     // Create table
     {
         let mut stream = client
-            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "test_db",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -209,10 +244,13 @@ async fn test_grpc_transaction_rollback() {
     }
 
     // Run transaction and return error to trigger rollback
-    let tx_res: Result<(), Status> = client.run_in_transaction("test_db", |tx| async move {
-        tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');").await?;
-        Err(Status::aborted("abort transaction"))
-    }).await;
+    let tx_res: Result<(), Status> = client
+        .run_in_transaction("test_db", |tx| async move {
+            tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');")
+                .await?;
+            Err(Status::aborted("abort transaction"))
+        })
+        .await;
 
     assert!(tx_res.is_err());
 
@@ -241,17 +279,26 @@ async fn test_multi_statement_rejection() {
     let data_path = temp_dir.path().to_path_buf();
 
     let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
-    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
     // Rejects multi-statement ExecuteQuery
     let err = client
-        .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY); INSERT INTO Users (id) VALUES (1);")
+        .execute_query(
+            "test_db",
+            "CREATE TABLE Users (id int PRIMARY KEY); INSERT INTO Users (id) VALUES (1);",
+        )
         .await
         .err()
         .unwrap();
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("Multiple SQL statements in a single execute() call are not allowed"));
+    assert!(
+        err.message()
+            .contains("Multiple SQL statements in a single execute() call are not allowed")
+    );
 }
 
 #[tokio::test]
@@ -265,8 +312,13 @@ async fn test_grpc_protocol_misuse() {
 
     // Create the database first
     {
-        let mut client = DuctTapeDbClient::connect(client_addr.clone()).await.unwrap();
-        client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+        let mut client = DuctTapeDbClient::connect(client_addr.clone())
+            .await
+            .unwrap();
+        client
+            .create_db("test_db", CompressionType::Uncompressed)
+            .await
+            .unwrap();
     }
 
     let mut raw_client = DuctTapeDbServiceClient::connect(client_addr).await.unwrap();
@@ -281,7 +333,9 @@ async fn test_grpc_protocol_misuse() {
             command: Some(Command::Execute(ExecuteTxQuery {
                 sql_query: "SELECT * FROM Users;".to_string(),
             })),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let resp = response.next().await.unwrap().unwrap();
         match resp.payload {
@@ -300,7 +354,9 @@ async fn test_grpc_protocol_misuse() {
 
         tx.send(TransactionRequest {
             command: Some(Command::Commit(CommitTransaction {})),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let resp = response.next().await.unwrap().unwrap();
         match resp.payload {
@@ -319,7 +375,9 @@ async fn test_grpc_protocol_misuse() {
 
         tx.send(TransactionRequest {
             command: Some(Command::Rollback(RollbackTransaction {})),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let resp = response.next().await.unwrap().unwrap();
         match resp.payload {
@@ -341,17 +399,24 @@ async fn test_grpc_protocol_misuse() {
             command: Some(Command::Start(StartTransaction {
                 db_name: "test_db".to_string(),
             })),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let resp1 = response.next().await.unwrap().unwrap();
-        assert!(matches!(resp1.payload, Some(TxPayload::QueryFinished(true))));
+        assert!(matches!(
+            resp1.payload,
+            Some(TxPayload::QueryFinished(true))
+        ));
 
         // Send second StartTransaction
         tx.send(TransactionRequest {
             command: Some(Command::Start(StartTransaction {
                 db_name: "test_db".to_string(),
             })),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let resp2 = response.next().await.unwrap().unwrap();
         match resp2.payload {
@@ -373,14 +438,18 @@ async fn test_grpc_protocol_misuse() {
             command: Some(Command::Start(StartTransaction {
                 db_name: "test_db".to_string(),
             })),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let resp = response.next().await.unwrap().unwrap();
         assert!(matches!(resp.payload, Some(TxPayload::QueryFinished(true))));
 
         // 2. Commit
         tx.send(TransactionRequest {
             command: Some(Command::Commit(CommitTransaction {})),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let resp = response.next().await.unwrap().unwrap();
         assert!(matches!(resp.payload, Some(TxPayload::CommitResult(_))));
 
@@ -389,7 +458,9 @@ async fn test_grpc_protocol_misuse() {
             command: Some(Command::Execute(ExecuteTxQuery {
                 sql_query: "SELECT * FROM Users;".to_string(),
             })),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let resp = response.next().await.unwrap().unwrap();
         match resp.payload {
             Some(TxPayload::ErrorMessage(msg)) => {
@@ -412,13 +483,20 @@ async fn test_grpc_ddl_transaction_rejection() {
     let client_addr = format!("http://127.0.0.1:{}", port);
     let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
 
-    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
     // 1. Remote transaction rejection of DDL
-    let tx_res = client.run_in_transaction("test_db", |tx| async move {
-        let _ = tx.execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);").await?;
-        Ok(())
-    }).await;
+    let tx_res = client
+        .run_in_transaction("test_db", |tx| async move {
+            let _ = tx
+                .execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);")
+                .await?;
+            Ok(())
+        })
+        .await;
 
     assert!(tx_res.is_err());
     let err_msg = tx_res.unwrap_err().message().to_string();
@@ -426,12 +504,19 @@ async fn test_grpc_ddl_transaction_rejection() {
 
     // 2. In-process transaction rejection of DDL
     let mut ip_client = DuctTapeDbClient::in_process(&data_path).unwrap();
-    ip_client.create_db("test_db_ip", CompressionType::Uncompressed).await.unwrap();
+    ip_client
+        .create_db("test_db_ip", CompressionType::Uncompressed)
+        .await
+        .unwrap();
 
-    let ip_tx_res = ip_client.run_in_transaction("test_db_ip", |tx| async move {
-        let _ = tx.execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);").await?;
-        Ok(())
-    }).await;
+    let ip_tx_res = ip_client
+        .run_in_transaction("test_db_ip", |tx| async move {
+            let _ = tx
+                .execute_query("CREATE TABLE Dummy (id int PRIMARY KEY);")
+                .await?;
+            Ok(())
+        })
+        .await;
 
     assert!(ip_tx_res.is_err());
     let ip_err_msg = ip_tx_res.unwrap_err().message().to_string();
@@ -440,7 +525,10 @@ async fn test_grpc_ddl_transaction_rejection() {
     // 3. Confirm DDL still works fine outside explicit transaction (auto-committed)
     {
         let mut stream = client
-            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "test_db",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -450,4 +538,3 @@ async fn test_grpc_ddl_transaction_rejection() {
 
     server_handle.abort();
 }
-

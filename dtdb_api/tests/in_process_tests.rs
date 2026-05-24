@@ -1,10 +1,10 @@
-use tempfile::TempDir;
 use futures_util::StreamExt;
 use std::fs;
+use tempfile::TempDir;
 
-use dtdb_storage::CompressionType;
-use dtdb_relational::DatabaseOptions;
 use dtdb_api::client::DuctTapeDbClient;
+use dtdb_relational::DatabaseOptions;
+use dtdb_storage::CompressionType;
 
 #[tokio::test]
 async fn test_in_process_client_integration() {
@@ -15,7 +15,10 @@ async fn test_in_process_client_integration() {
     let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
 
     // 2. Test CreateDb with Lz4
-    let create_lz4_resp = client.create_db("db_lz4", CompressionType::Lz4).await.unwrap();
+    let create_lz4_resp = client
+        .create_db("db_lz4", CompressionType::Lz4)
+        .await
+        .unwrap();
     assert!(create_lz4_resp.success);
     assert!(create_lz4_resp.message.contains("Lz4"));
 
@@ -41,7 +44,10 @@ async fn test_in_process_client_integration() {
         level_size_multiplier: None,
         max_level: None,
     };
-    let create_opt_resp = client.create_db_with_options("db_opt", options).await.unwrap();
+    let create_opt_resp = client
+        .create_db_with_options("db_opt", options)
+        .await
+        .unwrap();
     assert!(create_opt_resp.success);
 
     // Check directory layout & db_options.bin
@@ -57,7 +63,10 @@ async fn test_in_process_client_integration() {
     // Create Table
     {
         let mut stream = client
-            .execute_query("db_lz4", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .execute_query(
+                "db_lz4",
+                "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));",
+            )
             .await
             .unwrap();
 

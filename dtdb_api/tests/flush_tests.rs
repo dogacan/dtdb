@@ -1,15 +1,15 @@
+use futures_util::StreamExt;
+use std::fs;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use futures_util::StreamExt;
-use std::fs;
 
-use dtdb_storage::CompressionType;
-use dtdb_relational::DatabaseOptions;
 use dtdb_api::client::DuctTapeDbClient;
-use dtdb_api::server::DuctTapeDbServiceImpl;
 use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::server::DuctTapeDbServiceImpl;
+use dtdb_relational::DatabaseOptions;
+use dtdb_storage::CompressionType;
 
 // Helper to count SSTable files in a directory
 fn count_sst_files(dir: &std::path::Path) -> usize {
@@ -64,13 +64,19 @@ async fn test_wal_size_based_flush() {
         max_level: None,
     };
 
-    let create_resp = client.create_db_with_options("db_wal", options).await.unwrap();
+    let create_resp = client
+        .create_db_with_options("db_wal", options)
+        .await
+        .unwrap();
     assert!(create_resp.success);
 
     // Create table
     {
         let mut stream = client
-            .execute_query("db_wal", "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));")
+            .execute_query(
+                "db_wal",
+                "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -141,13 +147,19 @@ async fn test_periodic_time_based_flush() {
         max_level: None,
     };
 
-    let create_resp = client.create_db_with_options("db_periodic", options).await.unwrap();
+    let create_resp = client
+        .create_db_with_options("db_periodic", options)
+        .await
+        .unwrap();
     assert!(create_resp.success);
 
     // Create table
     {
         let mut stream = client
-            .execute_query("db_periodic", "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));")
+            .execute_query(
+                "db_periodic",
+                "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -161,7 +173,10 @@ async fn test_periodic_time_based_flush() {
     // Insert a small row
     {
         let mut stream = client
-            .execute_query("db_periodic", "INSERT INTO TestTable (id, value) VALUES (1, 'small');")
+            .execute_query(
+                "db_periodic",
+                "INSERT INTO TestTable (id, value) VALUES (1, 'small');",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -221,13 +236,19 @@ async fn test_manual_rpc_flush() {
         max_level: None,
     };
 
-    let create_resp = client.create_db_with_options("db_manual", options).await.unwrap();
+    let create_resp = client
+        .create_db_with_options("db_manual", options)
+        .await
+        .unwrap();
     assert!(create_resp.success);
 
     // Create table
     {
         let mut stream = client
-            .execute_query("db_manual", "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));")
+            .execute_query(
+                "db_manual",
+                "CREATE TABLE TestTable (id int PRIMARY KEY, value varchar(255));",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {
@@ -241,7 +262,10 @@ async fn test_manual_rpc_flush() {
     // Insert a small row
     {
         let mut stream = client
-            .execute_query("db_manual", "INSERT INTO TestTable (id, value) VALUES (1, 'small');")
+            .execute_query(
+                "db_manual",
+                "INSERT INTO TestTable (id, value) VALUES (1, 'small');",
+            )
             .await
             .unwrap();
         while let Some(res) = stream.next().await {

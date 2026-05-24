@@ -1,9 +1,9 @@
+use dtdb_storage::memtable::MemTable;
+use dtdb_storage::sstable::{SstableReader, SstableWriter};
+use dtdb_storage::wal::Wal;
+use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, WalEntry};
 use std::fs;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType, EngineOptions, WalEntry};
-use dtdb_storage::memtable::MemTable;
-use dtdb_storage::wal::Wal;
-use dtdb_storage::sstable::{SstableReader, SstableWriter};
 
 // Helper to create keys and values easily
 fn k_int(val: i64) -> DbKey {
@@ -154,7 +154,9 @@ fn test_engine_crud() {
     assert_eq!(engine.get(&k_str("b")).unwrap(), None);
 
     // Range scan matching key prefix
-    let scan_res = engine.filtered_scan(&k_str("a"), &k_str("c"), |_, _| true).unwrap();
+    let scan_res = engine
+        .filtered_scan(&k_str("a"), &k_str("c"), |_, _| true)
+        .unwrap();
     assert_eq!(scan_res.len(), 2);
     assert_eq!(scan_res[0], (k_str("a"), v_str("val_a")));
     assert_eq!(scan_res[1], (k_str("c"), v_str("val_c")));
@@ -240,8 +242,8 @@ fn test_engine_compaction() {
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("v1_old")).unwrap(); // Flushes
         engine.put(k_int(1), v_str("v1_new")).unwrap(); // Flushes
-        engine.put(k_int(2), v_str("v2")).unwrap();     // Flushes
-        engine.delete(k_int(2)).unwrap();                // Flushes
+        engine.put(k_int(2), v_str("v2")).unwrap(); // Flushes
+        engine.delete(k_int(2)).unwrap(); // Flushes
 
         // Verify we have multiple SST files on disk
         let mut sst_count = 0;
@@ -267,7 +269,10 @@ fn test_engine_compaction() {
             }
         }
         assert_eq!(sst_count, 1);
-        assert_eq!(sst_path.unwrap().file_name().unwrap().to_str().unwrap(), "L1_00005.sst");
+        assert_eq!(
+            sst_path.unwrap().file_name().unwrap().to_str().unwrap(),
+            "L1_00005.sst"
+        );
 
         // Verify queries are correct
         assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_str("v1_new")));

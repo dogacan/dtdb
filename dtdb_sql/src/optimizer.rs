@@ -1,8 +1,8 @@
-use dtdb_storage::DbKey;
-use dtdb_storage::DbValue;
-use dtdb_relational::{DataType, Schema};
 use crate::expr::{Expr, Operator};
 use crate::logical::LogicalPlan;
+use dtdb_relational::{DataType, Schema};
+use dtdb_storage::DbKey;
+use dtdb_storage::DbValue;
 
 /// Logical Optimizer applies rule-based optimizations to a LogicalPlan.
 pub struct Optimizer;
@@ -95,7 +95,11 @@ impl Optimizer {
                 source: Box::new(self.optimize_node(*source)),
                 keys,
             },
-            LogicalPlan::Limit { source, limit, offset } => LogicalPlan::Limit {
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => LogicalPlan::Limit {
                 source: Box::new(self.optimize_node(*source)),
                 limit,
                 offset,

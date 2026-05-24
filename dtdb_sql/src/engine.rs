@@ -1,17 +1,17 @@
-use std::sync::Arc;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
-use dtdb_storage::{DbKey, DbValue};
 use crate::SqlQuery;
-use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
 use crate::expr::{Expr, Operator};
 use crate::logical::{LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
-use crate::planner::{LogicalPlanner, SqlStatement};
 use crate::physical::{
-    PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalLimit,
-    PhysicalOperator, PhysicalProjection, PhysicalSeqScan, PhysicalSort,
+    PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalLimit, PhysicalOperator,
+    PhysicalProjection, PhysicalSeqScan, PhysicalSort,
 };
+use crate::planner::{LogicalPlanner, SqlStatement};
+use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
+use dtdb_storage::{DbKey, DbValue};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+use std::sync::Arc;
 
 /// Represents the tabular or DDL execution output of a SQL query.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,18 +38,23 @@ impl SqlEngine {
     pub fn is_ddl(&self, sql: &str) -> bool {
         let dialect = GenericDialect {};
         if let Ok(statements) = Parser::parse_sql(&dialect, sql)
-            && !statements.is_empty() {
-                return matches!(
-                    statements[0],
-                    sqlparser::ast::Statement::CreateTable { .. }
-                        | sqlparser::ast::Statement::Drop { .. }
-                );
-            }
+            && !statements.is_empty()
+        {
+            return matches!(
+                statements[0],
+                sqlparser::ast::Statement::CreateTable { .. }
+                    | sqlparser::ast::Statement::Drop { .. }
+            );
+        }
         false
     }
 
     /// Executes a parameterized SqlQuery safely by interpolating bound parameters first.
-    pub fn execute_query(&self, query: &SqlQuery, tx: &Transaction) -> Result<ExecutionResult, String> {
+    pub fn execute_query(
+        &self,
+        query: &SqlQuery,
+        tx: &Transaction,
+    ) -> Result<ExecutionResult, String> {
         let sql = query.interpolate()?;
         self.execute(&sql, tx)
     }
@@ -87,7 +92,8 @@ impl SqlEngine {
             return Err(
                 "Multiple SQL statements in a single execute() call are not allowed. \
                  Use DuctTapeDbClient::run_in_transaction() or the Transaction RPC to \
-                 execute multiple statements within a single transaction.".to_string()
+                 execute multiple statements within a single transaction."
+                    .to_string(),
             );
         }
 
@@ -144,11 +150,14 @@ impl SqlEngine {
                         other => return Err(format!("Invalid primary key type: {:?}", other)),
                     };
 
-                    tx.put(&table_name, pk_key, full_row).map_err(|e| e.to_string())?;
+                    tx.put(&table_name, pk_key, full_row)
+                        .map_err(|e| e.to_string())?;
                     insert_count += 1;
                 }
 
-                Ok(ExecutionResult::Insert { count: insert_count })
+                Ok(ExecutionResult::Insert {
+                    count: insert_count,
+                })
             }
             SqlStatement::Delete { table_name, filter } => {
                 let table = self
@@ -195,7 +204,9 @@ impl SqlEngine {
                     delete_count += 1;
                 }
 
-                Ok(ExecutionResult::Delete { count: delete_count })
+                Ok(ExecutionResult::Delete {
+                    count: delete_count,
+                })
             }
             SqlStatement::Update {
                 table_name,
@@ -263,14 +274,18 @@ impl SqlEngine {
                 for (old_pk, new_pk, updated_row) in updates {
                     if old_pk != new_pk {
                         tx.delete(&table_name, old_pk).map_err(|e| e.to_string())?;
-                        tx.put(&table_name, new_pk, updated_row).map_err(|e| e.to_string())?;
+                        tx.put(&table_name, new_pk, updated_row)
+                            .map_err(|e| e.to_string())?;
                     } else {
-                        tx.put(&table_name, new_pk, updated_row).map_err(|e| e.to_string())?;
+                        tx.put(&table_name, new_pk, updated_row)
+                            .map_err(|e| e.to_string())?;
                     }
                     update_count += 1;
                 }
 
-                Ok(ExecutionResult::Update { count: update_count })
+                Ok(ExecutionResult::Update {
+                    count: update_count,
+                })
             }
             SqlStatement::Query(logical_plan) => {
                 // 1. Optimize the Logical Plan
@@ -313,7 +328,9 @@ impl SqlEngine {
 
                 let plan_info = format!(
                     "--- Logical Plan ---\n{}\n--- Optimized Plan ---\n{}\n--- Physical Plan ---\n{}",
-                    logical_str.trim_end(), opt_logical_str.trim_end(), physical_str.trim_end()
+                    logical_str.trim_end(),
+                    opt_logical_str.trim_end(),
+                    physical_str.trim_end()
                 );
 
                 let rows = vec![Row::new(vec![DbValue::String(plan_info)])];
@@ -339,9 +356,9 @@ impl SqlEngine {
                 let (start, end) = match range {
                     Some(r) => r,
                     None => {
-                        let pk_idx = schema
-                            .primary_key_index()
-                            .ok_or_else(|| "No primary key found for Scan compilation".to_string())?;
+                        let pk_idx = schema.primary_key_index().ok_or_else(|| {
+                            "No primary key found for Scan compilation".to_string()
+                        })?;
                         let pk_col = &schema.columns[pk_idx];
                         match pk_col.data_type {
                             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
@@ -386,7 +403,11 @@ impl SqlEngine {
                     proj_schema,
                 )))
             }
-            LogicalPlan::Limit { source, limit, offset } => {
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => {
                 let src_op = self.compile_physical(*source, tx)?;
                 Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
@@ -414,7 +435,7 @@ impl SqlEngine {
                         return Err(format!(
                             "Only equality join conditions supported, got {:?}",
                             other
-                        ))
+                        ));
                     }
                 };
 

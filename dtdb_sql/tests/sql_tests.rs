@@ -1,8 +1,8 @@
+use dtdb_relational::{Database, Transaction};
+use dtdb_sql::{ExecutionResult, SqlEngine};
+use dtdb_storage::DbValue;
 use std::sync::Arc;
 use tempfile::TempDir;
-use dtdb_storage::DbValue;
-use dtdb_relational::{Database, Transaction};
-use dtdb_sql::{SqlEngine, ExecutionResult};
 
 // Helper function to setup database and SQL engine.
 fn setup_engine() -> (TempDir, Arc<Database>, SqlEngine) {
@@ -106,10 +106,7 @@ fn test_sql_joins() {
     // 1. Create tables
     let tx1 = Transaction::new(1, db.clone());
     engine
-        .execute(
-            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
-            &tx1,
-        )
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1)
         .unwrap();
     engine
         .execute(
@@ -210,7 +207,7 @@ fn test_sql_aggregations() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::Int(5),         // COUNT
+                DbValue::Int(5),          // COUNT
                 DbValue::Float(355000.0), // SUM
                 DbValue::Float(45000.0),  // MIN
                 DbValue::Float(110000.0)  // MAX
@@ -269,10 +266,7 @@ fn test_sql_like_wildcard() {
 
     let tx1 = Transaction::new(1, db.clone());
     engine
-        .execute(
-            "CREATE TABLE items (id INT PRIMARY KEY, code STRING)",
-            &tx1,
-        )
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, code STRING)", &tx1)
         .unwrap();
     tx1.commit().unwrap();
 
@@ -316,7 +310,10 @@ fn test_sql_like_wildcard() {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values[1], DbValue::String("abc-123".to_string()));
         assert_eq!(rows[1].values[1], DbValue::String("abc-789".to_string()));
-        assert_eq!(rows[2].values[1], DbValue::String("xyz-abc-999".to_string()));
+        assert_eq!(
+            rows[2].values[1],
+            DbValue::String("xyz-abc-999".to_string())
+        );
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -329,10 +326,7 @@ fn test_sql_transactions() {
     // 1. Create table
     let tx1 = Transaction::new(1, db.clone());
     engine
-        .execute(
-            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
-            &tx1,
-        )
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1)
         .unwrap();
     tx1.commit().unwrap();
 
@@ -349,21 +343,19 @@ fn test_sql_transactions() {
     // 3. Perform write and commit
     let tx3 = Transaction::new(3, db.clone());
     engine
-        .execute(
-            "INSERT INTO users (id, name) VALUES (20, 'KeepMe')",
-            &tx3,
-        )
+        .execute("INSERT INTO users (id, name) VALUES (20, 'KeepMe')", &tx3)
         .unwrap();
     tx3.commit().unwrap();
 
     // 4. Verify contents in a new transaction
     let tx4 = Transaction::new(4, db.clone());
-    let res = engine
-        .execute("SELECT id, name FROM users", &tx4)
-        .unwrap();
+    let res = engine.execute("SELECT id, name FROM users", &tx4).unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::Int(20), DbValue::String("KeepMe".to_string())]);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::Int(20), DbValue::String("KeepMe".to_string())]
+        );
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -430,10 +422,7 @@ fn test_sql_explain() {
 
     let tx1 = Transaction::new(1, db.clone());
     engine
-        .execute(
-            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
-            &tx1,
-        )
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1)
         .unwrap();
     tx1.commit().unwrap();
 
@@ -463,10 +452,11 @@ fn test_sql_query_macro_and_interpolation() {
     use dtdb_sql::sql_query;
 
     // 1. Test basic bindings and escaping
-    let query = sql_query!("SELECT * FROM users WHERE id = @id AND name = @name AND details = @details")
-        .bind("id", 42i64)
-        .bind("name", "Alice's Laptop")
-        .bind("details", "Some 'escaped' \"value\" @not_a_param");
+    let query =
+        sql_query!("SELECT * FROM users WHERE id = @id AND name = @name AND details = @details")
+            .bind("id", 42i64)
+            .bind("name", "Alice's Laptop")
+            .bind("details", "Some 'escaped' \"value\" @not_a_param");
 
     let interpolated = query.interpolate().unwrap();
     assert_eq!(
@@ -475,8 +465,8 @@ fn test_sql_query_macro_and_interpolation() {
     );
 
     // 2. Test raw bytes binding
-    let query = sql_query!("SELECT * FROM items WHERE hash = @hash")
-        .bind("hash", vec![1u8, 2u8, 255u8]);
+    let query =
+        sql_query!("SELECT * FROM items WHERE hash = @hash").bind("hash", vec![1u8, 2u8, 255u8]);
     assert_eq!(
         query.interpolate().unwrap(),
         "SELECT * FROM items WHERE hash = x'0102ff'"
@@ -491,8 +481,7 @@ fn test_sql_query_macro_and_interpolation() {
     );
 
     // 4. Verify unbound parameter results in an error
-    let query = sql_query!("SELECT * FROM users WHERE id = @id AND age = @age")
-        .bind("id", 10i64);
+    let query = sql_query!("SELECT * FROM users WHERE id = @id AND age = @age").bind("id", 10i64);
     assert!(query.interpolate().is_err());
 }
 
@@ -512,10 +501,11 @@ fn test_sql_query_execution_end_to_end() {
 
     let tx2 = Transaction::new(2, db.clone());
     // Insert using SqlQuery
-    let insert_query = sql_query!("INSERT INTO employees (id, name, score) VALUES (@id, @name, @score)")
-        .bind("id", 1i64)
-        .bind("name", "Bob's Team")
-        .bind("score", 95.5f64);
+    let insert_query =
+        sql_query!("INSERT INTO employees (id, name, score) VALUES (@id, @name, @score)")
+            .bind("id", 1i64)
+            .bind("name", "Bob's Team")
+            .bind("score", 95.5f64);
 
     let res = engine.execute_query(&insert_query, &tx2).unwrap();
     assert_eq!(res, ExecutionResult::Insert { count: 1 });
@@ -523,9 +513,11 @@ fn test_sql_query_execution_end_to_end() {
 
     let tx3 = Transaction::new(3, db.clone());
     // Select using SqlQuery
-    let select_query = sql_query!("SELECT id, name, score FROM employees WHERE name = @name AND score >= @min_score")
-        .bind("name", "Bob's Team")
-        .bind("min_score", 90.0f64);
+    let select_query = sql_query!(
+        "SELECT id, name, score FROM employees WHERE name = @name AND score >= @min_score"
+    )
+    .bind("name", "Bob's Team")
+    .bind("min_score", 90.0f64);
 
     let select_res = engine.execute_query(&select_query, &tx3).unwrap();
     if let ExecutionResult::Select { rows, .. } = select_res {
@@ -543,22 +535,33 @@ fn test_sql_delete() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1).unwrap();
+    engine
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1)
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')", &tx2).unwrap();
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     // Delete single row
     let tx3 = Transaction::new(3, db.clone());
-    let res = engine.execute("DELETE FROM users WHERE id = 2", &tx3).unwrap();
+    let res = engine
+        .execute("DELETE FROM users WHERE id = 2", &tx3)
+        .unwrap();
     assert_eq!(res, ExecutionResult::Delete { count: 1 });
     tx3.commit().unwrap();
 
     // Verify row 2 is deleted
     let tx4 = Transaction::new(4, db.clone());
-    let res = engine.execute("SELECT id, name FROM users ORDER BY id ASC", &tx4).unwrap();
+    let res = engine
+        .execute("SELECT id, name FROM users ORDER BY id ASC", &tx4)
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[0], DbValue::Int(1));
@@ -587,25 +590,45 @@ fn test_sql_update() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING, score FLOAT)", &tx1).unwrap();
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING, score FLOAT)",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute("INSERT INTO users (id, name, score) VALUES (1, 'Alice', 90.0), (2, 'Bob', 80.0)", &tx2).unwrap();
+    engine
+        .execute(
+            "INSERT INTO users (id, name, score) VALUES (1, 'Alice', 90.0), (2, 'Bob', 80.0)",
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     // Update non-pk columns
     let tx3 = Transaction::new(3, db.clone());
-    let res = engine.execute("UPDATE users SET name = 'AliceUpdated', score = 95.5 WHERE id = 1", &tx3).unwrap();
+    let res = engine
+        .execute(
+            "UPDATE users SET name = 'AliceUpdated', score = 95.5 WHERE id = 1",
+            &tx3,
+        )
+        .unwrap();
     assert_eq!(res, ExecutionResult::Update { count: 1 });
     tx3.commit().unwrap();
 
     // Verify update
     let tx4 = Transaction::new(4, db.clone());
-    let res = engine.execute("SELECT name, score FROM users WHERE id = 1", &tx4).unwrap();
+    let res = engine
+        .execute("SELECT name, score FROM users WHERE id = 1", &tx4)
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::String("AliceUpdated".to_string()));
+        assert_eq!(
+            rows[0].values[0],
+            DbValue::String("AliceUpdated".to_string())
+        );
         assert_eq!(rows[0].values[1], DbValue::Float(95.5));
     } else {
         panic!("Expected Select");
@@ -613,13 +636,17 @@ fn test_sql_update() {
 
     // Update pk column (causes delete + put)
     let tx5 = Transaction::new(5, db.clone());
-    let res = engine.execute("UPDATE users SET id = id + 10 WHERE id = 2", &tx5).unwrap();
+    let res = engine
+        .execute("UPDATE users SET id = id + 10 WHERE id = 2", &tx5)
+        .unwrap();
     assert_eq!(res, ExecutionResult::Update { count: 1 });
     tx5.commit().unwrap();
 
     // Verify old pk is gone and new pk exists
     let tx6 = Transaction::new(6, db.clone());
-    let res = engine.execute("SELECT id, name FROM users ORDER BY id ASC", &tx6).unwrap();
+    let res = engine
+        .execute("SELECT id, name FROM users ORDER BY id ASC", &tx6)
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[0], DbValue::Int(1)); // Alice
@@ -635,13 +662,30 @@ fn test_sql_left_join() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1).unwrap();
-    engine.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)", &tx1).unwrap();
+    engine
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1)
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')", &tx2).unwrap();
-    engine.execute("INSERT INTO orders (order_id, user_id, amount) VALUES (10, 1, 99.9), (20, 2, 199.9)", &tx2).unwrap();
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+            &tx2,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO orders (order_id, user_id, amount) VALUES (10, 1, 99.9), (20, 2, 199.9)",
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     let tx3 = Transaction::new(3, db.clone());
@@ -671,15 +715,27 @@ fn test_sql_limit_offset() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE users (id INT PRIMARY KEY)", &tx1).unwrap();
+    engine
+        .execute("CREATE TABLE users (id INT PRIMARY KEY)", &tx1)
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute("INSERT INTO users (id) VALUES (10), (20), (30), (40), (50)", &tx2).unwrap();
+    engine
+        .execute(
+            "INSERT INTO users (id) VALUES (10), (20), (30), (40), (50)",
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     let tx3 = Transaction::new(3, db.clone());
-    let res = engine.execute("SELECT id FROM users ORDER BY id ASC LIMIT 2 OFFSET 2", &tx3).unwrap();
+    let res = engine
+        .execute(
+            "SELECT id FROM users ORDER BY id ASC LIMIT 2 OFFSET 2",
+            &tx3,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[0], DbValue::Int(30));
@@ -694,25 +750,34 @@ fn test_sql_avg_aggregate() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE employees (id INT PRIMARY KEY, dept STRING, salary FLOAT)", &tx1).unwrap();
+    engine
+        .execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, dept STRING, salary FLOAT)",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute(
-        "INSERT INTO employees (id, dept, salary) VALUES \
+    engine
+        .execute(
+            "INSERT INTO employees (id, dept, salary) VALUES \
          (1, 'Sales', 50.0), \
          (2, 'Sales', 150.0), \
          (3, 'Eng', 100.0), \
          (4, 'Eng', 300.0)",
-        &tx2
-    ).unwrap();
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     let tx3 = Transaction::new(3, db.clone());
-    let res = engine.execute(
-        "SELECT dept, AVG(salary) FROM employees GROUP BY dept ORDER BY dept ASC",
-        &tx3
-    ).unwrap();
+    let res = engine
+        .execute(
+            "SELECT dept, AVG(salary) FROM employees GROUP BY dept ORDER BY dept ASC",
+            &tx3,
+        )
+        .unwrap();
 
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
@@ -732,11 +797,21 @@ fn test_sql_arithmetic_expressions() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE items (id INT PRIMARY KEY, val INT, factor FLOAT)", &tx1).unwrap();
+    engine
+        .execute(
+            "CREATE TABLE items (id INT PRIMARY KEY, val INT, factor FLOAT)",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute("INSERT INTO items (id, val, factor) VALUES (1, 10, 2.5)", &tx2).unwrap();
+    engine
+        .execute(
+            "INSERT INTO items (id, val, factor) VALUES (1, 10, 2.5)",
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     let tx3 = Transaction::new(3, db.clone());
@@ -763,18 +838,25 @@ fn test_sql_case_and_functions() {
     let (_temp, db, engine) = setup_engine();
 
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE products (id INT PRIMARY KEY, name STRING, price FLOAT, category STRING)", &tx1).unwrap();
+    engine
+        .execute(
+            "CREATE TABLE products (id INT PRIMARY KEY, name STRING, price FLOAT, category STRING)",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
 
     let tx2 = Transaction::new(2, db.clone());
-    engine.execute(
-        "INSERT INTO products (id, name, price, category) VALUES \
+    engine
+        .execute(
+            "INSERT INTO products (id, name, price, category) VALUES \
          (1, 'Laptop', 1200.0, 'Electronics'), \
          (2, 'Mouse', 25.0, ''), \
          (3, 'Desk', 0.0, 'Furniture'), \
          (4, 'Chair', 150.0, 'Furniture')",
-        &tx2
-    ).unwrap();
+            &tx2,
+        )
+        .unwrap();
     tx2.commit().unwrap();
 
     let tx3 = Transaction::new(3, db.clone());
@@ -810,10 +892,12 @@ fn test_sql_case_and_functions() {
     }
 
     // 3. Test LENGTH
-    let res = engine.execute(
-        "SELECT name, LENGTH(name) FROM products ORDER BY id ASC",
-        &tx3
-    ).unwrap();
+    let res = engine
+        .execute(
+            "SELECT name, LENGTH(name) FROM products ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].values[1], DbValue::Int(6)); // Laptop
@@ -838,13 +922,18 @@ fn test_sql_case_and_functions() {
     }
 
     // 5. Test COALESCE (returns first non-empty / non-zero value, but empty/zero are not NULL)
-    let res = engine.execute(
-        "SELECT name, COALESCE(category, 'Uncategorized') FROM products ORDER BY id ASC",
-        &tx3
-    ).unwrap();
+    let res = engine
+        .execute(
+            "SELECT name, COALESCE(category, 'Uncategorized') FROM products ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].values[1], DbValue::String("Electronics".to_string()));
+        assert_eq!(
+            rows[0].values[1],
+            DbValue::String("Electronics".to_string())
+        );
         assert_eq!(rows[1].values[1], DbValue::String("".to_string())); // Mouse category is empty "" -> NOT Null -> no fallback
         assert_eq!(rows[2].values[1], DbValue::String("Furniture".to_string()));
     } else {
@@ -852,10 +941,12 @@ fn test_sql_case_and_functions() {
     }
 
     // 6. Test COALESCE with multiple arguments and numeric fallback
-    let res = engine.execute(
-        "SELECT name, COALESCE(price, 99.0) FROM products ORDER BY id ASC",
-        &tx3
-    ).unwrap();
+    let res = engine
+        .execute(
+            "SELECT name, COALESCE(price, 99.0) FROM products ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].values[1], DbValue::Float(1200.0));
@@ -871,7 +962,12 @@ fn test_sql_explicit_null() {
 
     // 1. Create table with nullable and NOT NULL columns
     let tx1 = Transaction::new(1, db.clone());
-    engine.execute("CREATE TABLE nullable_test (id INT PRIMARY KEY, name STRING NOT NULL, note STRING)", &tx1).unwrap();
+    engine
+        .execute(
+            "CREATE TABLE nullable_test (id INT PRIMARY KEY, name STRING NOT NULL, note STRING)",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
 
     // 2. Insert explicit NULLs
@@ -881,18 +977,34 @@ fn test_sql_explicit_null() {
 
     // 3. Try to insert NULL into NOT NULL column (should fail validation)
     let tx3 = Transaction::new(3, db.clone());
-    let insert_fail = engine.execute("INSERT INTO nullable_test (id, name, note) VALUES (3, NULL, 'Note')", &tx3);
-    assert!(insert_fail.is_err(), "Expected insert of NULL into NOT NULL column to fail");
+    let insert_fail = engine.execute(
+        "INSERT INTO nullable_test (id, name, note) VALUES (3, NULL, 'Note')",
+        &tx3,
+    );
+    assert!(
+        insert_fail.is_err(),
+        "Expected insert of NULL into NOT NULL column to fail"
+    );
     let _ = tx3.rollback();
 
     // 4. Try to insert row omitting nullable column (should default to NULL)
     let tx4 = Transaction::new(4, db.clone());
-    engine.execute("INSERT INTO nullable_test (id, name) VALUES (3, 'Charlie')", &tx4).unwrap();
+    engine
+        .execute(
+            "INSERT INTO nullable_test (id, name) VALUES (3, 'Charlie')",
+            &tx4,
+        )
+        .unwrap();
     tx4.commit().unwrap();
 
     // 5. Select and verify explicit NULL and defaulted NULL
     let tx5 = Transaction::new(5, db.clone());
-    let res = engine.execute("SELECT id, name, note FROM nullable_test ORDER BY id ASC", &tx5).unwrap();
+    let res = engine
+        .execute(
+            "SELECT id, name, note FROM nullable_test ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 3);
         // Alice note is NULL
@@ -914,7 +1026,12 @@ fn test_sql_explicit_null() {
     }
 
     // 6. Test logic with NULL: NULL + 5, NULL AND true, NULL OR true, etc.
-    let res2 = engine.execute("SELECT note + 5, note AND 1, note OR 1 FROM nullable_test WHERE id = 1", &tx5).unwrap();
+    let res2 = engine
+        .execute(
+            "SELECT note + 5, note AND 1, note OR 1 FROM nullable_test WHERE id = 1",
+            &tx5,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res2 {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], DbValue::Null); // NULL + 5 = NULL
@@ -925,7 +1042,12 @@ fn test_sql_explicit_null() {
     }
 
     // 7. Test COALESCE with NULLs
-    let res3 = engine.execute("SELECT id, COALESCE(note, 'default') FROM nullable_test ORDER BY id ASC", &tx5).unwrap();
+    let res3 = engine
+        .execute(
+            "SELECT id, COALESCE(note, 'default') FROM nullable_test ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
     if let ExecutionResult::Select { rows, .. } = res3 {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values[1], DbValue::String("default".to_string()));
@@ -936,8 +1058,18 @@ fn test_sql_explicit_null() {
     }
 
     // 8. Test LEFT JOIN padding unmatched columns with NULL instead of 0.0/empty
-    engine.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)", &tx5).unwrap();
-    engine.execute("INSERT INTO orders (order_id, user_id, amount) VALUES (100, 2, 9.99)", &tx5).unwrap();
+    engine
+        .execute(
+            "CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)",
+            &tx5,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO orders (order_id, user_id, amount) VALUES (100, 2, 9.99)",
+            &tx5,
+        )
+        .unwrap();
     let res4 = engine.execute(
         "SELECT nullable_test.name, orders.amount FROM nullable_test LEFT JOIN orders ON nullable_test.id = orders.user_id ORDER BY nullable_test.id ASC",
         &tx5
@@ -957,4 +1089,3 @@ fn test_sql_explicit_null() {
         panic!("Expected Select");
     }
 }
-

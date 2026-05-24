@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use dtdb_relational::{Column, DataType, Schema};
 use crate::expr::{Expr, Operator};
+use dtdb_relational::{Column, DataType, Schema};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
@@ -128,22 +128,23 @@ impl LogicalPlan {
                 for (idx, aggr) in aggrs.iter().enumerate() {
                     let dt = match aggr {
                         AggregateExpr::Count(_) => DataType::Int,
-                        AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) | AggregateExpr::Avg(expr) => {
-                            match expr {
-                                Expr::Column(col_name) => {
-                                    let pos = source_schema.columns.iter().position(|col| {
-                                        col.name == *col_name
-                                            || col_name.ends_with(&format!(".{}", col.name))
-                                    });
-                                    if let Some(i) = pos {
-                                        source_schema.columns[i].data_type
-                                    } else {
-                                        DataType::Float
-                                    }
+                        AggregateExpr::Sum(expr)
+                        | AggregateExpr::Min(expr)
+                        | AggregateExpr::Max(expr)
+                        | AggregateExpr::Avg(expr) => match expr {
+                            Expr::Column(col_name) => {
+                                let pos = source_schema.columns.iter().position(|col| {
+                                    col.name == *col_name
+                                        || col_name.ends_with(&format!(".{}", col.name))
+                                });
+                                if let Some(i) = pos {
+                                    source_schema.columns[i].data_type
+                                } else {
+                                    DataType::Float
                                 }
-                                _ => DataType::Float,
                             }
-                        }
+                            _ => DataType::Float,
+                        },
                     };
                     cols.push(Column {
                         name: field_names[start_idx + idx].clone(),
@@ -169,29 +170,57 @@ pub fn format_logical_plan(plan: &LogicalPlan) -> String {
 fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
     let indent_str = "  ".repeat(indent);
     match node {
-        LogicalPlan::Scan { table_name, range, .. } => {
+        LogicalPlan::Scan {
+            table_name, range, ..
+        } => {
             let range_str = match range {
                 Some((s, e)) => format!("range=[{:?}, {:?}]", s, e),
                 None => "range=all".to_string(),
             };
-            out.push_str(&format!("{}- Scan: table={}, {}\n", indent_str, table_name, range_str));
+            out.push_str(&format!(
+                "{}- Scan: table={}, {}\n",
+                indent_str, table_name, range_str
+            ));
         }
         LogicalPlan::Filter { source, predicate } => {
-            out.push_str(&format!("{}- Filter: condition={:?}\n", indent_str, predicate));
+            out.push_str(&format!(
+                "{}- Filter: condition={:?}\n",
+                indent_str, predicate
+            ));
             format_logical_node(source, indent + 1, out);
         }
-        LogicalPlan::Projection { source, field_names, .. } => {
-            out.push_str(&format!("{}- Projection: fields={:?}\n", indent_str, field_names));
+        LogicalPlan::Projection {
+            source,
+            field_names,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{}- Projection: fields={:?}\n",
+                indent_str, field_names
+            ));
             format_logical_node(source, indent + 1, out);
         }
-        LogicalPlan::Join { left, right, condition, join_type } => {
-            out.push_str(&format!("{}- HashJoin: type={:?}, condition={:?}\n", indent_str, join_type, condition));
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            join_type,
+        } => {
+            out.push_str(&format!(
+                "{}- HashJoin: type={:?}, condition={:?}\n",
+                indent_str, join_type, condition
+            ));
             out.push_str(&format!("{}  left:\n", indent_str));
             format_logical_node(left, indent + 2, out);
             out.push_str(&format!("{}  right:\n", indent_str));
             format_logical_node(right, indent + 2, out);
         }
-        LogicalPlan::Aggregate { source, group_by, aggrs, field_names } => {
+        LogicalPlan::Aggregate {
+            source,
+            group_by,
+            aggrs,
+            field_names,
+        } => {
             out.push_str(&format!(
                 "{}- HashAggregate: group_by={:?}, aggregates={:?}, output_names={:?}\n",
                 indent_str, group_by, aggrs, field_names
@@ -206,12 +235,19 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{}- Sort: keys={:?}\n", indent_str, keys_str));
             format_logical_node(source, indent + 1, out);
         }
-        LogicalPlan::Limit { source, limit, offset } => {
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => {
             let limit_str = match limit {
                 Some(lim) => lim.to_string(),
                 None => "none".to_string(),
             };
-            out.push_str(&format!("{}- Limit: count={}, offset={}\n", indent_str, limit_str, offset));
+            out.push_str(&format!(
+                "{}- Limit: count={}, offset={}\n",
+                indent_str, limit_str, offset
+            ));
             format_logical_node(source, indent + 1, out);
         }
     }
@@ -246,7 +282,11 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
                 _ => DataType::Int, // Logical/comparison operators return Int (0 or 1)
             }
         }
-        Expr::Case { results, else_result, .. } => {
+        Expr::Case {
+            results,
+            else_result,
+            ..
+        } => {
             if let Some(first_res) = results.first() {
                 infer_expr_type(first_res, source_schema)
             } else if let Some(else_res) = else_result {

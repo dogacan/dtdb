@@ -1,13 +1,16 @@
-use std::io::{self, Write};
-use futures_util::StreamExt;
 use dtdb_api::client::DuctTapeDbClient;
-use dtdb_storage::CompressionType;
 use dtdb_relational::DatabaseOptions;
+use dtdb_storage::CompressionType;
+use futures_util::StreamExt;
+use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_addr = "http://127.0.0.1:50051".to_string();
-    println!("Connecting to remote DuctTapeDB server at {}...", server_addr);
+    println!(
+        "Connecting to remote DuctTapeDB server at {}...",
+        server_addr
+    );
 
     let mut client = match DuctTapeDbClient::connect(server_addr).await {
         Ok(c) => c,
@@ -27,8 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("                wal_size=<bytes>");
     println!("                flush_interval=<ms>");
     println!("  drop database <name>;                                  - Delete a database");
-    println!("  flush database [<name>];                               - Flush memory buffers to disk");
-    println!("  <SQL Query>;                                           - Run SELECT/INSERT/CREATE TABLE/DROP TABLE");
+    println!(
+        "  flush database [<name>];                               - Flush memory buffers to disk"
+    );
+    println!(
+        "  <SQL Query>;                                           - Run SELECT/INSERT/CREATE TABLE/DROP TABLE"
+    );
     println!("  exit | quit;                                           - Exit shell");
     println!();
 
@@ -91,7 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 2. Intercept "CREATE DATABASE <name> [options...]"
-            if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("create") && parts[1].eq_ignore_ascii_case("database") {
+            if parts.len() >= 3
+                && parts[0].eq_ignore_ascii_case("create")
+                && parts[1].eq_ignore_ascii_case("database")
+            {
                 let db_name = parts[2];
                 let mut compression = CompressionType::Lz4;
                 let mut memtable_size_limit = 1024 * 1024;
@@ -108,7 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else if comp_val == "lz4" {
                             compression = CompressionType::Lz4;
                         } else {
-                            println!("Warning: Unknown compression type '{}', defaulting to LZ4.", comp_val);
+                            println!(
+                                "Warning: Unknown compression type '{}', defaulting to LZ4.",
+                                comp_val
+                            );
                         }
                     } else if part_lower.starts_with("memtable_size=") {
                         if let Ok(v) = part_lower.split('=').nth(1).unwrap_or("").parse::<usize>() {
@@ -163,14 +176,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 3. Intercept "DROP DATABASE <name>"
-            if parts.len() == 3 && parts[0].eq_ignore_ascii_case("drop") && parts[1].eq_ignore_ascii_case("database") {
+            if parts.len() == 3
+                && parts[0].eq_ignore_ascii_case("drop")
+                && parts[1].eq_ignore_ascii_case("database")
+            {
                 let db_name = parts[2];
                 match client.drop_db(db_name).await {
                     Ok(resp) => {
-                        if resp.success
-                            && Some(db_name.to_string()) == active_db {
-                                active_db = None;
-                            }
+                        if resp.success && Some(db_name.to_string()) == active_db {
+                            active_db = None;
+                        }
                         println!("{}", resp.message);
                     }
                     Err(e) => {
@@ -182,7 +197,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 4. Intercept "FLUSH DATABASE [name]"
-            if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("flush") && parts[1].eq_ignore_ascii_case("database") {
+            if parts.len() >= 2
+                && parts[0].eq_ignore_ascii_case("flush")
+                && parts[1].eq_ignore_ascii_case("database")
+            {
                 let target_db = if parts.len() >= 3 {
                     Some(parts[2].to_string())
                 } else {
@@ -190,18 +208,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 match target_db {
-                    Some(db) => {
-                        match client.flush_db(&db).await {
-                            Ok(resp) => {
-                                println!("{}", resp.message);
-                            }
-                            Err(e) => {
-                                println!("Error: {}", e.message());
-                            }
+                    Some(db) => match client.flush_db(&db).await {
+                        Ok(resp) => {
+                            println!("{}", resp.message);
                         }
-                    }
+                        Err(e) => {
+                            println!("Error: {}", e.message());
+                        }
+                    },
                     None => {
-                        println!("Error: No database selected. Run 'USE <database_name>;' or specify database name.");
+                        println!(
+                            "Error: No database selected. Run 'USE <database_name>;' or specify database name."
+                        );
                     }
                 }
                 println!();

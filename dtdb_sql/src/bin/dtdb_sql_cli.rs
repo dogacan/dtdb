@@ -1,10 +1,10 @@
+use dtdb_relational::{Database, Transaction};
+use dtdb_sql::{ExecutionResult, SqlEngine};
+use dtdb_storage::DbValue;
 use std::env;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
-use dtdb_storage::DbValue;
-use dtdb_relational::{Database, Transaction};
-use dtdb_sql::{SqlEngine, ExecutionResult};
 
 fn main() {
     // 1. Parse CLI arguments
@@ -114,11 +114,8 @@ fn display_result(res: ExecutionResult) {
             }
 
             // Format SELECT query results nicely as a text table
-            let mut col_widths: Vec<usize> = schema
-                .columns
-                .iter()
-                .map(|col| col.name.len())
-                .collect();
+            let mut col_widths: Vec<usize> =
+                schema.columns.iter().map(|col| col.name.len()).collect();
 
             // Calculate max width for each column
             let mut row_strings = Vec::new();

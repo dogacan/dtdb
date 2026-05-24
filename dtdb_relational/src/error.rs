@@ -1,5 +1,5 @@
-use thiserror::Error;
 use dtdb_storage::StorageError;
+use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, RelationalError>;
 

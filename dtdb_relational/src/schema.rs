@@ -1,8 +1,8 @@
-use std::path::Path;
-use serde::{Deserialize, Serialize};
-use dtdb_storage::{DbKey, DbValue};
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
+use dtdb_storage::{DbKey, DbValue};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// DataType represents the supported SQL data types in DuctTapeDB.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

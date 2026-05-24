@@ -1,18 +1,22 @@
-use std::sync::Arc;
-use sqlparser::ast::{
-    BinaryOperator, ColumnOption, DataType as SqlDataType, Expr as SqlExpr,
-    FunctionArg, FunctionArgExpr, Query, SelectItem, Statement,
-    TableFactor, Value as SqlValue,
-};
-use dtdb_storage::DbValue;
-use dtdb_relational::{Column, DataType, Database, Schema};
 use crate::expr::{Expr, Operator};
-use crate::logical::{AggregateExpr, LogicalPlan, JoinType};
+use crate::logical::{AggregateExpr, JoinType, LogicalPlan};
+use dtdb_relational::{Column, DataType, Database, Schema};
+use dtdb_storage::DbValue;
+use sqlparser::ast::{
+    BinaryOperator, ColumnOption, DataType as SqlDataType, Expr as SqlExpr, FunctionArg,
+    FunctionArgExpr, Query, SelectItem, Statement, TableFactor, Value as SqlValue,
+};
+use std::sync::Arc;
 
 /// Represents a parsed and planned SQL statement.
 pub enum SqlStatement {
-    CreateTable { name: String, schema: Schema },
-    DropTable { name: String },
+    CreateTable {
+        name: String,
+        schema: Schema,
+    },
+    DropTable {
+        name: String,
+    },
     Insert {
         table_name: String,
         columns: Vec<String>,
@@ -50,9 +54,16 @@ impl LogicalPlanner {
 
                 for col in columns {
                     let dt = match &col.data_type {
-                        SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => DataType::Int,
-                        SqlDataType::Float(_) | SqlDataType::Double | SqlDataType::Real => DataType::Float,
-                        SqlDataType::Text | SqlDataType::Varchar(_) | SqlDataType::Char(_) | SqlDataType::String => DataType::String,
+                        SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => {
+                            DataType::Int
+                        }
+                        SqlDataType::Float(_) | SqlDataType::Double | SqlDataType::Real => {
+                            DataType::Float
+                        }
+                        SqlDataType::Text
+                        | SqlDataType::Varchar(_)
+                        | SqlDataType::Char(_)
+                        | SqlDataType::String => DataType::String,
                         SqlDataType::Bytea | SqlDataType::Blob(_) => DataType::Bytes,
                         other => return Err(format!("Unsupported SQL data type: {:?}", other)),
                     };
@@ -62,10 +73,11 @@ impl LogicalPlanner {
                         .iter()
                         .any(|opt| matches!(opt.option, ColumnOption::Unique { is_primary: true }));
 
-                    let is_nullable = !is_pk && !col
-                        .options
-                        .iter()
-                        .any(|opt| matches!(opt.option, ColumnOption::NotNull));
+                    let is_nullable = !is_pk
+                        && !col
+                            .options
+                            .iter()
+                            .any(|opt| matches!(opt.option, ColumnOption::NotNull));
 
                     cols.push(Column {
                         name: col.name.value.clone(),
@@ -81,9 +93,7 @@ impl LogicalPlanner {
                 })
             }
             Statement::Drop {
-                object_type,
-                names,
-                ..
+                object_type, names, ..
             } => {
                 // E.g., DROP TABLE names[0]
                 if matches!(object_type, sqlparser::ast::ObjectType::Table) && !names.is_empty() {
@@ -107,7 +117,12 @@ impl LogicalPlanner {
 
                 let col_names = if columns.is_empty() {
                     // Default to all columns in schema order
-                    table.schema.columns.iter().map(|c| c.name.clone()).collect()
+                    table
+                        .schema
+                        .columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect()
                 } else {
                     columns.iter().map(|c| c.value.clone()).collect()
                 };
@@ -123,7 +138,7 @@ impl LogicalPlanner {
                                     return Err(format!(
                                         "INSERT expects literal values, got expression {:?}",
                                         other
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -137,13 +152,17 @@ impl LogicalPlanner {
                     rows,
                 })
             }
-            Statement::Delete { from, selection, .. } => {
+            Statement::Delete {
+                from, selection, ..
+            } => {
                 if from.is_empty() {
                     return Err("DELETE statement requires a table name".to_string());
                 }
                 let name_str = match &from[0].relation {
                     TableFactor::Table { name, .. } => name.to_string(),
-                    other => return Err(format!("Unsupported table factor in DELETE: {:?}", other)),
+                    other => {
+                        return Err(format!("Unsupported table factor in DELETE: {:?}", other));
+                    }
                 };
                 let filter = match selection {
                     Some(expr) => Some(plan_expr(expr)?),
@@ -154,10 +173,17 @@ impl LogicalPlanner {
                     filter,
                 })
             }
-            Statement::Update { table, assignments, selection, .. } => {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => {
                 let name_str = match &table.relation {
                     TableFactor::Table { name, .. } => name.to_string(),
-                    other => return Err(format!("Unsupported table factor in UPDATE: {:?}", other)),
+                    other => {
+                        return Err(format!("Unsupported table factor in UPDATE: {:?}", other));
+                    }
                 };
                 let mut my_assignments = Vec::new();
                 for assign in assignments {
@@ -211,12 +237,12 @@ impl LogicalPlanner {
             for join in &relation.joins {
                 let right_scan = self.plan_table_factor(&join.relation)?;
                 let (join_cond, join_type) = match &join.join_operator {
-                    sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr)) => {
-                        (plan_expr(expr)?, JoinType::Inner)
-                    }
-                    sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr)) => {
-                        (plan_expr(expr)?, JoinType::Left)
-                    }
+                    sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(
+                        expr,
+                    )) => (plan_expr(expr)?, JoinType::Inner),
+                    sqlparser::ast::JoinOperator::LeftOuter(
+                        sqlparser::ast::JoinConstraint::On(expr),
+                    ) => (plan_expr(expr)?, JoinType::Left),
                     other => return Err(format!("Unsupported join type: {:?}", other)),
                 };
                 plan = LogicalPlan::Join {
@@ -265,12 +291,13 @@ impl LogicalPlanner {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                         if let Ok(planned) = plan_expr(expr)
-                            && let Some(pos) = group_exprs.iter().position(|ge| ge == &planned) {
-                                if let SelectItem::ExprWithAlias { alias, .. } = item {
-                                    field_names[pos] = alias.value.clone();
-                                }
-                                continue;
+                            && let Some(pos) = group_exprs.iter().position(|ge| ge == &planned)
+                        {
+                            if let SelectItem::ExprWithAlias { alias, .. } = item {
+                                field_names[pos] = alias.value.clone();
                             }
+                            continue;
+                        }
 
                         let alias = match item {
                             SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
@@ -279,7 +306,7 @@ impl LogicalPlanner {
                         extract_aggregates(expr, &mut aggr_exprs, &mut field_names, alias)?;
                     }
                     SelectItem::Wildcard(_) => {
-                        return Err("Wildcards not allowed in GROUP BY / Aggregations".to_string())
+                        return Err("Wildcards not allowed in GROUP BY / Aggregations".to_string());
                     }
                     _ => {}
                 }
@@ -363,7 +390,9 @@ impl LogicalPlanner {
         // 7. Plan LIMIT and OFFSET
         let limit = if let Some(limit_expr) = &query.limit {
             let l = match limit_expr {
-                SqlExpr::Value(SqlValue::Number(s, _)) => s.parse::<usize>().map_err(|e| e.to_string())?,
+                SqlExpr::Value(SqlValue::Number(s, _)) => {
+                    s.parse::<usize>().map_err(|e| e.to_string())?
+                }
                 other => return Err(format!("Unsupported limit expression: {:?}", other)),
             };
             Some(l)
@@ -373,7 +402,9 @@ impl LogicalPlanner {
 
         let offset = if let Some(offset_val) = &query.offset {
             match &offset_val.value {
-                SqlExpr::Value(SqlValue::Number(s, _)) => s.parse::<usize>().map_err(|e| e.to_string())?,
+                SqlExpr::Value(SqlValue::Number(s, _)) => {
+                    s.parse::<usize>().map_err(|e| e.to_string())?
+                }
                 other => return Err(format!("Unsupported offset expression: {:?}", other)),
             }
         } else {
@@ -457,7 +488,12 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             };
             Ok(Expr::Literal(db_val))
         }
-        SqlExpr::Like { negated, expr, pattern, escape_char: _ } => {
+        SqlExpr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char: _,
+        } => {
             if *negated {
                 return Err("NOT LIKE is not supported yet".to_string());
             }
@@ -493,19 +529,15 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
         SqlExpr::UnaryOp { op, expr } => {
             let inner = plan_expr(expr)?;
             match op {
-                sqlparser::ast::UnaryOperator::Minus => {
-                    match inner {
-                        Expr::Literal(DbValue::Int(i)) => Ok(Expr::Literal(DbValue::Int(-i))),
-                        Expr::Literal(DbValue::Float(f)) => Ok(Expr::Literal(DbValue::Float(-f))),
-                        other => {
-                            Ok(Expr::BinaryOp {
-                                left: Box::new(Expr::Literal(DbValue::Int(0))),
-                                op: Operator::Sub,
-                                right: Box::new(other),
-                            })
-                        }
-                    }
-                }
+                sqlparser::ast::UnaryOperator::Minus => match inner {
+                    Expr::Literal(DbValue::Int(i)) => Ok(Expr::Literal(DbValue::Int(-i))),
+                    Expr::Literal(DbValue::Float(f)) => Ok(Expr::Literal(DbValue::Float(-f))),
+                    other => Ok(Expr::BinaryOp {
+                        left: Box::new(Expr::Literal(DbValue::Int(0))),
+                        op: Operator::Sub,
+                        right: Box::new(other),
+                    }),
+                },
                 sqlparser::ast::UnaryOperator::Plus => Ok(inner),
                 other => Err(format!("Unsupported unary operator: {:?}", other)),
             }
@@ -543,16 +575,24 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             let name = func.name.to_string();
             let name_upper = name.to_uppercase();
             if matches!(name_upper.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
-                return Err(format!("Aggregate function {} cannot be used in scalar expression context", name));
+                return Err(format!(
+                    "Aggregate function {} cannot be used in scalar expression context",
+                    name
+                ));
             }
-            if matches!(name_upper.as_str(), "SUBSTR" | "SUBSTRING" | "LENGTH" | "COALESCE") {
+            if matches!(
+                name_upper.as_str(),
+                "SUBSTR" | "SUBSTRING" | "LENGTH" | "COALESCE"
+            ) {
                 let mut args = Vec::new();
                 for arg in &func.args {
                     match arg {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
                             args.push(plan_expr(inner_expr)?);
                         }
-                        other => return Err(format!("Unsupported function argument type: {:?}", other)),
+                        other => {
+                            return Err(format!("Unsupported function argument type: {:?}", other));
+                        }
                     }
                 }
                 Ok(Expr::Function { name, args })
@@ -568,9 +608,10 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
 fn select_items_have_aggrs(projection: &[SelectItem]) -> bool {
     for item in projection {
         if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item
-            && has_aggregate_function(expr) {
-                return true;
-            }
+            && has_aggregate_function(expr)
+        {
+            return true;
+        }
     }
     false
 }
@@ -603,8 +644,12 @@ fn extract_aggregates(
                 Expr::Literal(DbValue::Int(1))
             } else {
                 match &func.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => plan_expr(inner_expr)?,
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Expr::Literal(DbValue::Int(1)),
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
+                        plan_expr(inner_expr)?
+                    }
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                        Expr::Literal(DbValue::Int(1))
+                    }
                     other => return Err(format!("Unsupported function argument: {:?}", other)),
                 }
             };

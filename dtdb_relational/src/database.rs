@@ -1,13 +1,13 @@
+use crate::error::{RelationalError, Result};
+use crate::schema::Schema;
+use dtdb_storage::{CompressionType, EngineOptions, StorageEngine, ThreadSpawner, WalEntry};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, Mutex};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
-use dtdb_storage::{StorageEngine, CompressionType, EngineOptions, WalEntry, ThreadSpawner};
-use crate::error::{RelationalError, Result};
-use crate::schema::Schema;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum TransactionRecord {
@@ -86,7 +86,9 @@ impl Database {
         let db_options_path = dir_path.join("db_options.bin");
         let options = if db_options_path.exists() {
             let bytes = fs::read(&db_options_path)?;
-            bincode::deserialize::<DatabaseOptions>(&bytes).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?
+            bincode::deserialize::<DatabaseOptions>(&bytes).map_err(|e| {
+                RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
+            })?
         } else {
             DatabaseOptions {
                 compression: CompressionType::Lz4,
@@ -106,7 +108,11 @@ impl Database {
 
     /// Opens the database catalog directory with specified options and loads all tables.
     pub fn open_with_options(dir_path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
-        Self::open_with_options_and_spawner(dir_path, options, Arc::new(dtdb_storage::DefaultSpawner))
+        Self::open_with_options_and_spawner(
+            dir_path,
+            options,
+            Arc::new(dtdb_storage::DefaultSpawner),
+        )
     }
 
     /// Opens the database catalog directory with specified options and a custom ThreadSpawner, and loads all tables.
@@ -122,17 +128,17 @@ impl Database {
         for entry in fs::read_dir(&dir_path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with(".tmp_drop_") {
-                        let _ = fs::remove_dir_all(&path);
-                    }
-                }
+            if path.is_dir()
+                && let Some(name) = path.file_name().and_then(|s| s.to_str())
+                && name.starts_with(".tmp_drop_")
+            {
+                let _ = fs::remove_dir_all(&path);
             }
         }
 
         let db_options_path = dir_path.join("db_options.bin");
-        let bytes = bincode::serialize(&options).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+        let bytes = bincode::serialize(&options)
+            .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
         fs::write(&db_options_path, bytes)?;
 
         let mut tables = HashMap::new();
@@ -164,11 +170,17 @@ impl Database {
                         wal_size_limit: options.wal_size_limit,
                         l0_compaction_threshold: options.l0_compaction_threshold.unwrap_or(4),
                         sstable_target_size: options.sstable_target_size.unwrap_or(2 * 1024 * 1024),
-                        base_level_size_limit: options.base_level_size_limit.unwrap_or(10 * 1024 * 1024),
+                        base_level_size_limit: options
+                            .base_level_size_limit
+                            .unwrap_or(10 * 1024 * 1024),
                         level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
                         max_level: options.max_level.unwrap_or(7),
                     };
-                    let engine = Arc::new(StorageEngine::open_with_spawner(&path, engine_opts, spawner.clone())?);
+                    let engine = Arc::new(StorageEngine::open_with_spawner(
+                        &path,
+                        engine_opts,
+                        spawner.clone(),
+                    )?);
 
                     tables.insert(
                         name.clone(),
@@ -231,13 +243,20 @@ impl Database {
             wal_size_limit: self.options.wal_size_limit,
             l0_compaction_threshold: self.options.l0_compaction_threshold.unwrap_or(4),
             sstable_target_size: self.options.sstable_target_size.unwrap_or(2 * 1024 * 1024),
-            base_level_size_limit: self.options.base_level_size_limit.unwrap_or(10 * 1024 * 1024),
+            base_level_size_limit: self
+                .options
+                .base_level_size_limit
+                .unwrap_or(10 * 1024 * 1024),
             level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
             max_level: self.options.max_level.unwrap_or(7),
         };
 
         // Open the new Layer 1 storage engine
-        let engine = Arc::new(StorageEngine::open_with_spawner(&table_path, engine_opts, self.spawner.clone())?);
+        let engine = Arc::new(StorageEngine::open_with_spawner(
+            &table_path,
+            engine_opts,
+            self.spawner.clone(),
+        )?);
 
         tables_guard.insert(
             name.to_string(),
@@ -257,7 +276,7 @@ impl Database {
     /// and deletes the table directory on disk.
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let mut tables_guard = self.tables.write().unwrap();
-        
+
         // Remove the table from catalog mapping.
         // This drops our `Table` instance, dropping the `Arc<StorageEngine>`.
         let table = tables_guard
@@ -271,7 +290,9 @@ impl Database {
         loop {
             let has_active_readers = {
                 let access = self.active_table_access.lock().unwrap();
-                access.get(name).map_or(false, |readers| !readers.is_empty())
+                access
+                    .get(name)
+                    .is_some_and(|readers| !readers.is_empty())
             };
             if !has_active_readers {
                 break;
@@ -344,7 +365,7 @@ impl Database {
     pub fn commit_transaction(&self, tx_id: u64) -> Result<()> {
         let mut active = self.active_transactions.lock().unwrap();
         active.remove(&tx_id);
-        
+
         if active.is_empty() {
             // Truncate the file to zero to keep it compact.
             let _ = File::create(&self.transaction_log_path)?;
@@ -379,8 +400,9 @@ impl Database {
                 Err(e) => return Err(RelationalError::Io(e)),
             }
 
-            let record: TransactionRecord = bincode::deserialize(&bytes)
-                .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+            let record: TransactionRecord = bincode::deserialize(&bytes).map_err(|e| {
+                RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
+            })?;
             match record {
                 TransactionRecord::Prepared { tx_id, mutations } => {
                     prepared.insert(tx_id, mutations);
@@ -400,7 +422,10 @@ impl Database {
         for (tx_id, mutations) in prepared {
             for (table_name, entries) in mutations {
                 if let Ok(table) = self.get_table(&table_name) {
-                    println!("Rolling forward transaction {} for table {}", tx_id, table_name);
+                    println!(
+                        "Rolling forward transaction {} for table {}",
+                        tx_id, table_name
+                    );
                     table.engine.write_batch(entries)?;
                 }
             }
@@ -412,7 +437,9 @@ impl Database {
     }
 
     pub fn register_transaction(&self, tx_id: u64) -> u64 {
-        let version = self.global_commit_version.load(std::sync::atomic::Ordering::SeqCst);
+        let version = self
+            .global_commit_version
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut active = self.occ_active_transactions.lock().unwrap();
         active.insert(tx_id, version);
         version
@@ -420,7 +447,10 @@ impl Database {
 
     pub fn register_table_access(&self, table_name: &str, tx_id: u64) {
         let mut access = self.active_table_access.lock().unwrap();
-        access.entry(table_name.to_string()).or_default().insert(tx_id);
+        access
+            .entry(table_name.to_string())
+            .or_default()
+            .insert(tx_id);
     }
 
     pub fn unregister_transaction(&self, tx_id: u64) {
@@ -493,7 +523,10 @@ impl Database {
         }
 
         // 2. Increment global commit version to get a unique commit version
-        let commit_version = self.global_commit_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let commit_version = self
+            .global_commit_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
 
         // 3. Append to history
         let new_record = CommitRecord {

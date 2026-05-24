@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use dtdb_storage::DbValue;
 use dtdb_relational::{Row, Schema};
+use dtdb_storage::DbValue;
+use serde::{Deserialize, Serialize};
 
 /// Operator represents binary operations in SQL WHERE conditions.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +106,7 @@ impl Expr {
                             }
                         }
                         _ => unreachable!(),
-                    }
+                    };
                 } else if matches!(l_val, DbValue::Null) || matches!(r_val, DbValue::Null) {
                     // Propagate NULL for arithmetic, comparison, and LIKE operations
                     return Ok(DbValue::Null);
@@ -121,22 +121,14 @@ impl Expr {
                         let matched = like_match(&text, &pattern);
                         Ok(DbValue::Int(if matched { 1 } else { 0 }))
                     }
-                    Operator::Add => {
-                        eval_arithmetic(&l_val, &r_val, |a, b| a + b, |a, b| a + b)
-                    }
-                    Operator::Sub => {
-                        eval_arithmetic(&l_val, &r_val, |a, b| a - b, |a, b| a - b)
-                    }
-                    Operator::Mul => {
-                        eval_arithmetic(&l_val, &r_val, |a, b| a * b, |a, b| a * b)
-                    }
-                    Operator::Div => {
-                        match r_val {
-                            DbValue::Int(0) => Err("Division by zero".to_string()),
-                            DbValue::Float(0.0) => Err("Division by zero".to_string()),
-                            _ => eval_arithmetic(&l_val, &r_val, |a, b| a / b, |a, b| a / b),
-                        }
-                    }
+                    Operator::Add => eval_arithmetic(&l_val, &r_val, |a, b| a + b, |a, b| a + b),
+                    Operator::Sub => eval_arithmetic(&l_val, &r_val, |a, b| a - b, |a, b| a - b),
+                    Operator::Mul => eval_arithmetic(&l_val, &r_val, |a, b| a * b, |a, b| a * b),
+                    Operator::Div => match r_val {
+                        DbValue::Int(0) => Err("Division by zero".to_string()),
+                        DbValue::Float(0.0) => Err("Division by zero".to_string()),
+                        _ => eval_arithmetic(&l_val, &r_val, |a, b| a / b, |a, b| a / b),
+                    },
                     other_op => {
                         let ordering = compare_values(&l_val, &r_val)?;
                         let matched = match other_op {
@@ -165,7 +157,9 @@ impl Expr {
                 else_result,
             } => {
                 if conditions.len() != results.len() {
-                    return Err("CASE expression conditions and results length mismatch".to_string());
+                    return Err(
+                        "CASE expression conditions and results length mismatch".to_string()
+                    );
                 }
 
                 let mut matched_idx = None;
@@ -174,10 +168,11 @@ impl Expr {
                     for (i, cond_expr) in conditions.iter().enumerate() {
                         let cond_val = cond_expr.eval(row, schema)?;
                         if let Ok(ordering) = compare_values(&op_val, &cond_val)
-                            && ordering == std::cmp::Ordering::Equal {
-                                matched_idx = Some(i);
-                                break;
-                            }
+                            && ordering == std::cmp::Ordering::Equal
+                        {
+                            matched_idx = Some(i);
+                            break;
+                        }
                     }
                 } else {
                     for (i, cond_expr) in conditions.iter().enumerate() {
@@ -202,7 +197,10 @@ impl Expr {
                 match name_upper.as_str() {
                     "LENGTH" => {
                         if args.len() != 1 {
-                            return Err(format!("LENGTH expects exactly 1 argument, got {}", args.len()));
+                            return Err(format!(
+                                "LENGTH expects exactly 1 argument, got {}",
+                                args.len()
+                            ));
                         }
                         let val = args[0].eval(row, schema)?;
                         if matches!(val, DbValue::Null) {
@@ -213,7 +211,10 @@ impl Expr {
                     }
                     "SUBSTR" | "SUBSTRING" => {
                         if args.len() != 2 && args.len() != 3 {
-                            return Err(format!("SUBSTR expects 2 or 3 arguments, got {}", args.len()));
+                            return Err(format!(
+                                "SUBSTR expects 2 or 3 arguments, got {}",
+                                args.len()
+                            ));
                         }
                         let val = args[0].eval(row, schema)?;
                         if matches!(val, DbValue::Null) {
@@ -223,7 +224,12 @@ impl Expr {
                         let start_val = args[1].eval(row, schema)?;
                         let start = match start_val {
                             DbValue::Int(i) => i,
-                            other => return Err(format!("SUBSTR start index must be integer, got {:?}", other)),
+                            other => {
+                                return Err(format!(
+                                    "SUBSTR start index must be integer, got {:?}",
+                                    other
+                                ));
+                            }
                         };
 
                         let chars: Vec<char> = s.chars().collect();
@@ -247,7 +253,12 @@ impl Expr {
                             let len_val = args[2].eval(row, schema)?;
                             let length = match len_val {
                                 DbValue::Int(i) => i,
-                                other => return Err(format!("SUBSTR length must be integer, got {:?}", other)),
+                                other => {
+                                    return Err(format!(
+                                        "SUBSTR length must be integer, got {:?}",
+                                        other
+                                    ));
+                                }
                             };
                             if length <= 0 {
                                 Ok(DbValue::String("".to_string()))
@@ -256,7 +267,9 @@ impl Expr {
                                 let active_start = start_idx.max(0) as usize;
                                 let active_end = end_idx.clamp(0, n) as usize;
                                 if active_start < active_end && active_start < chars.len() {
-                                    Ok(DbValue::String(chars[active_start..active_end].iter().collect()))
+                                    Ok(DbValue::String(
+                                        chars[active_start..active_end].iter().collect(),
+                                    ))
                                 } else {
                                     Ok(DbValue::String("".to_string()))
                                 }
@@ -320,15 +333,15 @@ fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String
         (DbValue::Null, _) => Ok(std::cmp::Ordering::Less),
         (_, DbValue::Null) => Ok(std::cmp::Ordering::Greater),
         (DbValue::Int(lv), DbValue::Int(rv)) => Ok(lv.cmp(rv)),
-        (DbValue::Float(lv), DbValue::Float(rv)) => {
-            lv.partial_cmp(rv).ok_or_else(|| "NaN float comparison".to_string())
-        }
-        (DbValue::Int(lv), DbValue::Float(rv)) => {
-            (*lv as f64).partial_cmp(rv).ok_or_else(|| "NaN float comparison".to_string())
-        }
-        (DbValue::Float(lv), DbValue::Int(rv)) => {
-            lv.partial_cmp(&(*rv as f64)).ok_or_else(|| "NaN float comparison".to_string())
-        }
+        (DbValue::Float(lv), DbValue::Float(rv)) => lv
+            .partial_cmp(rv)
+            .ok_or_else(|| "NaN float comparison".to_string()),
+        (DbValue::Int(lv), DbValue::Float(rv)) => (*lv as f64)
+            .partial_cmp(rv)
+            .ok_or_else(|| "NaN float comparison".to_string()),
+        (DbValue::Float(lv), DbValue::Int(rv)) => lv
+            .partial_cmp(&(*rv as f64))
+            .ok_or_else(|| "NaN float comparison".to_string()),
         (DbValue::String(lv), DbValue::String(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Bytes(lv), DbValue::Bytes(rv)) => Ok(lv.cmp(rv)),
         (expected, actual) => Err(format!(
@@ -386,22 +399,13 @@ where
     FF: FnOnce(f64, f64) -> f64,
 {
     match (l, r) {
-        (DbValue::Int(lv), DbValue::Int(rv)) => {
-            Ok(DbValue::Int(int_op(*lv, *rv)))
-        }
-        (DbValue::Float(lv), DbValue::Float(rv)) => {
-            Ok(DbValue::Float(float_op(*lv, *rv)))
-        }
-        (DbValue::Int(lv), DbValue::Float(rv)) => {
-            Ok(DbValue::Float(float_op(*lv as f64, *rv)))
-        }
-        (DbValue::Float(lv), DbValue::Int(rv)) => {
-            Ok(DbValue::Float(float_op(*lv, *rv as f64)))
-        }
+        (DbValue::Int(lv), DbValue::Int(rv)) => Ok(DbValue::Int(int_op(*lv, *rv))),
+        (DbValue::Float(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv, *rv))),
+        (DbValue::Int(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv as f64, *rv))),
+        (DbValue::Float(lv), DbValue::Int(rv)) => Ok(DbValue::Float(float_op(*lv, *rv as f64))),
         (expected, actual) => Err(format!(
             "Cannot perform arithmetic on non-numeric types: {:?} and {:?}",
             expected, actual
         )),
     }
 }
-
