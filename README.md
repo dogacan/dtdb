@@ -193,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### C++ & Swift Bindings
 
-DuctTapeDB provides FFI bindings in the `dtdb_bindings` crate, allowing you to embed the database or connect to a gRPC server from C++ and Swift natively. 
+DuctTapeDB provides FFI bindings in the `dtdb_bindings` crate, allowing you to embed the database or connect to a gRPC server from C++ and Swift natively.
 
 It exposes a clean, synchronous client wrapper (`dtdb::Client`) featuring an exception-safe counterpart to `run_in_transaction`. For a complete guide on how to build, link, and use the C++ and Swift API, see the [C++ & Swift Bindings Guide](docs/bindings.md).
 
@@ -212,8 +212,8 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 ## 📚 Design Decisions
 
 * **Optimistic Concurrency Control (OCC)**: Transactions execute concurrently on top of a multi-threaded engine, using an OCC validation phase at commit time (checking read-write, write-write, and phantom conflicts) to guarantee isolation without coarse-grained locking.
+* **Snapshot Isolation**: DuctTableDB only implements snapshot isolation. SI is a well-understood, widely-deployed isolation level (used by PostgreSQL's default READ COMMITTED + REPEATABLE READ modes, Oracle, MySQL InnoDB). It is weaker than SERIALIZABLE but stronger than READ COMMITTED. Full SERIALIZABLE transactions are not supported for now.
 * **In-Memory Sorts**: Sorting and aggregations collect row lists in-memory rather than spilling sorted runs to temporary storage.
 * **Hash Joins**: Equality joins are performed via building temporary hash tables of the left stream and probing them from the right stream.
 * **Single-Statement Query Limitation**: Standard query execution (`execute()`) strictly rejects inputs containing multiple semicolon-separated statements. To run multiple queries atomically, users are required to use the explicit transaction interface (`run_in_transaction` or the gRPC transaction stream), ensuring transaction boundaries are clear and handled safely.
 * **Locality Groups & Column Storage**: Supports grouping table columns into separate physical locality groups stored in independent LSM-tree subdirectories. To guarantee 100% correct transactional updates without complex partial-row merges or concurrency anomalies, the database reads all columns during `UPDATE` operations while optimizing read paths (`SELECT` queries) using query-level column pruning to read only the needed locality groups.
-
