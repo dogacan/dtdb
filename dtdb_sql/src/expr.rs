@@ -30,6 +30,16 @@ pub enum Expr {
         op: Operator,
         right: Box<Expr>,
     },
+    Case {
+        operand: Option<Box<Expr>>,
+        conditions: Vec<Expr>,
+        results: Vec<Expr>,
+        else_result: Option<Box<Expr>>,
+    },
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 impl Expr {
@@ -118,7 +128,149 @@ impl Expr {
                     }
                 }
             }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if conditions.len() != results.len() {
+                    return Err("CASE expression conditions and results length mismatch".to_string());
+                }
+
+                let mut matched_idx = None;
+                if let Some(op_expr) = operand {
+                    let op_val = op_expr.eval(row, schema)?;
+                    for (i, cond_expr) in conditions.iter().enumerate() {
+                        let cond_val = cond_expr.eval(row, schema)?;
+                        if let Ok(ordering) = compare_values(&op_val, &cond_val) {
+                            if ordering == std::cmp::Ordering::Equal {
+                                matched_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    for (i, cond_expr) in conditions.iter().enumerate() {
+                        let cond_val = cond_expr.eval(row, schema)?;
+                        if to_bool(&cond_val)? {
+                            matched_idx = Some(i);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(idx) = matched_idx {
+                    results[idx].eval(row, schema)
+                } else if let Some(else_expr) = else_result {
+                    else_expr.eval(row, schema)
+                } else if !results.is_empty() {
+                    let first_val = results[0].eval(row, schema)?;
+                    match first_val {
+                        DbValue::Int(_) => Ok(DbValue::Int(0)),
+                        DbValue::Float(_) => Ok(DbValue::Float(0.0)),
+                        DbValue::String(_) => Ok(DbValue::String("".to_string())),
+                        DbValue::Bytes(_) => Ok(DbValue::Bytes(Vec::new())),
+                    }
+                } else {
+                    Ok(DbValue::Int(0))
+                }
+            }
+            Expr::Function { name, args } => {
+                let name_upper = name.to_uppercase();
+                match name_upper.as_str() {
+                    "LENGTH" => {
+                        if args.len() != 1 {
+                            return Err(format!("LENGTH expects exactly 1 argument, got {}", args.len()));
+                        }
+                        let val = args[0].eval(row, schema)?;
+                        let s = coerce_to_string(&val);
+                        Ok(DbValue::Int(s.chars().count() as i64))
+                    }
+                    "SUBSTR" | "SUBSTRING" => {
+                        if args.len() != 2 && args.len() != 3 {
+                            return Err(format!("SUBSTR expects 2 or 3 arguments, got {}", args.len()));
+                        }
+                        let val = args[0].eval(row, schema)?;
+                        let s = coerce_to_string(&val);
+                        let start_val = args[1].eval(row, schema)?;
+                        let start = match start_val {
+                            DbValue::Int(i) => i,
+                            other => return Err(format!("SUBSTR start index must be integer, got {:?}", other)),
+                        };
+
+                        let chars: Vec<char> = s.chars().collect();
+                        let n = chars.len() as i64;
+                        let start_idx = if start > 0 {
+                            start - 1
+                        } else if start == 0 {
+                            -1
+                        } else {
+                            n + start
+                        };
+
+                        if args.len() == 2 {
+                            let start_rust = start_idx.max(0) as usize;
+                            if start_rust >= chars.len() {
+                                Ok(DbValue::String("".to_string()))
+                            } else {
+                                Ok(DbValue::String(chars[start_rust..].iter().collect()))
+                            }
+                        } else {
+                            let len_val = args[2].eval(row, schema)?;
+                            let length = match len_val {
+                                DbValue::Int(i) => i,
+                                other => return Err(format!("SUBSTR length must be integer, got {:?}", other)),
+                            };
+                            if length <= 0 {
+                                Ok(DbValue::String("".to_string()))
+                            } else {
+                                let end_idx = start_idx + length;
+                                let active_start = start_idx.max(0) as usize;
+                                let active_end = end_idx.clamp(0, n) as usize;
+                                if active_start < active_end && active_start < chars.len() {
+                                    Ok(DbValue::String(chars[active_start..active_end].iter().collect()))
+                                } else {
+                                    Ok(DbValue::String("".to_string()))
+                                }
+                            }
+                        }
+                    }
+                    "COALESCE" => {
+                        if args.is_empty() {
+                            return Err("COALESCE expects at least 1 argument".to_string());
+                        }
+                        fn is_null_like(val: &DbValue) -> bool {
+                            match val {
+                                DbValue::Int(i) => *i == 0,
+                                DbValue::Float(f) => *f == 0.0,
+                                DbValue::String(s) => s.is_empty(),
+                                DbValue::Bytes(b) => b.is_empty(),
+                            }
+                        }
+                        let mut final_val = None;
+                        for arg_expr in args {
+                            let val = arg_expr.eval(row, schema)?;
+                            if !is_null_like(&val) {
+                                return Ok(val);
+                            }
+                            final_val = Some(val);
+                        }
+                        Ok(final_val.unwrap_or(DbValue::Int(0)))
+                    }
+                    other => Err(format!("Unsupported scalar function: {}", other)),
+                }
+            }
         }
+    }
+}
+
+fn coerce_to_string(val: &DbValue) -> String {
+    match val {
+        DbValue::String(s) => s.clone(),
+        DbValue::Int(i) => i.to_string(),
+        DbValue::Float(f) => f.to_string(),
+        DbValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }
 

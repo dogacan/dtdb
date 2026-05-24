@@ -484,6 +484,76 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             })
         }
         SqlExpr::Nested(inner) => plan_expr(inner),
+        SqlExpr::UnaryOp { op, expr } => {
+            let inner = plan_expr(expr)?;
+            match op {
+                sqlparser::ast::UnaryOperator::Minus => {
+                    match inner {
+                        Expr::Literal(DbValue::Int(i)) => Ok(Expr::Literal(DbValue::Int(-i))),
+                        Expr::Literal(DbValue::Float(f)) => Ok(Expr::Literal(DbValue::Float(-f))),
+                        other => {
+                            Ok(Expr::BinaryOp {
+                                left: Box::new(Expr::Literal(DbValue::Int(0))),
+                                op: Operator::Sub,
+                                right: Box::new(other),
+                            })
+                        }
+                    }
+                }
+                sqlparser::ast::UnaryOperator::Plus => Ok(inner),
+                other => Err(format!("Unsupported unary operator: {:?}", other)),
+            }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            let planned_operand = match operand {
+                Some(expr) => Some(Box::new(plan_expr(expr)?)),
+                None => None,
+            };
+            let planned_conditions = conditions
+                .iter()
+                .map(|c| plan_expr(c))
+                .collect::<Result<Vec<_>, String>>()?;
+            let planned_results = results
+                .iter()
+                .map(|r| plan_expr(r))
+                .collect::<Result<Vec<_>, String>>()?;
+            let planned_else = match else_result {
+                Some(expr) => Some(Box::new(plan_expr(expr)?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                operand: planned_operand,
+                conditions: planned_conditions,
+                results: planned_results,
+                else_result: planned_else,
+            })
+        }
+        SqlExpr::Function(func) => {
+            let name = func.name.to_string();
+            let name_upper = name.to_uppercase();
+            if matches!(name_upper.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
+                return Err(format!("Aggregate function {} cannot be used in scalar expression context", name));
+            }
+            if matches!(name_upper.as_str(), "SUBSTR" | "SUBSTRING" | "LENGTH" | "COALESCE") {
+                let mut args = Vec::new();
+                for arg in &func.args {
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
+                            args.push(plan_expr(inner_expr)?);
+                        }
+                        other => return Err(format!("Unsupported function argument type: {:?}", other)),
+                    }
+                }
+                Ok(Expr::Function { name, args })
+            } else {
+                Err(format!("Unsupported or unrecognized function: {}", name))
+            }
+        }
         other => Err(format!("Unsupported expression: {:?}", other)),
     }
 }

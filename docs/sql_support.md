@@ -186,3 +186,46 @@ Supported inside the projection list of a `SELECT` statement:
 *   `MIN(col)`: Returns the minimum value in the group.
 *   `MAX(col)`: Returns the maximum value in the group.
 *   `AVG(col)`: Computes the average of numeric column values.
+
+---
+
+## 5. Scalar & Conditional Functions
+
+### Conditional Expressions
+
+#### `CASE WHEN ... THEN ... ELSE END`
+Executes conditional logic matching branches in order. Supported in select projections, sorting, filters, and update assignments.
+
+*   **Searched CASE**:
+    Evaluates conditional predicates sequentially:
+    ```sql
+    CASE WHEN <condition1> THEN <result1> [WHEN <condition2> THEN <result2> ...] [ELSE <else_result>] END
+    ```
+    *   *Example*: `SELECT CASE WHEN price >= 1000 THEN 'expensive' ELSE 'cheap' END FROM products;`
+*   **Simple CASE**:
+    Compares an operand expression with branch keys:
+    ```sql
+    CASE <operand> WHEN <val1> THEN <result1> [WHEN <val2> THEN <result2> ...] [ELSE <else_result>] END
+    ```
+    *   *Example*: `SELECT CASE id WHEN 1 THEN 'One' WHEN 2 THEN 'Two' ELSE 'Other' END FROM products;`
+*   *Note on Default Fallback*: If no branch matches and no `ELSE` is provided, a default value corresponding to the result type (e.g. `0` for numeric, `""` for string) is returned.
+
+### Scalar Functions
+
+#### `LENGTH(<str>)`
+Returns the character length of the input string or value (with implicit coercion to string).
+*   *Example*: `SELECT LENGTH(name) FROM products;`
+
+#### `SUBSTR(<str>, <start> [, <length>])` / `SUBSTRING(...)`
+Extracts a substring starting at the 1-based index `start`.
+*   Supports negative `start` values (counting backwards from the end of the string).
+*   If `length` is omitted, extracts to the end of the string.
+*   *Examples*:
+    *   `SUBSTR('Laptop', 1, 3)` -> `'Lap'`
+    *   `SUBSTR('Laptop', 4)` -> `'top'`
+    *   `SUBSTR('Laptop', -3, 2)` -> `'to'`
+
+#### `COALESCE(<arg1>, <arg2>, ...)`
+Returns the first non-null-like argument.
+*   *Null-like Coercion*: Since fields are non-nullable and default-padded on LEFT JOIN mismatches, `COALESCE` treats type default/empty values (`0` for `INT`, `0.0` for `FLOAT`, `""` for `STRING`, empty byte arrays) as null-like markers and skips them.
+*   *Example*: `SELECT COALESCE(category, 'Uncategorized') FROM products;`

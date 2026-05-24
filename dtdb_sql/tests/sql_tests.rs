@@ -758,3 +758,110 @@ fn test_sql_arithmetic_expressions() {
     }
 }
 
+#[test]
+fn test_sql_case_and_functions() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE products (id INT PRIMARY KEY, name STRING, price FLOAT, category STRING)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute(
+        "INSERT INTO products (id, name, price, category) VALUES \
+         (1, 'Laptop', 1200.0, 'Electronics'), \
+         (2, 'Mouse', 25.0, ''), \
+         (3, 'Desk', 0.0, 'Furniture'), \
+         (4, 'Chair', 150.0, 'Furniture')",
+        &tx2
+    ).unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+
+    // 1. Test CASE WHEN (searched)
+    let res = engine.execute(
+        "SELECT name, CASE WHEN price >= 1000.0 THEN 'expensive' WHEN price >= 100.0 THEN 'moderate' ELSE 'cheap' END FROM products ORDER BY id ASC",
+        &tx3
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].values[1], DbValue::String("expensive".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::String("cheap".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::String("cheap".to_string()));
+        assert_eq!(rows[3].values[1], DbValue::String("moderate".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 2. Test CASE WHEN (simple)
+    let res = engine.execute(
+        "SELECT name, CASE id WHEN 1 THEN 'One' WHEN 2 THEN 'Two' ELSE 'Other' END FROM products ORDER BY id ASC",
+        &tx3
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].values[1], DbValue::String("One".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::String("Two".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::String("Other".to_string()));
+        assert_eq!(rows[3].values[1], DbValue::String("Other".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 3. Test LENGTH
+    let res = engine.execute(
+        "SELECT name, LENGTH(name) FROM products ORDER BY id ASC",
+        &tx3
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].values[1], DbValue::Int(6)); // Laptop
+        assert_eq!(rows[1].values[1], DbValue::Int(5)); // Mouse
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 4. Test SUBSTR (various bounds and forms)
+    let res = engine.execute(
+        "SELECT SUBSTR(name, 1, 3), SUBSTR(name, 4), SUBSTR(name, -3, 2), SUBSTR(name, 0, 2) FROM products WHERE id = 1",
+        &tx3
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::String("Lap".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::String("top".to_string()));
+        assert_eq!(rows[0].values[2], DbValue::String("to".to_string()));
+        assert_eq!(rows[0].values[3], DbValue::String("L".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 5. Test COALESCE (returns first non-empty / non-zero value)
+    let res = engine.execute(
+        "SELECT name, COALESCE(category, 'Uncategorized') FROM products ORDER BY id ASC",
+        &tx3
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].values[1], DbValue::String("Electronics".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::String("Uncategorized".to_string())); // Mouse category is empty "" -> Null-like -> fallback
+        assert_eq!(rows[2].values[1], DbValue::String("Furniture".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 6. Test COALESCE with multiple arguments and numeric fallback
+    let res = engine.execute(
+        "SELECT name, COALESCE(price, 99.0) FROM products ORDER BY id ASC",
+        &tx3
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].values[1], DbValue::Float(1200.0));
+        assert_eq!(rows[2].values[1], DbValue::Float(99.0)); // Desk price is 0.0 -> Null-like -> fallback
+    } else {
+        panic!("Expected Select");
+    }
+}
+

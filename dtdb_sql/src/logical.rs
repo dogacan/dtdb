@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use dtdb_relational::{Column, DataType, Schema};
-use crate::expr::Expr;
+use crate::expr::{Expr, Operator};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
@@ -75,27 +75,7 @@ impl LogicalPlan {
                 let source_schema = source.schema();
                 let mut cols = Vec::new();
                 for (name, expr) in field_names.iter().zip(expressions.iter()) {
-                    let dt = match expr {
-                        Expr::Literal(val) => match val {
-                            dtdb_storage::DbValue::Int(_) => DataType::Int,
-                            dtdb_storage::DbValue::Float(_) => DataType::Float,
-                            dtdb_storage::DbValue::String(_) => DataType::String,
-                            dtdb_storage::DbValue::Bytes(_) => DataType::Bytes,
-                        },
-                        Expr::Column(col_name) => {
-                            let idx = source_schema.columns.iter().position(|col| {
-                                col.name == *col_name
-                                    || col_name.ends_with(&format!(".{}", col.name))
-                                    || col.name.ends_with(&format!(".{}", col_name))
-                            });
-                            if let Some(i) = idx {
-                                source_schema.columns[i].data_type
-                            } else {
-                                DataType::String // Fallback
-                            }
-                        }
-                        Expr::BinaryOp { .. } => DataType::Int, // Binary comparisons return bool (Int 0 or 1)
-                    };
+                    let dt = infer_expr_type(expr, &source_schema);
                     cols.push(Column {
                         name: name.clone(),
                         data_type: dt,
@@ -230,6 +210,61 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             };
             out.push_str(&format!("{}- Limit: count={}, offset={}\n", indent_str, limit_str, offset));
             format_logical_node(source, indent + 1, out);
+        }
+    }
+}
+
+fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
+    match expr {
+        Expr::Literal(val) => match val {
+            dtdb_storage::DbValue::Int(_) => DataType::Int,
+            dtdb_storage::DbValue::Float(_) => DataType::Float,
+            dtdb_storage::DbValue::String(_) => DataType::String,
+            dtdb_storage::DbValue::Bytes(_) => DataType::Bytes,
+        },
+        Expr::Column(col_name) => {
+            let idx = source_schema.columns.iter().position(|col| {
+                col.name == *col_name
+                    || col_name.ends_with(&format!(".{}", col.name))
+                    || col.name.ends_with(&format!(".{}", col_name))
+            });
+            if let Some(i) = idx {
+                source_schema.columns[i].data_type
+            } else {
+                DataType::String // Fallback
+            }
+        }
+        Expr::BinaryOp { op, left, .. } => {
+            match op {
+                Operator::Add | Operator::Sub | Operator::Mul | Operator::Div => {
+                    infer_expr_type(left, source_schema)
+                }
+                _ => DataType::Int, // Logical/comparison operators return Int (0 or 1)
+            }
+        }
+        Expr::Case { results, else_result, .. } => {
+            if let Some(first_res) = results.first() {
+                infer_expr_type(first_res, source_schema)
+            } else if let Some(else_res) = else_result {
+                infer_expr_type(else_res, source_schema)
+            } else {
+                DataType::Int // Fallback
+            }
+        }
+        Expr::Function { name, args } => {
+            let name_upper = name.to_uppercase();
+            match name_upper.as_str() {
+                "LENGTH" => DataType::Int,
+                "SUBSTR" | "SUBSTRING" => DataType::String,
+                "COALESCE" => {
+                    if let Some(first_arg) = args.first() {
+                        infer_expr_type(first_arg, source_schema)
+                    } else {
+                        DataType::Int // Fallback
+                    }
+                }
+                _ => DataType::String, // Fallback
+            }
         }
     }
 }
