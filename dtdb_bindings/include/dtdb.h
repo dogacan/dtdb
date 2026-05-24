@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <cstddef>
 
 namespace dtdb {
 
@@ -17,6 +18,36 @@ public:
     template <size_t N>
     SqlQuery& bind(const char (&name)[N], const std::string& value) {
         params_.push_back({name, value});
+        return *this;
+    }
+
+    template <size_t N, typename T>
+    typename std::enable_if_t<std::is_arithmetic_v<T>, SqlQuery&>
+    bind(const char (&name)[N], T value) {
+        if constexpr (std::is_same_v<T, bool>) {
+            params_.push_back({name, value ? "1" : "0"});
+        } else {
+            params_.push_back({name, std::to_string(value)});
+        }
+        return *this;
+    }
+
+    template <size_t N>
+    SqlQuery& bind(const char (&name)[N], const std::vector<uint8_t>& value) {
+        std::string hex_str = "x'";
+        for (uint8_t byte : value) {
+            static const char hex[] = "0123456789abcdef";
+            hex_str.push_back(hex[byte >> 4]);
+            hex_str.push_back(hex[byte & 0xf]);
+        }
+        hex_str.push_back('\'');
+        params_.push_back({name, hex_str});
+        return *this;
+    }
+
+    template <size_t N>
+    SqlQuery& bind(const char (&name)[N], std::nullptr_t) {
+        params_.push_back({name, "NULL"});
         return *this;
     }
     

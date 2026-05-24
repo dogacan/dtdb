@@ -40,27 +40,27 @@ int main() {
             QueryResult insert1 = client.execute_tx_query(
                 tx,
                 dtdb::SqlQuery("INSERT INTO users (id, name, active) VALUES (@id, @name, @active);")
-                    .bind("id", "1")
+                    .bind("id", 1)
                     .bind("name", "Alice")
-                    .bind("active", "1")
+                    .bind("active", true)
             );
             assert(insert1.success);
 
             QueryResult insert2 = client.execute_tx_query(
                 tx,
                 dtdb::SqlQuery("INSERT INTO users (id, name, active) VALUES (@id, @name, @active);")
-                    .bind("id", "2")
+                    .bind("id", 2)
                     .bind("name", "Bob")
-                    .bind("active", "0")
+                    .bind("active", false)
             );
             assert(insert2.success);
 
             QueryResult insert3 = client.execute_tx_query(
                 tx,
                 dtdb::SqlQuery("INSERT INTO users (id, name, active) VALUES (@id, @name, @active);")
-                    .bind("id", "3")
+                    .bind("id", 3)
                     .bind("name", "Charlie")
-                    .bind("active", "1")
+                    .bind("active", true)
             );
             assert(insert3.success);
         });
@@ -71,7 +71,7 @@ int main() {
         QueryResult select_res = client.execute_query(
             "demo_db",
             dtdb::SqlQuery("SELECT id, name FROM users WHERE active = @active ORDER BY id ASC;")
-                .bind("active", "1")
+                .bind("active", true)
         );
         assert(select_res.success);
 
