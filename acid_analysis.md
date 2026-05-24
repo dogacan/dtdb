@@ -17,7 +17,7 @@ DuctTapeDB has a **surprisingly solid foundation** for an educational database �
 
 ```mermaid
 graph TD
-    A["Layer 4: RPC Server<br/>(dtdb_rpc)"] -->|"auto-commit per RPC call"| B["Layer 3: SQL Engine<br/>(dtdb_sql)"]
+    A["Layer 4: Client API & RPC Server<br/>(dtdb_api)"] -->|"auto-commit per RPC call"| B["Layer 3: SQL Engine<br/>(dtdb_sql)"]
     B -->|"Transaction &amp; direct DDL calls"| C["Layer 2: Relational &amp; Transactions<br/>(dtdb_relational)"]
     C -->|"write_batch / put / delete"| D["Layer 1: LSM Storage Engine<br/>(dtdb_storage)"]
     
@@ -65,7 +65,7 @@ SqlStatement::CreateTable { name, schema } => {
 
 **Commit failure leaves dangling Prepared record:**
 
-At the RPC layer ([server.rs:283-285](file:///Users/dogacan/projects/dtdb/dtdb_rpc/src/server.rs#L283-L285)), if `tx.commit()` fails, the server returns an error but does **not** call `rollback()`. The transaction is dropped (buffer discarded), but a `Prepared` record may exist in the log — which recovery will **roll forward**. This means a failed commit could retroactively succeed after restart.
+At the RPC layer ([server.rs:283-285](file:///Users/dogacan/projects/dtdb/dtdb_api/src/server.rs#L283-L285)), if `tx.commit()` fails, the server returns an error but does **not** call `rollback()`. The transaction is dropped (buffer discarded), but a `Prepared` record may exist in the log — which recovery will **roll forward**. This means a failed commit could retroactively succeed after restart.
 
 ---
 
@@ -250,8 +250,8 @@ Issues ranked by severity (impact × likelihood):
 
 | # | Issue | Impact | Location |
 |---|-------|--------|----------|
-| 8 | **No multi-statement transactions over RPC** | Each RPC call = 1 auto-committed transaction. No interactive BEGIN/COMMIT | [server.rs:274-276](file:///Users/dogacan/projects/dtdb/dtdb_rpc/src/server.rs#L274-L276) |
-| 9 | **Commit failure doesn't call rollback** | Dangling `Prepared` record may be rolled forward on restart | [server.rs:283-285](file:///Users/dogacan/projects/dtdb/dtdb_rpc/src/server.rs#L283-L285) |
+| 8 | **No multi-statement transactions over RPC** | Each RPC call = 1 auto-committed transaction. No interactive BEGIN/COMMIT | [server.rs:274-276](file:///Users/dogacan/projects/dtdb/dtdb_api/src/server.rs#L274-L276) |
+| 9 | **Commit failure doesn't call rollback** | Dangling `Prepared` record may be rolled forward on restart | [server.rs:283-285](file:///Users/dogacan/projects/dtdb/dtdb_api/src/server.rs#L283-L285) |
 | 10 | **Only first SQL statement executed** | `execute()` silently drops remaining statements in multi-statement input | [engine.rs:50](file:///Users/dogacan/projects/dtdb/dtdb_sql/src/engine.rs#L50) |
 | 11 | **Memtable read isolation gap** | `write_batch` applies entries one-by-one; concurrent reader may see partial batch | [engine.rs:271-277](file:///Users/dogacan/projects/dtdb/dtdb_storage/src/engine.rs#L271-L277) |
 

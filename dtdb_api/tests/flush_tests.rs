@@ -7,9 +7,9 @@ use std::fs;
 
 use dtdb_storage::CompressionType;
 use dtdb_relational::DatabaseOptions;
-use dtdb_rpc::client::DuctTapeDbClient;
-use dtdb_rpc::server::DuctTapeDbServiceImpl;
-use dtdb_rpc::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::server::DuctTapeDbServiceImpl;
+use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
 
 // Helper to count SSTable files in a directory
 fn count_sst_files(dir: &std::path::Path) -> usize {

@@ -10,7 +10,7 @@ DuctTapeDB is organized as a layered, bottom-up architecture. Each layer communi
 
 ```mermaid
 graph TD
-    A[Layer 4: RPC Server & Client - dtdb_rpc] -->|SQL Query| B[Layer 3: SQL Engine - dtdb_sql]
+    A[Layer 4: Client API & RPC Server - dtdb_api] -->|SQL Query| B[Layer 3: SQL Engine - dtdb_sql]
     B -->|Read/Write Rows| C[Layer 2: Relational & Transactions - dtdb_relational]
     C -->|Serialized Bytes| D[Layer 1: LSM-Tree Storage - dtdb_storage]
 ```
@@ -36,11 +36,11 @@ Parses, plans, optimizes, and executes queries.
 * **Volcano Execution Pipeline**: Compiles logical nodes into a streaming physical iterator pipeline (`next()` interface), executing joins via `PhysicalHashJoin` and groupings via `PhysicalHashAggregate`.
 * **SQL Dialect**: For more details on the dialect, data types, expressions, operators, and functions supported, see the [SQL Support Reference](docs/sql_support.md).
 
-### 4. Layer 4: RPC Server & Client (`dtdb_rpc`)
-Exposes database resources over a remote network.
+### 4. Layer 4: Client API & RPC Server (`dtdb_api`)
+Exposes database resources over a client API supporting both embedded (in-process) and client-server (gRPC) configurations.
 * **Protobuf API**: Defines database creation/deletion and streaming query execution endpoints.
 * **gRPC Server**: Restores existing databases on boot, handles transaction lifecycles, and streams query rows back.
-* **gRPC Client & CLI**: Client library and interactive shell tool to query remote databases.
+* **Client Library & CLI**: Unified client library to query databases either in-process or via gRPC, plus an interactive shell tool.
 
 ---
 
@@ -54,8 +54,8 @@ Exposes database resources over a remote network.
 ├── dtdb_relational/    # Layer 2: Relational Schema metadata & Transaction boundaries
 ├── dtdb_sql/           # Layer 3: SQL Query Planner, Optimizer, and Volcano execution
 │   └── src/bin/        # dtdb_sql_cli: Interactive multi-line SQL shell
-└── dtdb_rpc/           # Layer 4: gRPC Server, Client Library, and Remote Query Shell CLI
-    └── src/bin/        # dtdb_server (gRPC daemon) and dtdb_client_cli (Remote SQL prompt)
+└── dtdb_api/           # Layer 4: Client API (In-Process/Remote), gRPC Server, and SQL CLI
+    └── src/bin/        # dtdb_server (gRPC daemon) and dtdb_client_cli (SQL prompt)
 ```
 
 ---

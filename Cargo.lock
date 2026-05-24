@@ -162,18 +162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "dtdb_relational"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "dtdb_storage",
- "serde",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "dtdb_rpc"
+name = "dtdb_api"
 version = "0.1.0"
 dependencies = [
  "bincode",
@@ -193,6 +182,17 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "dtdb_relational"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "dtdb_storage",
+ "serde",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

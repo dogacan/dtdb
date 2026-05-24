@@ -1,3 +1,6 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::path::Path;
 use tonic::transport::Channel;
 use tonic::Status;
 use futures_core::Stream;
@@ -5,6 +8,7 @@ use futures_core::Stream;
 use dtdb_storage::CompressionType;
 use dtdb_relational::DatabaseOptions;
 use crate::proto::duct_tape_db_service_client::DuctTapeDbServiceClient;
+use crate::proto::duct_tape_db_service_server::DuctTapeDbService;
 use crate::proto::{
     CreateDbRequest, CreateDbResponse, DropDbRequest, DropDbResponse,
     ExecuteQueryRequest, ExecuteQueryResponse, CompressionOption,
@@ -12,15 +16,31 @@ use crate::proto::{
 };
 
 #[derive(Clone)]
+pub enum ClientMode {
+    Remote(DuctTapeDbServiceClient<Channel>),
+    InProcess(Arc<crate::server::DuctTapeDbServiceImpl>),
+}
+
+#[derive(Clone)]
 pub struct DuctTapeDbClient {
-    inner: DuctTapeDbServiceClient<Channel>,
+    inner: ClientMode,
 }
 
 impl DuctTapeDbClient {
     /// Connects to a remote DuctTapeDB gRPC server at the specified address.
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
-        let inner = DuctTapeDbServiceClient::connect(addr).await?;
-        Ok(Self { inner })
+        let client = DuctTapeDbServiceClient::connect(addr).await?;
+        Ok(Self {
+            inner: ClientMode::Remote(client),
+        })
+    }
+
+    /// Creates an in-process DuctTapeDB client using the specified data directory.
+    pub fn in_process(data_dir: impl AsRef<Path>) -> Result<Self, String> {
+        let service = crate::server::DuctTapeDbServiceImpl::new(data_dir)?;
+        Ok(Self {
+            inner: ClientMode::InProcess(Arc::new(service)),
+        })
     }
 
     /// Creates a database with the specified compression configuration.
@@ -43,8 +63,16 @@ impl DuctTapeDbClient {
             flush_interval_ms: None,
         };
 
-        let response = self.inner.create_db(request).await?;
-        Ok(response.into_inner())
+        match &mut self.inner {
+            ClientMode::Remote(client) => {
+                let response = client.create_db(request).await?;
+                Ok(response.into_inner())
+            }
+            ClientMode::InProcess(service) => {
+                let response = service.create_db(tonic::Request::new(request)).await?;
+                Ok(response.into_inner())
+            }
+        }
     }
 
     /// Creates a database with the specified configuration options.
@@ -67,8 +95,16 @@ impl DuctTapeDbClient {
             flush_interval_ms: options.flush_interval_ms,
         };
 
-        let response = self.inner.create_db(request).await?;
-        Ok(response.into_inner())
+        match &mut self.inner {
+            ClientMode::Remote(client) => {
+                let response = client.create_db(request).await?;
+                Ok(response.into_inner())
+            }
+            ClientMode::InProcess(service) => {
+                let response = service.create_db(tonic::Request::new(request)).await?;
+                Ok(response.into_inner())
+            }
+        }
     }
 
     /// Drops a database and removes all its disk resources.
@@ -77,8 +113,16 @@ impl DuctTapeDbClient {
             db_name: name.to_string(),
         };
 
-        let response = self.inner.drop_db(request).await?;
-        Ok(response.into_inner())
+        match &mut self.inner {
+            ClientMode::Remote(client) => {
+                let response = client.drop_db(request).await?;
+                Ok(response.into_inner())
+            }
+            ClientMode::InProcess(service) => {
+                let response = service.drop_db(tonic::Request::new(request)).await?;
+                Ok(response.into_inner())
+            }
+        }
     }
 
     /// Flushes all memory tables in the specified database to disk.
@@ -87,8 +131,16 @@ impl DuctTapeDbClient {
             db_name: name.to_string(),
         };
 
-        let response = self.inner.flush_db(request).await?;
-        Ok(response.into_inner())
+        match &mut self.inner {
+            ClientMode::Remote(client) => {
+                let response = client.flush_db(request).await?;
+                Ok(response.into_inner())
+            }
+            ClientMode::InProcess(service) => {
+                let response = service.flush_db(tonic::Request::new(request)).await?;
+                Ok(response.into_inner())
+            }
+        }
     }
 
     /// Executes a SQL query, returning a stream of query response payloads.
@@ -96,13 +148,22 @@ impl DuctTapeDbClient {
         &mut self,
         db_name: &str,
         sql_query: &str,
-    ) -> Result<impl Stream<Item = Result<ExecuteQueryResponse, Status>>, Status> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>, Status> {
         let request = ExecuteQueryRequest {
             db_name: db_name.to_string(),
             sql_query: sql_query.to_string(),
         };
 
-        let response = self.inner.execute_query(request).await?;
-        Ok(response.into_inner())
+        match &mut self.inner {
+            ClientMode::Remote(client) => {
+                let response = client.execute_query(request).await?;
+                let stream = response.into_inner();
+                Ok(Box::pin(stream))
+            }
+            ClientMode::InProcess(service) => {
+                let response = service.execute_query(tonic::Request::new(request)).await?;
+                Ok(response.into_inner())
+            }
+        }
     }
 }

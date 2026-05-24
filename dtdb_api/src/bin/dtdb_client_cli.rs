@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use futures_util::StreamExt;
-use dtdb_rpc::client::DuctTapeDbClient;
+use dtdb_api::client::DuctTapeDbClient;
 use dtdb_storage::CompressionType;
 use dtdb_relational::DatabaseOptions;
 
@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let prompt = match &active_db {
-            Some(db) => format!("dtdb_rpc ({}) > ", db),
-            None => "dtdb_rpc (none) > ".to_string(),
+            Some(db) => format!("dtdb_api ({}) > ", db),
+            None => "dtdb_api (none) > ".to_string(),
         };
 
         if query_buffer.is_empty() {
@@ -231,13 +231,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(resp) => {
                                 if let Some(payload) = resp.payload {
                                     match payload {
-                                        dtdb_rpc::proto::execute_query_response::Payload::Header(header) => {
+                                        dtdb_api::proto::execute_query_response::Payload::Header(header) => {
                                             columns = header.column_names;
                                         }
-                                        dtdb_rpc::proto::execute_query_response::Payload::Row(row) => {
+                                        dtdb_api::proto::execute_query_response::Payload::Row(row) => {
                                             rows.push(row.values);
                                         }
-                                        dtdb_rpc::proto::execute_query_response::Payload::InfoMessage(msg) => {
+                                        dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg) => {
                                             info_msg = Some(msg);
                                         }
                                     }

@@ -3,6 +3,6 @@ members = [
     "dtdb_storage",
     "dtdb_relational",
     "dtdb_sql",
-    "dtdb_rpc",
+    "dtdb_api",
 ]
 resolver = "2"

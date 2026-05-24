@@ -6,9 +6,9 @@ use futures_util::StreamExt;
 use std::fs;
 
 use dtdb_storage::CompressionType;
-use dtdb_rpc::client::DuctTapeDbClient;
-use dtdb_rpc::server::DuctTapeDbServiceImpl;
-use dtdb_rpc::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::server::DuctTapeDbServiceImpl;
+use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
 
 #[tokio::test]
 async fn test_grpc_client_server_integration() {
@@ -79,7 +79,7 @@ async fn test_grpc_client_server_integration() {
         assert_eq!(payloads.len(), 1);
         let payload = payloads[0].payload.as_ref().unwrap();
         match payload {
-            dtdb_rpc::proto::execute_query_response::Payload::InfoMessage(msg) => {
+            dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg) => {
                 assert!(msg.contains("Table created"));
             }
             _ => panic!("Expected info message"),
@@ -98,7 +98,7 @@ async fn test_grpc_client_server_integration() {
         }
         assert_eq!(payloads.len(), 1);
         match payloads[0].payload.as_ref().unwrap() {
-            dtdb_rpc::proto::execute_query_response::Payload::InfoMessage(msg) => {
+            dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg) => {
                 assert!(msg.contains("Inserted 1 row"));
             }
             _ => panic!("Expected info message"),
@@ -119,7 +119,7 @@ async fn test_grpc_client_server_integration() {
 
         // Header validation
         match payloads[0].payload.as_ref().unwrap() {
-            dtdb_rpc::proto::execute_query_response::Payload::Header(header) => {
+            dtdb_api::proto::execute_query_response::Payload::Header(header) => {
                 assert_eq!(header.column_names, vec!["id", "name"]);
             }
             _ => panic!("Expected header payload"),
@@ -127,7 +127,7 @@ async fn test_grpc_client_server_integration() {
 
         // Row validation
         match payloads[1].payload.as_ref().unwrap() {
-            dtdb_rpc::proto::execute_query_response::Payload::Row(row) => {
+            dtdb_api::proto::execute_query_response::Payload::Row(row) => {
                 assert_eq!(row.values, vec!["10", "Alice"]);
             }
             _ => panic!("Expected row payload"),

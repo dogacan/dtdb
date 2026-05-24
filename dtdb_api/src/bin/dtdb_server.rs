@@ -1,8 +1,8 @@
 use std::env;
 use std::path::PathBuf;
 use tonic::transport::Server;
-use dtdb_rpc::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
-use dtdb_rpc::server::DuctTapeDbServiceImpl;
+use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::server::DuctTapeDbServiceImpl;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
