@@ -28,3 +28,21 @@ jobs:
 
     - name: Run tests
       run: cargo test --verbose
+
+  tsan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust Nightly
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+        components: rust-src
+
+    - name: Run tests with ThreadSanitizer
+      env:
+        RUSTFLAGS: "-Z sanitizer=thread"
+        RUSTDOCFLAGS: "-Z sanitizer=thread"
+      run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --verbose
