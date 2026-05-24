@@ -10,8 +10,8 @@ service DuctTapeDbService {
 }
 
 enum CompressionOption {
-    COMPRESSION_LZ4 = 0;
-    COMPRESSION_UNCOMPRESSED = 1;
+    COMPRESSION_UNCOMPRESSED = 0
+    COMPRESSION_LZ4 = 1;
 }
 
 message CreateDbRequest {
