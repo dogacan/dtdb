@@ -52,6 +52,7 @@ pub enum DbValue {
     Float(f64),
     String(String),
     Bytes(Vec<u8>),
+    Null,
 }
 
 /// CompressionType represents the supported block compression algorithms in DuctTapeDB.

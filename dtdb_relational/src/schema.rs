@@ -11,6 +11,11 @@ pub enum DataType {
     Float,
     String,
     Bytes,
+    Null,
+}
+
+fn default_nullable() -> bool {
+    true
 }
 
 /// Column represents a schema definition for a single table column.
@@ -19,6 +24,8 @@ pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub is_primary_key: bool,
+    #[serde(default = "default_nullable")]
+    pub is_nullable: bool,
 }
 
 /// Schema defines the set of columns and types of a relational table.
@@ -49,6 +56,14 @@ impl Schema {
 
         for (idx, (col, val)) in self.columns.iter().zip(row.values.iter()).enumerate() {
             match (col.data_type, val) {
+                (_, DbValue::Null) => {
+                    if !col.is_nullable {
+                        return Err(RelationalError::SchemaMismatch(format!(
+                            "Column '{}' (index {}) is not nullable, but got NULL",
+                            col.name, idx
+                        )));
+                    }
+                }
                 (DataType::Int, DbValue::Int(_)) => {}
                 (DataType::Float, DbValue::Float(_)) => {}
                 (DataType::String, DbValue::String(_)) => {}

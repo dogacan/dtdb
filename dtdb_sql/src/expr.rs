@@ -74,17 +74,47 @@ impl Expr {
                 let l_val = left.eval(row, schema)?;
                 let r_val = right.eval(row, schema)?;
 
+                // Handle logical AND/OR with three-valued logic
+                if matches!(op, Operator::And | Operator::Or) {
+                    return match op {
+                        Operator::And => {
+                            let l_null = matches!(l_val, DbValue::Null);
+                            let r_null = matches!(r_val, DbValue::Null);
+                            if l_null && r_null {
+                                return Ok(DbValue::Null);
+                            }
+                            let l_bool = if l_null { None } else { Some(to_bool(&l_val)?) };
+                            let r_bool = if r_null { None } else { Some(to_bool(&r_val)?) };
+                            match (l_bool, r_bool) {
+                                (Some(false), _) | (_, Some(false)) => Ok(DbValue::Int(0)),
+                                (Some(true), Some(true)) => Ok(DbValue::Int(1)),
+                                _ => Ok(DbValue::Null),
+                            }
+                        }
+                        Operator::Or => {
+                            let l_null = matches!(l_val, DbValue::Null);
+                            let r_null = matches!(r_val, DbValue::Null);
+                            if l_null && r_null {
+                                return Ok(DbValue::Null);
+                            }
+                            let l_bool = if l_null { None } else { Some(to_bool(&l_val)?) };
+                            let r_bool = if r_null { None } else { Some(to_bool(&r_val)?) };
+                            match (l_bool, r_bool) {
+                                (Some(true), _) | (_, Some(true)) => Ok(DbValue::Int(1)),
+                                (Some(false), Some(false)) => Ok(DbValue::Int(0)),
+                                _ => Ok(DbValue::Null),
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                } else if matches!(l_val, DbValue::Null) || matches!(r_val, DbValue::Null) {
+                    // Propagate NULL for arithmetic, comparison, and LIKE operations
+                    return Ok(DbValue::Null);
+                }
+
                 match op {
-                    Operator::And => {
-                        let l_bool = to_bool(&l_val)?;
-                        let r_bool = to_bool(&r_val)?;
-                        Ok(DbValue::Int(if l_bool && r_bool { 1 } else { 0 }))
-                    }
-                    Operator::Or => {
-                        let l_bool = to_bool(&l_val)?;
-                        let r_bool = to_bool(&r_val)?;
-                        Ok(DbValue::Int(if l_bool || r_bool { 1 } else { 0 }))
-                    }
+                    Operator::And => unreachable!(),
+                    Operator::Or => unreachable!(),
                     Operator::Like => {
                         let text = to_string_val(&l_val)?;
                         let pattern = to_string_val(&r_val)?;
@@ -164,16 +194,8 @@ impl Expr {
                     results[idx].eval(row, schema)
                 } else if let Some(else_expr) = else_result {
                     else_expr.eval(row, schema)
-                } else if !results.is_empty() {
-                    let first_val = results[0].eval(row, schema)?;
-                    match first_val {
-                        DbValue::Int(_) => Ok(DbValue::Int(0)),
-                        DbValue::Float(_) => Ok(DbValue::Float(0.0)),
-                        DbValue::String(_) => Ok(DbValue::String("".to_string())),
-                        DbValue::Bytes(_) => Ok(DbValue::Bytes(Vec::new())),
-                    }
                 } else {
-                    Ok(DbValue::Int(0))
+                    Ok(DbValue::Null)
                 }
             }
             Expr::Function { name, args } => {
@@ -184,6 +206,9 @@ impl Expr {
                             return Err(format!("LENGTH expects exactly 1 argument, got {}", args.len()));
                         }
                         let val = args[0].eval(row, schema)?;
+                        if matches!(val, DbValue::Null) {
+                            return Ok(DbValue::Null);
+                        }
                         let s = coerce_to_string(&val);
                         Ok(DbValue::Int(s.chars().count() as i64))
                     }
@@ -192,6 +217,9 @@ impl Expr {
                             return Err(format!("SUBSTR expects 2 or 3 arguments, got {}", args.len()));
                         }
                         let val = args[0].eval(row, schema)?;
+                        if matches!(val, DbValue::Null) {
+                            return Ok(DbValue::Null);
+                        }
                         let s = coerce_to_string(&val);
                         let start_val = args[1].eval(row, schema)?;
                         let start = match start_val {
@@ -240,23 +268,15 @@ impl Expr {
                         if args.is_empty() {
                             return Err("COALESCE expects at least 1 argument".to_string());
                         }
-                        fn is_null_like(val: &DbValue) -> bool {
-                            match val {
-                                DbValue::Int(i) => *i == 0,
-                                DbValue::Float(f) => *f == 0.0,
-                                DbValue::String(s) => s.is_empty(),
-                                DbValue::Bytes(b) => b.is_empty(),
-                            }
-                        }
                         let mut final_val = None;
                         for arg_expr in args {
                             let val = arg_expr.eval(row, schema)?;
-                            if !is_null_like(&val) {
+                            if !matches!(val, DbValue::Null) {
                                 return Ok(val);
                             }
                             final_val = Some(val);
                         }
-                        Ok(final_val.unwrap_or(DbValue::Int(0)))
+                        Ok(final_val.unwrap_or(DbValue::Null))
                     }
                     other => Err(format!("Unsupported scalar function: {}", other)),
                 }
@@ -271,13 +291,15 @@ fn coerce_to_string(val: &DbValue) -> String {
         DbValue::Int(i) => i.to_string(),
         DbValue::Float(f) => f.to_string(),
         DbValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        DbValue::Null => "NULL".to_string(),
     }
 }
 
-/// Coerces a DbValue to a boolean (Int not equal to 0).
+/// Coerces a DbValue to a boolean (Int not equal to 0, or Null treated as false).
 fn to_bool(val: &DbValue) -> Result<bool, String> {
     match val {
         DbValue::Int(v) => Ok(*v != 0),
+        DbValue::Null => Ok(false),
         other => Err(format!("Cannot convert value to boolean: {:?}", other)),
     }
 }
@@ -295,6 +317,9 @@ fn to_string_val(val: &DbValue) -> Result<String, String> {
 /// For example, comparing an Int with a Float automatically converts the Int to Float.
 fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String> {
     match (l, r) {
+        (DbValue::Null, DbValue::Null) => Ok(std::cmp::Ordering::Equal),
+        (DbValue::Null, _) => Ok(std::cmp::Ordering::Less),
+        (_, DbValue::Null) => Ok(std::cmp::Ordering::Greater),
         (DbValue::Int(lv), DbValue::Int(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Float(lv), DbValue::Float(rv)) => {
             lv.partial_cmp(rv).ok_or_else(|| "NaN float comparison".to_string())

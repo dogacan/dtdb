@@ -105,16 +105,8 @@ impl SqlEngine {
                 let mut insert_count = 0;
 
                 for row_vals in rows {
-                    // Start with default values for each column.
-                    let mut aligned_vals = vec![DbValue::Int(0); schema.columns.len()];
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        aligned_vals[i] = match col.data_type {
-                            DataType::Int => DbValue::Int(0),
-                            DataType::Float => DbValue::Float(0.0),
-                            DataType::String => DbValue::String("".to_string()),
-                            DataType::Bytes => DbValue::Bytes(Vec::new()),
-                        };
-                    }
+                    // Start with NULL values for each column.
+                    let mut aligned_vals = vec![DbValue::Null; schema.columns.len()];
 
                     // Map provided row values to the correct column indices.
                     for (col_idx, col_name) in columns.iter().enumerate() {
@@ -302,6 +294,7 @@ impl SqlEngine {
                     name: "Query Plan".to_string(),
                     data_type: DataType::String,
                     is_primary_key: false,
+                    is_nullable: true,
                 }]);
 
                 let plan_info = format!(

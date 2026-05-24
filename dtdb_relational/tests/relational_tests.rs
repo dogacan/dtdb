@@ -11,16 +11,19 @@ fn create_test_schema() -> Schema {
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
+            is_nullable: false,
         },
         Column {
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
+            is_nullable: true,
         },
         Column {
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
+            is_nullable: true,
         },
     ])
 }

@@ -658,9 +658,9 @@ fn test_sql_left_join() {
         // Bob: matched
         assert_eq!(rows[1].values[0], DbValue::String("Bob".to_string()));
         assert_eq!(rows[1].values[1], DbValue::Float(199.9));
-        // Charlie: unmatched (padded with default Float 0.0)
+        // Charlie: unmatched (padded with NULL)
         assert_eq!(rows[2].values[0], DbValue::String("Charlie".to_string()));
-        assert_eq!(rows[2].values[1], DbValue::Float(0.0));
+        assert_eq!(rows[2].values[1], DbValue::Null);
     } else {
         panic!("Expected Select");
     }
@@ -837,7 +837,7 @@ fn test_sql_case_and_functions() {
         panic!("Expected Select");
     }
 
-    // 5. Test COALESCE (returns first non-empty / non-zero value)
+    // 5. Test COALESCE (returns first non-empty / non-zero value, but empty/zero are not NULL)
     let res = engine.execute(
         "SELECT name, COALESCE(category, 'Uncategorized') FROM products ORDER BY id ASC",
         &tx3
@@ -845,7 +845,7 @@ fn test_sql_case_and_functions() {
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].values[1], DbValue::String("Electronics".to_string()));
-        assert_eq!(rows[1].values[1], DbValue::String("Uncategorized".to_string())); // Mouse category is empty "" -> Null-like -> fallback
+        assert_eq!(rows[1].values[1], DbValue::String("".to_string())); // Mouse category is empty "" -> NOT Null -> no fallback
         assert_eq!(rows[2].values[1], DbValue::String("Furniture".to_string()));
     } else {
         panic!("Expected Select");
@@ -859,7 +859,100 @@ fn test_sql_case_and_functions() {
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].values[1], DbValue::Float(1200.0));
-        assert_eq!(rows[2].values[1], DbValue::Float(99.0)); // Desk price is 0.0 -> Null-like -> fallback
+        assert_eq!(rows[2].values[1], DbValue::Float(0.0)); // Desk price is 0.0 -> NOT Null -> no fallback
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_explicit_null() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create table with nullable and NOT NULL columns
+    let tx1 = Transaction::new(1, db.clone());
+    engine.execute("CREATE TABLE nullable_test (id INT PRIMARY KEY, name STRING NOT NULL, note STRING)", &tx1).unwrap();
+    tx1.commit().unwrap();
+
+    // 2. Insert explicit NULLs
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute("INSERT INTO nullable_test (id, name, note) VALUES (1, 'Alice', NULL), (2, 'Bob', 'First Note')", &tx2).unwrap();
+    tx2.commit().unwrap();
+
+    // 3. Try to insert NULL into NOT NULL column (should fail validation)
+    let tx3 = Transaction::new(3, db.clone());
+    let insert_fail = engine.execute("INSERT INTO nullable_test (id, name, note) VALUES (3, NULL, 'Note')", &tx3);
+    assert!(insert_fail.is_err(), "Expected insert of NULL into NOT NULL column to fail");
+    let _ = tx3.rollback();
+
+    // 4. Try to insert row omitting nullable column (should default to NULL)
+    let tx4 = Transaction::new(4, db.clone());
+    engine.execute("INSERT INTO nullable_test (id, name) VALUES (3, 'Charlie')", &tx4).unwrap();
+    tx4.commit().unwrap();
+
+    // 5. Select and verify explicit NULL and defaulted NULL
+    let tx5 = Transaction::new(5, db.clone());
+    let res = engine.execute("SELECT id, name, note FROM nullable_test ORDER BY id ASC", &tx5).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        // Alice note is NULL
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[0].values[1], DbValue::String("Alice".to_string()));
+        assert_eq!(rows[0].values[2], DbValue::Null);
+
+        // Bob note is "First Note"
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[1].values[1], DbValue::String("Bob".to_string()));
+        assert_eq!(rows[1].values[2], DbValue::String("First Note".to_string()));
+
+        // Charlie note defaulted to NULL
+        assert_eq!(rows[2].values[0], DbValue::Int(3));
+        assert_eq!(rows[2].values[1], DbValue::String("Charlie".to_string()));
+        assert_eq!(rows[2].values[2], DbValue::Null);
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 6. Test logic with NULL: NULL + 5, NULL AND true, NULL OR true, etc.
+    let res2 = engine.execute("SELECT note + 5, note AND 1, note OR 1 FROM nullable_test WHERE id = 1", &tx5).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res2 {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Null); // NULL + 5 = NULL
+        assert_eq!(rows[0].values[1], DbValue::Null); // NULL AND 1 = NULL
+        assert_eq!(rows[0].values[2], DbValue::Int(1)); // NULL OR 1 = 1
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 7. Test COALESCE with NULLs
+    let res3 = engine.execute("SELECT id, COALESCE(note, 'default') FROM nullable_test ORDER BY id ASC", &tx5).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res3 {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[1], DbValue::String("default".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::String("First Note".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::String("default".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 8. Test LEFT JOIN padding unmatched columns with NULL instead of 0.0/empty
+    engine.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)", &tx5).unwrap();
+    engine.execute("INSERT INTO orders (order_id, user_id, amount) VALUES (100, 2, 9.99)", &tx5).unwrap();
+    let res4 = engine.execute(
+        "SELECT nullable_test.name, orders.amount FROM nullable_test LEFT JOIN orders ON nullable_test.id = orders.user_id ORDER BY nullable_test.id ASC",
+        &tx5
+    ).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res4 {
+        assert_eq!(rows.len(), 3);
+        // Alice (1): unmatched order -> amount is NULL
+        assert_eq!(rows[0].values[0], DbValue::String("Alice".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::Null);
+        // Bob (2): matched order -> amount is 9.99
+        assert_eq!(rows[1].values[0], DbValue::String("Bob".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::Float(9.99));
+        // Charlie (3): unmatched order -> amount is NULL
+        assert_eq!(rows[2].values[0], DbValue::String("Charlie".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::Null);
     } else {
         panic!("Expected Select");
     }

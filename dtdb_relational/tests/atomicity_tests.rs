@@ -15,11 +15,13 @@ fn create_user_schema() -> Schema {
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
+            is_nullable: false,
         },
         Column {
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
+            is_nullable: true,
         },
     ])
 }
@@ -31,11 +33,13 @@ fn create_product_schema() -> Schema {
             name: "sku".to_string(),
             data_type: DataType::String,
             is_primary_key: true,
+            is_nullable: false,
         },
         Column {
             name: "price".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
+            is_nullable: true,
         },
     ])
 }

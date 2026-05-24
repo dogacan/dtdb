@@ -80,6 +80,7 @@ impl LogicalPlan {
                         name: name.clone(),
                         data_type: dt,
                         is_primary_key: false,
+                        is_nullable: true,
                     });
                 }
                 Schema::new(cols)
@@ -118,6 +119,7 @@ impl LogicalPlan {
                         name: field_names[idx].clone(),
                         data_type: dt,
                         is_primary_key: false,
+                        is_nullable: true,
                     });
                 }
 
@@ -147,6 +149,7 @@ impl LogicalPlan {
                         name: field_names[start_idx + idx].clone(),
                         data_type: dt,
                         is_primary_key: false,
+                        is_nullable: true,
                     });
                 }
 
@@ -221,6 +224,7 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
             dtdb_storage::DbValue::Float(_) => DataType::Float,
             dtdb_storage::DbValue::String(_) => DataType::String,
             dtdb_storage::DbValue::Bytes(_) => DataType::Bytes,
+            dtdb_storage::DbValue::Null => DataType::Null,
         },
         Expr::Column(col_name) => {
             let idx = source_schema.columns.iter().position(|col| {

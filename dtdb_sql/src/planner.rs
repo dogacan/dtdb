@@ -62,10 +62,16 @@ impl LogicalPlanner {
                         .iter()
                         .any(|opt| matches!(opt.option, ColumnOption::Unique { is_primary: true }));
 
+                    let is_nullable = !is_pk && !col
+                        .options
+                        .iter()
+                        .any(|opt| matches!(opt.option, ColumnOption::NotNull));
+
                     cols.push(Column {
                         name: col.name.value.clone(),
                         data_type: dt,
                         is_primary_key: is_pk,
+                        is_nullable,
                     });
                 }
 
@@ -447,6 +453,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                 }
                 SqlValue::SingleQuotedString(s) => DbValue::String(s.clone()),
                 SqlValue::Boolean(b) => DbValue::Int(if *b { 1 } else { 0 }),
+                SqlValue::Null => DbValue::Null,
                 other => return Err(format!("Unsupported SQL value type: {:?}", other)),
             };
             Ok(Expr::Literal(db_val))

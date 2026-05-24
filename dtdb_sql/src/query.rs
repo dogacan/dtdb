@@ -71,6 +71,9 @@ impl SqlQuery {
                                 s.push('\'');
                                 result.push_str(&s);
                             }
+                            DbValue::Null => {
+                                result.push_str("NULL");
+                            }
                         }
                     } else {
                         return Err(format!("Unbound query parameter: @{}", name));

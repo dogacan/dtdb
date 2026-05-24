@@ -177,6 +177,7 @@ pub(crate) fn execution_result_to_responses(result: dtdb_sql::ExecutionResult) -
                     DbValue::Float(v) => v.to_string(),
                     DbValue::String(s) => s.clone(),
                     DbValue::Bytes(b) => format!("{:?}", b),
+                    DbValue::Null => "NULL".to_string(),
                 }).collect();
 
                 responses.push(ExecuteQueryResponse {

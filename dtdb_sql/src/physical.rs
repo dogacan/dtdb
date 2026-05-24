@@ -333,8 +333,10 @@ impl PhysicalOperator for PhysicalHashJoin {
             let right_schema = self.right.schema().clone();
             while let Some(row) = self.right.next()? {
                 let key_val = self.right_on.eval(&row, &right_schema)?;
-                let hash_key = hash_value_to_string(&key_val);
-                table.entry(hash_key).or_insert_with(Vec::new).push(row);
+                if key_val != DbValue::Null {
+                    let hash_key = hash_value_to_string(&key_val);
+                    table.entry(hash_key).or_insert_with(Vec::new).push(row);
+                }
             }
             self.hash_table = Some(table);
         }
@@ -348,24 +350,27 @@ impl PhysicalOperator for PhysicalHashJoin {
             let key_val = self.left_on.eval(&left_row, &left_schema)?;
             let hash_key = hash_value_to_string(&key_val);
 
-            if let Some(right_rows) = hash_table.get(&hash_key) {
-                // Generate joined rows: combine left row fields + right row fields
-                for right_row in right_rows {
+            if key_val != DbValue::Null {
+                if let Some(right_rows) = hash_table.get(&hash_key) {
+                    // Generate joined rows: combine left row fields + right row fields
+                    for right_row in right_rows {
+                        let mut merged_values = left_row.values.clone();
+                        merged_values.extend(right_row.values.clone());
+                        self.join_buffer.push(Row::new(merged_values));
+                    }
+                } else if self.join_type == JoinType::Left {
+                    // Left outer join mismatch: pad right columns with NULL values
                     let mut merged_values = left_row.values.clone();
-                    merged_values.extend(right_row.values.clone());
+                    for _ in &right_schema.columns {
+                        merged_values.push(DbValue::Null);
+                    }
                     self.join_buffer.push(Row::new(merged_values));
                 }
             } else if self.join_type == JoinType::Left {
-                // Left outer join mismatch: pad right columns with default values
+                // Left outer join mismatch: pad right columns with NULL values
                 let mut merged_values = left_row.values.clone();
-                for col in &right_schema.columns {
-                    let default_val = match col.data_type {
-                        dtdb_relational::DataType::Int => DbValue::Int(0),
-                        dtdb_relational::DataType::Float => DbValue::Float(0.0),
-                        dtdb_relational::DataType::String => DbValue::String("".to_string()),
-                        dtdb_relational::DataType::Bytes => DbValue::Bytes(Vec::new()),
-                    };
-                    merged_values.push(default_val);
+                for _ in &right_schema.columns {
+                    merged_values.push(DbValue::Null);
                 }
                 self.join_buffer.push(Row::new(merged_values));
             }
@@ -451,7 +456,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
                         .iter()
                         .map(|aggr| match aggr {
                             AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                            AggregateExpr::Sum(_) => Accumulator::Sum { sum: 0.0 },
+                            AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
                             AggregateExpr::Min(_) => Accumulator::Min { min: None },
                             AggregateExpr::Max(_) => Accumulator::Max { max: None },
                             AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -509,7 +514,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
 // ==========================================
 enum Accumulator {
     Count { count: i64 },
-    Sum { sum: f64 },
+    Sum { sum: Option<f64> },
     Min { min: Option<DbValue> },
     Max { max: Option<DbValue> },
     Avg { sum: f64, count: i64 },
@@ -517,15 +522,21 @@ enum Accumulator {
 
 impl Accumulator {
     fn update(&mut self, val: &DbValue) -> Result<(), String> {
+        if matches!(val, DbValue::Null) {
+            return Ok(()); // Ignore NULL values for all aggregates
+        }
         match self {
             Accumulator::Count { count } => {
                 *count += 1;
             }
-            Accumulator::Sum { sum } => match val {
-                DbValue::Int(v) => *sum += *v as f64,
-                DbValue::Float(v) => *sum += *v,
-                other => return Err(format!("Cannot compute SUM on non-numeric value {:?}", other)),
-            },
+            Accumulator::Sum { sum } => {
+                let s = sum.get_or_insert(0.0);
+                match val {
+                    DbValue::Int(v) => *s += *v as f64,
+                    DbValue::Float(v) => *s += *v,
+                    other => return Err(format!("Cannot compute SUM on non-numeric value {:?}", other)),
+                }
+            }
             Accumulator::Min { min } => match min {
                 Some(m) => {
                     let ord = compare_values(val, m)?;
@@ -559,12 +570,12 @@ impl Accumulator {
     fn finalize(&self) -> DbValue {
         match self {
             Accumulator::Count { count } => DbValue::Int(*count),
-            Accumulator::Sum { sum } => DbValue::Float(*sum),
-            Accumulator::Min { min } => min.clone().unwrap_or(DbValue::Int(0)),
-            Accumulator::Max { max } => max.clone().unwrap_or(DbValue::Int(0)),
+            Accumulator::Sum { sum } => sum.map(DbValue::Float).unwrap_or(DbValue::Null),
+            Accumulator::Min { min } => min.clone().unwrap_or(DbValue::Null),
+            Accumulator::Max { max } => max.clone().unwrap_or(DbValue::Null),
             Accumulator::Avg { sum, count } => {
                 if *count == 0 {
-                    DbValue::Float(0.0)
+                    DbValue::Null
                 } else {
                     DbValue::Float(*sum / (*count as f64))
                 }
@@ -583,11 +594,15 @@ fn hash_value_to_string(val: &DbValue) -> String {
         DbValue::Float(v) => format!("F:{}", v),
         DbValue::String(s) => format!("S:{}", s),
         DbValue::Bytes(b) => format!("B:{:?}", b),
+        DbValue::Null => "NULL".to_string(),
     }
 }
 
 fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String> {
     match (l, r) {
+        (DbValue::Null, DbValue::Null) => Ok(std::cmp::Ordering::Equal),
+        (DbValue::Null, _) => Ok(std::cmp::Ordering::Less),
+        (_, DbValue::Null) => Ok(std::cmp::Ordering::Greater),
         (DbValue::Int(lv), DbValue::Int(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Float(lv), DbValue::Float(rv)) => {
             lv.partial_cmp(rv).ok_or_else(|| "NaN float comparison".to_string())
