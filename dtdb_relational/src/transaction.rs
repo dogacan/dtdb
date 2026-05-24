@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use dtdb_storage::{DbKey, DbValue, WalEntry};
-use crate::database::{Database, TransactionRecord};
+use crate::database::{Database, TransactionRecord, Table};
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
 use crate::schema::DataType;
@@ -46,11 +46,17 @@ impl Transaction {
         }
     }
 
+    fn get_table(&self, table_name: &str) -> Result<Table> {
+        let table = self.database.get_table(table_name)?;
+        self.database.register_table_access(table_name, self.tx_id);
+        Ok(table)
+    }
+
     /// Inserts or updates a Row inside the transaction buffer.
     ///
     /// Validates the row schema and primary key constraints.
     pub fn put(&self, table_name: &str, key: DbKey, row: Row) -> Result<()> {
-        let table = self.database.get_table(table_name)?;
+        let table = self.get_table(table_name)?;
 
         // Validate Row and Primary Key constraints.
         table.schema.validate_row(&row)?;
@@ -68,7 +74,7 @@ impl Transaction {
 
     /// Deletes a row by primary key inside the transaction buffer.
     pub fn delete(&self, table_name: &str, key: DbKey) -> Result<()> {
-        let table = self.database.get_table(table_name)?;
+        let table = self.get_table(table_name)?;
 
         // Validate that key type matches primary key column DataType.
         let pk_idx = table.schema.primary_key_index().ok_or_else(|| {
@@ -101,7 +107,7 @@ impl Transaction {
     /// Checks the transaction buffer first (Read-Your-Own-Writes),
     /// falling back to the underlying StorageEngine.
     pub fn get(&self, table_name: &str, key: &DbKey) -> Result<Option<Row>> {
-        let table = self.database.get_table(table_name)?;
+        let table = self.get_table(table_name)?;
 
         // 1. Check transaction write buffer.
         {
@@ -150,7 +156,7 @@ impl Transaction {
     where
         F: Fn(&Row) -> bool,
     {
-        let table = self.database.get_table(table_name)?;
+        let table = self.get_table(table_name)?;
 
         // Track the scan range.
         {
@@ -305,7 +311,7 @@ impl Transaction {
 
         // 3. Write batches to respective table storage engines
         for (table_name, entries) in table_batches {
-            let table = self.database.get_table(&table_name)?;
+            let table = self.get_table(&table_name)?;
             table.engine.write_batch(entries)?;
         }
 

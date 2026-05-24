@@ -67,6 +67,7 @@ pub struct Database {
     occ_active_transactions: Mutex<HashMap<u64, u64>>,
     commit_history: Mutex<Vec<CommitRecord>>,
     spawner: Arc<dyn ThreadSpawner>,
+    active_table_access: Mutex<HashMap<String, HashSet<u64>>>,
 }
 
 impl Database {
@@ -116,6 +117,19 @@ impl Database {
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
+
+        // Clean up stranded temporary directories from previous crashes
+        for entry in fs::read_dir(&dir_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with(".tmp_drop_") {
+                        let _ = fs::remove_dir_all(&path);
+                    }
+                }
+            }
+        }
 
         let db_options_path = dir_path.join("db_options.bin");
         let bytes = bincode::serialize(&options).map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
@@ -173,6 +187,7 @@ impl Database {
         let global_commit_version = std::sync::atomic::AtomicU64::new(0);
         let occ_active_transactions = Mutex::new(HashMap::new());
         let commit_history = Mutex::new(Vec::new());
+        let active_table_access = Mutex::new(HashMap::new());
 
         let db = Self {
             dir_path,
@@ -184,6 +199,7 @@ impl Database {
             occ_active_transactions,
             commit_history,
             spawner,
+            active_table_access,
         };
 
         db.recover_transactions()?;
@@ -251,9 +267,37 @@ impl Database {
         // Explicitly drop table handles to close open files.
         drop(table);
 
+        // Wait until all transactions currently accessing this table have finished.
+        loop {
+            let has_active_readers = {
+                let access = self.active_table_access.lock().unwrap();
+                access.get(name).map_or(false, |readers| !readers.is_empty())
+            };
+            if !has_active_readers {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
         let table_path = self.dir_path.join(name);
         if table_path.exists() {
-            fs::remove_dir_all(table_path)?;
+            // Generate a unique temporary directory name.
+            let rand_val = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let temp_name = format!(".tmp_drop_{}_{}", name, rand_val);
+            let temp_table_path = self.dir_path.join(&temp_name);
+
+            // Atomically rename the table directory to a unique temporary "tombstone" directory.
+            fs::rename(&table_path, &temp_table_path)?;
+
+            // Remove the temporary directory non-atomically (crash safe).
+            fs::remove_dir_all(temp_table_path)?;
+
+            // Clean up the tracking entry.
+            let mut access = self.active_table_access.lock().unwrap();
+            access.remove(name);
         }
 
         Ok(())
@@ -374,9 +418,19 @@ impl Database {
         version
     }
 
+    pub fn register_table_access(&self, table_name: &str, tx_id: u64) {
+        let mut access = self.active_table_access.lock().unwrap();
+        access.entry(table_name.to_string()).or_default().insert(tx_id);
+    }
+
     pub fn unregister_transaction(&self, tx_id: u64) {
         let mut active = self.occ_active_transactions.lock().unwrap();
         active.remove(&tx_id);
+
+        let mut access = self.active_table_access.lock().unwrap();
+        for readers in access.values_mut() {
+            readers.remove(&tx_id);
+        }
     }
 
     pub fn validate_and_commit(

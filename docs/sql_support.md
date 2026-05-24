@@ -46,6 +46,10 @@ Removes the table catalog entry and deletes the corresponding storage directory 
     ```
 *   **Transaction Restriction**:
     *   `DROP TABLE` is a DDL statement and is **not allowed** inside explicit multi-statement transactions. It must be run as a single auto-committed statement.
+*   **Concurrency & Serialization**:
+    *   `DROP TABLE` utilizes **catalog-level serialization** by acquiring an exclusive write lock on the database catalog.
+    *   If active transactions are currently accessing (reading from or writing to) the target table, `DROP TABLE` will block and wait for those transactions to complete before proceeding.
+    *   While `DROP TABLE` is waiting or executing, any new transactions attempting to access *any* table in the database will block until the `DROP TABLE` operation completes.
 *   **Example**:
     ```sql
     DROP TABLE Users;
@@ -242,8 +246,13 @@ Returns the first non-null argument.
 
 ## 6. Transactions & DDL Restrictions
 
-DuctTapeDB supports explicit multi-statement transactions using a stream-based API or the client `run_in_transaction` method. 
+DuctTapeDB supports explicit multi-statement transactions using a stream-based API or the client `run_in_transaction` method.
 
+### DDL Concurrency & Serialization
+*   **Catalog Locking**: DDL statements (`CREATE TABLE` and `DROP TABLE`) are serialized database-wide. They acquire an exclusive write lock on the database catalog, preventing concurrent transactions from starting or accessing any tables until the DDL operation completes.
+*   **Active Transactions**: If active transactions are already accessing a table that is being dropped, `DROP TABLE` will block and wait for them to finish before modifying the catalog or deleting files on disk.
+
+### Transaction Boundaries
 *   **Supported inside Transactions**:
     *   DML statements: `INSERT`, `UPDATE`, `DELETE`.
     *   Queries: `SELECT`, `EXPLAIN`.

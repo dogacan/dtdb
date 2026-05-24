@@ -219,3 +219,66 @@ fn test_transaction_scans_and_merges() {
     assert_eq!(scan_res[1], r_user(25, "twentyfive", 25.0));
     assert_eq!(scan_res[2], r_user(30, "thirty", 30.0));
 }
+
+#[test]
+fn test_drop_table_blocks_on_active_transaction() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", k_int(1), r_user(1, "alice", 95.5)).unwrap();
+
+    // Access the table to register active access
+    tx.get("users", &k_int(1)).unwrap();
+
+    let db_clone = db.clone();
+    let drop_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_finished_clone = drop_finished.clone();
+    let handle = std::thread::spawn(move || {
+        db_clone.drop_table("users").unwrap();
+        drop_finished_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // Sleep to ensure the background drop_table thread has spawned and is waiting on active readers
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(!drop_finished.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Drop the transaction to unregister it and release the lock/wait
+    drop(tx);
+
+    // Wait for the drop_table thread to finish
+    handle.join().unwrap();
+    assert!(drop_finished.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Verify directory is deleted from disk
+    let table_path = temp_dir.path().join("users");
+    assert!(!table_path.exists());
+}
+
+#[test]
+fn test_drop_table_stranded_cleanup_on_startup() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    // 1. Open Database and create a table.
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.create_table("users", create_test_schema()).unwrap();
+    }
+
+    // 2. Create a fake stranded ".tmp_drop_" directory inside the database directory.
+    let stranded_path = db_path.join(".tmp_drop_users_12345");
+    std::fs::create_dir_all(&stranded_path).unwrap();
+    std::fs::write(stranded_path.join("some_sst.sst"), b"garbage").unwrap();
+
+    assert!(stranded_path.exists());
+
+    // 3. Re-open Database (which should trigger startup cleanup).
+    {
+        let _db = Database::open(&db_path).unwrap();
+    }
+
+    // 4. Verify the stranded directory was deleted.
+    assert!(!stranded_path.exists());
+}
