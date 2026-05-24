@@ -7,6 +7,24 @@ service DuctTapeDbService {
     rpc DropDb (DropDbRequest) returns (DropDbResponse);
     rpc ExecuteQuery (ExecuteQueryRequest) returns (stream ExecuteQueryResponse);
     rpc FlushDb (FlushDbRequest) returns (FlushDbResponse);
+
+    // Bidirectional streaming RPC for multi-statement transactions.
+    //
+    // Protocol:
+    //   1. Client sends StartTransaction with the target database name.
+    //   2. Client sends one or more ExecuteTxQuery messages. For each query,
+    //      the server streams back zero or more QueryResult responses followed
+    //      by a QueryFinished marker (query_finished = true).
+    //   3. Client sends CommitTransaction to commit, or RollbackTransaction
+    //      to explicitly abort.
+    //   4. If the client stream drops/disconnects at any point before Commit,
+    //      the transaction is automatically rolled back.
+    //
+    // Misuse protection:
+    //   - Sending multiple StartTransaction messages returns an error.
+    //   - Sending Execute/Commit/Rollback before StartTransaction returns an error.
+    //   - Sending Execute after Commit/Rollback returns an error.
+    rpc Transaction (stream TransactionRequest) returns (stream TransactionResponse);
 }
 
 enum CompressionOption {
@@ -65,4 +83,40 @@ message Header {
 
 message Row {
     repeated string values = 1;
+}
+
+// --- Transaction streaming messages ---
+
+message TransactionRequest {
+    oneof command {
+        StartTransaction start = 1;
+        ExecuteTxQuery execute = 2;
+        CommitTransaction commit = 3;
+        RollbackTransaction rollback = 4;
+    }
+}
+
+message StartTransaction {
+    string db_name = 1;
+}
+
+message ExecuteTxQuery {
+    string sql_query = 1;
+}
+
+message CommitTransaction {}
+message RollbackTransaction {}
+
+message TransactionResponse {
+    oneof payload {
+        ExecuteQueryResponse query_result = 1;
+        CommitResult commit_result = 2;
+        string error_message = 3;
+        bool query_finished = 4;
+    }
+}
+
+message CommitResult {
+    bool success = 1;
+    string message = 2;
 }

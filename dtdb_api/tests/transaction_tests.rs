@@ -1,0 +1,403 @@
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
+use tonic::Status;
+use futures_util::StreamExt;
+use std::path::Path;
+
+use dtdb_storage::CompressionType;
+use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::server::DuctTapeDbServiceImpl;
+use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
+use dtdb_api::proto::duct_tape_db_service_client::DuctTapeDbServiceClient;
+use dtdb_api::proto::{
+    TransactionRequest, StartTransaction, ExecuteTxQuery, CommitTransaction, RollbackTransaction,
+};
+use dtdb_api::proto::transaction_request::Command;
+use dtdb_api::proto::transaction_response::Payload as TxPayload;
+use dtdb_api::proto::execute_query_response::Payload as EqPayload;
+
+// Helper to spin up a gRPC server on a random port
+async fn start_test_server(data_path: &Path) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let service = DuctTapeDbServiceImpl::new(data_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(DuctTapeDbServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    // Let the server spin up
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    (port, server_handle)
+}
+
+#[tokio::test]
+async fn test_in_process_transaction_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+
+    // Create table first
+    {
+        let mut stream = client
+            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // Run transaction
+    let tx_res = client.run_in_transaction("test_db", |tx| async move {
+        tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');").await?;
+        tx.execute_query("INSERT INTO Users (id, name) VALUES (2, 'Bob');").await?;
+        Ok("success_value")
+    }).await;
+
+    assert_eq!(tx_res.unwrap(), "success_value");
+
+    // Verify both rows exist
+    let mut stream = client
+        .execute_query("test_db", "SELECT id, name FROM Users ORDER BY id ASC;")
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Some(res) = stream.next().await {
+        let resp = res.unwrap();
+        if let Some(EqPayload::Row(row)) = resp.payload {
+            rows.push(row.values);
+        }
+    }
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec!["1", "Alice"]);
+    assert_eq!(rows[1], vec!["2", "Bob"]);
+}
+
+#[tokio::test]
+async fn test_in_process_transaction_rollback() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+
+    // Create table first
+    {
+        let mut stream = client
+            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // Run transaction and return error to trigger rollback
+    let tx_res: Result<(), Status> = client.run_in_transaction("test_db", |tx| async move {
+        tx.execute_query("INSERT INTO Users (id, name) VALUES (1, 'Alice');").await?;
+        Err(Status::aborted("abort transaction"))
+    }).await;
+
+    assert!(tx_res.is_err());
+    assert_eq!(tx_res.unwrap_err().code(), tonic::Code::Aborted);
+
+    // Verify table is empty
+    let mut stream = client
+        .execute_query("test_db", "SELECT id, name FROM Users;")
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Some(res) = stream.next().await {
+        let resp = res.unwrap();
+        if let Some(EqPayload::Row(row)) = resp.payload {
+            rows.push(row.values);
+        }
+    }
+
+    assert_eq!(rows.len(), 0);
+}
+
+#[tokio::test]
+async fn test_grpc_transaction_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let (port, server_handle) = start_test_server(&data_path).await;
+
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+
+    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+
+    // Create table
+    {
+        let mut stream = client
+            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // Run transaction
+    let tx_res = client.run_in_transaction("test_db", |tx| async move {
+        tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');").await?;
+        tx.execute_query("INSERT INTO Users (id, name) VALUES (20, 'Dave');").await?;
+        Ok("success")
+    }).await;
+
+    assert_eq!(tx_res.unwrap(), "success");
+
+    // Verify rows exist
+    let mut stream = client
+        .execute_query("test_db", "SELECT id, name FROM Users ORDER BY id ASC;")
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Some(res) = stream.next().await {
+        let resp = res.unwrap();
+        if let Some(EqPayload::Row(row)) = resp.payload {
+            rows.push(row.values);
+        }
+    }
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec!["10", "Charlie"]);
+    assert_eq!(rows[1], vec!["20", "Dave"]);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_grpc_transaction_rollback() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let (port, server_handle) = start_test_server(&data_path).await;
+
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+
+    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+
+    // Create table
+    {
+        let mut stream = client
+            .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));")
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // Run transaction and return error to trigger rollback
+    let tx_res: Result<(), Status> = client.run_in_transaction("test_db", |tx| async move {
+        tx.execute_query("INSERT INTO Users (id, name) VALUES (10, 'Charlie');").await?;
+        Err(Status::aborted("abort transaction"))
+    }).await;
+
+    assert!(tx_res.is_err());
+
+    // Verify table is empty
+    let mut stream = client
+        .execute_query("test_db", "SELECT id, name FROM Users;")
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Some(res) = stream.next().await {
+        let resp = res.unwrap();
+        if let Some(EqPayload::Row(row)) = resp.payload {
+            rows.push(row.values);
+        }
+    }
+
+    assert_eq!(rows.len(), 0);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_multi_statement_rejection() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+
+    // Rejects multi-statement ExecuteQuery
+    let err = client
+        .execute_query("test_db", "CREATE TABLE Users (id int PRIMARY KEY); INSERT INTO Users (id) VALUES (1);")
+        .await
+        .err()
+        .unwrap();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("Multiple SQL statements in a single execute() call are not allowed"));
+}
+
+#[tokio::test]
+async fn test_grpc_protocol_misuse() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let (port, server_handle) = start_test_server(&data_path).await;
+
+    let client_addr = format!("http://127.0.0.1:{}", port);
+
+    // Create the database first
+    {
+        let mut client = DuctTapeDbClient::connect(client_addr.clone()).await.unwrap();
+        client.create_db("test_db", CompressionType::Uncompressed).await.unwrap();
+    }
+
+    let mut raw_client = DuctTapeDbServiceClient::connect(client_addr).await.unwrap();
+
+    // Scenario A: Send Execute before Start
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        tx.send(TransactionRequest {
+            command: Some(Command::Execute(ExecuteTxQuery {
+                sql_query: "SELECT * FROM Users;".to_string(),
+            })),
+        }).await.unwrap();
+
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("must send StartTransaction before executing queries"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    // Scenario B: Send Commit before Start
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        tx.send(TransactionRequest {
+            command: Some(Command::Commit(CommitTransaction {})),
+        }).await.unwrap();
+
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("must send StartTransaction before committing"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    // Scenario C: Send Rollback before Start
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        tx.send(TransactionRequest {
+            command: Some(Command::Rollback(RollbackTransaction {})),
+        }).await.unwrap();
+
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("must send StartTransaction before rolling back"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    // Scenario D: Send multiple StartTransaction commands
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        // Send first StartTransaction
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+            })),
+        }).await.unwrap();
+
+        let resp1 = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp1.payload, Some(TxPayload::QueryFinished(true))));
+
+        // Send second StartTransaction
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+            })),
+        }).await.unwrap();
+
+        let resp2 = response.next().await.unwrap().unwrap();
+        match resp2.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("StartTransaction already received"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    // Scenario E: Send commands after Commit
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        // 1. Start
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+            })),
+        }).await.unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp.payload, Some(TxPayload::QueryFinished(true))));
+
+        // 2. Commit
+        tx.send(TransactionRequest {
+            command: Some(Command::Commit(CommitTransaction {})),
+        }).await.unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp.payload, Some(TxPayload::CommitResult(_))));
+
+        // 3. Execute query (misuse)
+        tx.send(TransactionRequest {
+            command: Some(Command::Execute(ExecuteTxQuery {
+                sql_query: "SELECT * FROM Users;".to_string(),
+            })),
+        }).await.unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("Transaction already completed"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    server_handle.abort();
+}

@@ -8,6 +8,7 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use futures_core::Stream;
+use futures_util::StreamExt;
 use tonic::{Request, Response, Status};
 
 use dtdb_storage::{CompressionType, DbValue};
@@ -19,12 +20,13 @@ use crate::proto::{
     CreateDbRequest, CreateDbResponse, DropDbRequest, DropDbResponse,
     ExecuteQueryRequest, ExecuteQueryResponse, Header, Row, CompressionOption,
     FlushDbRequest, FlushDbResponse,
+    TransactionRequest, TransactionResponse, CommitResult,
 };
 
 pub struct DuctTapeDbServiceImpl {
     data_dir: PathBuf,
-    databases: RwLock<HashMap<String, DbState>>,
-    next_tx_id: AtomicU64,
+    databases: Arc<RwLock<HashMap<String, DbState>>>,
+    next_tx_id: Arc<AtomicU64>,
 }
 
 struct DbState {
@@ -37,11 +39,11 @@ impl DuctTapeDbServiceImpl {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
-        let databases = RwLock::new(HashMap::new());
+        let databases = Arc::new(RwLock::new(HashMap::new()));
         let service = Self {
             data_dir: data_dir.clone(),
             databases,
-            next_tx_id: AtomicU64::new(1),
+            next_tx_id: Arc::new(AtomicU64::new(1)),
         };
 
         // Scan and restore databases
@@ -106,11 +108,79 @@ impl DuctTapeDbServiceImpl {
             }
         });
     }
+
+    /// Returns the database and SQL engine for the given database name, if it exists.
+    pub fn get_db_and_engine(&self, db_name: &str) -> Option<(Arc<Database>, Arc<SqlEngine>)> {
+        let dbs = self.databases.read().unwrap();
+        dbs.get(db_name).map(|state| (state.database.clone(), state.sql_engine.clone()))
+    }
+
+    /// Allocates the next unique transaction ID.
+    pub fn next_tx_id(&self) -> u64 {
+        self.next_tx_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+/// Helper: converts an `ExecutionResult` into a sequence of `ExecuteQueryResponse` messages.
+pub(crate) fn execution_result_to_responses(result: dtdb_sql::ExecutionResult) -> Vec<ExecuteQueryResponse> {
+    match result {
+        dtdb_sql::ExecutionResult::CreateTable => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    "Table created successfully.".to_string(),
+                )),
+            }]
+        }
+        dtdb_sql::ExecutionResult::DropTable => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    "Table dropped successfully.".to_string(),
+                )),
+            }]
+        }
+        dtdb_sql::ExecutionResult::Insert { count } => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    format!("Inserted {} row(s).", count),
+                )),
+            }]
+        }
+        dtdb_sql::ExecutionResult::Select { schema, rows } => {
+            let mut responses = Vec::new();
+
+            // Header
+            let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
+            responses.push(ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::Header(Header {
+                    column_names,
+                })),
+            });
+
+            // Rows
+            for row in rows {
+                let values = row.values.iter().map(|val| match val {
+                    DbValue::Int(v) => v.to_string(),
+                    DbValue::Float(v) => v.to_string(),
+                    DbValue::String(s) => s.clone(),
+                    DbValue::Bytes(b) => format!("{:?}", b),
+                }).collect();
+
+                responses.push(ExecuteQueryResponse {
+                    payload: Some(crate::proto::execute_query_response::Payload::Row(Row {
+                        values,
+                    })),
+                });
+            }
+
+            responses
+        }
+    }
 }
 
 #[tonic::async_trait]
 impl DuctTapeDbService for DuctTapeDbServiceImpl {
     type ExecuteQueryStream = Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>;
+    type TransactionStream = Pin<Box<dyn Stream<Item = Result<TransactionResponse, Status>> + Send + 'static>>;
 
     async fn create_db(
         &self,
@@ -284,58 +354,12 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                     return Err(Status::aborted(format!("Transaction commit failed: {}", e)));
                 }
 
-                // Handle sending results to stream
+                // Convert result into response messages and send them via the channel
+                let responses = execution_result_to_responses(result);
                 tokio::spawn(async move {
-                    match result {
-                        dtdb_sql::ExecutionResult::CreateTable => {
-                            let _ = tx_chan.send(Ok(ExecuteQueryResponse {
-                                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
-                                    "Table created successfully.".to_string(),
-                                )),
-                            })).await;
-                        }
-                        dtdb_sql::ExecutionResult::DropTable => {
-                            let _ = tx_chan.send(Ok(ExecuteQueryResponse {
-                                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
-                                    "Table dropped successfully.".to_string(),
-                                )),
-                            })).await;
-                        }
-                        dtdb_sql::ExecutionResult::Insert { count } => {
-                            let _ = tx_chan.send(Ok(ExecuteQueryResponse {
-                                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
-                                    format!("Inserted {} row(s).", count),
-                                )),
-                            })).await;
-                        }
-                        dtdb_sql::ExecutionResult::Select { schema, rows } => {
-                            // Send Header first
-                            let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
-                            if tx_chan.send(Ok(ExecuteQueryResponse {
-                                payload: Some(crate::proto::execute_query_response::Payload::Header(Header {
-                                    column_names,
-                                })),
-                            })).await.is_err() {
-                                return;
-                            }
-
-                            // Send rows
-                            for row in rows {
-                                let values = row.values.iter().map(|val| match val {
-                                    DbValue::Int(v) => v.to_string(),
-                                    DbValue::Float(v) => v.to_string(),
-                                    DbValue::String(s) => s.clone(),
-                                    DbValue::Bytes(b) => format!("{:?}", b),
-                                }).collect();
-
-                                if tx_chan.send(Ok(ExecuteQueryResponse {
-                                    payload: Some(crate::proto::execute_query_response::Payload::Row(Row {
-                                        values,
-                                    })),
-                                })).await.is_err() {
-                                    return;
-                                }
-                            }
+                    for resp in responses {
+                        if tx_chan.send(Ok(resp)).await.is_err() {
+                            return;
                         }
                     }
                 });
@@ -348,5 +372,234 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
 
         let stream = ReceiverStream::new(rx_chan);
         Ok(Response::new(Box::pin(stream) as Self::ExecuteQueryStream))
+    }
+
+    /// Bidirectional streaming RPC for multi-statement transactions.
+    ///
+    /// This implements a state machine with the following valid transitions:
+    ///
+    ///   [Idle] --Start--> [Active] --Execute--> [Active]
+    ///                       |                      |
+    ///                       +--Commit/Rollback--> [Done]
+    ///
+    /// Invalid transitions (e.g. double Start, Execute before Start) return
+    /// error messages on the response stream. If the client disconnects at
+    /// any point before committing, the transaction is automatically rolled back.
+    async fn transaction(
+        &self,
+        request: Request<tonic::Streaming<TransactionRequest>>,
+    ) -> Result<Response<Self::TransactionStream>, Status> {
+        let mut in_stream = request.into_inner();
+        let (tx_chan, rx_chan) = mpsc::channel::<Result<TransactionResponse, Status>>(128);
+
+        // Clone Arc-wrapped fields so they can be moved into the spawned task.
+        let databases = self.databases.clone();
+        let next_tx_id = self.next_tx_id.clone();
+
+        tokio::spawn(async move {
+            // Transaction state machine.
+            // - `None` means we haven't received StartTransaction yet (Idle state).
+            // - `Some(...)` means the transaction is active.
+            let mut tx_state: Option<(Transaction, Arc<SqlEngine>)> = None;
+            let mut finished = false; // True after Commit or Rollback (Done state).
+
+            while let Some(msg_result) = in_stream.next().await {
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // Client stream error — roll back if active.
+                        if let Some((tx, _)) = tx_state.take() {
+                            let _ = tx.rollback();
+                        }
+                        let _ = tx_chan.send(Ok(TransactionResponse {
+                            payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                format!("Stream error: {}", e),
+                            )),
+                        })).await;
+                        return;
+                    }
+                };
+
+                let command = match msg.command {
+                    Some(c) => c,
+                    None => {
+                        let _ = tx_chan.send(Ok(TransactionResponse {
+                            payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                "Empty transaction request (no command specified)".to_string(),
+                            )),
+                        })).await;
+                        continue;
+                    }
+                };
+
+                // Guard: reject all commands after commit/rollback.
+                if finished {
+                    let _ = tx_chan.send(Ok(TransactionResponse {
+                        payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                            "Transaction already completed (committed or rolled back). \
+                             No further commands are accepted.".to_string(),
+                        )),
+                    })).await;
+                    continue;
+                }
+
+                match command {
+                    // --- StartTransaction ---
+                    crate::proto::transaction_request::Command::Start(start) => {
+                        // Guard: reject duplicate StartTransaction.
+                        if tx_state.is_some() {
+                            let _ = tx_chan.send(Ok(TransactionResponse {
+                                payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                    "Protocol error: StartTransaction already received. \
+                                     Only one StartTransaction is allowed per stream.".to_string(),
+                                )),
+                            })).await;
+                            continue;
+                        }
+
+                        let db_name = start.db_name.trim();
+                        let lookup = {
+                            let dbs = databases.read().unwrap();
+                            dbs.get(db_name).map(|state| (state.database.clone(), state.sql_engine.clone()))
+                        };
+                        let (database, sql_engine) = match lookup {
+                            Some(pair) => pair,
+                            None => {
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        format!("Database '{}' not found", db_name),
+                                    )),
+                                })).await;
+                                return;
+                            }
+                        };
+
+                        let tx_id = next_tx_id.fetch_add(1, Ordering::SeqCst);
+                        let tx = Transaction::new(tx_id, database);
+                        tx_state = Some((tx, sql_engine));
+
+                        // Acknowledge the transaction start.
+                        let _ = tx_chan.send(Ok(TransactionResponse {
+                            payload: Some(crate::proto::transaction_response::Payload::QueryFinished(true)),
+                        })).await;
+                    }
+
+                    // --- ExecuteTxQuery ---
+                    crate::proto::transaction_request::Command::Execute(exec) => {
+                        // Guard: reject Execute before StartTransaction.
+                        let (tx, sql_engine) = match tx_state {
+                            Some(ref s) => s,
+                            None => {
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        "Protocol error: must send StartTransaction before executing queries.".to_string(),
+                                    )),
+                                })).await;
+                                continue;
+                            }
+                        };
+
+                        let sql_query = exec.sql_query.trim();
+                        match sql_engine.execute(sql_query, tx) {
+                            Ok(result) => {
+                                let responses = execution_result_to_responses(result);
+                                for resp in responses {
+                                    let tx_resp = TransactionResponse {
+                                        payload: Some(crate::proto::transaction_response::Payload::QueryResult(resp)),
+                                    };
+                                    if tx_chan.send(Ok(tx_resp)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                // Send query_finished marker so the client knows this query's
+                                // results are complete and it can send the next command.
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::QueryFinished(true)),
+                                })).await;
+                            }
+                            Err(e) => {
+                                // SQL error — report the error but keep the transaction alive.
+                                // The client can choose to retry, send more queries, or rollback.
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        format!("SQL Error: {}", e),
+                                    )),
+                                })).await;
+                                // Still send query_finished so the client can proceed.
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::QueryFinished(true)),
+                                })).await;
+                            }
+                        }
+                    }
+
+                    // --- CommitTransaction ---
+                    crate::proto::transaction_request::Command::Commit(_) => {
+                        // Guard: reject Commit before StartTransaction.
+                        let (tx, _) = match tx_state.take() {
+                            Some(s) => s,
+                            None => {
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        "Protocol error: must send StartTransaction before committing.".to_string(),
+                                    )),
+                                })).await;
+                                continue;
+                            }
+                        };
+
+                        let commit_result = match tx.commit() {
+                            Ok(()) => CommitResult {
+                                success: true,
+                                message: "Transaction committed successfully.".to_string(),
+                            },
+                            Err(e) => CommitResult {
+                                success: false,
+                                message: format!("Transaction commit failed: {}", e),
+                            },
+                        };
+
+                        let _ = tx_chan.send(Ok(TransactionResponse {
+                            payload: Some(crate::proto::transaction_response::Payload::CommitResult(commit_result)),
+                        })).await;
+                        finished = true;
+                    }
+
+                    // --- RollbackTransaction ---
+                    crate::proto::transaction_request::Command::Rollback(_) => {
+                        // Guard: reject Rollback before StartTransaction.
+                        let (tx, _) = match tx_state.take() {
+                            Some(s) => s,
+                            None => {
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        "Protocol error: must send StartTransaction before rolling back.".to_string(),
+                                    )),
+                                })).await;
+                                continue;
+                            }
+                        };
+
+                        let _ = tx.rollback();
+                        let _ = tx_chan.send(Ok(TransactionResponse {
+                            payload: Some(crate::proto::transaction_response::Payload::CommitResult(CommitResult {
+                                success: true,
+                                message: "Transaction rolled back.".to_string(),
+                            })),
+                        })).await;
+                        finished = true;
+                    }
+                }
+            }
+
+            // Client stream ended without an explicit Commit or Rollback.
+            // Automatically roll back the transaction to prevent dangling state.
+            if let Some((tx, _)) = tx_state.take() {
+                let _ = tx.rollback();
+            }
+        });
+
+        let stream = ReceiverStream::new(rx_chan);
+        Ok(Response::new(Box::pin(stream) as Self::TransactionStream))
     }
 }

@@ -38,7 +38,25 @@ impl SqlEngine {
         self.execute(&sql, tx)
     }
 
-    /// Parses, plans, optimizes, and executes a SQL query within the given transaction.
+    /// Parses, plans, optimizes, and executes a single SQL statement within the given transaction.
+    ///
+    /// # Single-Statement Restriction
+    ///
+    /// This method intentionally rejects inputs containing multiple SQL statements
+    /// (e.g. "INSERT ...; INSERT ...;"). This is a deliberate design choice:
+    ///
+    /// - **Atomicity**: Each `execute()` call runs as a single auto-committed transaction.
+    ///   Silently executing only the first statement of a multi-statement input would
+    ///   cause data loss. Executing all statements without transaction boundaries would
+    ///   leave partial results on failure.
+    ///
+    /// - **Explicit transactions**: Callers who need to execute multiple statements
+    ///   atomically should use `DuctTapeDbClient::run_in_transaction()` (client API)
+    ///   or the `Transaction` bidirectional streaming RPC, which provide proper
+    ///   transaction boundaries with commit/rollback semantics.
+    ///
+    /// This restriction ensures that every `execute()` call has clear, predictable
+    /// atomicity semantics: exactly one statement, exactly one transaction.
     pub fn execute(&self, sql: &str, tx: &Transaction) -> Result<ExecutionResult, String> {
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
@@ -46,7 +64,17 @@ impl SqlEngine {
             return Err("No SQL statements found".to_string());
         }
 
-        // We execute the first statement in the query block
+        // Reject multi-statement inputs. Callers who need to run multiple statements
+        // in a single transaction must use RunInTransaction or the Transaction RPC.
+        // See the doc comment above for the full rationale.
+        if statements.len() > 1 {
+            return Err(
+                "Multiple SQL statements in a single execute() call are not allowed. \
+                 Use DuctTapeDbClient::run_in_transaction() or the Transaction RPC to \
+                 execute multiple statements within a single transaction.".to_string()
+            );
+        }
+
         let statement = &statements[0];
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(statement)?;
 
