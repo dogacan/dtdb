@@ -62,25 +62,49 @@ Inserts new rows into a table.
     INSERT INTO Users (id, name, score) VALUES (1, 'Alice', 95.5), (2, 'Bob', 88.0);
     ```
 
+#### `UPDATE`
+Updates existing rows in a table.
+*   **Syntax**:
+    ```sql
+    UPDATE <table_name> SET <column_name> = <expression>, ... [WHERE <predicate>];
+    ```
+*   **Notes**:
+    - Updates modifying primary key columns are planned as a `DELETE` followed by an `INSERT` under the hood.
+*   **Example**:
+    ```sql
+    UPDATE Users SET score = score + 5.0, name = 'Alice Updated' WHERE id = 1;
+    ```
+
+#### `DELETE`
+Deletes rows from a table.
+*   **Syntax**:
+    ```sql
+    DELETE FROM <table_name> [WHERE <predicate>];
+    ```
+*   **Example**:
+    ```sql
+    DELETE FROM Users WHERE score < 50.0;
+    ```
+
 #### `SELECT`
 Queries rows from table relations.
 *   **Syntax**:
     ```sql
     SELECT <projection>
     FROM <table_name>
-    [JOIN <other_table> ON <join_condition>]
+    [JOIN | LEFT JOIN <other_table> ON <join_condition>]
     [WHERE <predicate>]
     [GROUP BY <group_by_columns>]
     [ORDER BY <sort_columns>]
-    [LIMIT <number>];
+    [LIMIT <number>] [OFFSET <number>];
     ```
 *   **Clauses Detail**:
     *   **Projection**: Supports columns, expressions, aliases (`col AS alias`), aggregate functions, and wildcard (`*`).
-    *   **JOIN**: Supports inner equality joins (e.g. `ON t1.id = t2.user_id`). Nested or non-equality joins are not supported.
+    *   **JOIN**: Supports inner and left outer equality joins (e.g. `ON t1.id = t2.user_id` or `LEFT JOIN ... ON ...`). Non-equality joins or right/full outer joins are not supported. Unmatched left rows are padded with type-default values for the right-side columns.
     *   **WHERE**: Filters source tuples using comparison and logical operators.
     *   **GROUP BY**: Groups rows by one or more columns for aggregation. When grouping, non-aggregate expressions in the select list are restricted to grouping columns.
     *   **ORDER BY**: Orders results by one or more expressions in ascending (`ASC`, default) or descending (`DESC`) order. You can sort by columns that are not projected in the select list.
-    *   **LIMIT**: Restricts the maximum number of rows returned.
+    *   **LIMIT**: Restricts the maximum number of rows returned. Optional `OFFSET` skips a specified number of rows before returning results.
 *   **Examples**:
     ```sql
     -- Simple select with sorting and limit
@@ -145,6 +169,13 @@ Used to combine boolean expressions:
     *   *Example*: `WHERE name LIKE 'A%'` (starts with 'A'), `WHERE name LIKE '%b%'` (contains 'b').
     *   *Note*: `NOT LIKE` is not supported.
 
+### Arithmetic Operators
+Used for mathematical computations in select projections or predicates:
+*   `+`: Addition
+*   `-`: Subtraction
+*   `*`: Multiplication
+*   `/`: Division (performs integer division if both operands are integers, float division otherwise)
+
 ---
 
 ## 4. Aggregate Functions
@@ -154,3 +185,4 @@ Supported inside the projection list of a `SELECT` statement:
 *   `SUM(col)`: Computes the sum of numeric values.
 *   `MIN(col)`: Returns the minimum value in the group.
 *   `MAX(col)`: Returns the maximum value in the group.
+*   `AVG(col)`: Computes the average of numeric column values.
