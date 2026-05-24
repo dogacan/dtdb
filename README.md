@@ -1,6 +1,6 @@
 # DuctTapeDB 🛠️
 
-**DuctTapeDB** is an educational, from-scratch relational database written in Rust. It prioritizes clean abstractions, highly readable code, and simplicity over high performance and absolute reliability, making it the perfect learning sandbox for database internals.
+**DuctTapeDB** is a from-scratch relational database written in Rust. It prioritizes clean abstractions, highly readable code, and simplicity over high performance and absolute reliability.
 
 ---
 
