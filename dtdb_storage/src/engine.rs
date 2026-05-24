@@ -1,11 +1,11 @@
+use crate::memtable::MemTable;
+use crate::sstable::{SstableReader, SstableWriter};
+use crate::wal::{Wal, WalEntry};
+use crate::{DbKey, DbValue, EngineOptions, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use crate::{DbKey, DbValue, Result, EngineOptions};
-use crate::memtable::MemTable;
-use crate::wal::{Wal, WalEntry};
-use crate::sstable::{SstableReader, SstableWriter};
 
 /// StorageEngine coordinates the LSM-tree storage components:
 /// - An active in-memory MemTable.
@@ -40,10 +40,7 @@ impl StorageEngine {
     ///
     /// If SSTables and/or a WAL exist, it replays the WAL to recover data,
     /// flushes recovered data to a new SSTable, cleans up the WAL, and returns.
-    pub fn open(
-        dir_path: impl AsRef<Path>,
-        options: EngineOptions,
-    ) -> Result<Self> {
+    pub fn open(dir_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
 
@@ -69,7 +66,9 @@ impl StorageEngine {
                     if stem.starts_with('L') {
                         let parts: Vec<&str> = stem[1..].split('_').collect();
                         if parts.len() == 2 {
-                            if let (Ok(level), Ok(id)) = (parts[0].parse::<usize>(), parts[1].parse::<u64>()) {
+                            if let (Ok(level), Ok(id)) =
+                                (parts[0].parse::<usize>(), parts[1].parse::<u64>())
+                            {
                                 max_id = max_id.max(id);
                                 discovered_ssts.push((level, id, path));
                             }
@@ -82,7 +81,10 @@ impl StorageEngine {
         let mut sstables_map: BTreeMap<usize, Vec<Mutex<SstableReader>>> = BTreeMap::new();
         for (level, id, path) in discovered_ssts {
             let reader = SstableReader::open(&path, id, level)?;
-            sstables_map.entry(level).or_default().push(Mutex::new(reader));
+            sstables_map
+                .entry(level)
+                .or_default()
+                .push(Mutex::new(reader));
         }
 
         // Sort the files in each level:
@@ -126,14 +128,21 @@ impl StorageEngine {
             if memtable.byte_size() > 0 {
                 let next_id = max_id + 1;
                 let sst_path = dir_path.join(format!("L0_{:05}.sst", next_id));
-                let mut writer = SstableWriter::create(&sst_path, active_options.block_size_limit, active_options.compression)?;
+                let mut writer = SstableWriter::create(
+                    &sst_path,
+                    active_options.block_size_limit,
+                    active_options.compression,
+                )?;
                 for (key, val) in memtable.entries() {
                     writer.append(key, val)?;
                 }
                 writer.finish()?;
 
                 let reader = SstableReader::open(&sst_path, next_id, 0)?;
-                sstables_map.entry(0).or_default().insert(0, Mutex::new(reader));
+                sstables_map
+                    .entry(0)
+                    .or_default()
+                    .insert(0, Mutex::new(reader));
                 memtable.clear();
             }
 
@@ -293,7 +302,12 @@ impl StorageEngine {
     }
 
     /// Performs a range scan between `start` and `end` (inclusive) matching the filter.
-    pub fn filtered_scan<F>(&self, start: &DbKey, end: &DbKey, filter: F) -> Result<Vec<(DbKey, DbValue)>>
+    pub fn filtered_scan<F>(
+        &self,
+        start: &DbKey,
+        end: &DbKey,
+        filter: F,
+    ) -> Result<Vec<(DbKey, DbValue)>>
     where
         F: Fn(&DbKey, &DbValue) -> bool,
     {
@@ -345,7 +359,9 @@ impl StorageEngine {
             for sstable in ssts.iter() {
                 let mut reader = sstable.lock().unwrap();
                 // Check if the SSTable range overlaps with our scan range [start, end].
-                let f_key = reader.first_key().expect("Level 1+ SSTable must not be empty");
+                let f_key = reader
+                    .first_key()
+                    .expect("Level 1+ SSTable must not be empty");
                 let l_key = reader.last_key();
                 if f_key > end || l_key < start {
                     continue; // No overlap
@@ -407,7 +423,7 @@ impl StorageEngine {
     /// Finds the first level that violates its capacity limit.
     fn find_level_to_compact(&self) -> Option<usize> {
         let sstables = self.sstables.read().unwrap();
-        
+
         // 1. Check Level 0 file count
         if let Some(l0_ssts) = sstables.get(&0) {
             if l0_ssts.len() >= self.options.l0_compaction_threshold {
@@ -475,7 +491,7 @@ impl StorageEngine {
         // 1. Select source files and compute overlapping target files
         {
             let mut sstables_guard = self.sstables.write().unwrap();
-            
+
             if source_level == 0 {
                 // Compact all L0 files
                 source_files = sstables_guard.remove(&0).unwrap_or_default();
@@ -512,7 +528,9 @@ impl StorageEngine {
                     for sstable in target_list {
                         let overlaps = {
                             let reader = sstable.lock().unwrap();
-                            let fk = reader.first_key().expect("Target SSTable must not be empty");
+                            let fk = reader
+                                .first_key()
+                                .expect("Target SSTable must not be empty");
                             let lk = reader.last_key();
                             fk <= &max_k && lk >= &min_k
                         };
@@ -530,7 +548,7 @@ impl StorageEngine {
 
         // 2. Merge-sort all selected files
         let mut merged_data = BTreeMap::new();
-        
+
         let mut l0_files_sorted = Vec::new();
         let mut other_files = Vec::new();
         for f in source_files.iter().chain(overlapping_target_files.iter()) {
@@ -602,9 +620,15 @@ impl StorageEngine {
 
             if current_writer.is_none() {
                 current_id = self.get_next_id()?;
-                let path = self.dir_path.join(format!("L{}_{:05}.sst", target_level, current_id));
+                let path = self
+                    .dir_path
+                    .join(format!("L{}_{:05}.sst", target_level, current_id));
                 current_path = Some(path.clone());
-                current_writer = Some(SstableWriter::create(&path, self.options.block_size_limit, self.options.compression)?);
+                current_writer = Some(SstableWriter::create(
+                    &path,
+                    self.options.block_size_limit,
+                    self.options.compression,
+                )?);
                 current_writer_uncompressed_bytes = 0;
             }
 
@@ -626,24 +650,29 @@ impl StorageEngine {
             if current_writer_uncompressed_bytes >= self.options.sstable_target_size {
                 let writer = current_writer.take().unwrap();
                 writer.finish()?;
-                let reader = SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
+                let reader =
+                    SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
                 new_sstables.push(Mutex::new(reader));
             }
         }
 
         if let Some(writer) = current_writer.take() {
             writer.finish()?;
-            let reader = SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
+            let reader =
+                SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
             new_sstables.push(Mutex::new(reader));
         }
 
         // 4. Update the active sstables map and delete old files
         {
             let mut sstables_guard = self.sstables.write().unwrap();
-            
+
             // Add new sstables to target level
             let target_list = sstables_guard.entry(target_level).or_default();
-            let old_target_ids: HashSet<u64> = overlapping_target_files.iter().map(|f| f.lock().unwrap().id).collect();
+            let old_target_ids: HashSet<u64> = overlapping_target_files
+                .iter()
+                .map(|f| f.lock().unwrap().id)
+                .collect();
             target_list.retain(|f| !old_target_ids.contains(&f.lock().unwrap().id));
             target_list.extend(new_sstables);
             target_list.sort_by(|a, b| {
@@ -681,7 +710,11 @@ impl StorageEngine {
         let sst_path = self.dir_path.join(format!("L0_{:05}.sst", next_id));
 
         // 2. Write MemTable entries to the new SSTable.
-        let mut writer = SstableWriter::create(&sst_path, self.options.block_size_limit, self.options.compression)?;
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            self.options.block_size_limit,
+            self.options.compression,
+        )?;
         for (key, val) in entries {
             writer.append(key, val)?;
         }
@@ -717,4 +750,3 @@ impl StorageEngine {
         Ok(())
     }
 }
-
