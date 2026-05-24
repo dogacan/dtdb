@@ -182,6 +182,7 @@ dependencies = [
  "dtdb_storage",
  "futures-core",
  "futures-util",
+ "indexmap 1.9.3",
  "pin-project",
  "prost",
  "prost-build",
