@@ -20,6 +20,12 @@ pub enum TransactionRecord {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct CommitRecord {
+    pub commit_version: u64,
+    pub keys: HashMap<String, HashSet<dtdb_storage::DbKey>>,
+}
+
 /// Table represents a relational table mapping column definitions to an underlying LSM engine.
 ///
 /// We implement `Clone` on `Table`. This is a clean Rust design pattern:
@@ -57,6 +63,9 @@ pub struct Database {
     pub options: DatabaseOptions,
     transaction_log_path: PathBuf,
     active_transactions: Mutex<HashSet<u64>>,
+    global_commit_version: std::sync::atomic::AtomicU64,
+    occ_active_transactions: Mutex<HashMap<u64, u64>>,
+    commit_history: Mutex<Vec<CommitRecord>>,
 }
 
 impl Database {
@@ -144,6 +153,9 @@ impl Database {
 
         let transaction_log_path = dir_path.join("transactions.log");
         let active_transactions = Mutex::new(HashSet::new());
+        let global_commit_version = std::sync::atomic::AtomicU64::new(0);
+        let occ_active_transactions = Mutex::new(HashMap::new());
+        let commit_history = Mutex::new(Vec::new());
 
         let db = Self {
             dir_path,
@@ -151,6 +163,9 @@ impl Database {
             options,
             transaction_log_path,
             active_transactions,
+            global_commit_version,
+            occ_active_transactions,
+            commit_history,
         };
 
         db.recover_transactions()?;
@@ -331,6 +346,129 @@ impl Database {
 
         // Clean up the log since recovery has completed.
         let _ = File::create(&self.transaction_log_path)?;
+        Ok(())
+    }
+
+    pub fn register_transaction(&self, tx_id: u64) -> u64 {
+        let version = self.global_commit_version.load(std::sync::atomic::Ordering::SeqCst);
+        let mut active = self.occ_active_transactions.lock().unwrap();
+        active.insert(tx_id, version);
+        version
+    }
+
+    pub fn unregister_transaction(&self, tx_id: u64) {
+        let mut active = self.occ_active_transactions.lock().unwrap();
+        active.remove(&tx_id);
+    }
+
+    pub fn validate_and_commit(
+        &self,
+        tx_id: u64,
+        start_version: u64,
+        read_set: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
+        scan_ranges: &HashMap<String, Vec<(dtdb_storage::DbKey, dtdb_storage::DbKey)>>,
+        write_keys: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
+    ) -> Result<u64> {
+        let mut history = self.commit_history.lock().unwrap();
+
+        // 1. Perform validation against history for commits > start_version
+        for record in history.iter() {
+            if record.commit_version > start_version {
+                // Check read-write conflict: Did the committed record modify a key we read?
+                for (table_name, read_keys) in read_set {
+                    if let Some(committed_keys) = record.keys.get(table_name) {
+                        for k in read_keys {
+                            if committed_keys.contains(k) {
+                                return Err(RelationalError::TransactionConflict(format!(
+                                    "Conflict detected: Key {:?} in table {} was modified by a concurrent transaction (tx_id: {})",
+                                    k, table_name, tx_id
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                // Check phantom conflict: Did the committed record modify/insert a key in a range we scanned?
+                for (table_name, ranges) in scan_ranges {
+                    if let Some(committed_keys) = record.keys.get(table_name) {
+                        for k in committed_keys {
+                            for (start, end) in ranges {
+                                if k >= start && k <= end {
+                                    return Err(RelationalError::TransactionConflict(format!(
+                                        "Phantom read conflict detected: Key {:?} in table {} fell within scanned range [{:?}, {:?}] (tx_id: {})",
+                                        k, table_name, start, end, tx_id
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Increment global commit version to get a unique commit version
+        let commit_version = self.global_commit_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+        // 3. Append to history
+        let new_record = CommitRecord {
+            commit_version,
+            keys: write_keys.clone(),
+        };
+        history.push(new_record);
+
+        // 4. Prune older history
+        let min_start_version = {
+            let active = self.occ_active_transactions.lock().unwrap();
+            active.values().copied().min().unwrap_or(commit_version)
+        };
+        history.retain(|r| r.commit_version >= min_start_version);
+
+        Ok(commit_version)
+    }
+
+    pub fn validate_read_only(
+        &self,
+        tx_id: u64,
+        start_version: u64,
+        read_set: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
+        scan_ranges: &HashMap<String, Vec<(dtdb_storage::DbKey, dtdb_storage::DbKey)>>,
+    ) -> Result<()> {
+        let history = self.commit_history.lock().unwrap();
+
+        for record in history.iter() {
+            if record.commit_version > start_version {
+                // Check read-write conflict: Did the committed record modify a key we read?
+                for (table_name, read_keys) in read_set {
+                    if let Some(committed_keys) = record.keys.get(table_name) {
+                        for k in read_keys {
+                            if committed_keys.contains(k) {
+                                return Err(RelationalError::TransactionConflict(format!(
+                                    "Conflict detected: Key {:?} in table {} was modified by a concurrent transaction (tx_id: {})",
+                                    k, table_name, tx_id
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                // Check phantom conflict: Did the committed record modify/insert a key in a range we scanned?
+                for (table_name, ranges) in scan_ranges {
+                    if let Some(committed_keys) = record.keys.get(table_name) {
+                        for k in committed_keys {
+                            for (start, end) in ranges {
+                                if k >= start && k <= end {
+                                    return Err(RelationalError::TransactionConflict(format!(
+                                        "Phantom read conflict detected: Key {:?} in table {} fell within scanned range [{:?}, {:?}] (tx_id: {})",
+                                        k, table_name, start, end, tx_id
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

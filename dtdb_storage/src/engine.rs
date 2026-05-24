@@ -317,14 +317,18 @@ impl StorageEngine {
         }
 
         // 2. Apply all mutations to the MemTable.
-        let mem = self.memtable.read().unwrap();
-        for entry in &entries {
-            match entry {
-                WalEntry::Put { key, value } => mem.put(key.clone(), value.clone()),
-                WalEntry::Delete { key } => mem.delete(key.clone()),
-                WalEntry::Batch(_) => {} // Nested batches are not expected
+        {
+            let mem = self.memtable.write().unwrap();
+            for entry in &entries {
+                match entry {
+                    WalEntry::Put { key, value } => mem.put(key.clone(), value.clone()),
+                    WalEntry::Delete { key } => mem.delete(key.clone()),
+                    WalEntry::Batch(_) => {} // Nested batches are not expected
+                }
             }
         }
+
+        let mem = self.memtable.read().unwrap();
 
         // 3. Check if memtable is full or WAL size exceeds limit. If so, trigger flush.
         let trigger_flush = {

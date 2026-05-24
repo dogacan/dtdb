@@ -21,15 +21,28 @@ pub struct Transaction {
     // Some(Row) represents an insert or update.
     // None represents a deletion (tombstone).
     write_buffer: Mutex<HashMap<String, HashMap<DbKey, Option<Row>>>>,
+    start_version: u64,
+    read_set: Mutex<HashMap<String, HashSet<DbKey>>>,
+    scan_ranges: Mutex<HashMap<String, Vec<(DbKey, DbKey)>>>,
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        self.database.unregister_transaction(self.tx_id);
+    }
 }
 
 impl Transaction {
     /// Creates a new transaction.
     pub fn new(tx_id: u64, database: Arc<Database>) -> Self {
+        let start_version = database.register_transaction(tx_id);
         Self {
             tx_id,
             database,
             write_buffer: Mutex::new(HashMap::new()),
+            start_version,
+            read_set: Mutex::new(HashMap::new()),
+            scan_ranges: Mutex::new(HashMap::new()),
         }
     }
 
@@ -101,6 +114,15 @@ impl Transaction {
         }
 
         // 2. Fall back to underlying storage engine.
+        // Track the key in our read set.
+        {
+            let mut read_set = self.read_set.lock().unwrap();
+            read_set
+                .entry(table_name.to_string())
+                .or_default()
+                .insert(key.clone());
+        }
+
         match table.engine.get(key)? {
             Some(DbValue::Bytes(bytes)) => {
                 let row = Row::from_bytes(&bytes)?;
@@ -131,6 +153,15 @@ impl Transaction {
     {
         let table = self.database.get_table(table_name)?;
 
+        // Track the scan range.
+        {
+            let mut scan_ranges = self.scan_ranges.lock().unwrap();
+            scan_ranges
+                .entry(table_name.to_string())
+                .or_default()
+                .push((start.clone(), end.clone()));
+        }
+
         // We use a BTreeMap sorted by primary key to merge values.
         let mut merged = BTreeMap::new();
         let mut seen = HashSet::new();
@@ -153,6 +184,15 @@ impl Transaction {
         // 2. Scan underlying storage engine.
         let engine_entries = table.engine.filtered_scan(start, end, |_, _| true)?;
         for (k, v) in engine_entries {
+            // Track the read key in our read set.
+            {
+                let mut read_set = self.read_set.lock().unwrap();
+                read_set
+                    .entry(table_name.to_string())
+                    .or_default()
+                    .insert(k.clone());
+            }
+
             // Only add if not overridden by the active transaction write buffer.
             if !seen.contains(&k) {
                 match v {
@@ -207,6 +247,48 @@ impl Transaction {
             }
             if !entries.is_empty() {
                 table_batches.insert(table_name.clone(), entries);
+            }
+        }
+
+        // 1.5 Extract write keys for OCC validation
+        let mut write_keys = HashMap::new();
+        for (table_name, entries) in &table_batches {
+            let mut keys = HashSet::new();
+            for entry in entries {
+                match entry {
+                    WalEntry::Put { key, .. } => {
+                        keys.insert(key.clone());
+                    }
+                    WalEntry::Delete { key } => {
+                        keys.insert(key.clone());
+                    }
+                    WalEntry::Batch(_) => {}
+                }
+            }
+            if !keys.is_empty() {
+                write_keys.insert(table_name.clone(), keys);
+            }
+        }
+
+        // Validate transaction using OCC
+        {
+            let read_set = self.read_set.lock().unwrap();
+            let scan_ranges = self.scan_ranges.lock().unwrap();
+            if !write_keys.is_empty() {
+                self.database.validate_and_commit(
+                    self.tx_id,
+                    self.start_version,
+                    &read_set,
+                    &scan_ranges,
+                    &write_keys,
+                )?;
+            } else {
+                self.database.validate_read_only(
+                    self.tx_id,
+                    self.start_version,
+                    &read_set,
+                    &scan_ranges,
+                )?;
             }
         }
 
