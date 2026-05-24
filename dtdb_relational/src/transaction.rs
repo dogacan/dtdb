@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use dtdb_storage::{DbKey, DbValue};
-use crate::database::Database;
+use dtdb_storage::{DbKey, DbValue, WalEntry};
+use crate::database::{Database, TransactionRecord};
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
 use crate::schema::DataType;
@@ -185,21 +185,51 @@ impl Transaction {
     pub fn commit(&self) -> Result<()> {
         let mut buffer = self.write_buffer.lock().unwrap();
 
-        // Flush all table buffers.
+        // 1. Group all buffered mutations by table as WalEntry batches.
+        let mut table_batches = HashMap::new();
         for (table_name, table_buffer) in buffer.iter() {
-            let table = self.database.get_table(table_name)?;
+            let mut entries = Vec::new();
             for (key, val) in table_buffer {
                 match val {
                     Some(row) => {
                         let bytes = row.to_bytes()?;
-                        table.engine.put(key.clone(), DbValue::Bytes(bytes))?;
+                        entries.push(WalEntry::Put {
+                            key: key.clone(),
+                            value: DbValue::Bytes(bytes),
+                        });
                     }
                     None => {
-                        table.engine.delete(key.clone())?;
+                        entries.push(WalEntry::Delete {
+                            key: key.clone(),
+                        });
                     }
                 }
             }
+            if !entries.is_empty() {
+                table_batches.insert(table_name.clone(), entries);
+            }
         }
+
+        if table_batches.is_empty() {
+            buffer.clear();
+            return Ok(());
+        }
+
+        // 2. Write Prepared record to Global Log & fsync
+        let record = TransactionRecord::Prepared {
+            tx_id: self.tx_id,
+            mutations: table_batches.clone(),
+        };
+        self.database.write_transaction_record(&record)?;
+
+        // 3. Write batches to respective table storage engines
+        for (table_name, entries) in table_batches {
+            let table = self.database.get_table(&table_name)?;
+            table.engine.write_batch(entries)?;
+        }
+
+        // 4. Mark Committed & Truncate if clean
+        self.database.commit_transaction(self.tx_id)?;
 
         buffer.clear();
         Ok(())

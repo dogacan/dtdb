@@ -9,6 +9,7 @@ use crate::{DbKey, DbValue, Result, StorageError};
 pub enum WalEntry {
     Put { key: DbKey, value: DbValue },
     Delete { key: DbKey },
+    Batch(Vec<WalEntry>),
 }
 
 /// A Write-Ahead Log (WAL) provides durability by writing mutations to disk
@@ -45,6 +46,12 @@ impl Wal {
     /// Appends a `Delete` operation to the log.
     pub fn append_delete(&mut self, key: &DbKey) -> Result<()> {
         let entry = WalEntry::Delete { key: key.clone() };
+        self.write_entry(&entry)
+    }
+
+    /// Appends a batch of operations to the log.
+    pub fn append_batch(&mut self, entries: Vec<WalEntry>) -> Result<()> {
+        let entry = WalEntry::Batch(entries);
         self.write_entry(&entry)
     }
 

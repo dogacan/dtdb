@@ -6,6 +6,7 @@ pub mod wal;
 pub mod sstable;
 pub mod engine;
 pub use engine::StorageEngine;
+pub use wal::WalEntry;
 
 /// Result type wrapper for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;

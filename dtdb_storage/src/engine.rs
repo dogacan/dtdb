@@ -116,12 +116,21 @@ impl StorageEngine {
         let memtable = Arc::new(MemTable::new());
 
         if wal_path.exists() {
+            fn apply_entry(mem: &MemTable, ent: WalEntry) {
+                match ent {
+                    WalEntry::Put { key, value } => mem.put(key, value),
+                    WalEntry::Delete { key } => mem.delete(key),
+                    WalEntry::Batch(sub) => {
+                        for e in sub {
+                            apply_entry(mem, e);
+                        }
+                    }
+                }
+            }
+
             let entries = Wal::recover(&wal_path)?;
             for entry in entries {
-                match entry {
-                    WalEntry::Put { key, value } => memtable.put(key, value),
-                    WalEntry::Delete { key } => memtable.delete(key),
-                }
+                apply_entry(&memtable, entry);
             }
 
             // If we recovered data, flush it to disk immediately to start clean.
@@ -239,6 +248,52 @@ impl StorageEngine {
         let _write_lock = self.write_mutex.lock().unwrap();
         let mem = self.memtable.read().unwrap();
         self.flush_memtable_internal(&mem)?;
+        Ok(())
+    }
+
+    /// Writes a batch of mutations to the database atomically with a single fsync.
+    pub fn write_batch(&self, entries: Vec<WalEntry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Acquire the write mutex to serialize mutations.
+        let _write_lock = self.write_mutex.lock().unwrap();
+
+        // 1. Log the entire batch to the WAL as a single write and fsync.
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.append_batch(entries.clone())?;
+        }
+
+        // 2. Apply all mutations to the MemTable.
+        let mem = self.memtable.read().unwrap();
+        for entry in &entries {
+            match entry {
+                WalEntry::Put { key, value } => mem.put(key.clone(), value.clone()),
+                WalEntry::Delete { key } => mem.delete(key.clone()),
+                WalEntry::Batch(_) => {} // Nested batches are not expected
+            }
+        }
+
+        // 3. Check if memtable is full or WAL size exceeds limit. If so, trigger flush.
+        let trigger_flush = {
+            let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
+            let wal_full = {
+                let wal = self.wal.lock().unwrap();
+                if let Ok(size) = wal.size() {
+                    size as usize >= self.options.wal_size_limit
+                } else {
+                    false
+                }
+            };
+            mem_full || wal_full
+        };
+
+        if trigger_flush {
+            self.flush_memtable_internal(&mem)?;
+        }
+
         Ok(())
     }
 

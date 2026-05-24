@@ -1,10 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use dtdb_storage::{StorageEngine, CompressionType, EngineOptions};
+use std::sync::{Arc, RwLock, Mutex};
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
+use dtdb_storage::{StorageEngine, CompressionType, EngineOptions, WalEntry};
 use crate::error::{RelationalError, Result};
 use crate::schema::Schema;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum TransactionRecord {
+    Prepared {
+        tx_id: u64,
+        mutations: HashMap<String, Vec<WalEntry>>,
+    },
+    Committed {
+        tx_id: u64,
+    },
+}
 
 /// Table represents a relational table mapping column definitions to an underlying LSM engine.
 ///
@@ -41,6 +55,8 @@ pub struct Database {
     dir_path: PathBuf,
     tables: RwLock<HashMap<String, Table>>,
     pub options: DatabaseOptions,
+    transaction_log_path: PathBuf,
+    active_transactions: Mutex<HashSet<u64>>,
 }
 
 impl Database {
@@ -126,11 +142,20 @@ impl Database {
             }
         }
 
-        Ok(Self {
+        let transaction_log_path = dir_path.join("transactions.log");
+        let active_transactions = Mutex::new(HashSet::new());
+
+        let db = Self {
             dir_path,
             tables: RwLock::new(tables),
             options,
-        })
+            transaction_log_path,
+            active_transactions,
+        };
+
+        db.recover_transactions()?;
+
+        Ok(db)
     }
 
     /// Creates a new relational table.
@@ -214,5 +239,98 @@ impl Database {
     pub fn list_tables(&self) -> Vec<String> {
         let tables_guard = self.tables.read().unwrap();
         tables_guard.keys().cloned().collect()
+    }
+
+    fn append_record(&self, record: &TransactionRecord) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.transaction_log_path)?;
+        let bytes = bincode::serialize(record)
+            .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+        let len = bytes.len() as u32;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn write_transaction_record(&self, record: &TransactionRecord) -> Result<()> {
+        let mut active = self.active_transactions.lock().unwrap();
+        if let TransactionRecord::Prepared { tx_id, .. } = record {
+            active.insert(*tx_id);
+        }
+        self.append_record(record)?;
+        Ok(())
+    }
+
+    pub fn commit_transaction(&self, tx_id: u64) -> Result<()> {
+        let mut active = self.active_transactions.lock().unwrap();
+        active.remove(&tx_id);
+        
+        if active.is_empty() {
+            // Truncate the file to zero to keep it compact.
+            let _ = File::create(&self.transaction_log_path)?;
+        } else {
+            let record = TransactionRecord::Committed { tx_id };
+            self.append_record(&record)?;
+        }
+        Ok(())
+    }
+
+    fn recover_transactions(&self) -> Result<()> {
+        if !self.transaction_log_path.exists() {
+            return Ok(());
+        }
+
+        let file = File::open(&self.transaction_log_path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut prepared = std::collections::BTreeMap::new();
+
+        loop {
+            let mut len_bytes = [0u8; 4];
+            match std::io::Read::read_exact(&mut reader, &mut len_bytes) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(RelationalError::Io(e)),
+            }
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            let mut bytes = vec![0u8; len];
+            match std::io::Read::read_exact(&mut reader, &mut bytes) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // Ignore truncated
+                Err(e) => return Err(RelationalError::Io(e)),
+            }
+
+            let record: TransactionRecord = bincode::deserialize(&bytes)
+                .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+            match record {
+                TransactionRecord::Prepared { tx_id, mutations } => {
+                    prepared.insert(tx_id, mutations);
+                }
+                TransactionRecord::Committed { tx_id } => {
+                    prepared.remove(&tx_id);
+                }
+            }
+        }
+
+        if prepared.is_empty() {
+            let _ = File::create(&self.transaction_log_path)?;
+            return Ok(());
+        }
+
+        println!("Recovering {} pending transactions...", prepared.len());
+        for (tx_id, mutations) in prepared {
+            for (table_name, entries) in mutations {
+                if let Ok(table) = self.get_table(&table_name) {
+                    println!("Rolling forward transaction {} for table {}", tx_id, table_name);
+                    table.engine.write_batch(entries)?;
+                }
+            }
+        }
+
+        // Clean up the log since recovery has completed.
+        let _ = File::create(&self.transaction_log_path)?;
+        Ok(())
     }
 }

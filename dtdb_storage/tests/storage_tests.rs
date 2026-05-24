@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::TempDir;
-use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType, EngineOptions};
+use dtdb_storage::{DbKey, DbValue, StorageEngine, CompressionType, EngineOptions, WalEntry};
 use dtdb_storage::memtable::MemTable;
 use dtdb_storage::wal::Wal;
 use dtdb_storage::sstable::{SstableReader, SstableWriter};
@@ -62,11 +62,19 @@ fn test_wal_recovery() {
 
     // Replay into a MemTable
     let mem = MemTable::new();
-    for entry in entries {
-        match entry {
-            dtdb_storage::wal::WalEntry::Put { key, value } => mem.put(key, value),
-            dtdb_storage::wal::WalEntry::Delete { key } => mem.delete(key),
+    fn apply_entry(mem: &MemTable, ent: WalEntry) {
+        match ent {
+            WalEntry::Put { key, value } => mem.put(key, value),
+            WalEntry::Delete { key } => mem.delete(key),
+            WalEntry::Batch(sub) => {
+                for e in sub {
+                    apply_entry(mem, e);
+                }
+            }
         }
+    }
+    for entry in entries {
+        apply_entry(&mem, entry);
     }
 
     assert_eq!(mem.get(&k_int(1)), Some(None)); // Tombstone
