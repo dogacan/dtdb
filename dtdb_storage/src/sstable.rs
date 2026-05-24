@@ -153,12 +153,17 @@ pub struct SstableReader {
     file: File,
     index: Vec<IndexEntry>,
     pub compression: CompressionType,
+    pub id: u64,
+    pub level: usize,
+    pub path: std::path::PathBuf,
+    pub last_key: DbKey,
 }
 
 impl SstableReader {
     /// Opens the SSTable file at the given path and loads its index block.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = File::open(path)?;
+    pub fn open(path: impl AsRef<Path>, id: u64, level: usize) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
+        let mut file = File::open(&path_buf)?;
         let file_len = file.metadata()?.len();
 
         if file_len < FOOTER_SIZE {
@@ -200,11 +205,38 @@ impl SstableReader {
             }
         };
 
-        Ok(Self {
+        let mut reader = Self {
             file,
             index: index_block.entries,
             compression: index_block.compression,
-        })
+            id,
+            level,
+            path: path_buf,
+            last_key: DbKey::Int(0), // Temp placeholder
+        };
+
+        // Cache the last key of the SSTable by reading the last block
+        if !reader.index.is_empty() {
+            let last_block_idx = reader.index.len() - 1;
+            let last_block = reader.read_block(last_block_idx)?;
+            if let Some((k, _)) = last_block.last() {
+                reader.last_key = k.clone();
+            }
+        }
+
+        Ok(reader)
+    }
+
+    pub fn first_key(&self) -> Option<&DbKey> {
+        self.index.first().map(|e| &e.first_key)
+    }
+
+    pub fn last_key(&self) -> &DbKey {
+        &self.last_key
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
     }
 
     /// Performs a point lookup for a key.

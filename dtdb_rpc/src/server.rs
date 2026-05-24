@@ -144,6 +144,11 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             block_size_limit: req.block_size_limit.unwrap_or(4096) as usize,
             wal_size_limit: req.wal_size_limit.unwrap_or(32 * 1024 * 1024) as usize,
             flush_interval_ms: req.flush_interval_ms,
+            l0_compaction_threshold: None,
+            sstable_target_size: None,
+            base_level_size_limit: None,
+            level_size_multiplier: None,
+            max_level: None,
         };
 
         let database = Arc::new(Database::open_with_options(&db_path, options.clone())

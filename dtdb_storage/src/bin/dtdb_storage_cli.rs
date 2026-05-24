@@ -13,12 +13,17 @@ fn main() {
     let db_path = Path::new(&args[1]);
 
     println!("Opening database at: {:?}", db_path);
-    // Open storage engine with 1MB memtable size limit, 4KB block size limit, and 32MB WAL limit
+    // Open storage engine with default limits and parameters
     let options = EngineOptions {
         compression: CompressionType::Lz4,
         memtable_size_limit: 1024 * 1024,
         block_size_limit: 4096,
         wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 4,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
     };
     let engine = match StorageEngine::open(db_path, options) {
         Ok(eng) => eng,

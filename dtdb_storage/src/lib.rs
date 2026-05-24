@@ -66,5 +66,10 @@ pub struct EngineOptions {
     pub memtable_size_limit: usize,
     pub block_size_limit: usize,
     pub wal_size_limit: usize,
+    pub l0_compaction_threshold: usize,
+    pub sstable_target_size: usize,
+    pub base_level_size_limit: usize,
+    pub level_size_multiplier: usize,
+    pub max_level: usize,
 }
 

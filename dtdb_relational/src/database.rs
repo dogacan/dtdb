@@ -29,6 +29,11 @@ pub struct DatabaseOptions {
     pub block_size_limit: usize,
     pub wal_size_limit: usize,
     pub flush_interval_ms: Option<u64>,
+    pub l0_compaction_threshold: Option<usize>,
+    pub sstable_target_size: Option<usize>,
+    pub base_level_size_limit: Option<usize>,
+    pub level_size_multiplier: Option<usize>,
+    pub max_level: Option<usize>,
 }
 
 /// Database represents a catalog of Tables stored in a base directory.
@@ -55,6 +60,11 @@ impl Database {
                 block_size_limit: 4096,
                 wal_size_limit: 32 * 1024 * 1024,
                 flush_interval_ms: None,
+                l0_compaction_threshold: None,
+                sstable_target_size: None,
+                base_level_size_limit: None,
+                level_size_multiplier: None,
+                max_level: None,
             }
         };
         Self::open_with_options(dir_path, options)
@@ -96,6 +106,11 @@ impl Database {
                         memtable_size_limit: options.memtable_size_limit,
                         block_size_limit: options.block_size_limit,
                         wal_size_limit: options.wal_size_limit,
+                        l0_compaction_threshold: options.l0_compaction_threshold.unwrap_or(4),
+                        sstable_target_size: options.sstable_target_size.unwrap_or(2 * 1024 * 1024),
+                        base_level_size_limit: options.base_level_size_limit.unwrap_or(10 * 1024 * 1024),
+                        level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
+                        max_level: options.max_level.unwrap_or(7),
                     };
                     let engine = Arc::new(StorageEngine::open(&path, engine_opts)?);
 
@@ -140,6 +155,11 @@ impl Database {
             memtable_size_limit: self.options.memtable_size_limit,
             block_size_limit: self.options.block_size_limit,
             wal_size_limit: self.options.wal_size_limit,
+            l0_compaction_threshold: self.options.l0_compaction_threshold.unwrap_or(4),
+            sstable_target_size: self.options.sstable_target_size.unwrap_or(2 * 1024 * 1024),
+            base_level_size_limit: self.options.base_level_size_limit.unwrap_or(10 * 1024 * 1024),
+            level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
+            max_level: self.options.max_level.unwrap_or(7),
         };
 
         // Open the new Layer 1 storage engine

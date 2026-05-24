@@ -143,6 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     block_size_limit,
                     wal_size_limit,
                     flush_interval_ms,
+                    l0_compaction_threshold: None,
+                    sstable_target_size: None,
+                    base_level_size_limit: None,
+                    level_size_multiplier: None,
+                    max_level: None,
                 };
 
                 match client.create_db_with_options(db_name, options).await {

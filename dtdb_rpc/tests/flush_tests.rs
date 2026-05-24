@@ -57,6 +57,11 @@ async fn test_wal_size_based_flush() {
         block_size_limit: 4096,
         wal_size_limit: 100, // 100 bytes limit
         flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
     };
 
     let create_resp = client.create_db_with_options("db_wal", options).await.unwrap();
@@ -129,6 +134,11 @@ async fn test_periodic_time_based_flush() {
         block_size_limit: 4096,
         wal_size_limit: 1024 * 1024,
         flush_interval_ms: Some(150),
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
     };
 
     let create_resp = client.create_db_with_options("db_periodic", options).await.unwrap();
@@ -204,6 +214,11 @@ async fn test_manual_rpc_flush() {
         block_size_limit: 4096,
         wal_size_limit: 1024 * 1024,
         flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
     };
 
     let create_resp = client.create_db_with_options("db_manual", options).await.unwrap();
