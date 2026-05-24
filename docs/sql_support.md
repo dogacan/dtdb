@@ -15,7 +15,7 @@ Creates a new table catalog entry and initializes the underlying LSM storage eng
     CREATE TABLE <table_name> (
         <column_name> <data_type> [PRIMARY KEY | NOT NULL],
         ...
-    );
+    ) [WITH (locality_groups = '<group_config>')];
     ```
 *   **Supported Data Types**:
     *   `INT` / `INTEGER` / `BIGINT`: Mapped to 64-bit signed integers (`i64`).
@@ -27,16 +27,24 @@ Creates a new table catalog entry and initializes the underlying LSM storage eng
     *   Each table must define exactly one column as the `PRIMARY KEY` (which serves as the LSM key and is implicitly `NOT NULL`).
     *   Columns are nullable by default. To disallow `NULL` values in a column, add the `NOT NULL` constraint.
     *   Inserting or updating a row to set a `NOT NULL` or `PRIMARY KEY` column to `NULL` results in a schema mismatch error.
+*   **Locality Groups**:
+    *   Columns can be partitioned into physical groups using the `WITH (locality_groups = 'group1:col_a,col_b; group2:col_c')` syntax. Columns within the same group are stored in a dedicated LSM-tree storage engine subdirectory.
+    *   Unspecified/default columns are placed in a `default` storage engine (subdirectory `default/`).
+    *   If no custom locality groups are specified at all, all data is placed directly at the table's root directory (avoiding subdirectory overhead and keeping backward compatibility).
+    *   `SELECT` queries optimize disk I/O by executing **read pruning**, only scanning the storage engine subdirectories containing the requested/referenced columns.
+    *   `UPDATE` queries always read all columns (no read pruning) to reconstruct the full row state before writing back, ensuring transactional consistency.
 *   **Transaction Restriction**:
     *   `CREATE TABLE` is a DDL statement and is **not allowed** inside explicit multi-statement transactions. It must be run as a single auto-committed statement.
 *   **Example**:
     ```sql
-    CREATE TABLE Users (
+    CREATE TABLE employees (
         id INT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        score DOUBLE
-    );
+        name STRING,
+        salary INT,
+        department STRING
+    ) WITH (locality_groups = 'lg_name:name; lg_finance:salary');
     ```
+
 
 #### `DROP TABLE`
 Removes the table catalog entry and deletes the corresponding storage directory on disk.
