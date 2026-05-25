@@ -1,8 +1,9 @@
-use crate::{CompressionType, DbKey, DbValue, Result, StorageError};
+use crate::{BlockCache, CompressionType, DbKey, DbValue, Result, StorageError};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAGIC_NUMBER: &[u8; 8] = b"DTDB_SST";
 const FOOTER_SIZE: u64 = 24; // 8 bytes index_offset + 8 bytes index_len + 8 bytes magic number
@@ -194,11 +195,17 @@ pub struct SstableReader {
     pub level: usize,
     pub path: std::path::PathBuf,
     pub last_key: DbKey,
+    block_cache: Option<Arc<BlockCache>>,
 }
 
 impl SstableReader {
     /// Opens the SSTable file at the given path and loads its index block.
-    pub fn open(path: impl AsRef<Path>, id: u64, level: usize) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        id: u64,
+        level: usize,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let mut file = File::open(&path_buf)?;
         let file_len = file.metadata()?.len();
@@ -250,6 +257,7 @@ impl SstableReader {
             level,
             path: path_buf,
             last_key: DbKey::Int(0), // Temp placeholder
+            block_cache,
         };
 
         // Cache the last key of the SSTable by reading the last block
@@ -314,8 +322,17 @@ impl SstableReader {
         }
     }
 
-    /// Reads and decompresses a block by its index.
-    fn read_block(&mut self, idx: usize) -> Result<Vec<(DbKey, Option<DbValue>)>> {
+    /// Reads and decompresses a block by its index, utilizing the block cache if present.
+    #[allow(clippy::type_complexity)]
+    fn read_block(&mut self, idx: usize) -> Result<Arc<Vec<(DbKey, Option<DbValue>)>>> {
+        if let Some(ref cache) = self.block_cache {
+            let mut cache_guard = cache.lock().unwrap();
+            let key = (self.id, idx);
+            if let Some(block) = cache_guard.get(&key) {
+                return Ok(block.clone());
+            }
+        }
+
         let entry = &self.index[idx];
         self.file.seek(SeekFrom::Start(entry.offset))?;
 
@@ -329,7 +346,15 @@ impl SstableReader {
         };
 
         let block: Vec<(DbKey, Option<DbValue>)> = bincode::deserialize(&raw_bytes)?;
-        Ok(block)
+        let block_arc = Arc::new(block);
+
+        if let Some(ref cache) = self.block_cache {
+            let mut cache_guard = cache.lock().unwrap();
+            let key = (self.id, idx);
+            cache_guard.insert(key, block_arc.clone());
+        }
+
+        Ok(block_arc)
     }
 
     /// Performs a range scan between `start` and `end` (both inclusive) matching the filter.
@@ -370,13 +395,13 @@ impl SstableReader {
             }
 
             let block = self.read_block(block_idx)?;
-            for (k, v) in block {
-                if k >= *start
-                    && k <= *end
+            for (k, v) in block.iter() {
+                if k >= start
+                    && k <= end
                     && let Some(val) = v
-                    && filter(&k, &val)
+                    && filter(k, val)
                 {
-                    results.push((k, val));
+                    results.push((k.clone(), val.clone()));
                 }
             }
         }
@@ -416,9 +441,9 @@ impl SstableReader {
             }
 
             let block = self.read_block(block_idx)?;
-            for (k, v) in block {
-                if k >= *start && k <= *end {
-                    results.push((k, v));
+            for (k, v) in block.iter() {
+                if k >= start && k <= end {
+                    results.push((k.clone(), v.clone()));
                 }
             }
         }
@@ -431,7 +456,7 @@ impl SstableReader {
         let mut entries = Vec::new();
         for idx in 0..self.index.len() {
             let block = self.read_block(idx)?;
-            entries.extend(block);
+            entries.extend(block.iter().cloned());
         }
         Ok(entries)
     }

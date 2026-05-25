@@ -25,6 +25,7 @@ fn get_test_options() -> EngineOptions {
         base_level_size_limit: 10 * 1024,
         level_size_multiplier: 10,
         max_level: 7,
+        block_cache_capacity: 1000,
     }
 }
 

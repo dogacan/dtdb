@@ -160,6 +160,16 @@ impl LogicalPlanner {
                                                             |e| format!("Invalid max_level: {}", e),
                                                         )?);
                                                 }
+                                                "block_cache_capacity" => {
+                                                    opts.block_cache_capacity = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!(
+                                                                "Invalid block_cache_capacity: {}",
+                                                                e
+                                                            )
+                                                        })?,
+                                                    );
+                                                }
                                                 other => {
                                                     return Err(format!(
                                                         "Unknown locality group option: {}",

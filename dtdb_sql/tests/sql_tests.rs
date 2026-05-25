@@ -1141,7 +1141,7 @@ fn test_locality_groups_overrides_end_to_end() {
     let tx1 = Transaction::new(1, db.clone());
     let res = engine
         .execute(
-            "CREATE TABLE employees (id INT PRIMARY KEY, name STRING, salary INT, department STRING) WITH (locality_groups = 'lg_name:name:block_size_limit=8192,compression=uncompressed; lg_finance:salary:wal_size_limit=1048576,max_level=5')",
+            "CREATE TABLE employees (id INT PRIMARY KEY, name STRING, salary INT, department STRING) WITH (locality_groups = 'lg_name:name:block_size_limit=8192,compression=uncompressed,block_cache_capacity=500; lg_finance:salary:wal_size_limit=1048576,max_level=5,block_cache_capacity=0')",
             &tx1,
         )
         .unwrap();
@@ -1172,6 +1172,7 @@ fn test_locality_groups_overrides_end_to_end() {
             lg_name_opts.compression,
             Some(dtdb_storage::CompressionType::Uncompressed)
         );
+        assert_eq!(lg_name_opts.block_cache_capacity, Some(500));
 
         let lg_finance_opts = table
             .schema
@@ -1180,6 +1181,7 @@ fn test_locality_groups_overrides_end_to_end() {
             .unwrap();
         assert_eq!(lg_finance_opts.wal_size_limit, Some(1048576));
         assert_eq!(lg_finance_opts.max_level, Some(5));
+        assert_eq!(lg_finance_opts.block_cache_capacity, Some(0));
 
         // 3. Verify on-disk storage engine options.bin for each group
         let table_path = temp_dir.path().join("employees");
@@ -1195,6 +1197,7 @@ fn test_locality_groups_overrides_end_to_end() {
             lg_name_engine_opts.compression,
             dtdb_storage::CompressionType::Uncompressed
         );
+        assert_eq!(lg_name_engine_opts.block_cache_capacity, 500);
 
         // lg_finance options.bin verification
         let lg_finance_opts_path = table_path.join("lg_lg_finance").join("options.bin");
@@ -1204,5 +1207,6 @@ fn test_locality_groups_overrides_end_to_end() {
             bincode::deserialize(&lg_finance_bytes).unwrap();
         assert_eq!(lg_finance_engine_opts.wal_size_limit, 1048576);
         assert_eq!(lg_finance_engine_opts.max_level, 5);
+        assert_eq!(lg_finance_engine_opts.block_cache_capacity, 0);
     }
 }

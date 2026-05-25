@@ -56,6 +56,7 @@ fn test_l0_to_l1_auto_compaction() {
         base_level_size_limit: 10 * 1024 * 1024,
         level_size_multiplier: 10,
         max_level: 7,
+        block_cache_capacity: 1000,
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -101,6 +102,7 @@ fn test_sstable_splitting_by_target_size() {
         base_level_size_limit: 10 * 1024 * 1024,
         level_size_multiplier: 10,
         max_level: 7,
+        block_cache_capacity: 1000,
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -155,6 +157,7 @@ fn test_tombstone_purging() {
         base_level_size_limit: 10 * 1024 * 1024,
         level_size_multiplier: 10,
         max_level: 2, // max level is 2
+        block_cache_capacity: 1000,
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -191,6 +194,7 @@ fn test_deep_stress_and_consistency() {
         base_level_size_limit: 1000,
         level_size_multiplier: 2,
         max_level: 4,
+        block_cache_capacity: 1000,
     };
 
     let engine = Arc::new(StorageEngine::open(&db_path, options).unwrap());

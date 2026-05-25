@@ -252,6 +252,7 @@ pub struct DatabaseOptions {
     pub base_level_size_limit: Option<usize>,
     pub level_size_multiplier: Option<usize>,
     pub max_level: Option<usize>,
+    pub block_cache_capacity: Option<usize>,
 }
 
 /// Database represents a catalog of Tables stored in a base directory.
@@ -299,6 +300,7 @@ impl Database {
                 base_level_size_limit: None,
                 level_size_multiplier: None,
                 max_level: None,
+                block_cache_capacity: Some(1000),
             }
         };
         Self::open_with_options_and_spawner(dir_path, options, spawner)
@@ -373,6 +375,7 @@ impl Database {
                             .unwrap_or(10 * 1024 * 1024),
                         level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
                         max_level: options.max_level.unwrap_or(7),
+                        block_cache_capacity: options.block_cache_capacity.unwrap_or(1000),
                     };
 
                     let mut engines = HashMap::new();
@@ -477,6 +480,7 @@ impl Database {
                 .unwrap_or(10 * 1024 * 1024),
             level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
             max_level: self.options.max_level.unwrap_or(7),
+            block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
         };
 
         let mut engines = HashMap::new();

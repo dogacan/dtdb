@@ -161,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     base_level_size_limit: None,
                     level_size_multiplier: None,
                     max_level: None,
+                    block_cache_capacity: Some(1000),
                 };
 
                 match client.create_db_with_options(db_name, options).await {

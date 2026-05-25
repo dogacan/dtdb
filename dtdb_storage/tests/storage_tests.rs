@@ -97,7 +97,7 @@ fn test_sstable_write_read() {
     }
 
     // Read and verify
-    let mut reader = SstableReader::open(&sst_path, 1, 0).unwrap();
+    let mut reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
     assert_eq!(reader.get(&k_int(1)).unwrap(), Some(Some(v_int(10))));
     assert_eq!(reader.get(&k_int(2)).unwrap(), Some(Some(v_int(20))));
     assert_eq!(reader.get(&k_int(3)).unwrap(), Some(None)); // Tombstone
@@ -132,6 +132,7 @@ fn test_engine_crud() {
         base_level_size_limit: 10 * 1024 * 1024,
         level_size_multiplier: 10,
         max_level: 7,
+        block_cache_capacity: 1000,
     };
     let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
 
@@ -180,6 +181,7 @@ fn test_engine_crash_recovery() {
             base_level_size_limit: 10 * 1024 * 1024,
             level_size_multiplier: 10,
             max_level: 7,
+            block_cache_capacity: 1000,
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("one")).unwrap();
@@ -200,6 +202,7 @@ fn test_engine_crash_recovery() {
             base_level_size_limit: 10 * 1024 * 1024,
             level_size_multiplier: 10,
             max_level: 7,
+            block_cache_capacity: 1000,
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         assert_eq!(engine.get(&k_int(1)).unwrap(), None); // Deleted
@@ -238,6 +241,7 @@ fn test_engine_compaction() {
             base_level_size_limit: 10 * 1024 * 1024,
             level_size_multiplier: 10,
             max_level: 7,
+            block_cache_capacity: 1000,
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("v1_old")).unwrap(); // Flushes

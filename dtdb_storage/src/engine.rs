@@ -25,6 +25,7 @@ struct EngineInner {
     manifest_mutex: Mutex<()>,
     next_sst_id: AtomicU64,
     spawner: Arc<dyn ThreadSpawner>,
+    block_cache: Option<Arc<crate::BlockCache>>,
 }
 
 #[derive(Default)]
@@ -112,6 +113,14 @@ impl EngineInner {
             options
         };
 
+        let block_cache = if active_options.block_cache_capacity > 0 {
+            Some(Arc::new(Mutex::new(crate::LruCache::new(
+                active_options.block_cache_capacity,
+            ))))
+        } else {
+            None
+        };
+
         // 1. Load or initialize/migrate the Manifest.
         let manifest_path = dir_path.join("manifest.bin");
         let manifest = if manifest_path.exists() {
@@ -178,7 +187,7 @@ impl EngineInner {
 
         let mut sstables_map: BTreeMap<usize, Vec<Arc<Mutex<SstableReader>>>> = BTreeMap::new();
         for (level, id, path) in discovered_ssts {
-            let reader = SstableReader::open(&path, id, level)?;
+            let reader = SstableReader::open(&path, id, level, block_cache.clone())?;
             sstables_map
                 .entry(level)
                 .or_default()
@@ -243,7 +252,7 @@ impl EngineInner {
                 }
                 writer.finish()?;
 
-                let reader = SstableReader::open(&sst_path, next_id, 0)?;
+                let reader = SstableReader::open(&sst_path, next_id, 0, block_cache.clone())?;
                 sstables_map
                     .entry(0)
                     .or_default()
@@ -268,6 +277,7 @@ impl EngineInner {
             manifest_mutex: Mutex::new(()),
             next_sst_id: AtomicU64::new(max_id + 1),
             spawner,
+            block_cache,
         })
     }
 
@@ -741,16 +751,24 @@ impl EngineInner {
             if current_writer_uncompressed_bytes >= self.options.sstable_target_size {
                 let writer = current_writer.take().unwrap();
                 writer.finish()?;
-                let reader =
-                    SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
+                let reader = SstableReader::open(
+                    current_path.take().unwrap(),
+                    current_id,
+                    target_level,
+                    self.block_cache.clone(),
+                )?;
                 new_sstables.push(Arc::new(Mutex::new(reader)));
             }
         }
 
         if let Some(writer) = current_writer.take() {
             writer.finish()?;
-            let reader =
-                SstableReader::open(current_path.take().unwrap(), current_id, target_level)?;
+            let reader = SstableReader::open(
+                current_path.take().unwrap(),
+                current_id,
+                target_level,
+                self.block_cache.clone(),
+            )?;
             new_sstables.push(Arc::new(Mutex::new(reader)));
         }
 
@@ -842,7 +860,7 @@ impl EngineInner {
             manifest.save(&manifest_path)?;
         }
 
-        let reader = SstableReader::open(&sst_path, next_id, 0)?;
+        let reader = SstableReader::open(&sst_path, next_id, 0, self.block_cache.clone())?;
         {
             let mut ssts = self.sstables.write().unwrap();
             ssts.entry(0)

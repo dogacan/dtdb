@@ -43,6 +43,7 @@ pub struct LocalityGroupOptions {
     pub base_level_size_limit: Option<usize>,
     pub level_size_multiplier: Option<usize>,
     pub max_level: Option<usize>,
+    pub block_cache_capacity: Option<usize>,
 }
 
 impl LocalityGroupOptions {
@@ -68,6 +69,9 @@ impl LocalityGroupOptions {
                 .level_size_multiplier
                 .unwrap_or(defaults.level_size_multiplier),
             max_level: self.max_level.unwrap_or(defaults.max_level),
+            block_cache_capacity: self
+                .block_cache_capacity
+                .unwrap_or(defaults.block_cache_capacity),
         }
     }
 }

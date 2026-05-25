@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod block_cache;
 pub mod engine;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
 pub mod wal;
+pub use block_cache::{BlockCache, LruCache};
 pub use engine::StorageEngine;
 pub use wal::WalEntry;
 
@@ -86,6 +88,7 @@ pub struct EngineOptions {
     pub base_level_size_limit: usize,
     pub level_size_multiplier: usize,
     pub max_level: usize,
+    pub block_cache_capacity: usize,
 }
 
 impl From<i64> for DbValue {

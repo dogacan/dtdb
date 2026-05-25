@@ -254,6 +254,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             base_level_size_limit: None,
             level_size_multiplier: None,
             max_level: None,
+            block_cache_capacity: Some(1000),
         };
 
         let database = Arc::new(

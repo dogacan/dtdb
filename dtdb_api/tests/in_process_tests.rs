@@ -43,6 +43,7 @@ async fn test_in_process_client_integration() {
         base_level_size_limit: None,
         level_size_multiplier: None,
         max_level: None,
+        block_cache_capacity: Some(1000),
     };
     let create_opt_resp = client
         .create_db_with_options("db_opt", options)
