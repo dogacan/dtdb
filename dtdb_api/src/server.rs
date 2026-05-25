@@ -565,8 +565,28 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             }
                         };
 
+                        let proto_level = start
+                            .isolation_level
+                            .and_then(|v| crate::proto::IsolationLevel::try_from(v).ok())
+                            .unwrap_or(crate::proto::IsolationLevel::SnapshotIsolation);
+
+                        let isolation_level = match proto_level {
+                            crate::proto::IsolationLevel::ReadUncommitted => {
+                                dtdb_relational::IsolationLevel::ReadUncommitted
+                            }
+                            crate::proto::IsolationLevel::ReadCommitted => {
+                                dtdb_relational::IsolationLevel::ReadCommitted
+                            }
+                            crate::proto::IsolationLevel::RepeatableRead => {
+                                dtdb_relational::IsolationLevel::RepeatableRead
+                            }
+                            crate::proto::IsolationLevel::SnapshotIsolation => {
+                                dtdb_relational::IsolationLevel::SnapshotIsolation
+                            }
+                        };
+
                         let tx_id = next_tx_id.fetch_add(1, Ordering::SeqCst);
-                        let tx = Transaction::new(tx_id, database);
+                        let tx = Transaction::new_with_isolation(tx_id, database, isolation_level);
                         tx_state = Some((tx, sql_engine));
 
                         // Acknowledge the transaction start.

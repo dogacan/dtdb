@@ -32,6 +32,13 @@ enum CompressionOption {
     COMPRESSION_LZ4 = 1;
 }
 
+enum IsolationLevel {
+    READ_UNCOMMITTED = 0;
+    READ_COMMITTED = 1;
+    REPEATABLE_READ = 2;
+    SNAPSHOT_ISOLATION = 3;
+}
+
 message CreateDbRequest {
     string db_name = 1;
     CompressionOption compression = 2;
@@ -98,6 +105,7 @@ message TransactionRequest {
 
 message StartTransaction {
     string db_name = 1;
+    optional IsolationLevel isolation_level = 2;
 }
 
 message ExecuteTxQuery {

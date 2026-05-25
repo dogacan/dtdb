@@ -424,6 +424,7 @@ async fn test_grpc_protocol_misuse() {
         tx.send(TransactionRequest {
             command: Some(Command::Start(StartTransaction {
                 db_name: "test_db".to_string(),
+                isolation_level: None,
             })),
         })
         .await
@@ -439,6 +440,7 @@ async fn test_grpc_protocol_misuse() {
         tx.send(TransactionRequest {
             command: Some(Command::Start(StartTransaction {
                 db_name: "test_db".to_string(),
+                isolation_level: None,
             })),
         })
         .await
@@ -463,6 +465,7 @@ async fn test_grpc_protocol_misuse() {
         tx.send(TransactionRequest {
             command: Some(Command::Start(StartTransaction {
                 db_name: "test_db".to_string(),
+                isolation_level: None,
             })),
         })
         .await
@@ -565,6 +568,74 @@ async fn test_grpc_ddl_transaction_rejection() {
             res.unwrap();
         }
     }
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_grpc_transaction_with_isolation_options() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let (port, server_handle) = start_test_server(&data_path).await;
+
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+
+    client
+        .create_db("test_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
+
+    // Create table
+    {
+        let mut stream = client
+            .execute_query(
+                "test_db",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
+            )
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // Run transaction under ReadCommitted isolation
+    let options = dtdb_api::client::TransactionOptions {
+        isolation_level: dtdb_api::client::IsolationLevel::ReadCommitted,
+    };
+    let tx_res = client
+        .run_in_transaction_with_options("test_db", options, |tx| async move {
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (100, 'Eve');"
+            ))
+            .await?;
+            Ok("read_committed_done")
+        })
+        .await;
+
+    assert_eq!(tx_res.unwrap(), "read_committed_done");
+
+    // Verify row exists
+    let mut stream = client
+        .execute_query(
+            "test_db",
+            dtdb_api::sql_query!("SELECT id, name FROM Users WHERE id = 100;"),
+        )
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    while let Some(res) = stream.next().await {
+        let resp = res.unwrap();
+        if let Some(EqPayload::Row(row)) = resp.payload {
+            rows.push(row.values);
+        }
+    }
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], vec!["100", "Eve"]);
 
     server_handle.abort();
 }

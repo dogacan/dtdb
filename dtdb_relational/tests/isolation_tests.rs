@@ -217,3 +217,115 @@ fn test_occ_blind_write_write_conflict() {
         commit_res
     );
 }
+
+#[test]
+fn test_read_committed_isolation() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    // Setup initial row
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(42), r_user(42, "Original")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 1. Start Tx1 in Read Committed
+    let tx1 = Transaction::new_with_isolation(
+        2,
+        db.clone(),
+        dtdb_relational::IsolationLevel::ReadCommitted,
+    );
+    assert_eq!(
+        tx1.get("users", &k_int(42)).unwrap(),
+        Some(r_user(42, "Original"))
+    );
+
+    // 2. Start and commit Tx2 updating the row
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(42), r_user(42, "Updated")).unwrap();
+    tx2.commit().unwrap();
+
+    // 3. Tx1 reads row again — should see updated value (non-repeatable read!)
+    assert_eq!(
+        tx1.get("users", &k_int(42)).unwrap(),
+        Some(r_user(42, "Updated"))
+    );
+
+    // 4. Tx1 commits successfully (no read-write conflict validation)
+    tx1.commit().unwrap();
+}
+
+#[test]
+fn test_repeatable_read_no_phantom_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    // Setup initial rows
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+        tx.put("users", k_int(15), r_user(15, "Fifteen")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 1. Tx1 performs range scan over [1, 10] in Repeatable Read
+    let tx1 = Transaction::new_with_isolation(
+        2,
+        db.clone(),
+        dtdb_relational::IsolationLevel::RepeatableRead,
+    );
+    let scan1 = tx1
+        .filtered_scan("users", &k_int(1), &k_int(10), |_| true)
+        .unwrap();
+    assert_eq!(scan1.len(), 1);
+    assert_eq!(scan1[0], r_user(5, "Five"));
+
+    // 2. Tx2 inserts a new row at id = 7 (falls within scanned range [1, 10]) and commits
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(7), r_user(7, "Seven")).unwrap();
+    tx2.commit().unwrap();
+
+    // 3. Tx1 attempts to commit. Must succeed under Repeatable Read (allowing phantoms).
+    tx1.commit().unwrap();
+}
+
+#[test]
+fn test_repeatable_read_does_conflict_on_modified_read_key() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    // Setup initial row
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(42), r_user(42, "Original")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 1. Start Tx1 in Repeatable Read and read row
+    let tx1 = Transaction::new_with_isolation(
+        2,
+        db.clone(),
+        dtdb_relational::IsolationLevel::RepeatableRead,
+    );
+    assert_eq!(
+        tx1.get("users", &k_int(42)).unwrap(),
+        Some(r_user(42, "Original"))
+    );
+
+    // 2. Start and commit Tx2 updating the row
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(42), r_user(42, "Updated")).unwrap();
+    tx2.commit().unwrap();
+
+    // 3. Tx1 attempts to commit and must conflict since K=42 was modified since it started
+    let commit_res = tx1.commit();
+    assert!(
+        matches!(commit_res, Err(RelationalError::TransactionConflict(_))),
+        "Expected TransactionConflict, got {:?}",
+        commit_res
+    );
+}

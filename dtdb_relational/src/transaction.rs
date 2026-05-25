@@ -6,6 +6,27 @@ use dtdb_storage::{DbKey, DbValue, WalEntry};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    SnapshotIsolation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TransactionOptions {
+    pub isolation_level: IsolationLevel,
+}
+
+impl Default for TransactionOptions {
+    fn default() -> Self {
+        Self {
+            isolation_level: IsolationLevel::SnapshotIsolation,
+        }
+    }
+}
+
 /// Transaction represents a client connection transaction session.
 ///
 /// It provides ACID guarantees using a local memory write buffer:
@@ -24,6 +45,7 @@ pub struct Transaction {
     start_version: u64,
     read_set: Mutex<HashMap<String, HashSet<DbKey>>>,
     scan_ranges: Mutex<HashMap<String, Vec<(DbKey, DbKey)>>>,
+    pub isolation_level: IsolationLevel,
 }
 
 impl Drop for Transaction {
@@ -35,6 +57,15 @@ impl Drop for Transaction {
 impl Transaction {
     /// Creates a new transaction.
     pub fn new(tx_id: u64, database: Arc<Database>) -> Self {
+        Self::new_with_isolation(tx_id, database, IsolationLevel::SnapshotIsolation)
+    }
+
+    /// Creates a new transaction with a specific isolation level.
+    pub fn new_with_isolation(
+        tx_id: u64,
+        database: Arc<Database>,
+        isolation_level: IsolationLevel,
+    ) -> Self {
         let start_version = database.register_transaction(tx_id);
         Self {
             tx_id,
@@ -43,6 +74,7 @@ impl Transaction {
             start_version,
             read_set: Mutex::new(HashMap::new()),
             scan_ranges: Mutex::new(HashMap::new()),
+            isolation_level,
         }
     }
 
@@ -131,6 +163,8 @@ impl Transaction {
 
         // 2. Fall back to underlying storage engine.
         // Track the key in our read set.
+        if self.isolation_level == IsolationLevel::SnapshotIsolation
+            || self.isolation_level == IsolationLevel::RepeatableRead
         {
             let mut read_set = self.read_set.lock().unwrap();
             read_set
@@ -173,7 +207,7 @@ impl Transaction {
         let table = self.get_table(table_name)?;
 
         // Track the scan range.
-        {
+        if self.isolation_level == IsolationLevel::SnapshotIsolation {
             let mut scan_ranges = self.scan_ranges.lock().unwrap();
             scan_ranges
                 .entry(table_name.to_string())
@@ -204,6 +238,8 @@ impl Transaction {
         let engine_entries = table.filtered_scan(start, end, columns)?;
         for (k, row) in engine_entries {
             // Track the read key in our read set.
+            if self.isolation_level == IsolationLevel::SnapshotIsolation
+                || self.isolation_level == IsolationLevel::RepeatableRead
             {
                 let mut read_set = self.read_set.lock().unwrap();
                 read_set

@@ -15,6 +15,7 @@ use crate::proto::{
     TransactionResponse,
 };
 use dtdb_relational::{DatabaseOptions, Transaction};
+pub use dtdb_relational::{IsolationLevel, TransactionOptions};
 use dtdb_sql::SqlEngine;
 use dtdb_storage::CompressionType;
 
@@ -220,6 +221,21 @@ impl DuctTapeDbClient {
         F: FnOnce(TransactionClient) -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
+        self.run_in_transaction_with_options(db_name, TransactionOptions::default(), func)
+            .await
+    }
+
+    /// Executes a closure within a single database transaction with specific transaction options.
+    pub async fn run_in_transaction_with_options<F, Fut, T>(
+        &mut self,
+        db_name: &str,
+        options: TransactionOptions,
+        func: F,
+    ) -> Result<T, Status>
+    where
+        F: FnOnce(TransactionClient) -> Fut,
+        Fut: std::future::Future<Output = Result<T, Status>>,
+    {
         match &mut self.inner {
             ClientMode::InProcess(service) => {
                 // In-process mode: directly create a Transaction and SqlEngine,
@@ -230,7 +246,7 @@ impl DuctTapeDbClient {
                     })?;
 
                 let tx_id = service.next_tx_id();
-                let tx = Transaction::new(tx_id, database);
+                let tx = Transaction::new_with_isolation(tx_id, database, options.isolation_level);
                 let tx_client = TransactionClient {
                     mode: TransactionClientMode::InProcess {
                         tx: Arc::new(tx),
@@ -275,12 +291,28 @@ impl DuctTapeDbClient {
                 // and receive TransactionResponse messages from the server.
                 let (req_tx, req_rx) = tokio::sync::mpsc::channel::<TransactionRequest>(32);
 
+                let proto_level = match options.isolation_level {
+                    dtdb_relational::IsolationLevel::ReadUncommitted => {
+                        crate::proto::IsolationLevel::ReadUncommitted
+                    }
+                    dtdb_relational::IsolationLevel::ReadCommitted => {
+                        crate::proto::IsolationLevel::ReadCommitted
+                    }
+                    dtdb_relational::IsolationLevel::RepeatableRead => {
+                        crate::proto::IsolationLevel::RepeatableRead
+                    }
+                    dtdb_relational::IsolationLevel::SnapshotIsolation => {
+                        crate::proto::IsolationLevel::SnapshotIsolation
+                    }
+                };
+
                 // Send StartTransaction.
                 req_tx
                     .send(TransactionRequest {
                         command: Some(crate::proto::transaction_request::Command::Start(
                             StartTransaction {
                                 db_name: db_name.to_string(),
+                                isolation_level: Some(proto_level as i32),
                             },
                         )),
                     })
