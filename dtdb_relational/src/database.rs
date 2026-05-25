@@ -103,6 +103,7 @@ impl Table {
                                     let k = match col_val {
                                         DbValue::Int(v) => DbKey::Int(*v),
                                         DbValue::String(s) => DbKey::String(s.clone()),
+                                        DbValue::Bool(b) => DbKey::Bool(*b),
                                         _ => continue,
                                     };
                                     old_keys.push(k);
@@ -130,6 +131,7 @@ impl Table {
                                 let k = match col_val {
                                     DbValue::Int(v) => DbKey::Int(*v),
                                     DbValue::String(s) => DbKey::String(s.clone()),
+                                    DbValue::Bool(b) => DbKey::Bool(*b),
                                     _ => continue,
                                 };
                                 new_keys.push(k);
@@ -172,6 +174,7 @@ impl Table {
                                     let k = match col_val {
                                         DbValue::Int(v) => DbKey::Int(*v),
                                         DbValue::String(s) => DbKey::String(s.clone()),
+                                        DbValue::Bool(b) => DbKey::Bool(*b),
                                         _ => continue,
                                     };
                                     old_keys.push(k);
@@ -380,6 +383,7 @@ pub struct Database {
     commit_history: Mutex<Vec<CommitRecord>>,
     spawner: Arc<dyn ThreadSpawner>,
     active_table_access: Mutex<HashMap<String, HashSet<u64>>>,
+    pub auto_increment_sequences: Mutex<HashMap<String, i64>>,
 }
 
 impl Database {
@@ -556,6 +560,7 @@ impl Database {
         let occ_active_transactions = Mutex::new(HashMap::new());
         let commit_history = Mutex::new(Vec::new());
         let active_table_access = Mutex::new(HashMap::new());
+        let auto_increment_sequences = Mutex::new(HashMap::new());
 
         let db = Self {
             dir_path,
@@ -568,7 +573,36 @@ impl Database {
             commit_history,
             spawner,
             active_table_access,
+            auto_increment_sequences,
         };
+
+        // Initialize auto-increment sequences for loaded tables
+        {
+            let mut seqs = db.auto_increment_sequences.lock().unwrap();
+            let tables_guard = db.tables.read().unwrap();
+            for (name, table) in tables_guard.iter() {
+                if let Some(col_idx) = table
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.is_auto_increment)
+                {
+                    let mut max_val = 0i64;
+                    if let Ok((start, end)) = table.schema.primary_key_bounds()
+                        && let Ok(rows) = table.filtered_scan(&start, &end, None)
+                    {
+                        for (_, row) in rows {
+                            if let Some(DbValue::Int(v)) = row.get_by_index(col_idx)
+                                && *v > max_val
+                            {
+                                max_val = *v;
+                            }
+                        }
+                    }
+                    seqs.insert(name.clone(), max_val + 1);
+                }
+            }
+        }
 
         db.recover_transactions()?;
 
@@ -637,6 +671,8 @@ impl Database {
             }
         }
 
+        let has_auto_inc = schema.columns.iter().any(|c| c.is_auto_increment);
+
         tables_guard.insert(
             name.to_string(),
             Table {
@@ -646,6 +682,11 @@ impl Database {
                 index_engines: HashMap::new(),
             },
         );
+
+        if has_auto_inc {
+            let mut seqs = self.auto_increment_sequences.lock().unwrap();
+            seqs.insert(name.to_string(), 1);
+        }
 
         Ok(())
     }
@@ -699,6 +740,52 @@ impl Database {
             access.remove(name);
         }
 
+        Ok(())
+    }
+
+    /// Generates and returns the next auto-increment sequence ID for a table.
+    pub fn next_sequence_value(&self, table_name: &str) -> Result<i64> {
+        let mut seqs = self.auto_increment_sequences.lock().unwrap();
+        if let Some(val) = seqs.get_mut(table_name) {
+            let next = *val;
+            *val += 1;
+            Ok(next)
+        } else {
+            let table = self.get_table(table_name)?;
+            let mut max_val = 0i64;
+            if let Some(col_idx) = table
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.is_auto_increment)
+            {
+                let (start, end) = table.schema.primary_key_bounds()?;
+                if let Ok(rows) = table.filtered_scan(&start, &end, None) {
+                    for (_, row) in rows {
+                        if let Some(DbValue::Int(v)) = row.get_by_index(col_idx)
+                            && *v > max_val
+                        {
+                            max_val = *v;
+                        }
+                    }
+                }
+            }
+            let next = max_val + 1;
+            seqs.insert(table_name.to_string(), next + 1);
+            Ok(next)
+        }
+    }
+
+    /// Updates the auto-increment sequence to be at least `val + 1`.
+    pub fn update_sequence_value(&self, table_name: &str, val: i64) -> Result<()> {
+        let mut seqs = self.auto_increment_sequences.lock().unwrap();
+        if let Some(current) = seqs.get_mut(table_name) {
+            if val >= *current {
+                *current = val + 1;
+            }
+        } else {
+            seqs.insert(table_name.to_string(), val + 1);
+        }
         Ok(())
     }
 
@@ -1072,17 +1159,7 @@ impl Database {
 
         // 9. Populate the index from existing table data
         // Determine scan bounds based on primary key type
-        let pk_idx = table.schema.primary_key_index().ok_or_else(|| {
-            RelationalError::SchemaMismatch("Table does not define a primary key".to_string())
-        })?;
-        let pk_col = &table.schema.columns[pk_idx];
-        let (start, end) = match pk_col.data_type {
-            crate::schema::DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
-            _ => (
-                DbKey::String("".to_string()),
-                DbKey::String("\u{10ffff}".to_string()),
-            ),
-        };
+        let (start, end) = table.schema.primary_key_bounds()?;
 
         // Scan the table
         let rows = table.filtered_scan(&start, &end, None)?;
@@ -1101,6 +1178,7 @@ impl Database {
                 let k = match col_val {
                     DbValue::Int(v) => DbKey::Int(*v),
                     DbValue::String(s) => DbKey::String(s.clone()),
+                    DbValue::Bool(b) => DbKey::Bool(*b),
                     other => {
                         return Err(RelationalError::SchemaMismatch(format!(
                             "Cannot index non-indexable value type {:?}",

@@ -133,16 +133,12 @@ impl Expr {
                     Ok(DbValue::Null)
                 } else {
                     let b = to_bool(&val)?;
-                    Ok(DbValue::Int(if b { 0 } else { 1 }))
+                    Ok(DbValue::Bool(!b))
                 }
             }
             Expr::IsNull(inner) => {
                 let val = inner.eval(row, schema)?;
-                Ok(DbValue::Int(if matches!(val, DbValue::Null) {
-                    1
-                } else {
-                    0
-                }))
+                Ok(DbValue::Bool(matches!(val, DbValue::Null)))
             }
             Expr::InList { expr, list } => {
                 let val = expr.eval(row, schema)?;
@@ -155,13 +151,13 @@ impl Expr {
                     if matches!(item_val, DbValue::Null) {
                         has_null = true;
                     } else if compare_values(&val, &item_val) == Ok(std::cmp::Ordering::Equal) {
-                        return Ok(DbValue::Int(1));
+                        return Ok(DbValue::Bool(true));
                     }
                 }
                 if has_null {
                     Ok(DbValue::Null)
                 } else {
-                    Ok(DbValue::Int(0))
+                    Ok(DbValue::Bool(false))
                 }
             }
             Expr::BinaryOp { left, op, right } => {
@@ -180,8 +176,8 @@ impl Expr {
                             let l_bool = if l_null { None } else { Some(to_bool(&l_val)?) };
                             let r_bool = if r_null { None } else { Some(to_bool(&r_val)?) };
                             match (l_bool, r_bool) {
-                                (Some(false), _) | (_, Some(false)) => Ok(DbValue::Int(0)),
-                                (Some(true), Some(true)) => Ok(DbValue::Int(1)),
+                                (Some(false), _) | (_, Some(false)) => Ok(DbValue::Bool(false)),
+                                (Some(true), Some(true)) => Ok(DbValue::Bool(true)),
                                 _ => Ok(DbValue::Null),
                             }
                         }
@@ -194,8 +190,8 @@ impl Expr {
                             let l_bool = if l_null { None } else { Some(to_bool(&l_val)?) };
                             let r_bool = if r_null { None } else { Some(to_bool(&r_val)?) };
                             match (l_bool, r_bool) {
-                                (Some(true), _) | (_, Some(true)) => Ok(DbValue::Int(1)),
-                                (Some(false), Some(false)) => Ok(DbValue::Int(0)),
+                                (Some(true), _) | (_, Some(true)) => Ok(DbValue::Bool(true)),
+                                (Some(false), Some(false)) => Ok(DbValue::Bool(false)),
                                 _ => Ok(DbValue::Null),
                             }
                         }
@@ -213,7 +209,7 @@ impl Expr {
                         let text = to_string_val(&l_val)?;
                         let pattern = to_string_val(&r_val)?;
                         let matched = like_match(&text, &pattern);
-                        Ok(DbValue::Int(if matched { 1 } else { 0 }))
+                        Ok(DbValue::Bool(matched))
                     }
                     Operator::Add => eval_arithmetic(&l_val, &r_val, |a, b| a + b, |a, b| a + b),
                     Operator::Sub => eval_arithmetic(&l_val, &r_val, |a, b| a - b, |a, b| a - b),
@@ -240,7 +236,7 @@ impl Expr {
                             }
                             _ => unreachable!(),
                         };
-                        Ok(DbValue::Int(if matched { 1 } else { 0 }))
+                        Ok(DbValue::Bool(matched))
                     }
                 }
             }
@@ -471,13 +467,15 @@ fn coerce_to_string(val: &DbValue) -> String {
         DbValue::Int(i) => i.to_string(),
         DbValue::Float(f) => f.to_string(),
         DbValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        DbValue::Bool(b) => b.to_string(),
         DbValue::Null => "NULL".to_string(),
     }
 }
 
-/// Coerces a DbValue to a boolean (Int not equal to 0, or Null treated as false).
+/// Coerces a DbValue to a boolean (Bool directly, Int not equal to 0, or Null treated as false).
 fn to_bool(val: &DbValue) -> Result<bool, String> {
     match val {
+        DbValue::Bool(b) => Ok(*b),
         DbValue::Int(v) => Ok(*v != 0),
         DbValue::Null => Ok(false),
         other => Err(format!("Cannot convert value to boolean: {:?}", other)),
@@ -510,6 +508,9 @@ fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String
         (DbValue::Float(lv), DbValue::Int(rv)) => lv
             .partial_cmp(&(*rv as f64))
             .ok_or_else(|| "NaN float comparison".to_string()),
+        (DbValue::Bool(lv), DbValue::Bool(rv)) => Ok(lv.cmp(rv)),
+        (DbValue::Bool(lv), DbValue::Int(rv)) => Ok((*lv as i64).cmp(rv)),
+        (DbValue::Int(lv), DbValue::Bool(rv)) => Ok(lv.cmp(&(*rv as i64))),
         (DbValue::String(lv), DbValue::String(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Bytes(lv), DbValue::Bytes(rv)) => Ok(lv.cmp(rv)),
         (expected, actual) => Err(format!(

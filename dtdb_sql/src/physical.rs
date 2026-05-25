@@ -105,6 +105,7 @@ impl PhysicalOperator for PhysicalFilter {
         while let Some(row) = self.source.next()? {
             let res = self.predicate.eval(&row, self.source.schema())?;
             match res {
+                DbValue::Bool(b) if b => return Ok(Some(row)),
                 DbValue::Int(v) if v != 0 => return Ok(Some(row)),
                 _ => {} // Skip row
             }
@@ -727,6 +728,7 @@ fn hash_value_to_string(val: &DbValue) -> String {
         DbValue::Float(v) => format!("F:{}", v),
         DbValue::String(s) => format!("S:{}", s),
         DbValue::Bytes(b) => format!("B:{:?}", b),
+        DbValue::Bool(b) => format!("Bo:{}", b),
         DbValue::Null => "NULL".to_string(),
     }
 }
@@ -748,6 +750,7 @@ fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String
             .ok_or_else(|| "NaN float comparison".to_string()),
         (DbValue::String(lv), DbValue::String(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Bytes(lv), DbValue::Bytes(rv)) => Ok(lv.cmp(rv)),
+        (DbValue::Bool(lv), DbValue::Bool(rv)) => Ok(lv.cmp(rv)),
         (expected, actual) => Err(format!(
             "Type mismatch: cannot compare {:?} and {:?}",
             expected, actual

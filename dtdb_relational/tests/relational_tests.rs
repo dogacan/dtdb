@@ -13,6 +13,8 @@ fn create_test_schema() -> Schema {
             is_primary_key: true,
             is_nullable: false,
             locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
         },
         Column {
             name: "name".to_string(),
@@ -20,6 +22,8 @@ fn create_test_schema() -> Schema {
             is_primary_key: false,
             is_nullable: true,
             locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
         },
         Column {
             name: "score".to_string(),
@@ -27,6 +31,8 @@ fn create_test_schema() -> Schema {
             is_primary_key: false,
             is_nullable: true,
             locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
         },
     ])
 }
@@ -302,6 +308,8 @@ fn test_locality_group_pruning_verification() {
             is_primary_key: true,
             is_nullable: false,
             locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
         },
         Column {
             name: "name".to_string(),
@@ -309,6 +317,8 @@ fn test_locality_group_pruning_verification() {
             is_primary_key: false,
             is_nullable: true,
             locality_group: Some("lg_name".to_string()),
+            default_value: None,
+            is_auto_increment: false,
         },
         Column {
             name: "score".to_string(),
@@ -316,6 +326,8 @@ fn test_locality_group_pruning_verification() {
             is_primary_key: false,
             is_nullable: true,
             locality_group: Some("lg_score".to_string()),
+            default_value: None,
+            is_auto_increment: false,
         },
     ]);
 

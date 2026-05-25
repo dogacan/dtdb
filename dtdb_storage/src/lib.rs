@@ -54,6 +54,7 @@ pub enum StorageError {
 pub enum DbKey {
     Int(i64),
     String(String),
+    Bool(bool),
     Composite(Vec<DbKey>),
 }
 
@@ -62,6 +63,7 @@ impl DbKey {
         match self {
             DbKey::Int(_) => 8,
             DbKey::String(s) => s.len(),
+            DbKey::Bool(_) => 1,
             DbKey::Composite(keys) => keys.iter().map(|k| k.byte_size()).sum(),
         }
     }
@@ -77,8 +79,11 @@ pub enum DbValue {
     Float(f64),
     String(String),
     Bytes(Vec<u8>),
+    Bool(bool),
     Null,
 }
+
+impl Eq for DbValue {}
 
 /// CompressionType represents the supported block compression algorithms in DuctTapeDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +122,12 @@ impl From<f64> for DbValue {
 impl From<String> for DbValue {
     fn from(v: String) -> Self {
         DbValue::String(v)
+    }
+}
+
+impl From<bool> for DbValue {
+    fn from(v: bool) -> Self {
+        DbValue::Bool(v)
     }
 }
 

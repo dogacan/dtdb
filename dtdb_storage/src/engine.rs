@@ -741,6 +741,7 @@ impl EngineInner {
                     Some(DbValue::Float(_)) => 8,
                     Some(DbValue::String(s)) => s.len(),
                     Some(DbValue::Bytes(b)) => b.len(),
+                    Some(DbValue::Bool(_)) => 1,
                     Some(DbValue::Null) => 1,
                     None => 1,
                 };

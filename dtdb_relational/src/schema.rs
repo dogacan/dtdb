@@ -13,6 +13,7 @@ pub enum DataType {
     String,
     Bytes,
     Null,
+    Bool,
 }
 
 fn default_nullable() -> bool {
@@ -29,6 +30,10 @@ pub struct Column {
     pub is_nullable: bool,
     #[serde(default)]
     pub locality_group: Option<String>,
+    #[serde(default)]
+    pub default_value: Option<DbValue>,
+    #[serde(default)]
+    pub is_auto_increment: bool,
 }
 
 /// LocalityGroupOptions represents overridden storage configurations for a locality group.
@@ -194,6 +199,7 @@ impl Schema {
                 (DataType::Float, DbValue::Float(_)) => {}
                 (DataType::String, DbValue::String(_)) => {}
                 (DataType::Bytes, DbValue::Bytes(_)) => {}
+                (DataType::Bool, DbValue::Bool(_)) => {}
                 (expected, actual) => {
                     return Err(RelationalError::SchemaMismatch(format!(
                         "Column '{}' (index {}) expects type {:?}, but got value {:?}",
@@ -205,45 +211,221 @@ impl Schema {
         Ok(())
     }
 
-    /// Validates that a DbKey matches the primary key column defined in the Schema.
-    /// Also checks that the key matches the primary key column value in the row.
+    /// Validates that a DbKey matches the primary key column(s) defined in the Schema.
+    /// Also checks that the key matches the primary key column value(s) in the row.
     pub fn validate_key(&self, key: &DbKey, row: &Row) -> Result<()> {
-        let pk_index = self.primary_key_index().ok_or_else(|| {
-            RelationalError::SchemaMismatch("Schema does not define a primary key".to_string())
-        })?;
-        let pk_column = &self.columns[pk_index];
-        let pk_value = &row.values[pk_index];
-
-        // 1. Verify that key matches column's DataType.
-        match (pk_column.data_type, key) {
-            (DataType::Int, DbKey::Int(_)) => {}
-            (DataType::String, DbKey::String(_)) => {}
-            (expected, actual_key) => {
-                return Err(RelationalError::SchemaMismatch(format!(
-                    "Primary key column '{}' expects {:?}, but key is {:?}",
-                    pk_column.name, expected, actual_key
-                )));
-            }
+        let indices = self.primary_key_indices();
+        if indices.is_empty() {
+            return Err(RelationalError::SchemaMismatch(
+                "Schema does not define a primary key".to_string(),
+            ));
         }
 
-        // 2. Verify key matches the value inside the row's primary key column.
-        match (key, pk_value) {
-            (DbKey::Int(k), DbValue::Int(v)) if k == v => {}
-            (DbKey::String(k), DbValue::String(v)) if k == v => {}
-            (k, v) => {
-                return Err(RelationalError::SchemaMismatch(format!(
-                    "Key mismatch: primary key value in Row is {:?}, but passed key is {:?}",
-                    v, k
-                )));
+        let validate_single = |col_idx: usize, k: &DbKey, val: &DbValue| -> Result<()> {
+            let col = &self.columns[col_idx];
+            // 1. Verify key type matches column type
+            match (col.data_type, k) {
+                (DataType::Int, DbKey::Int(_)) => {}
+                (DataType::String, DbKey::String(_)) => {}
+                (DataType::Bool, DbKey::Bool(_)) => {}
+                (expected, actual_key) => {
+                    return Err(RelationalError::SchemaMismatch(format!(
+                        "Primary key column '{}' expects {:?}, but key is {:?}",
+                        col.name, expected, actual_key
+                    )));
+                }
+            }
+            // 2. Verify key matches value in row
+            match (k, val) {
+                (DbKey::Int(kv), DbValue::Int(vv)) if kv == vv => {}
+                (DbKey::String(kv), DbValue::String(vv)) if kv == vv => {}
+                (DbKey::Bool(kv), DbValue::Bool(vv)) if kv == vv => {}
+                (kv, vv) => {
+                    return Err(RelationalError::SchemaMismatch(format!(
+                        "Key mismatch: primary key value in Row is {:?}, but passed key is {:?}",
+                        vv, kv
+                    )));
+                }
+            }
+            Ok(())
+        };
+
+        if indices.len() == 1 {
+            let pk_idx = indices[0];
+            let pk_value = &row.values[pk_idx];
+            validate_single(pk_idx, key, pk_value)?;
+        } else {
+            match key {
+                DbKey::Composite(parts) => {
+                    if parts.len() != indices.len() {
+                        return Err(RelationalError::SchemaMismatch(format!(
+                            "Composite key has {} parts, but schema expects {}",
+                            parts.len(),
+                            indices.len()
+                        )));
+                    }
+                    for (i, part) in parts.iter().enumerate() {
+                        let pk_idx = indices[i];
+                        let pk_value = &row.values[pk_idx];
+                        validate_single(pk_idx, part, pk_value)?;
+                    }
+                }
+                _ => {
+                    return Err(RelationalError::SchemaMismatch(format!(
+                        "Expected Composite key for multi-column primary key, got {:?}",
+                        key
+                    )));
+                }
             }
         }
-
         Ok(())
     }
 
-    /// Returns the index of the primary key column.
+    /// Validates a DbKey structure and type against the primary key columns definition only.
+    pub fn validate_key_only(&self, key: &DbKey) -> Result<()> {
+        let indices = self.primary_key_indices();
+        if indices.is_empty() {
+            return Err(RelationalError::SchemaMismatch(
+                "Schema does not define a primary key".to_string(),
+            ));
+        }
+
+        let validate_single = |col_idx: usize, k: &DbKey| -> Result<()> {
+            let col = &self.columns[col_idx];
+            match (col.data_type, k) {
+                (DataType::Int, DbKey::Int(_)) => Ok(()),
+                (DataType::String, DbKey::String(_)) => Ok(()),
+                (DataType::Bool, DbKey::Bool(_)) => Ok(()),
+                (expected, actual_key) => Err(RelationalError::SchemaMismatch(format!(
+                    "Primary key column '{}' expects {:?}, but key is {:?}",
+                    col.name, expected, actual_key
+                ))),
+            }
+        };
+
+        if indices.len() == 1 {
+            validate_single(indices[0], key)?;
+        } else {
+            match key {
+                DbKey::Composite(parts) => {
+                    if parts.len() != indices.len() {
+                        return Err(RelationalError::SchemaMismatch(format!(
+                            "Composite key has {} parts, but schema expects {}",
+                            parts.len(),
+                            indices.len()
+                        )));
+                    }
+                    for (i, part) in parts.iter().enumerate() {
+                        validate_single(indices[i], part)?;
+                    }
+                }
+                _ => {
+                    return Err(RelationalError::SchemaMismatch(format!(
+                        "Expected Composite key for multi-column primary key, got {:?}",
+                        key
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the indices of the primary key columns.
+    pub fn primary_key_indices(&self) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| col.is_primary_key)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Extract the primary key (single or composite) from a Row.
+    pub fn extract_primary_key(&self, row: &Row) -> Result<DbKey> {
+        let indices = self.primary_key_indices();
+        if indices.is_empty() {
+            return Err(RelationalError::SchemaMismatch(
+                "Schema does not define a primary key".to_string(),
+            ));
+        }
+        if indices.len() == 1 {
+            let val = &row.values[indices[0]];
+            match val {
+                DbValue::Int(v) => Ok(DbKey::Int(*v)),
+                DbValue::String(s) => Ok(DbKey::String(s.clone())),
+                DbValue::Bool(b) => Ok(DbKey::Bool(*b)),
+                DbValue::Null => Err(RelationalError::SchemaMismatch(
+                    "Primary key cannot be NULL".to_string(),
+                )),
+                other => Err(RelationalError::SchemaMismatch(format!(
+                    "Unsupported primary key type: {:?}",
+                    other
+                ))),
+            }
+        } else {
+            let mut keys = Vec::new();
+            for &idx in &indices {
+                let val = &row.values[idx];
+                let k = match val {
+                    DbValue::Int(v) => DbKey::Int(*v),
+                    DbValue::String(s) => DbKey::String(s.clone()),
+                    DbValue::Bool(b) => DbKey::Bool(*b),
+                    DbValue::Null => {
+                        return Err(RelationalError::SchemaMismatch(
+                            "Primary key cannot be NULL".to_string(),
+                        ));
+                    }
+                    other => {
+                        return Err(RelationalError::SchemaMismatch(format!(
+                            "Unsupported primary key type in composite: {:?}",
+                            other
+                        )));
+                    }
+                };
+                keys.push(k);
+            }
+            Ok(DbKey::Composite(keys))
+        }
+    }
+
+    /// Get default ranges/bounds for primary key scan.
+    pub fn primary_key_bounds(&self) -> Result<(DbKey, DbKey)> {
+        let indices = self.primary_key_indices();
+        if indices.is_empty() {
+            return Err(RelationalError::SchemaMismatch(
+                "Schema does not define a primary key".to_string(),
+            ));
+        }
+
+        let get_bounds = |dt: DataType| match dt {
+            DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+            DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
+            _ => (
+                DbKey::String("".to_string()),
+                DbKey::String("\u{10ffff}".to_string()),
+            ),
+        };
+
+        if indices.len() == 1 {
+            let col = &self.columns[indices[0]];
+            Ok(get_bounds(col.data_type))
+        } else {
+            let mut mins = Vec::new();
+            let mut maxs = Vec::new();
+            for &idx in &indices {
+                let col = &self.columns[idx];
+                let (min_val, max_val) = get_bounds(col.data_type);
+                mins.push(min_val);
+                maxs.push(max_val);
+            }
+            Ok((DbKey::Composite(mins), DbKey::Composite(maxs)))
+        }
+    }
+
+    /// Returns the index of the primary key column if there is exactly one.
     pub fn primary_key_index(&self) -> Option<usize> {
-        self.columns.iter().position(|col| col.is_primary_key)
+        let pks = self.primary_key_indices();
+        if pks.len() == 1 { Some(pks[0]) } else { None }
     }
 
     /// Returns the index of the column with the given name.

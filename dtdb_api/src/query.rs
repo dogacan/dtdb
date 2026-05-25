@@ -55,6 +55,7 @@ impl SqlQuery {
                         match val {
                             DbValue::Int(i) => result.push_str(&i.to_string()),
                             DbValue::Float(f) => result.push_str(&f.to_string()),
+                            DbValue::Bool(b) => result.push_str(&b.to_string()),
                             DbValue::String(s) => {
                                 // Escape single quotes by doubling them (SQL standard)
                                 let escaped = s.replace('\'', "''");

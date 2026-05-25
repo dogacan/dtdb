@@ -137,8 +137,11 @@ impl SqlEngine {
                 let mut insert_count = 0;
 
                 for row_vals in rows {
-                    // Start with NULL values for each column.
-                    let mut aligned_vals = vec![DbValue::Null; schema.columns.len()];
+                    // Start with default values for each column.
+                    let mut aligned_vals = Vec::with_capacity(schema.columns.len());
+                    for col in &schema.columns {
+                        aligned_vals.push(col.default_value.clone().unwrap_or(DbValue::Null));
+                    }
 
                     // Map provided row values to the correct column indices.
                     for (col_idx, col_name) in columns.iter().enumerate() {
@@ -148,19 +151,37 @@ impl SqlEngine {
                         aligned_vals[schema_idx] = row_vals[col_idx].clone();
                     }
 
+                    // Handle auto-increment columns.
+                    for (col_idx, col) in schema.columns.iter().enumerate() {
+                        if col.is_auto_increment {
+                            if matches!(aligned_vals[col_idx], DbValue::Null) {
+                                let next_val = self
+                                    .database
+                                    .next_sequence_value(&table_name)
+                                    .map_err(|e| e.to_string())?;
+                                aligned_vals[col_idx] = DbValue::Int(next_val);
+                            } else if let DbValue::Int(explicit_val) = aligned_vals[col_idx] {
+                                self.database
+                                    .update_sequence_value(&table_name, explicit_val)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+
                     let full_row = Row::new(aligned_vals);
 
                     // Extract the primary key value.
-                    let pk_idx = schema
-                        .primary_key_index()
-                        .ok_or_else(|| "Primary key not defined".to_string())?;
-                    let pk_val = &full_row.values[pk_idx];
+                    let pk_key = schema
+                        .extract_primary_key(&full_row)
+                        .map_err(|e| e.to_string())?;
 
-                    let pk_key = match pk_val {
-                        DbValue::Int(v) => DbKey::Int(*v),
-                        DbValue::String(s) => DbKey::String(s.clone()),
-                        other => return Err(format!("Invalid primary key type: {:?}", other)),
-                    };
+                    if tx
+                        .get(&table_name, &pk_key)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                    {
+                        return Err("Duplicate primary key".to_string());
+                    }
 
                     tx.put(&table_name, pk_key, full_row)
                         .map_err(|e| e.to_string())?;
@@ -195,19 +216,12 @@ impl SqlEngine {
                 let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut delete_count = 0;
-                let pk_idx = table
-                    .schema
-                    .primary_key_index()
-                    .ok_or_else(|| "Primary key not defined".to_string())?;
-
                 let mut keys_to_delete = Vec::new();
                 while let Some(row) = physical_op.next()? {
-                    let pk_val = &row.values[pk_idx];
-                    let pk_key = match pk_val {
-                        DbValue::Int(v) => DbKey::Int(*v),
-                        DbValue::String(s) => DbKey::String(s.clone()),
-                        other => return Err(format!("Invalid primary key type: {:?}", other)),
-                    };
+                    let pk_key = table
+                        .schema
+                        .extract_primary_key(&row)
+                        .map_err(|e| e.to_string())?;
                     keys_to_delete.push(pk_key);
                 }
 
@@ -248,11 +262,6 @@ impl SqlEngine {
                 let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut update_count = 0;
-                let pk_idx = table
-                    .schema
-                    .primary_key_index()
-                    .ok_or_else(|| "Primary key not defined".to_string())?;
-
                 let mut updates = Vec::new();
                 while let Some(row) = physical_op.next()? {
                     let mut updated_values = row.values.clone();
@@ -265,21 +274,17 @@ impl SqlEngine {
                         updated_values[col_idx] = new_val;
                     }
 
-                    let old_pk_val = &row.values[pk_idx];
-                    let old_pk_key = match old_pk_val {
-                        DbValue::Int(v) => DbKey::Int(*v),
-                        DbValue::String(s) => DbKey::String(s.clone()),
-                        other => return Err(format!("Invalid primary key type: {:?}", other)),
-                    };
-
-                    let new_pk_val = &updated_values[pk_idx];
-                    let new_pk_key = match new_pk_val {
-                        DbValue::Int(v) => DbKey::Int(*v),
-                        DbValue::String(s) => DbKey::String(s.clone()),
-                        other => return Err(format!("Invalid primary key type: {:?}", other)),
-                    };
+                    let old_pk_key = table
+                        .schema
+                        .extract_primary_key(&row)
+                        .map_err(|e| e.to_string())?;
 
                     let updated_row = Row::new(updated_values);
+                    let new_pk_key = table
+                        .schema
+                        .extract_primary_key(&updated_row)
+                        .map_err(|e| e.to_string())?;
+
                     updates.push((old_pk_key, new_pk_key, updated_row));
                 }
 
@@ -347,6 +352,8 @@ impl SqlEngine {
                     is_primary_key: false,
                     is_nullable: true,
                     locality_group: None,
+                    default_value: None,
+                    is_auto_increment: false,
                 }]);
 
                 let plan_info = format!(
@@ -404,6 +411,7 @@ impl SqlEngine {
                             })?;
                         match col.data_type {
                             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+                            DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
                             _ => (
                                 DbKey::String("".to_string()),
                                 DbKey::String("\u{10ffff}".to_string()),
@@ -426,19 +434,7 @@ impl SqlEngine {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
                     Some(r) => r,
-                    None => {
-                        let pk_idx = schema.primary_key_index().ok_or_else(|| {
-                            "No primary key found for Scan compilation".to_string()
-                        })?;
-                        let pk_col = &schema.columns[pk_idx];
-                        match pk_col.data_type {
-                            DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
-                            _ => (
-                                DbKey::String("".to_string()),
-                                DbKey::String("\u{10ffff}".to_string()),
-                            ),
-                        }
-                    }
+                    None => schema.primary_key_bounds().map_err(|e| e.to_string())?,
                 };
 
                 let rows = tx

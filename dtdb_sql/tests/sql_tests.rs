@@ -953,7 +953,7 @@ fn test_sql_explicit_null() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], DbValue::Null); // NULL + 5 = NULL
         assert_eq!(rows[0].values[1], DbValue::Null); // NULL AND 1 = NULL
-        assert_eq!(rows[0].values[2], DbValue::Int(1)); // NULL OR 1 = 1
+        assert_eq!(rows[0].values[2], DbValue::Bool(true)); // NULL OR 1 = true
     } else {
         panic!("Expected Select");
     }
@@ -1685,5 +1685,257 @@ fn test_sql_pass2_table_and_join_features() {
         );
     } else {
         panic!("Expected Select");
+    }
+}
+
+#[test]
+fn test_sql_pass3_schema_and_constraints() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Boolean data type and predicates
+    {
+        let tx1 = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE bool_test (id INT PRIMARY KEY, active BOOLEAN)",
+                &tx1,
+            )
+            .unwrap();
+        tx1.commit().unwrap();
+
+        let tx2 = Transaction::new(2, db.clone());
+        engine
+            .execute(
+                "INSERT INTO bool_test (id, active) VALUES (1, true), (2, false), (3, NULL)",
+                &tx2,
+            )
+            .unwrap();
+        tx2.commit().unwrap();
+
+        let tx3 = Transaction::new(3, db.clone());
+        let res = engine
+            .execute("SELECT id, active FROM bool_test ORDER BY id ASC", &tx3)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].values, vec![DbValue::Int(1), DbValue::Bool(true)]);
+            assert_eq!(rows[1].values, vec![DbValue::Int(2), DbValue::Bool(false)]);
+            assert_eq!(rows[2].values, vec![DbValue::Int(3), DbValue::Null]);
+        } else {
+            panic!("Expected Select");
+        }
+
+        // Test filtering on boolean predicate active = true
+        let res = engine
+            .execute("SELECT id FROM bool_test WHERE active = true", &tx3)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values, vec![DbValue::Int(1)]);
+        } else {
+            panic!("Expected Select");
+        }
+
+        // Test filtering on boolean predicate NOT active
+        let res = engine
+            .execute("SELECT id FROM bool_test WHERE NOT active", &tx3)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values, vec![DbValue::Int(2)]);
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    // 2. Composite Primary Keys
+    {
+        let tx4 = Transaction::new(4, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE composite_test (tenant_id INT, user_id INT, role STRING, PRIMARY KEY (tenant_id, user_id))",
+                &tx4,
+            )
+            .unwrap();
+        tx4.commit().unwrap();
+
+        let tx5 = Transaction::new(5, db.clone());
+        engine
+            .execute(
+                "INSERT INTO composite_test (tenant_id, user_id, role) VALUES (1, 10, 'admin'), (1, 20, 'user'), (2, 10, 'admin')",
+                &tx5,
+            )
+            .unwrap();
+        tx5.commit().unwrap();
+
+        let tx6 = Transaction::new(6, db.clone());
+        let res = engine
+            .execute(
+                "SELECT tenant_id, user_id, role FROM composite_test ORDER BY tenant_id ASC, user_id ASC",
+                &tx6,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows[0].values,
+                vec![
+                    DbValue::Int(1),
+                    DbValue::Int(10),
+                    DbValue::String("admin".to_string())
+                ]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![
+                    DbValue::Int(1),
+                    DbValue::Int(20),
+                    DbValue::String("user".to_string())
+                ]
+            );
+            assert_eq!(
+                rows[2].values,
+                vec![
+                    DbValue::Int(2),
+                    DbValue::Int(10),
+                    DbValue::String("admin".to_string())
+                ]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // Test duplicate primary key error
+        let tx7 = Transaction::new(7, db.clone());
+        let insert_fail = engine.execute(
+            "INSERT INTO composite_test (tenant_id, user_id, role) VALUES (1, 10, 'super')",
+            &tx7,
+        );
+        assert!(
+            insert_fail.is_err(),
+            "Expected composite key violation to error out"
+        );
+        let _ = tx7.rollback();
+    }
+
+    // 3. Column DEFAULT values
+    {
+        let tx8 = Transaction::new(8, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE default_test (id INT PRIMARY KEY, name STRING DEFAULT 'Unnamed', count INT DEFAULT 42)",
+                &tx8,
+            )
+            .unwrap();
+        tx8.commit().unwrap();
+
+        let tx9 = Transaction::new(9, db.clone());
+        engine
+            .execute("INSERT INTO default_test (id) VALUES (1)", &tx9)
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO default_test (id, name) VALUES (2, 'Bob')",
+                &tx9,
+            )
+            .unwrap();
+        tx9.commit().unwrap();
+
+        let tx10 = Transaction::new(10, db.clone());
+        let res = engine
+            .execute(
+                "SELECT id, name, count FROM default_test ORDER BY id ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].values,
+                vec![
+                    DbValue::Int(1),
+                    DbValue::String("Unnamed".to_string()),
+                    DbValue::Int(42)
+                ]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![
+                    DbValue::Int(2),
+                    DbValue::String("Bob".to_string()),
+                    DbValue::Int(42)
+                ]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    // 4. Auto-increment / Identity columns
+    {
+        let tx11 = Transaction::new(11, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE auto_test (id SERIAL PRIMARY KEY, note STRING)",
+                &tx11,
+            )
+            .unwrap();
+        tx11.commit().unwrap();
+
+        let tx12 = Transaction::new(12, db.clone());
+        engine
+            .execute(
+                "INSERT INTO auto_test (note) VALUES ('First'), ('Second')",
+                &tx12,
+            )
+            .unwrap();
+        tx12.commit().unwrap();
+
+        let tx13 = Transaction::new(13, db.clone());
+        let res = engine
+            .execute("SELECT id, note FROM auto_test ORDER BY id ASC", &tx13)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("First".to_string())]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![DbValue::Int(2), DbValue::String("Second".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // Test inserting explicit ID (e.g. 10) manually resets sequence or works
+        let tx14 = Transaction::new(14, db.clone());
+        engine
+            .execute("INSERT INTO auto_test (id, note) VALUES (10, 'Ten')", &tx14)
+            .unwrap();
+        // Insert without ID should increment from the max value now
+        engine
+            .execute("INSERT INTO auto_test (note) VALUES ('Eleven')", &tx14)
+            .unwrap();
+        tx14.commit().unwrap();
+
+        let tx15 = Transaction::new(15, db.clone());
+        let res = engine
+            .execute("SELECT id, note FROM auto_test ORDER BY id ASC", &tx15)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 4);
+            assert_eq!(
+                rows[2].values,
+                vec![DbValue::Int(10), DbValue::String("Ten".to_string())]
+            );
+            assert_eq!(
+                rows[3].values,
+                vec![DbValue::Int(11), DbValue::String("Eleven".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
     }
 }

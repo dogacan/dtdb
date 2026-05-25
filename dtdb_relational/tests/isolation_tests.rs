@@ -12,6 +12,8 @@ fn create_user_schema() -> Schema {
             is_primary_key: true,
             is_nullable: false,
             locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
         },
         Column {
             name: "name".to_string(),
@@ -19,6 +21,8 @@ fn create_user_schema() -> Schema {
             is_primary_key: false,
             is_nullable: true,
             locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
         },
     ])
 }

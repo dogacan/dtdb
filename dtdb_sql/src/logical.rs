@@ -91,6 +91,8 @@ impl LogicalPlan {
                         is_primary_key: false,
                         is_nullable: true,
                         locality_group: None,
+                        default_value: None,
+                        is_auto_increment: false,
                     });
                 }
                 Schema::new(cols)
@@ -131,6 +133,8 @@ impl LogicalPlan {
                         is_primary_key: false,
                         is_nullable: true,
                         locality_group: None,
+                        default_value: None,
+                        is_auto_increment: false,
                     });
                 }
 
@@ -163,6 +167,8 @@ impl LogicalPlan {
                         is_primary_key: false,
                         is_nullable: true,
                         locality_group: None,
+                        default_value: None,
+                        is_auto_increment: false,
                     });
                 }
 
@@ -349,6 +355,7 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
             dtdb_storage::DbValue::Float(_) => DataType::Float,
             dtdb_storage::DbValue::String(_) => DataType::String,
             dtdb_storage::DbValue::Bytes(_) => DataType::Bytes,
+            dtdb_storage::DbValue::Bool(_) => DataType::Bool,
             dtdb_storage::DbValue::Null => DataType::Null,
         },
         Expr::Column(col_name) => {

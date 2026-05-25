@@ -60,6 +60,7 @@ impl LogicalPlanner {
             Statement::CreateTable {
                 name,
                 columns,
+                constraints,
                 with_options,
                 ..
             } => {
@@ -194,14 +195,37 @@ impl LogicalPlanner {
                     }
                 }
 
+                let mut pk_cols = std::collections::HashSet::new();
+                for constraint in constraints {
+                    if let sqlparser::ast::TableConstraint::Unique {
+                        is_primary: true,
+                        columns,
+                        ..
+                    } = constraint
+                    {
+                        for col_ident in columns {
+                            pk_cols.insert(col_ident.value.clone());
+                        }
+                    }
+                }
+
                 for col in columns {
                     let dt = match &col.data_type {
                         SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => {
                             DataType::Int
                         }
+                        SqlDataType::Custom(name, _)
+                            if {
+                                let name_str = name.to_string().to_uppercase();
+                                name_str == "SERIAL" || name_str == "BIGSERIAL"
+                            } =>
+                        {
+                            DataType::Int
+                        }
                         SqlDataType::Float(_) | SqlDataType::Double | SqlDataType::Real => {
                             DataType::Float
                         }
+                        SqlDataType::Boolean => DataType::Bool,
                         SqlDataType::Text
                         | SqlDataType::Varchar(_)
                         | SqlDataType::Char(_)
@@ -210,10 +234,13 @@ impl LogicalPlanner {
                         other => return Err(format!("Unsupported SQL data type: {:?}", other)),
                     };
 
-                    let is_pk = col
+                    let mut is_pk = col
                         .options
                         .iter()
                         .any(|opt| matches!(opt.option, ColumnOption::Unique { is_primary: true }));
+                    if pk_cols.contains(&col.name.value) {
+                        is_pk = true;
+                    }
 
                     let is_nullable = !is_pk
                         && !col
@@ -223,12 +250,41 @@ impl LogicalPlanner {
 
                     let group = locality_map.get(&col.name.value).cloned();
 
+                    let mut default_value = None;
+                    for opt in &col.options {
+                        if let ColumnOption::Default(ref default_expr) = opt.option {
+                            default_value = Some(eval_default_expr(default_expr)?);
+                        }
+                    }
+
+                    let mut is_auto_increment = false;
+                    if let SqlDataType::Custom(name, _) = &col.data_type {
+                        let name_str = name.to_string().to_uppercase();
+                        if name_str == "SERIAL" || name_str == "BIGSERIAL" {
+                            is_auto_increment = true;
+                        }
+                    }
+                    for opt in &col.options {
+                        if let ColumnOption::DialectSpecific(tokens) = &opt.option {
+                            for token in tokens {
+                                if let sqlparser::tokenizer::Token::Word(w) = token {
+                                    let val = w.value.to_uppercase();
+                                    if val == "AUTO_INCREMENT" || val == "AUTOINCREMENT" {
+                                        is_auto_increment = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     cols.push(Column {
                         name: col.name.value.clone(),
                         data_type: dt,
                         is_primary_key: is_pk,
                         is_nullable,
                         locality_group: group,
+                        default_value,
+                        is_auto_increment,
                     });
                 }
 
@@ -749,7 +805,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                     }
                 }
                 SqlValue::SingleQuotedString(s) => DbValue::String(s.clone()),
-                SqlValue::Boolean(b) => DbValue::Int(if *b { 1 } else { 0 }),
+                SqlValue::Boolean(b) => DbValue::Bool(*b),
                 SqlValue::Null => DbValue::Null,
                 other => return Err(format!("Unsupported SQL value type: {:?}", other)),
             };
@@ -957,6 +1013,45 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
         }
         SqlExpr::Nested(inner) => has_aggregate_function(inner),
         _ => false,
+    }
+}
+
+fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {
+    match expr {
+        SqlExpr::Value(val) => match val {
+            SqlValue::Number(num_str, _) => {
+                if let Ok(i) = num_str.parse::<i64>() {
+                    Ok(DbValue::Int(i))
+                } else if let Ok(f) = num_str.parse::<f64>() {
+                    Ok(DbValue::Float(f))
+                } else {
+                    Err(format!("Invalid numeric literal for default: {}", num_str))
+                }
+            }
+            SqlValue::SingleQuotedString(s) => Ok(DbValue::String(s.clone())),
+            SqlValue::Boolean(b) => Ok(DbValue::Bool(*b)),
+            SqlValue::Null => Ok(DbValue::Null),
+            other => Err(format!("Unsupported value type for default: {:?}", other)),
+        },
+        SqlExpr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            let val = eval_default_expr(inner)?;
+            match val {
+                DbValue::Int(i) => Ok(DbValue::Int(-i)),
+                DbValue::Float(f) => Ok(DbValue::Float(-f)),
+                _ => Err("Invalid negative default value".to_string()),
+            }
+        }
+        SqlExpr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Plus,
+            expr: inner,
+        } => eval_default_expr(inner),
+        other => Err(format!(
+            "Unsupported expression type for default: {:?}",
+            other
+        )),
     }
 }
 

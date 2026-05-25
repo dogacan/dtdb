@@ -133,6 +133,7 @@ fn display_result(res: ExecutionResult) {
                         DbValue::Float(v) => v.to_string(),
                         DbValue::String(s) => s.clone(),
                         DbValue::Bytes(b) => format!("{:?}", b),
+                        DbValue::Bool(b) => b.to_string(),
                         DbValue::Null => "NULL".to_string(),
                     };
                     if val_str.len() > col_widths[i] {

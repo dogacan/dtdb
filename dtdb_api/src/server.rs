@@ -208,6 +208,7 @@ pub(crate) fn execution_result_to_responses(
                         DbValue::Float(v) => v.to_string(),
                         DbValue::String(s) => s.clone(),
                         DbValue::Bytes(b) => format!("{:?}", b),
+                        DbValue::Bool(b) => b.to_string(),
                         DbValue::Null => "NULL".to_string(),
                     })
                     .collect();

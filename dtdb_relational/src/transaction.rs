@@ -1,7 +1,6 @@
 use crate::database::{Database, Table, TransactionRecord};
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use crate::schema::DataType;
 use dtdb_storage::{DbKey, DbValue, WalEntry};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -108,21 +107,8 @@ impl Transaction {
     pub fn delete(&self, table_name: &str, key: DbKey) -> Result<()> {
         let table = self.get_table(table_name)?;
 
-        // Validate that key type matches primary key column DataType.
-        let pk_idx = table.schema.primary_key_index().ok_or_else(|| {
-            RelationalError::SchemaMismatch("Schema does not define a primary key".to_string())
-        })?;
-        let pk_column = &table.schema.columns[pk_idx];
-        match (pk_column.data_type, &key) {
-            (DataType::Int, DbKey::Int(_)) => {}
-            (DataType::String, DbKey::String(_)) => {}
-            (expected, actual) => {
-                return Err(RelationalError::SchemaMismatch(format!(
-                    "Primary key column expects type {:?}, but key is {:?}",
-                    expected, actual
-                )));
-            }
-        }
+        // Validate key.
+        table.schema.validate_key_only(&key)?;
 
         // Insert a deletion tombstone (None) into transaction buffer.
         let mut buffer = self.write_buffer.lock().unwrap();
@@ -276,21 +262,7 @@ impl Transaction {
         })?;
 
         // 1. Resolve primary key bounds
-        let (min_pk, max_pk) = if let Some(pk_idx) = table.schema.primary_key_index() {
-            let pk_col = &table.schema.columns[pk_idx];
-            match pk_col.data_type {
-                DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
-                _ => (
-                    DbKey::String("".to_string()),
-                    DbKey::String("\u{10ffff}".to_string()),
-                ),
-            }
-        } else {
-            (
-                DbKey::String("".to_string()),
-                DbKey::String("\u{10ffff}".to_string()),
-            )
-        };
+        let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
 
         // Construct composite key scan bounds for the index engine
         let start_bound = DbKey::Composite(vec![start_val.clone(), min_pk]);
@@ -334,6 +306,7 @@ impl Transaction {
                     let k = match val {
                         DbValue::Int(v) => Some(DbKey::Int(*v)),
                         DbValue::String(s) => Some(DbKey::String(s.clone())),
+                        DbValue::Bool(b) => Some(DbKey::Bool(*b)),
                         _ => None,
                     };
                     if let Some(k) = k
