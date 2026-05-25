@@ -63,6 +63,7 @@ async fn test_wal_size_based_flush() {
         level_size_multiplier: None,
         max_level: None,
         block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
     };
 
     let create_resp = client
@@ -149,6 +150,7 @@ async fn test_periodic_time_based_flush() {
         level_size_multiplier: None,
         max_level: None,
         block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
     };
 
     let create_resp = client
@@ -241,6 +243,7 @@ async fn test_manual_rpc_flush() {
         level_size_multiplier: None,
         max_level: None,
         block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
     };
 
     let create_resp = client

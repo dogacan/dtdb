@@ -25,6 +25,7 @@ pub enum ExecutionResult {
     Delete { count: usize },
     Update { count: usize },
     Select { schema: Schema, rows: Vec<Row> },
+    Analyze,
 }
 
 /// SqlEngine orchestrates the parser, logical planner, optimizer, and physical execution pipeline.
@@ -454,6 +455,12 @@ impl SqlEngine {
                 let rows = vec![Row::new(vec![DbValue::String(plan_info)])];
 
                 Ok(ExecutionResult::Select { schema, rows })
+            }
+            SqlStatement::Analyze { table_name } => {
+                self.database
+                    .analyze_table(&table_name, tx)
+                    .map_err(|e| e.to_string())?;
+                Ok(ExecutionResult::Analyze)
             }
         }
     }

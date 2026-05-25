@@ -393,3 +393,45 @@ fn test_locality_group_pruning_verification() {
         ]
     );
 }
+
+#[test]
+fn test_background_statistics_collector() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    // Create options with analyze_frequency_ms = Some(10)
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(1000),
+        analyze_frequency_ms: Some(10), // Run every 10ms
+    };
+
+    let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    // Verify initial statistics is empty or zero rows
+    let stats = db.get_table_statistics("users").unwrap();
+    assert_eq!(stats.row_count, 0);
+
+    // Insert some rows in a transaction
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", k_int(1), r_user(1, "alice", 95.5)).unwrap();
+    tx.put("users", k_int(2), r_user(2, "bob", 80.0)).unwrap();
+    tx.commit().unwrap();
+
+    // Sleep for a short while (e.g. 50ms) to allow the background thread to run and update stats
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Verify background thread ran and updated statistics
+    let stats2 = db.get_table_statistics("users").unwrap();
+    assert_eq!(stats2.row_count, 2);
+}

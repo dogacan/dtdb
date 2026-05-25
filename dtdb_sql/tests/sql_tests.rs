@@ -2249,3 +2249,58 @@ fn test_sql_pass4_dml_and_set_operations() {
         assert!(err_res2.unwrap_err().contains("type mismatch"));
     }
 }
+
+#[test]
+fn test_sql_analyze() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create table and index
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE items (id INT PRIMARY KEY, name STRING, active BOOL)",
+            &tx1,
+        )
+        .unwrap();
+    engine
+        .execute("CREATE INDEX idx_name ON items (name)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    // 2. Insert data
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO items (id, name, active) VALUES (1, 'apple', true), (2, 'banana', false), (3, 'apple', true)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // Flush tables to generate SSTables so we actually get non-zero sizes / SSTable count
+    let table = db.get_table("items").unwrap();
+    table.flush_memtable().unwrap();
+
+    // 3. Execute ANALYZE via SQL
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine.execute("ANALYZE TABLE items", &tx3).unwrap();
+    assert_eq!(res, ExecutionResult::Analyze);
+    tx3.commit().unwrap();
+
+    // 4. Verify statistics
+    let stats = db.get_table_statistics("items").unwrap();
+    assert_eq!(stats.row_count, 3);
+    assert_eq!(stats.table_name, "items");
+
+    // Default locality group stats
+    let lg_stats = stats.locality_group_stats.get("").unwrap();
+    assert!(lg_stats.entry_count > 0);
+    assert!(lg_stats.total_sstable_size > 0);
+    assert_eq!(lg_stats.num_sstables, 1);
+
+    // Index stats
+    let idx_stats = stats.index_stats.get("idx_name").unwrap();
+    assert_eq!(idx_stats.entry_count, 3);
+    assert_eq!(idx_stats.unique_values, 2); // 'apple' and 'banana'
+    assert_eq!(idx_stats.avg_rows_per_value, 1.5);
+}

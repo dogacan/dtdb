@@ -65,6 +65,7 @@ impl Transaction {
         database: Arc<Database>,
         isolation_level: IsolationLevel,
     ) -> Self {
+        database.start_background_analyze_if_needed(&database);
         let start_version = database.register_transaction(tx_id);
         Self {
             tx_id,

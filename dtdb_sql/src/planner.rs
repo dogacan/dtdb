@@ -47,6 +47,9 @@ pub enum SqlStatement {
         table_name: String,
         index_name: String,
     },
+    Analyze {
+        table_name: String,
+    },
 }
 
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
@@ -226,6 +229,14 @@ impl LogicalPlanner {
                             } =>
                         {
                             DataType::Int
+                        }
+                        SqlDataType::Custom(name, _)
+                            if {
+                                let name_str = name.to_string().to_uppercase();
+                                name_str == "BOOL"
+                            } =>
+                        {
+                            DataType::Bool
                         }
                         SqlDataType::Float(_) | SqlDataType::Double | SqlDataType::Real => {
                             DataType::Float
@@ -477,6 +488,9 @@ impl LogicalPlanner {
                 let logical_plan = self.plan_query(query)?;
                 Ok(SqlStatement::Query(logical_plan))
             }
+            Statement::Analyze { table_name, .. } => Ok(SqlStatement::Analyze {
+                table_name: table_name.to_string(),
+            }),
             Statement::Explain { statement, .. } => {
                 let inner = self.plan(statement)?;
                 match inner {

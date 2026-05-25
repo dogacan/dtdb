@@ -138,6 +138,13 @@ pub(crate) fn execution_result_to_responses(
     result: dtdb_sql::ExecutionResult,
 ) -> Vec<ExecuteQueryResponse> {
     match result {
+        dtdb_sql::ExecutionResult::Analyze => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    "Table analyzed successfully.".to_string(),
+                )),
+            }]
+        }
         dtdb_sql::ExecutionResult::CreateTable => {
             vec![ExecuteQueryResponse {
                 payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
@@ -270,6 +277,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             level_size_multiplier: None,
             max_level: None,
             block_cache_capacity: Some(1000),
+            analyze_frequency_ms: req.analyze_frequency_ms,
         };
 
         let database = Arc::new(

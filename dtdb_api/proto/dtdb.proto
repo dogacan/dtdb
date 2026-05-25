@@ -46,6 +46,7 @@ message CreateDbRequest {
     optional uint64 block_size_limit = 4;
     optional uint64 wal_size_limit = 5;
     optional uint64 flush_interval_ms = 6;
+    optional uint64 analyze_frequency_ms = 7;
 }
 
 message CreateDbResponse {

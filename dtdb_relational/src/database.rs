@@ -1,6 +1,7 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
 use crate::schema::{IndexDefinition, Schema};
+use crate::transaction::Transaction;
 use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, ThreadSpawner, WalEntry,
 };
@@ -355,6 +356,30 @@ impl Table {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct TableStatistics {
+    pub table_name: String,
+    pub row_count: u64,
+    pub total_size_bytes: u64,
+    pub locality_group_stats: HashMap<String, GroupStats>,
+    pub index_stats: HashMap<String, IndexStats>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct GroupStats {
+    pub num_sstables: usize,
+    pub total_sstable_size: u64,
+    pub entry_count: u64,
+    pub tombstone_count: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct IndexStats {
+    pub entry_count: u64,
+    pub unique_values: u64,
+    pub avg_rows_per_value: f64,
+}
+
 /// DatabaseOptions defines the configuration parameters for a Database.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DatabaseOptions {
@@ -369,6 +394,8 @@ pub struct DatabaseOptions {
     pub level_size_multiplier: Option<usize>,
     pub max_level: Option<usize>,
     pub block_cache_capacity: Option<usize>,
+    #[serde(default)]
+    pub analyze_frequency_ms: Option<u64>,
 }
 
 /// Database represents a catalog of Tables stored in a base directory.
@@ -384,6 +411,8 @@ pub struct Database {
     spawner: Arc<dyn ThreadSpawner>,
     active_table_access: Mutex<HashMap<String, HashSet<u64>>>,
     pub auto_increment_sequences: Mutex<HashMap<String, i64>>,
+    pub statistics: RwLock<HashMap<String, TableStatistics>>,
+    is_background_analyze_started: std::sync::atomic::AtomicBool,
 }
 
 impl Database {
@@ -418,6 +447,7 @@ impl Database {
                 level_size_multiplier: None,
                 max_level: None,
                 block_cache_capacity: Some(1000),
+                analyze_frequency_ms: None,
             }
         };
         Self::open_with_options_and_spawner(dir_path, options, spawner)
@@ -459,6 +489,7 @@ impl Database {
         fs::write(&db_options_path, bytes)?;
 
         let mut tables = HashMap::new();
+        let mut statistics = HashMap::new();
 
         for entry in fs::read_dir(&dir_path)? {
             let entry = entry?;
@@ -541,6 +572,14 @@ impl Database {
                         index_engines.insert(idx_def.name.clone(), engine);
                     }
 
+                    let stats_path = path.join("statistics.bin");
+                    if stats_path.exists()
+                        && let Ok(bytes) = fs::read(&stats_path)
+                        && let Ok(stats) = bincode::deserialize::<TableStatistics>(&bytes)
+                    {
+                        statistics.insert(name.clone(), stats);
+                    }
+
                     tables.insert(
                         name.clone(),
                         Table {
@@ -574,6 +613,8 @@ impl Database {
             spawner,
             active_table_access,
             auto_increment_sequences,
+            statistics: RwLock::new(statistics),
+            is_background_analyze_started: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Initialize auto-increment sequences for loaded tables
@@ -673,6 +714,21 @@ impl Database {
 
         let has_auto_inc = schema.columns.iter().any(|c| c.is_auto_increment);
 
+        let initial_stats = TableStatistics {
+            table_name: name.to_string(),
+            ..Default::default()
+        };
+
+        {
+            let mut stats_guard = self.statistics.write().unwrap();
+            stats_guard.insert(name.to_string(), initial_stats.clone());
+        }
+
+        let stats_path = table_path.join("statistics.bin");
+        let bytes = bincode::serialize(&initial_stats)
+            .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+        fs::write(stats_path, bytes)?;
+
         tables_guard.insert(
             name.to_string(),
             Table {
@@ -706,6 +762,11 @@ impl Database {
 
         // Explicitly drop table handles to close open files.
         drop(table);
+
+        {
+            let mut stats_guard = self.statistics.write().unwrap();
+            stats_guard.remove(name);
+        }
 
         // Wait until all transactions currently accessing this table have finished.
         loop {
@@ -1263,5 +1324,164 @@ impl Database {
 
     pub fn commit_history_len(&self) -> usize {
         self.commit_history.lock().unwrap().len()
+    }
+
+    /// Triggers background stats collection if options specify it and it hasn't been started.
+    pub fn start_background_analyze_if_needed(&self, db_arc: &Arc<Database>) {
+        if let Some(ms) = self.options.analyze_frequency_ms
+            && !self
+                .is_background_analyze_started
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let weak_db = Arc::downgrade(db_arc);
+            let spawner = self.spawner.clone();
+            spawner.spawn(Box::new(move || {
+                let mut i = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if let Some(db) = weak_db.upgrade() {
+                        let tx_id = 1_000_000_000_000 + i;
+                        i += 1;
+                        let tx = Transaction::new_with_isolation(
+                            tx_id,
+                            db.clone(),
+                            crate::transaction::IsolationLevel::ReadUncommitted,
+                        );
+                        if let Err(e) = db.analyze_all(&tx) {
+                            eprintln!("Background analyze error: {:?}", e);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    /// Gathers database statistics for a single table.
+    pub fn analyze_table(&self, table_name: &str, _tx: &Transaction) -> Result<()> {
+        let table = self.get_table(table_name)?;
+
+        // 1. Compute logical row count
+        let (start, end) = table.schema.primary_key_bounds()?;
+        let rows = table.filtered_scan(&start, &end, Some(&[]))?;
+        let row_count = rows.len() as u64;
+
+        // 2. Fetch storage engine statistics for locality groups
+        let mut locality_group_stats = HashMap::new();
+        let mut total_size_bytes = 0;
+        for (group, engine) in &table.engines {
+            let stats = engine.get_statistics()?;
+            let group_stats = GroupStats {
+                num_sstables: stats.num_sstables,
+                total_sstable_size: stats.total_sstable_size,
+                entry_count: stats.sstable_entries + stats.memtable_entries,
+                tombstone_count: stats.sstable_tombstones + stats.memtable_tombstones,
+            };
+            total_size_bytes += stats.total_sstable_size;
+            locality_group_stats.insert(group.clone(), group_stats);
+        }
+
+        // 3. Fetch index statistics
+        let mut index_stats = HashMap::new();
+        let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
+        for idx_def in &table.schema.indexes {
+            if let Some(index_engine) = table.index_engines.get(&idx_def.name) {
+                let mut min_idx_keys = Vec::new();
+                let mut max_idx_keys = Vec::new();
+                for col_name in &idx_def.columns {
+                    let col_idx = table.schema.column_index(col_name).unwrap();
+                    let col = &table.schema.columns[col_idx];
+                    let (min_val, max_val) = match col.data_type {
+                        crate::schema::DataType::Int => {
+                            (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX))
+                        }
+                        crate::schema::DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
+                        _ => (
+                            DbKey::String("".to_string()),
+                            DbKey::String("\u{10ffff}".to_string()),
+                        ),
+                    };
+                    min_idx_keys.push(min_val);
+                    max_idx_keys.push(max_val);
+                }
+                min_idx_keys.push(min_pk.clone());
+                max_idx_keys.push(max_pk.clone());
+                let start_bound = DbKey::Composite(min_idx_keys);
+                let end_bound = DbKey::Composite(max_idx_keys);
+
+                let index_entries =
+                    index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
+
+                // Track stats for the index engine too
+                let index_engine_stats = index_engine.get_statistics()?;
+                total_size_bytes += index_engine_stats.total_sstable_size;
+
+                let entry_count = index_entries.len() as u64;
+                let mut unique_prefixes = HashSet::new();
+                for (idx_key, _) in &index_entries {
+                    if let DbKey::Composite(parts) = idx_key
+                        && !parts.is_empty()
+                    {
+                        let prefix = parts[0..parts.len() - 1].to_vec();
+                        unique_prefixes.insert(prefix);
+                    }
+                }
+                let unique_values = unique_prefixes.len() as u64;
+                let avg_rows_per_value = if unique_values > 0 {
+                    entry_count as f64 / unique_values as f64
+                } else {
+                    0.0
+                };
+
+                index_stats.insert(
+                    idx_def.name.clone(),
+                    IndexStats {
+                        entry_count,
+                        unique_values,
+                        avg_rows_per_value,
+                    },
+                );
+            }
+        }
+
+        let stats = TableStatistics {
+            table_name: table_name.to_string(),
+            row_count,
+            total_size_bytes,
+            locality_group_stats,
+            index_stats,
+        };
+
+        // 4. Update in-memory cache and persist to file
+        {
+            let mut stats_guard = self.statistics.write().unwrap();
+            stats_guard.insert(table_name.to_string(), stats.clone());
+        }
+
+        let table_path = self.dir_path.join(table_name);
+        let stats_path = table_path.join("statistics.bin");
+        let bytes = bincode::serialize(&stats)
+            .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
+        fs::write(stats_path, bytes)?;
+
+        Ok(())
+    }
+
+    /// Gathers statistics for all tables in the database.
+    pub fn analyze_all(&self, tx: &Transaction) -> Result<()> {
+        let tables = self.list_tables();
+        for table_name in tables {
+            if self.get_table(&table_name).is_ok() {
+                self.analyze_table(&table_name, tx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the cached statistics for a table if they exist.
+    pub fn get_table_statistics(&self, table_name: &str) -> Option<TableStatistics> {
+        let stats_guard = self.statistics.read().unwrap();
+        stats_guard.get(table_name).cloned()
     }
 }

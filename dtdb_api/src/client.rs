@@ -73,6 +73,7 @@ impl DuctTapeDbClient {
             block_size_limit: None,
             wal_size_limit: None,
             flush_interval_ms: None,
+            analyze_frequency_ms: None,
         };
 
         match &mut self.inner {
@@ -105,6 +106,7 @@ impl DuctTapeDbClient {
             block_size_limit: Some(options.block_size_limit as u64),
             wal_size_limit: Some(options.wal_size_limit as u64),
             flush_interval_ms: options.flush_interval_ms,
+            analyze_frequency_ms: options.analyze_frequency_ms,
         };
 
         match &mut self.inner {

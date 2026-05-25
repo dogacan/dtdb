@@ -175,5 +175,8 @@ fn display_result(res: ExecutionResult) {
             println!("{}", divider);
             println!("{} row(s) in set", rows.len());
         }
+        ExecutionResult::Analyze => {
+            println!("Table analyzed successfully.");
+        }
     }
 }
