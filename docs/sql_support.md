@@ -63,6 +63,42 @@ Removes the table catalog entry and deletes the corresponding storage directory 
     DROP TABLE Users;
     ```
 
+#### `CREATE INDEX`
+Creates a secondary index on one or more columns of a table.
+*   **Syntax**:
+    ```sql
+    CREATE INDEX <index_name> ON <table_name> (<column_name>, ...);
+    ```
+*   **Notes**:
+    *   Creates a new secondary index storage engine. If the table already contains data, the index is dynamically populated by reading all existing rows.
+    *   To guarantee index key uniqueness in the LSM-tree, the table's primary key is appended as the last element of the composite index key (e.g., `[column_value, primary_key]`).
+    *   Rows with `NULL` values for the indexed column(s) are skipped during indexing.
+*   **Transaction Restriction**:
+    *   `CREATE INDEX` is a DDL statement and is **not allowed** inside explicit transactions. It must be run as a single auto-committed statement.
+*   **Concurrency & Serialization**:
+    *   Acquires an exclusive write lock on the database catalog and waits for all active transactions accessing the target table to finish before initializing and populating the index.
+*   **Example**:
+    ```sql
+    CREATE INDEX idx_score ON students (score);
+    ```
+
+#### `DROP INDEX`
+Removes a secondary index from a table.
+*   **Syntax**:
+    ```sql
+    DROP INDEX <index_name>;
+    ```
+*   **Notes**:
+    *   Removes the index definition from the table schema and deletes the on-disk index directory.
+*   **Transaction Restriction**:
+    *   `DROP INDEX` is a DDL statement and is **not allowed** inside explicit transactions.
+*   **Concurrency & Serialization**:
+    *   Acquires an exclusive write lock on the database catalog and waits for all active transactions accessing the target table to finish before deleting the index.
+*   **Example**:
+    ```sql
+    DROP INDEX idx_score;
+    ```
+
 ---
 
 ### Data Manipulation Language (DML) & Queries
@@ -257,13 +293,13 @@ Returns the first non-null argument.
 DuctTapeDB supports explicit multi-statement transactions using a stream-based API or the client `run_in_transaction` method.
 
 ### DDL Concurrency & Serialization
-*   **Catalog Locking**: DDL statements (`CREATE TABLE` and `DROP TABLE`) are serialized database-wide. They acquire an exclusive write lock on the database catalog, preventing concurrent transactions from starting or accessing any tables until the DDL operation completes.
-*   **Active Transactions**: If active transactions are already accessing a table that is being dropped, `DROP TABLE` will block and wait for them to finish before modifying the catalog or deleting files on disk.
+*   **Catalog Locking**: DDL statements (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`) are serialized database-wide. They acquire an exclusive write lock on the database catalog, preventing concurrent transactions from starting or accessing any tables until the DDL operation completes.
+*   **Active Transactions**: If active transactions are already accessing a table that is being dropped or has an index being created/dropped, the DDL operation will block and wait for them to finish before modifying the catalog or deleting files on disk.
 
 ### Transaction Boundaries
 *   **Supported inside Transactions**:
     *   DML statements: `INSERT`, `UPDATE`, `DELETE`.
     *   Queries: `SELECT`, `EXPLAIN`.
 *   **Disabled inside Transactions**:
-    *   DDL statements: `CREATE TABLE` and `DROP TABLE` are not allowed inside explicit transactions. Attempting to execute them within a transaction yields a validation error immediately, leaving the transaction session active for rollback or commit of other statements.
+    *   DDL statements: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` are not allowed inside explicit transactions. Attempting to execute them within a transaction yields a validation error immediately, leaving the transaction session active for rollback or commit of other statements.
     *   DDL statements must instead be executed as single, auto-committed statements outside explicit transactions.

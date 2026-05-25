@@ -2,8 +2,8 @@ use crate::expr::{Expr, Operator};
 use crate::logical::{LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
-    PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalLimit, PhysicalOperator,
-    PhysicalProjection, PhysicalSeqScan, PhysicalSort,
+    PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalIndexScan, PhysicalLimit,
+    PhysicalOperator, PhysicalProjection, PhysicalSeqScan, PhysicalSort,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -18,6 +18,8 @@ use std::sync::Arc;
 pub enum ExecutionResult {
     CreateTable,
     DropTable,
+    CreateIndex,
+    DropIndex,
     Insert { count: usize },
     Delete { count: usize },
     Update { count: usize },
@@ -34,7 +36,7 @@ impl SqlEngine {
         Self { database }
     }
 
-    /// Checks if the SQL string contains a DDL statement (CREATE TABLE or DROP TABLE).
+    /// Checks if the SQL string contains a DDL statement (CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX).
     pub fn is_ddl(&self, sql: &str) -> bool {
         let dialect = GenericDialect {};
         if let Ok(statements) = Parser::parse_sql(&dialect, sql)
@@ -44,6 +46,7 @@ impl SqlEngine {
                 statements[0],
                 sqlparser::ast::Statement::CreateTable { .. }
                     | sqlparser::ast::Statement::Drop { .. }
+                    | sqlparser::ast::Statement::CreateIndex { .. }
             );
         }
         false
@@ -100,6 +103,25 @@ impl SqlEngine {
             SqlStatement::DropTable { name } => {
                 self.database.drop_table(&name).map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::DropTable)
+            }
+            SqlStatement::CreateIndex {
+                table_name,
+                index_name,
+                columns,
+            } => {
+                self.database
+                    .create_index(&table_name, &index_name, columns)
+                    .map_err(|e| e.to_string())?;
+                Ok(ExecutionResult::CreateIndex)
+            }
+            SqlStatement::DropIndex {
+                table_name,
+                index_name,
+            } => {
+                self.database
+                    .drop_index(&table_name, &index_name)
+                    .map_err(|e| e.to_string())?;
+                Ok(ExecutionResult::DropIndex)
             }
             SqlStatement::Insert {
                 table_name,
@@ -349,6 +371,53 @@ impl SqlEngine {
         columns: Option<&[String]>,
     ) -> Result<Box<dyn PhysicalOperator>, String> {
         match plan {
+            LogicalPlan::IndexScan {
+                table_name,
+                index_name,
+                schema,
+                range,
+            } => {
+                // Calculate scan range bounds.
+                let (start, end) = match range {
+                    Some(r) => r,
+                    None => {
+                        let idx_def = schema
+                            .indexes
+                            .iter()
+                            .find(|idx| idx.name == index_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "Index '{}' not found in schema during compilation",
+                                    index_name
+                                )
+                            })?;
+                        let col_name = idx_def
+                            .columns
+                            .first()
+                            .ok_or_else(|| format!("Index '{}' defines no columns", index_name))?;
+                        let col = schema
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == col_name)
+                            .ok_or_else(|| {
+                                format!("Indexed column '{}' not found in schema", col_name)
+                            })?;
+                        match col.data_type {
+                            DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+                            _ => (
+                                DbKey::String("".to_string()),
+                                DbKey::String("\u{10ffff}".to_string()),
+                            ),
+                        }
+                    }
+                };
+
+                let rows = tx
+                    .index_scan(&table_name, &index_name, &start, &end, columns)
+                    .map_err(|e| e.to_string())?;
+
+                Ok(Box::new(PhysicalIndexScan::new(schema, rows)))
+            }
             LogicalPlan::Scan {
                 table_name,
                 schema,

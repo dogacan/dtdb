@@ -77,10 +77,7 @@ impl SstableWriter {
     /// Keys MUST be appended in strictly sorted order.
     pub fn append(&mut self, key: DbKey, value: Option<DbValue>) -> Result<()> {
         // Simple heuristic for estimated uncompressed size in memory.
-        let key_sz = match &key {
-            DbKey::Int(_) => 8,
-            DbKey::String(s) => s.len(),
-        };
+        let key_sz = key.byte_size();
         let val_sz = match &value {
             Some(DbValue::Int(_)) => 8,
             Some(DbValue::Float(_)) => 8,

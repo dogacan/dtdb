@@ -28,6 +28,13 @@ pub enum LogicalPlan {
         // Optional key range bounds (start_key, end_key) pushed down by the optimizer.
         range: Option<(dtdb_storage::DbKey, dtdb_storage::DbKey)>,
     },
+    IndexScan {
+        table_name: String,
+        index_name: String,
+        schema: Schema,
+        // Optional key range bounds (start_key, end_key) on the indexed columns pushed down by the optimizer.
+        range: Option<(dtdb_storage::DbKey, dtdb_storage::DbKey)>,
+    },
     Filter {
         source: Box<LogicalPlan>,
         predicate: Expr,
@@ -161,6 +168,7 @@ impl LogicalPlan {
                 Schema::new(cols)
             }
             LogicalPlan::Sort { source, .. } => source.schema(),
+            LogicalPlan::IndexScan { schema, .. } => schema.clone(),
         }
     }
 
@@ -221,6 +229,7 @@ impl LogicalPlan {
             LogicalPlan::Limit { source, .. } => {
                 source.collect_columns(columns);
             }
+            LogicalPlan::IndexScan { .. } => {}
         }
     }
 }
@@ -313,6 +322,21 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
                 indent_str, limit_str, offset
             ));
             format_logical_node(source, indent + 1, out);
+        }
+        LogicalPlan::IndexScan {
+            table_name,
+            index_name,
+            range,
+            ..
+        } => {
+            let range_str = match range {
+                Some((s, e)) => format!("range=[{:?}, {:?}]", s, e),
+                None => "range=all".to_string(),
+            };
+            out.push_str(&format!(
+                "{}- IndexScan: table={}, index={}, {}\n",
+                indent_str, table_name, index_name, range_str
+            ));
         }
     }
 }

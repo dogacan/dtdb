@@ -735,17 +735,15 @@ impl EngineInner {
             let writer = current_writer.as_mut().unwrap();
             writer.append(k.clone(), v.clone())?;
 
-            let entry_sz = match &k {
-                DbKey::Int(_) => 8,
-                DbKey::String(s) => s.len(),
-            } + match &v {
-                Some(DbValue::Int(_)) => 8,
-                Some(DbValue::Float(_)) => 8,
-                Some(DbValue::String(s)) => s.len(),
-                Some(DbValue::Bytes(b)) => b.len(),
-                Some(DbValue::Null) => 1,
-                None => 1,
-            };
+            let entry_sz = k.byte_size()
+                + match &v {
+                    Some(DbValue::Int(_)) => 8,
+                    Some(DbValue::Float(_)) => 8,
+                    Some(DbValue::String(s)) => s.len(),
+                    Some(DbValue::Bytes(b)) => b.len(),
+                    Some(DbValue::Null) => 1,
+                    None => 1,
+                };
             current_writer_uncompressed_bytes += entry_sz;
 
             if current_writer_uncompressed_bytes >= self.options.sstable_target_size {

@@ -54,6 +54,17 @@ pub enum StorageError {
 pub enum DbKey {
     Int(i64),
     String(String),
+    Composite(Vec<DbKey>),
+}
+
+impl DbKey {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            DbKey::Int(_) => 8,
+            DbKey::String(s) => s.len(),
+            DbKey::Composite(keys) => keys.iter().map(|k| k.byte_size()).sum(),
+        }
+    }
 }
 
 /// DbValue represents strongly typed values in the database.
@@ -124,5 +135,28 @@ impl From<Vec<u8>> for DbValue {
 impl<'a> From<&'a [u8]> for DbValue {
     fn from(v: &'a [u8]) -> Self {
         DbValue::Bytes(v.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_composite_key_ordering() {
+        let k1 = DbKey::Composite(vec![DbKey::Int(10), DbKey::Int(1)]);
+        let k2 = DbKey::Composite(vec![DbKey::Int(10), DbKey::Int(2)]);
+        let k3 = DbKey::Composite(vec![DbKey::Int(9), DbKey::Int(20)]);
+        let k4 = DbKey::Composite(vec![DbKey::Int(10)]);
+
+        assert!(k1 < k2);
+        assert!(k3 < k1);
+        assert!(k4 < k1);
+    }
+
+    #[test]
+    fn test_composite_key_byte_size() {
+        let key = DbKey::Composite(vec![DbKey::Int(10), DbKey::String("hello".to_string())]);
+        assert_eq!(key.byte_size(), 8 + 5);
     }
 }

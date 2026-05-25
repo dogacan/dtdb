@@ -1,4 +1,4 @@
-use dtdb_relational::{Database, Transaction};
+use dtdb_relational::{Database, Table, Transaction};
 use dtdb_sql::{ExecutionResult, SqlEngine};
 use dtdb_storage::DbValue;
 use std::sync::Arc;
@@ -1208,5 +1208,244 @@ fn test_locality_groups_overrides_end_to_end() {
         assert_eq!(lg_finance_engine_opts.wal_size_limit, 1048576);
         assert_eq!(lg_finance_engine_opts.max_level, 5);
         assert_eq!(lg_finance_engine_opts.block_cache_capacity, 0);
+    }
+}
+
+#[test]
+fn test_sql_secondary_indexing() {
+    let (temp_dir, db, engine) = setup_engine();
+
+    // 1. Create table and insert initial data
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE students (id INT PRIMARY KEY, name STRING, score INT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO students (id, name, score) VALUES (1, 'Alice', 95), (2, 'Bob', 80), (3, 'Charlie', 85)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // 2. Create index on score (rebuilds and populates from existing table rows)
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute("CREATE INDEX idx_score ON students (score)", &tx3)
+        .unwrap();
+    assert!(matches!(res, ExecutionResult::CreateIndex));
+    tx3.commit().unwrap();
+    drop(tx3);
+
+    // Verify index is registered in schema
+    {
+        let table = db.get_table("students").unwrap();
+        assert_eq!(table.schema.indexes.len(), 1);
+        assert_eq!(table.schema.indexes[0].name, "idx_score");
+        assert_eq!(table.schema.indexes[0].columns, vec!["score".to_string()]);
+        // Directory for index should exist
+        let index_dir = Table::index_dir(&temp_dir.path().join("students"), "idx_score");
+        assert!(index_dir.exists());
+    }
+
+    // 3. Verify EXPLAIN displays PhysicalIndexScan for query filtering on score
+    let tx4 = Transaction::new(4, db.clone());
+    let explain_res = engine
+        .execute("EXPLAIN SELECT name FROM students WHERE score = 85", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_res {
+        let plan_str = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected string plan representation"),
+        };
+        assert!(
+            plan_str
+                .contains("- IndexScan: table=students, index=idx_score, range=[Int(85), Int(85)]")
+        );
+        assert!(plan_str.contains("- PhysicalIndexScan"));
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // 4. Verify index-based SELECT returns correct results
+    let select_res = engine
+        .execute("SELECT name FROM students WHERE score = 85", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = select_res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::String("Charlie".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+    drop(tx4);
+
+    // 5. Verify index maintenance on subsequent insertions, updates, and deletions
+    let tx5 = Transaction::new(5, db.clone());
+    // Insert new row
+    engine
+        .execute(
+            "INSERT INTO students (id, name, score) VALUES (4, 'Dave', 90)",
+            &tx5,
+        )
+        .unwrap();
+    // Update Bob's score from 80 to 88
+    engine
+        .execute("UPDATE students SET score = 88 WHERE id = 2", &tx5)
+        .unwrap();
+    // Delete Alice (score 95)
+    engine
+        .execute("DELETE FROM students WHERE id = 1", &tx5)
+        .unwrap();
+    tx5.commit().unwrap();
+    drop(tx5);
+
+    // Verify querying Dave (score 90) uses index scan and is correct
+    let tx6 = Transaction::new(6, db.clone());
+    let res_dave = engine
+        .execute("SELECT name FROM students WHERE score = 90", &tx6)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res_dave {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::String("Dave".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // Verify Bob's updated score (88) is queryable, and old score (80) returns empty
+    let res_bob_new = engine
+        .execute("SELECT name FROM students WHERE score = 88", &tx6)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res_bob_new {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::String("Bob".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+    let res_bob_old = engine
+        .execute("SELECT name FROM students WHERE score = 80", &tx6)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res_bob_old {
+        assert!(rows.is_empty());
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // Verify Alice (score 95) is no longer found
+    let res_alice = engine
+        .execute("SELECT name FROM students WHERE score = 95", &tx6)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res_alice {
+        assert!(rows.is_empty());
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    // 6. Verify index range query (e.g. score >= 85 AND score <= 90) uses IndexScan and returns correct rows
+    let range_explain = engine
+        .execute(
+            "EXPLAIN SELECT name FROM students WHERE score >= 85 AND score <= 90",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = range_explain {
+        let plan_str = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected string plan representation"),
+        };
+        assert!(
+            plan_str
+                .contains("- IndexScan: table=students, index=idx_score, range=[Int(85), Int(90)]")
+        );
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+
+    let range_select = engine
+        .execute(
+            "SELECT name FROM students WHERE score >= 85 AND score <= 90 ORDER BY score ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = range_select {
+        // Charlie (85) and Bob (88) and Dave (90)
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values, vec![DbValue::String("Charlie".to_string())]);
+        assert_eq!(rows[1].values, vec![DbValue::String("Bob".to_string())]);
+        assert_eq!(rows[2].values, vec![DbValue::String("Dave".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+    drop(tx6);
+
+    // 7. Verify transaction isolation / Read-Your-Own-Writes index scan behavior
+    let tx7 = Transaction::new(7, db.clone());
+    // Insert new student inside transaction (score 87)
+    engine
+        .execute(
+            "INSERT INTO students (id, name, score) VALUES (5, 'Eve', 87)",
+            &tx7,
+        )
+        .unwrap();
+    // Delete Charlie inside transaction (score 85)
+    engine
+        .execute("DELETE FROM students WHERE id = 3", &tx7)
+        .unwrap();
+
+    // Query using index *inside* transaction tx7
+    let tx7_select = engine
+        .execute(
+            "SELECT name FROM students WHERE score >= 85 AND score <= 90 ORDER BY score ASC",
+            &tx7,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = tx7_select {
+        // Eve (87) and Bob (88) and Dave (90). Charlie (85) must be deleted.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values, vec![DbValue::String("Eve".to_string())]);
+        assert_eq!(rows[1].values, vec![DbValue::String("Bob".to_string())]);
+        assert_eq!(rows[2].values, vec![DbValue::String("Dave".to_string())]);
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+    tx7.rollback().unwrap();
+    drop(tx7);
+
+    // 8. Verify DROP INDEX
+    let tx8 = Transaction::new(8, db.clone());
+    let drop_res = engine.execute("DROP INDEX idx_score", &tx8).unwrap();
+    assert!(matches!(drop_res, ExecutionResult::DropIndex));
+    tx8.commit().unwrap();
+    drop(tx8);
+
+    // Verify index is removed from schema and disk directory deleted
+    {
+        let table = db.get_table("students").unwrap();
+        assert_eq!(table.schema.indexes.len(), 0);
+        let index_dir = Table::index_dir(&temp_dir.path().join("students"), "idx_score");
+        assert!(!index_dir.exists());
+    }
+
+    // Verify EXPLAIN reverts back to PhysicalSeqScan
+    let tx9 = Transaction::new(9, db.clone());
+    let explain_after = engine
+        .execute("EXPLAIN SELECT name FROM students WHERE score = 85", &tx9)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_after {
+        let plan_str = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected string plan representation"),
+        };
+        assert!(plan_str.contains("- Scan: table=students, range=all"));
+        assert!(plan_str.contains("- PhysicalSeqScan"));
+    } else {
+        panic!("Expected ExecutionResult::Select");
     }
 }

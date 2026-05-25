@@ -101,10 +101,7 @@ impl MemTable {
         let map = self.map.read().unwrap();
         let mut total = 0;
         for (key, val) in map.iter() {
-            total += match key {
-                DbKey::Int(_) => 8,
-                DbKey::String(s) => s.len(),
-            };
+            total += key.byte_size();
             total += match val {
                 Some(DbValue::Int(_)) => 8,
                 Some(DbValue::Float(_)) => 8,

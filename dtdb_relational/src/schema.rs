@@ -76,12 +76,21 @@ impl LocalityGroupOptions {
     }
 }
 
+/// IndexDefinition represents a secondary index configuration.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IndexDefinition {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
 /// Schema defines the set of columns and types of a relational table.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub columns: Vec<Column>,
     #[serde(default)]
     pub locality_group_options: HashMap<String, LocalityGroupOptions>,
+    #[serde(default)]
+    pub indexes: Vec<IndexDefinition>,
 }
 
 impl Schema {
@@ -90,6 +99,7 @@ impl Schema {
         Self {
             columns,
             locality_group_options: HashMap::new(),
+            indexes: Vec::new(),
         }
     }
 
@@ -101,6 +111,7 @@ impl Schema {
         Self {
             columns,
             locality_group_options,
+            indexes: Vec::new(),
         }
     }
 

@@ -33,8 +33,32 @@ impl Optimizer {
                         schema,
                         range: _,
                     } => {
-                        // Extract bounds if the predicate filters on the primary key
-                        if let Some((start, end)) = extract_key_range(&predicate, &schema) {
+                        // Rule-based secondary index selection:
+                        // Search for a matching predicate on the leading column of any index.
+                        let mut index_match = None;
+                        for index in &schema.indexes {
+                            if let Some(col_name) = index.columns.first()
+                                && let Some(col) =
+                                    schema.columns.iter().find(|c| c.name == *col_name)
+                                && let Some((start, end)) =
+                                    extract_bounds_for_column(&predicate, &col.name, &col.data_type)
+                            {
+                                index_match = Some((index.name.clone(), start, end));
+                                break;
+                            }
+                        }
+
+                        if let Some((index_name, start, end)) = index_match {
+                            LogicalPlan::Filter {
+                                source: Box::new(LogicalPlan::IndexScan {
+                                    table_name,
+                                    index_name,
+                                    schema,
+                                    range: Some((start, end)),
+                                }),
+                                predicate,
+                            }
+                        } else if let Some((start, end)) = extract_key_range(&predicate, &schema) {
                             LogicalPlan::Filter {
                                 source: Box::new(LogicalPlan::Scan {
                                     table_name,
@@ -114,10 +138,10 @@ enum Boundary {
     Upper(DbValue),
 }
 
-fn get_boundary(expr: &Expr, pk_name: &str) -> Option<Boundary> {
+fn get_column_boundary(expr: &Expr, col_name: &str) -> Option<Boundary> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
-            if let Some(lit) = get_pk_comparison(left, right, pk_name) {
+            if let Some(lit) = get_column_comparison(left, right, col_name) {
                 match op {
                     Operator::GtEq | Operator::Gt => Some(Boundary::Lower(lit.clone())),
                     Operator::LtEq | Operator::Lt => Some(Boundary::Upper(lit.clone())),
@@ -131,19 +155,23 @@ fn get_boundary(expr: &Expr, pk_name: &str) -> Option<Boundary> {
     }
 }
 
-fn get_pk_comparison<'a>(left: &'a Expr, right: &'a Expr, pk_name: &str) -> Option<&'a DbValue> {
+fn get_column_comparison<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    col_name: &str,
+) -> Option<&'a DbValue> {
     match (left, right) {
         (Expr::Column(name), Expr::Literal(lit))
-            if name == pk_name
-                || name.ends_with(&format!(".{}", pk_name))
-                || pk_name.ends_with(&format!(".{}", name)) =>
+            if name == col_name
+                || name.ends_with(&format!(".{}", col_name))
+                || col_name.ends_with(&format!(".{}", name)) =>
         {
             Some(lit)
         }
         (Expr::Literal(lit), Expr::Column(name))
-            if name == pk_name
-                || name.ends_with(&format!(".{}", pk_name))
-                || pk_name.ends_with(&format!(".{}", name)) =>
+            if name == col_name
+                || name.ends_with(&format!(".{}", col_name))
+                || col_name.ends_with(&format!(".{}", name)) =>
         {
             Some(lit)
         }
@@ -159,18 +187,19 @@ fn val_to_key(val: &DbValue) -> Option<DbKey> {
     }
 }
 
-/// Helper to examine an expression tree and extract range constraints for the primary key.
-fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)> {
-    let pk_idx = schema.primary_key_index()?;
-    let pk_col = &schema.columns[pk_idx];
-
+/// Helper to examine an expression tree and extract range constraints for the given column.
+fn extract_bounds_for_column(
+    predicate: &Expr,
+    col_name: &str,
+    col_type: &DataType,
+) -> Option<(DbKey, DbKey)> {
     match predicate {
         Expr::BinaryOp {
             left,
             op: Operator::Eq,
             right,
         } => {
-            if let Some(lit) = get_pk_comparison(left, right, &pk_col.name) {
+            if let Some(lit) = get_column_comparison(left, right, col_name) {
                 let key = val_to_key(lit)?;
                 return Some((key.clone(), key));
             }
@@ -180,9 +209,8 @@ fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)
             op: Operator::And,
             right,
         } => {
-            // E.g., id >= 10 AND id <= 20
-            let boundary_l = get_boundary(left, &pk_col.name);
-            let boundary_r = get_boundary(right, &pk_col.name);
+            let boundary_l = get_column_boundary(left, col_name);
+            let boundary_r = get_column_boundary(right, col_name);
 
             match (boundary_l, boundary_r) {
                 (Some(Boundary::Lower(l_lit)), Some(Boundary::Upper(u_lit)))
@@ -195,7 +223,7 @@ fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)
             }
         }
         Expr::BinaryOp { left, op, right } => {
-            if let Some(lit) = get_pk_comparison(left, right, &pk_col.name) {
+            if let Some(lit) = get_column_comparison(left, right, col_name) {
                 let key = val_to_key(lit)?;
                 match op {
                     Operator::GtEq | Operator::Gt => {
@@ -203,18 +231,19 @@ fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)
                             match key {
                                 DbKey::Int(v) => DbKey::Int(v + 1),
                                 DbKey::String(s) => DbKey::String(s + "\0"),
+                                _ => key,
                             }
                         } else {
                             key
                         };
-                        let end = match pk_col.data_type {
+                        let end = match col_type {
                             DataType::Int => DbKey::Int(i64::MAX),
                             _ => DbKey::String("\u{10ffff}".to_string()),
                         };
                         return Some((start, end));
                     }
                     Operator::LtEq | Operator::Lt => {
-                        let start = match pk_col.data_type {
+                        let start = match col_type {
                             DataType::Int => DbKey::Int(i64::MIN),
                             _ => DbKey::String("".to_string()),
                         };
@@ -222,6 +251,7 @@ fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)
                             match key {
                                 DbKey::Int(v) => DbKey::Int(v - 1),
                                 DbKey::String(s) => DbKey::String(s),
+                                _ => key,
                             }
                         } else {
                             key
@@ -235,4 +265,11 @@ fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)
         _ => {}
     }
     None
+}
+
+/// Helper to examine an expression tree and extract range constraints for the primary key.
+fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)> {
+    let pk_idx = schema.primary_key_index()?;
+    let pk_col = &schema.columns[pk_idx];
+    extract_bounds_for_column(predicate, &pk_col.name, &pk_col.data_type)
 }

@@ -33,6 +33,15 @@ pub enum SqlStatement {
     },
     Query(LogicalPlan),
     Explain(LogicalPlan),
+    CreateIndex {
+        table_name: String,
+        index_name: String,
+        columns: Vec<String>,
+    },
+    DropIndex {
+        table_name: String,
+        index_name: String,
+    },
 }
 
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
@@ -231,13 +240,65 @@ impl LogicalPlanner {
             Statement::Drop {
                 object_type, names, ..
             } => {
-                // E.g., DROP TABLE names[0]
+                // E.g., DROP TABLE names[0] or DROP INDEX names[0]
                 if matches!(object_type, sqlparser::ast::ObjectType::Table) && !names.is_empty() {
                     let table_name = names[0].to_string();
                     Ok(SqlStatement::DropTable { name: table_name })
+                } else if matches!(object_type, sqlparser::ast::ObjectType::Index)
+                    && !names.is_empty()
+                {
+                    let index_name = names[0].to_string();
+                    // Look up the table containing this index
+                    let tables = self.database.list_tables();
+                    let mut found_table = None;
+                    for table_name in tables {
+                        if let Ok(table) = self.database.get_table(&table_name)
+                            && table
+                                .schema
+                                .indexes
+                                .iter()
+                                .any(|idx| idx.name == index_name)
+                        {
+                            found_table = Some(table_name);
+                            break;
+                        }
+                    }
+                    if let Some(table_name) = found_table {
+                        Ok(SqlStatement::DropIndex {
+                            table_name,
+                            index_name,
+                        })
+                    } else {
+                        Err(format!("Index '{}' not found in database", index_name))
+                    }
                 } else {
-                    Err("Only DROP TABLE statement is supported".to_string())
+                    Err("Only DROP TABLE and DROP INDEX statements are supported".to_string())
                 }
+            }
+            Statement::CreateIndex {
+                name,
+                table_name,
+                columns,
+                ..
+            } => {
+                let index_name = name.to_string();
+                let table_str = table_name.to_string();
+                let mut col_names = Vec::new();
+                for col in columns {
+                    if let sqlparser::ast::Expr::Identifier(ident) = &col.expr {
+                        col_names.push(ident.value.clone());
+                    } else {
+                        return Err(
+                            "Only simple column identifiers are supported in CREATE INDEX"
+                                .to_string(),
+                        );
+                    }
+                }
+                Ok(SqlStatement::CreateIndex {
+                    table_name: table_str,
+                    index_name,
+                    columns: col_names,
+                })
             }
             Statement::Insert {
                 table_name,

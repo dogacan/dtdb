@@ -152,6 +152,20 @@ pub(crate) fn execution_result_to_responses(
                 )),
             }]
         }
+        dtdb_sql::ExecutionResult::CreateIndex => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    "Index created successfully.".to_string(),
+                )),
+            }]
+        }
+        dtdb_sql::ExecutionResult::DropIndex => {
+            vec![ExecuteQueryResponse {
+                payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(
+                    "Index dropped successfully.".to_string(),
+                )),
+            }]
+        }
         dtdb_sql::ExecutionResult::Insert { count } => {
             vec![ExecuteQueryResponse {
                 payload: Some(crate::proto::execute_query_response::Payload::InfoMessage(

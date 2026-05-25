@@ -98,6 +98,12 @@ fn display_result(res: ExecutionResult) {
         ExecutionResult::DropTable => {
             println!("Table dropped successfully.");
         }
+        ExecutionResult::CreateIndex => {
+            println!("Index created successfully.");
+        }
+        ExecutionResult::DropIndex => {
+            println!("Index dropped successfully.");
+        }
         ExecutionResult::Insert { count } => {
             println!("Inserted {} row(s).", count);
         }

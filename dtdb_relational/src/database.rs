@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use crate::schema::Schema;
+use crate::schema::{IndexDefinition, Schema};
 use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, ThreadSpawner, WalEntry,
 };
@@ -42,6 +42,7 @@ pub struct Table {
     pub name: String,
     pub schema: Schema,
     pub engines: HashMap<String, Arc<StorageEngine>>,
+    pub index_engines: HashMap<String, Arc<StorageEngine>>,
 }
 
 impl Table {
@@ -55,11 +56,21 @@ impl Table {
         }
     }
 
+    /// Helper to get the physical directory path for a secondary index.
+    pub fn index_dir(table_path: &Path, index_name: &str) -> PathBuf {
+        table_path.join(format!("index_{}", index_name))
+    }
+
     /// Performs a write batch of mutations to the table, splitting updates across locality groups.
     pub fn write_batch(&self, entries: Vec<WalEntry>) -> Result<()> {
         let mut group_batches: HashMap<String, Vec<WalEntry>> = HashMap::new();
         for group in self.engines.keys() {
             group_batches.insert(group.clone(), Vec::new());
+        }
+
+        let mut index_batches: HashMap<String, Vec<WalEntry>> = HashMap::new();
+        for idx in &self.schema.indexes {
+            index_batches.insert(idx.name.clone(), Vec::new());
         }
 
         for entry in entries {
@@ -76,6 +87,66 @@ impl Table {
                         }
                     };
                     let full_row = Row::from_bytes(&bytes)?;
+
+                    // If we have indexes, perform read-before-write maintenance
+                    if !self.schema.indexes.is_empty() {
+                        let old_row_opt = self.get(&key, None)?;
+                        if let Some(old_row) = old_row_opt {
+                            for idx in &self.schema.indexes {
+                                let mut old_keys = Vec::new();
+                                for col_name in &idx.columns {
+                                    let col_idx = self.schema.column_index(col_name).unwrap();
+                                    let col_val = &old_row.values[col_idx];
+                                    if matches!(col_val, DbValue::Null) {
+                                        continue;
+                                    }
+                                    let k = match col_val {
+                                        DbValue::Int(v) => DbKey::Int(*v),
+                                        DbValue::String(s) => DbKey::String(s.clone()),
+                                        _ => continue,
+                                    };
+                                    old_keys.push(k);
+                                }
+                                if old_keys.len() == idx.columns.len() {
+                                    old_keys.push(key.clone());
+                                    index_batches.get_mut(&idx.name).unwrap().push(
+                                        WalEntry::Delete {
+                                            key: DbKey::Composite(old_keys),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        // Add new index entry
+                        for idx in &self.schema.indexes {
+                            let mut new_keys = Vec::new();
+                            for col_name in &idx.columns {
+                                let col_idx = self.schema.column_index(col_name).unwrap();
+                                let col_val = &full_row.values[col_idx];
+                                if matches!(col_val, DbValue::Null) {
+                                    continue;
+                                }
+                                let k = match col_val {
+                                    DbValue::Int(v) => DbKey::Int(*v),
+                                    DbValue::String(s) => DbKey::String(s.clone()),
+                                    _ => continue,
+                                };
+                                new_keys.push(k);
+                            }
+                            if new_keys.len() == idx.columns.len() {
+                                new_keys.push(key.clone());
+                                index_batches
+                                    .get_mut(&idx.name)
+                                    .unwrap()
+                                    .push(WalEntry::Put {
+                                        key: DbKey::Composite(new_keys),
+                                        value: DbValue::Null,
+                                    });
+                            }
+                        }
+                    }
+
                     for (group, batch) in &mut group_batches {
                         let sub_row = self.schema.split_row(&full_row, group);
                         let sub_bytes = sub_row.to_bytes()?;
@@ -86,6 +157,37 @@ impl Table {
                     }
                 }
                 WalEntry::Delete { key } => {
+                    // If we have indexes, perform read-before-write maintenance
+                    if !self.schema.indexes.is_empty() {
+                        let old_row_opt = self.get(&key, None)?;
+                        if let Some(old_row) = old_row_opt {
+                            for idx in &self.schema.indexes {
+                                let mut old_keys = Vec::new();
+                                for col_name in &idx.columns {
+                                    let col_idx = self.schema.column_index(col_name).unwrap();
+                                    let col_val = &old_row.values[col_idx];
+                                    if matches!(col_val, DbValue::Null) {
+                                        continue;
+                                    }
+                                    let k = match col_val {
+                                        DbValue::Int(v) => DbKey::Int(*v),
+                                        DbValue::String(s) => DbKey::String(s.clone()),
+                                        _ => continue,
+                                    };
+                                    old_keys.push(k);
+                                }
+                                if old_keys.len() == idx.columns.len() {
+                                    old_keys.push(key.clone());
+                                    index_batches.get_mut(&idx.name).unwrap().push(
+                                        WalEntry::Delete {
+                                            key: DbKey::Composite(old_keys),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     for batch in group_batches.values_mut() {
                         batch.push(WalEntry::Delete { key: key.clone() });
                     }
@@ -94,11 +196,22 @@ impl Table {
             }
         }
 
+        // Apply mutations to main tables
         for (group, batch) in group_batches {
             if let Some(engine) = self.engines.get(&group) {
                 engine.write_batch(batch)?;
             }
         }
+
+        // Apply mutations to indexes
+        for (idx_name, batch) in index_batches {
+            if !batch.is_empty()
+                && let Some(engine) = self.index_engines.get(&idx_name)
+            {
+                engine.write_batch(batch)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -413,12 +526,24 @@ impl Database {
                         }
                     }
 
+                    let mut index_engines = HashMap::new();
+                    for idx_def in &schema.indexes {
+                        let idx_path = Table::index_dir(&path, &idx_def.name);
+                        let engine = Arc::new(StorageEngine::open_with_spawner(
+                            &idx_path,
+                            engine_opts,
+                            spawner.clone(),
+                        )?);
+                        index_engines.insert(idx_def.name.clone(), engine);
+                    }
+
                     tables.insert(
                         name.clone(),
                         Table {
                             name,
                             schema,
                             engines,
+                            index_engines,
                         },
                     );
                 }
@@ -518,6 +643,7 @@ impl Database {
                 name: name.to_string(),
                 schema,
                 engines,
+                index_engines: HashMap::new(),
             },
         );
 
@@ -838,6 +964,207 @@ impl Database {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Creates a secondary index for a table.
+    pub fn create_index(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+
+        // 1. Check table existence
+        let table = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+
+        // 2. Check for duplicate index name
+        if table
+            .schema
+            .indexes
+            .iter()
+            .any(|idx| idx.name == index_name)
+        {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Index '{}' already exists on table '{}'",
+                index_name, table_name
+            )));
+        }
+
+        // 3. Verify columns exist in schema
+        for col_name in &columns {
+            if table.schema.column_index(col_name).is_none() {
+                return Err(RelationalError::SchemaMismatch(format!(
+                    "Column '{}' does not exist in table '{}' schema",
+                    col_name, table_name
+                )));
+            }
+        }
+
+        // 4. Save updated schema configuration
+        let table_path = self.dir_path.join(table_name);
+        let schema_path = table_path.join("schema.bin");
+        table.schema.indexes.push(IndexDefinition {
+            name: index_name.to_string(),
+            columns: columns.clone(),
+        });
+        table.schema.save_to_file(&schema_path)?;
+
+        // 5. Construct EngineOptions
+        let engine_opts = EngineOptions {
+            compression: self.options.compression,
+            memtable_size_limit: self.options.memtable_size_limit,
+            block_size_limit: self.options.block_size_limit,
+            wal_size_limit: self.options.wal_size_limit,
+            l0_compaction_threshold: self.options.l0_compaction_threshold.unwrap_or(4),
+            sstable_target_size: self.options.sstable_target_size.unwrap_or(2 * 1024 * 1024),
+            base_level_size_limit: self
+                .options
+                .base_level_size_limit
+                .unwrap_or(10 * 1024 * 1024),
+            level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
+            max_level: self.options.max_level.unwrap_or(7),
+            block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
+        };
+
+        // 6. Create index directory
+        let idx_path = Table::index_dir(&table_path, index_name);
+        fs::create_dir_all(&idx_path)?;
+
+        // 7. Open the storage engine
+        let engine = Arc::new(StorageEngine::open_with_spawner(
+            &idx_path,
+            engine_opts,
+            self.spawner.clone(),
+        )?);
+
+        // 8. Wait until all active transactions accessing this table have finished (matching DDL behavior)
+        loop {
+            let has_active_readers = {
+                let access = self.active_table_access.lock().unwrap();
+                access
+                    .get(table_name)
+                    .is_some_and(|readers| !readers.is_empty())
+            };
+            if !has_active_readers {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // 9. Populate the index from existing table data
+        // Determine scan bounds based on primary key type
+        let pk_idx = table.schema.primary_key_index().ok_or_else(|| {
+            RelationalError::SchemaMismatch("Table does not define a primary key".to_string())
+        })?;
+        let pk_col = &table.schema.columns[pk_idx];
+        let (start, end) = match pk_col.data_type {
+            crate::schema::DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+            _ => (
+                DbKey::String("".to_string()),
+                DbKey::String("\u{10ffff}".to_string()),
+            ),
+        };
+
+        // Scan the table
+        let rows = table.filtered_scan(&start, &end, None)?;
+        let mut index_entries = Vec::new();
+        for (pk_key, row) in rows {
+            // Support composite index keys or single key.
+            // For columns, we construct a vector of DbKeys.
+            let mut keys = Vec::new();
+            for col_name in &columns {
+                let col_idx = table.schema.column_index(col_name).unwrap();
+                let col_val = &row.values[col_idx];
+                if matches!(col_val, DbValue::Null) {
+                    // Skip indexing rows with Null values for simplification
+                    continue;
+                }
+                let k = match col_val {
+                    DbValue::Int(v) => DbKey::Int(*v),
+                    DbValue::String(s) => DbKey::String(s.clone()),
+                    other => {
+                        return Err(RelationalError::SchemaMismatch(format!(
+                            "Cannot index non-indexable value type {:?}",
+                            other
+                        )));
+                    }
+                };
+                keys.push(k);
+            }
+            if keys.len() == columns.len() {
+                keys.push(pk_key);
+                index_entries.push(WalEntry::Put {
+                    key: DbKey::Composite(keys),
+                    value: DbValue::Null,
+                });
+            }
+        }
+
+        if !index_entries.is_empty() {
+            engine.write_batch(index_entries)?;
+        }
+
+        // 10. Store the engine reference
+        table.index_engines.insert(index_name.to_string(), engine);
+
+        Ok(())
+    }
+
+    /// Drops a secondary index from a table.
+    pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+
+        let table = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+
+        // 1. Verify index exists
+        let idx_pos = table
+            .schema
+            .indexes
+            .iter()
+            .position(|idx| idx.name == index_name)
+            .ok_or_else(|| {
+                RelationalError::SchemaMismatch(format!(
+                    "Index '{}' does not exist on table '{}'",
+                    index_name, table_name
+                ))
+            })?;
+
+        // 2. Remove the engine reference so it releases file handles
+        let engine = table.index_engines.remove(index_name);
+        drop(engine);
+
+        // 3. Wait for active readers of the table
+        loop {
+            let has_active_readers = {
+                let access = self.active_table_access.lock().unwrap();
+                access
+                    .get(table_name)
+                    .is_some_and(|readers| !readers.is_empty())
+            };
+            if !has_active_readers {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // 4. Save schema with index removed
+        let table_path = self.dir_path.join(table_name);
+        let schema_path = table_path.join("schema.bin");
+        table.schema.indexes.remove(idx_pos);
+        table.schema.save_to_file(&schema_path)?;
+
+        // 5. Delete on-disk index directory
+        let idx_path = Table::index_dir(&table_path, index_name);
+        if idx_path.exists() {
+            fs::remove_dir_all(idx_path)?;
         }
 
         Ok(())

@@ -52,6 +52,41 @@ impl PhysicalOperator for PhysicalSeqScan {
 }
 
 // ==========================================
+// 1.5. IndexScan Physical Operator
+// ==========================================
+pub struct PhysicalIndexScan {
+    schema: Schema,
+    rows_iter: std::vec::IntoIter<Row>,
+}
+
+impl PhysicalIndexScan {
+    pub fn new(schema: Schema, rows: Vec<Row>) -> Self {
+        Self {
+            schema,
+            rows_iter: rows.into_iter(),
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalIndexScan {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        Ok(self.rows_iter.next())
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        out.push_str(&format!(
+            "{}- PhysicalIndexScan: schema={:?}\n",
+            "  ".repeat(indent),
+            self.schema
+        ));
+    }
+}
+
+// ==========================================
 // 2. Filter Physical Operator
 // ==========================================
 pub struct PhysicalFilter {

@@ -224,6 +224,95 @@ impl Transaction {
         Ok(results)
     }
 
+    /// Performs an index range scan, resolving primary keys and fetching corresponding rows,
+    /// then applying the transaction's write buffer modifications.
+    pub fn index_scan(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        start_val: &DbKey,
+        end_val: &DbKey,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<Row>> {
+        let table = self.get_table(table_name)?;
+        let index_engine = table.index_engines.get(index_name).ok_or_else(|| {
+            RelationalError::SchemaMismatch(format!("Index '{}' not found", index_name))
+        })?;
+
+        // 1. Resolve primary key bounds
+        let (min_pk, max_pk) = if let Some(pk_idx) = table.schema.primary_key_index() {
+            let pk_col = &table.schema.columns[pk_idx];
+            match pk_col.data_type {
+                DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+                _ => (
+                    DbKey::String("".to_string()),
+                    DbKey::String("\u{10ffff}".to_string()),
+                ),
+            }
+        } else {
+            (
+                DbKey::String("".to_string()),
+                DbKey::String("\u{10ffff}".to_string()),
+            )
+        };
+
+        // Construct composite key scan bounds for the index engine
+        let start_bound = DbKey::Composite(vec![start_val.clone(), min_pk]);
+        let end_bound = DbKey::Composite(vec![end_val.clone(), max_pk]);
+
+        // Scan the index engine
+        let index_entries = index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
+
+        let mut rows = Vec::new();
+        let mut resolved_pks = HashSet::new();
+
+        // 2. Fetch rows by primary key from transaction/main table
+        for (idx_key, _) in index_entries {
+            if let DbKey::Composite(mut parts) = idx_key
+                && let Some(pk) = parts.pop()
+            {
+                resolved_pks.insert(pk.clone());
+                if let Some(row) = self.get_projected(table_name, &pk, columns)? {
+                    rows.push(row);
+                }
+            }
+        }
+
+        // 3. Scan the transaction `write_buffer` for any matching rows not already resolved by index scan
+        let buffer = self.write_buffer.lock().unwrap();
+        if let Some(table_buffer) = buffer.get(table_name) {
+            for (pk, row_opt) in table_buffer {
+                if resolved_pks.contains(pk) {
+                    continue;
+                }
+                if let Some(row) = row_opt
+                    && let Some(idx_def) = table
+                        .schema
+                        .indexes
+                        .iter()
+                        .find(|idx| idx.name == index_name)
+                    && let Some(col_name) = idx_def.columns.first()
+                    && let Some(col_idx) = table.schema.column_index(col_name)
+                {
+                    let val = &row.values[col_idx];
+                    let k = match val {
+                        DbValue::Int(v) => Some(DbKey::Int(*v)),
+                        DbValue::String(s) => Some(DbKey::String(s.clone())),
+                        _ => None,
+                    };
+                    if let Some(k) = k
+                        && &k >= start_val
+                        && &k <= end_val
+                    {
+                        rows.push(row.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
     /// Commits all buffered mutations in this transaction to the tables.
     pub fn commit(&self) -> Result<()> {
         let mut buffer = self.write_buffer.lock().unwrap();
