@@ -66,6 +66,19 @@ pub enum LogicalPlan {
         limit: Option<usize>,
         offset: usize,
     },
+    SetOp {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        op: SetOpType,
+        all: bool,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpType {
+    Union,
+    Intersect,
+    Except,
 }
 
 impl LogicalPlan {
@@ -176,6 +189,7 @@ impl LogicalPlan {
             }
             LogicalPlan::Sort { source, .. } => source.schema(),
             LogicalPlan::IndexScan { schema, .. } => schema.clone(),
+            LogicalPlan::SetOp { left, .. } => left.schema(),
         }
     }
 
@@ -237,6 +251,10 @@ impl LogicalPlan {
                 source.collect_columns(columns);
             }
             LogicalPlan::IndexScan { .. } => {}
+            LogicalPlan::SetOp { left, right, .. } => {
+                left.collect_columns(columns);
+                right.collect_columns(columns);
+            }
         }
     }
 }
@@ -344,6 +362,21 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
                 "{}- IndexScan: table={}, index={}, {}\n",
                 indent_str, table_name, index_name, range_str
             ));
+        }
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            out.push_str(&format!(
+                "{}- SetOp: op={:?}, all={}\n",
+                indent_str, op, all
+            ));
+            out.push_str(&format!("{}  left:\n", indent_str));
+            format_logical_node(left, indent + 2, out);
+            out.push_str(&format!("{}  right:\n", indent_str));
+            format_logical_node(right, indent + 2, out);
         }
     }
 }

@@ -1939,3 +1939,313 @@ fn test_sql_pass3_schema_and_constraints() {
         }
     }
 }
+
+#[test]
+fn test_sql_pass4_dml_and_set_operations() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. INSERT INTO SELECT
+    {
+        let tx1 = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE src_table (id SERIAL PRIMARY KEY, note STRING)",
+                &tx1,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "CREATE TABLE dest_table (id SERIAL PRIMARY KEY, note STRING, extra STRING DEFAULT 'Cool')",
+                &tx1,
+            )
+            .unwrap();
+        tx1.commit().unwrap();
+
+        let tx2 = Transaction::new(2, db.clone());
+        engine
+            .execute(
+                "INSERT INTO src_table (note) VALUES ('Apple'), ('Banana'), ('Cherry')",
+                &tx2,
+            )
+            .unwrap();
+        tx2.commit().unwrap();
+
+        // Perform INSERT INTO SELECT with explicit columns mapping
+        let tx3 = Transaction::new(3, db.clone());
+        let res = engine
+            .execute(
+                "INSERT INTO dest_table (id, note) SELECT id, note FROM src_table",
+                &tx3,
+            )
+            .unwrap();
+        assert_eq!(res, ExecutionResult::Insert { count: 3 });
+        tx3.commit().unwrap();
+
+        // Verify content in dest_table
+        let tx4 = Transaction::new(4, db.clone());
+        let res = engine
+            .execute(
+                "SELECT id, note, extra FROM dest_table ORDER BY id ASC",
+                &tx4,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows[0].values,
+                vec![
+                    DbValue::Int(1),
+                    DbValue::String("Apple".to_string()),
+                    DbValue::String("Cool".to_string())
+                ]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![
+                    DbValue::Int(2),
+                    DbValue::String("Banana".to_string()),
+                    DbValue::String("Cool".to_string())
+                ]
+            );
+            assert_eq!(
+                rows[2].values,
+                vec![
+                    DbValue::Int(3),
+                    DbValue::String("Cherry".to_string()),
+                    DbValue::String("Cool".to_string())
+                ]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // Test duplicate PK error on INSERT INTO SELECT
+        let tx5 = Transaction::new(5, db.clone());
+        let err_res = engine.execute(
+            "INSERT INTO dest_table (id, note) SELECT id, note FROM src_table",
+            &tx5,
+        );
+        assert!(err_res.is_err());
+        assert_eq!(err_res.unwrap_err(), "Duplicate primary key".to_string());
+        let _ = tx5.rollback();
+
+        // Test INSERT INTO SELECT auto-increment logic
+        let tx6 = Transaction::new(6, db.clone());
+        // Since we insert note only, id should generate from sequence starting from next of max(3) = 4
+        let res = engine
+            .execute(
+                "INSERT INTO dest_table (note) SELECT note FROM src_table",
+                &tx6,
+            )
+            .unwrap();
+        assert_eq!(res, ExecutionResult::Insert { count: 3 });
+        tx6.commit().unwrap();
+
+        let tx7 = Transaction::new(7, db.clone());
+        let res = engine
+            .execute(
+                "SELECT id, note, extra FROM dest_table ORDER BY id ASC",
+                &tx7,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 6);
+            assert_eq!(rows[3].values[0], DbValue::Int(4));
+            assert_eq!(rows[4].values[0], DbValue::Int(5));
+            assert_eq!(rows[5].values[0], DbValue::Int(6));
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    // 2. Set Operations (UNION, UNION ALL, INTERSECT, EXCEPT)
+    {
+        let tx8 = Transaction::new(8, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE set_a (row_id SERIAL PRIMARY KEY, id INT, val STRING)",
+                &tx8,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "CREATE TABLE set_b (row_id SERIAL PRIMARY KEY, id INT, val STRING)",
+                &tx8,
+            )
+            .unwrap();
+        tx8.commit().unwrap();
+
+        let tx9 = Transaction::new(9, db.clone());
+        engine
+            .execute(
+                "INSERT INTO set_a (id, val) VALUES (1, 'apple'), (2, 'banana'), (2, 'banana'), (3, 'cherry')",
+                &tx9,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO set_b (id, val) VALUES (2, 'banana'), (3, 'cherry'), (3, 'cherry'), (4, 'date')",
+                &tx9,
+            )
+            .unwrap();
+        tx9.commit().unwrap();
+
+        let tx10 = Transaction::new(10, db.clone());
+
+        // UNION DISTINCT (default UNION)
+        let res = engine
+            .execute(
+                "SELECT id, val FROM set_a UNION SELECT id, val FROM set_b ORDER BY id ASC, val ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 4);
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("apple".to_string())]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+            );
+            assert_eq!(
+                rows[2].values,
+                vec![DbValue::Int(3), DbValue::String("cherry".to_string())]
+            );
+            assert_eq!(
+                rows[3].values,
+                vec![DbValue::Int(4), DbValue::String("date".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // UNION ALL
+        let res = engine
+            .execute(
+                "SELECT id, val FROM set_a UNION ALL SELECT id, val FROM set_b ORDER BY id ASC, val ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 8);
+            let expected = vec![
+                vec![DbValue::Int(1), DbValue::String("apple".to_string())],
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())],
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())],
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())],
+                vec![DbValue::Int(3), DbValue::String("cherry".to_string())],
+                vec![DbValue::Int(3), DbValue::String("cherry".to_string())],
+                vec![DbValue::Int(3), DbValue::String("cherry".to_string())],
+                vec![DbValue::Int(4), DbValue::String("date".to_string())],
+            ];
+            for (i, val) in expected.into_iter().enumerate() {
+                assert_eq!(rows[i].values, val);
+            }
+        } else {
+            panic!("Expected Select");
+        }
+
+        // EXCEPT DISTINCT (default EXCEPT)
+        let res = engine
+            .execute(
+                "SELECT id, val FROM set_a EXCEPT SELECT id, val FROM set_b ORDER BY id ASC, val ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("apple".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // EXCEPT ALL
+        let res = engine
+            .execute(
+                "SELECT id, val FROM set_a EXCEPT ALL SELECT id, val FROM set_b ORDER BY id ASC, val ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            // set_a has two (2, 'banana') and set_b has one. So one (2, 'banana') should remain.
+            // set_a has one (1, 'apple') and set_b has none. So one (1, 'apple') should remain.
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("apple".to_string())]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // INTERSECT DISTINCT (default INTERSECT)
+        let res = engine
+            .execute(
+                "SELECT id, val FROM set_a INTERSECT SELECT id, val FROM set_b ORDER BY id ASC, val ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![DbValue::Int(3), DbValue::String("cherry".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // INTERSECT ALL
+        let res = engine
+            .execute(
+                "SELECT id, val FROM set_a INTERSECT ALL SELECT id, val FROM set_b ORDER BY id ASC, val ASC",
+                &tx10,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            // (2, banana): left count 2, right count 1. Intersect ALL -> min(2, 1) = 1 row.
+            // (3, cherry): left count 1, right count 2. Intersect ALL -> min(1, 2) = 1 row.
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+            );
+            assert_eq!(
+                rows[1].values,
+                vec![DbValue::Int(3), DbValue::String("cherry".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+
+        // Column count mismatch test
+        let err_res = engine.execute(
+            "SELECT id FROM set_a UNION SELECT id, val FROM set_b",
+            &tx10,
+        );
+        assert!(err_res.is_err());
+        assert!(
+            err_res
+                .unwrap_err()
+                .contains("must have the same number of columns")
+        );
+
+        // Data type mismatch test
+        let err_res2 = engine.execute("SELECT id FROM set_a UNION SELECT val FROM set_b", &tx10);
+        assert!(err_res2.is_err());
+        assert!(err_res2.unwrap_err().contains("type mismatch"));
+    }
+}

@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{AggregateExpr, JoinType, LogicalPlan};
+use crate::logical::{AggregateExpr, JoinType, LogicalPlan, SetOpType};
 use dtdb_relational::{Column, DataType, Database, Schema};
 use dtdb_storage::DbValue;
 use sqlparser::ast::{
@@ -21,6 +21,11 @@ pub enum SqlStatement {
         table_name: String,
         columns: Vec<String>,
         rows: Vec<Vec<DbValue>>,
+    },
+    InsertSelect {
+        table_name: String,
+        columns: Vec<String>,
+        query: LogicalPlan,
     },
     Delete {
         table_name: String,
@@ -380,30 +385,39 @@ impl LogicalPlanner {
                     columns.iter().map(|c| c.value.clone()).collect()
                 };
 
-                let mut rows = Vec::new();
-                if let sqlparser::ast::SetExpr::Values(values) = &*source.body {
-                    for row_exprs in &values.rows {
-                        let mut row_vals = Vec::new();
-                        for expr in row_exprs {
-                            match plan_expr(expr)? {
-                                Expr::Literal(val) => row_vals.push(val),
-                                other => {
-                                    return Err(format!(
-                                        "INSERT expects literal values, got expression {:?}",
-                                        other
-                                    ));
+                match &*source.body {
+                    sqlparser::ast::SetExpr::Values(values) => {
+                        let mut rows = Vec::new();
+                        for row_exprs in &values.rows {
+                            let mut row_vals = Vec::new();
+                            for expr in row_exprs {
+                                match plan_expr(expr)? {
+                                    Expr::Literal(val) => row_vals.push(val),
+                                    other => {
+                                        return Err(format!(
+                                            "INSERT expects literal values, got expression {:?}",
+                                            other
+                                        ));
+                                    }
                                 }
                             }
+                            rows.push(row_vals);
                         }
-                        rows.push(row_vals);
+                        Ok(SqlStatement::Insert {
+                            table_name: table_str,
+                            columns: col_names,
+                            rows,
+                        })
+                    }
+                    _ => {
+                        let logical_plan = self.plan_query(source)?;
+                        Ok(SqlStatement::InsertSelect {
+                            table_name: table_str,
+                            columns: col_names,
+                            query: logical_plan,
+                        })
                     }
                 }
-
-                Ok(SqlStatement::Insert {
-                    table_name: table_str,
-                    columns: col_names,
-                    rows,
-                })
             }
             Statement::Delete {
                 from, selection, ..
@@ -476,11 +490,309 @@ impl LogicalPlanner {
 
     /// Plans a SELECT query into a LogicalPlan.
     fn plan_query(&self, query: &Query) -> Result<LogicalPlan, String> {
-        let select = match &*query.body {
-            sqlparser::ast::SetExpr::Select(select) => select,
-            other => return Err(format!("Unsupported query body: {:?}", other)),
-        };
+        use sqlparser::ast::SetExpr;
+        match &*query.body {
+            SetExpr::Select(select) => self.plan_select_query(select, query),
+            other => {
+                let mut plan = self.plan_set_expr(other)?;
 
+                // Plan ORDER BY at the query level (after the set operation)
+                if !query.order_by.is_empty() {
+                    let mut sort_keys = Vec::new();
+                    for sort_expr in &query.order_by {
+                        let expr = plan_expr(&sort_expr.expr)?;
+                        let asc = sort_expr.asc.unwrap_or(true);
+                        sort_keys.push((expr, asc));
+                    }
+                    plan = LogicalPlan::Sort {
+                        source: Box::new(plan),
+                        keys: sort_keys,
+                    };
+                }
+
+                // Plan LIMIT and OFFSET at the query level
+                let limit = if let Some(limit_expr) = &query.limit {
+                    let l = match limit_expr {
+                        SqlExpr::Value(SqlValue::Number(s, _)) => {
+                            s.parse::<usize>().map_err(|e| e.to_string())?
+                        }
+                        other_expr => {
+                            return Err(format!("Unsupported limit expression: {:?}", other_expr));
+                        }
+                    };
+                    Some(l)
+                } else {
+                    None
+                };
+
+                let offset = if let Some(offset_val) = &query.offset {
+                    match &offset_val.value {
+                        SqlExpr::Value(SqlValue::Number(s, _)) => {
+                            s.parse::<usize>().map_err(|e| e.to_string())?
+                        }
+                        other_expr => {
+                            return Err(format!("Unsupported offset expression: {:?}", other_expr));
+                        }
+                    }
+                } else {
+                    0
+                };
+
+                if limit.is_some() || offset > 0 {
+                    plan = LogicalPlan::Limit {
+                        source: Box::new(plan),
+                        limit,
+                        offset,
+                    };
+                }
+
+                Ok(plan)
+            }
+        }
+    }
+
+    fn plan_set_expr(&self, set_expr: &sqlparser::ast::SetExpr) -> Result<LogicalPlan, String> {
+        use sqlparser::ast::SelectItem;
+        use sqlparser::ast::SetExpr;
+
+        match set_expr {
+            SetExpr::Select(select) => {
+                // 1. Plan FROM clause (Leaf scan / joins)
+                let mut plan = self.plan_from(&select.from)?;
+
+                // 2. Plan JOIN clause
+                if !select.from.is_empty() {
+                    let relation = &select.from[0];
+                    for join in &relation.joins {
+                        let right_scan = self.plan_table_factor(&join.relation)?;
+                        let (join_cond, join_type) = match &join.join_operator {
+                            sqlparser::ast::JoinOperator::Inner(
+                                sqlparser::ast::JoinConstraint::On(expr),
+                            ) => (plan_expr(expr)?, JoinType::Inner),
+                            sqlparser::ast::JoinOperator::LeftOuter(
+                                sqlparser::ast::JoinConstraint::On(expr),
+                            ) => (plan_expr(expr)?, JoinType::Left),
+                            sqlparser::ast::JoinOperator::CrossJoin => (
+                                Expr::Literal(dtdb_storage::DbValue::Int(1)),
+                                JoinType::Cross,
+                            ),
+                            sqlparser::ast::JoinOperator::Inner(
+                                sqlparser::ast::JoinConstraint::None,
+                            ) => (
+                                Expr::Literal(dtdb_storage::DbValue::Int(1)),
+                                JoinType::Cross,
+                            ),
+                            other => {
+                                return Err(format!("Unsupported JOIN operator: {:?}", other));
+                            }
+                        };
+                        plan = LogicalPlan::Join {
+                            left: Box::new(plan),
+                            right: Box::new(right_scan),
+                            condition: join_cond,
+                            join_type,
+                        };
+                    }
+                }
+
+                // 3. Plan WHERE clause
+                if let Some(selection) = &select.selection {
+                    plan = LogicalPlan::Filter {
+                        source: Box::new(plan),
+                        predicate: plan_expr(selection)?,
+                    };
+                }
+
+                // 4. Plan GROUP BY / aggregations / HAVING
+                let has_groupby = !select.group_by.is_empty();
+                let has_aggrs = select_items_have_aggrs(&select.projection);
+                let has_having = select.having.is_some();
+
+                if has_groupby || has_aggrs || has_having {
+                    // Aggregate planning
+                    let group_exprs = select.group_by.iter().map(plan_expr).collect::<Result<
+                        Vec<_>,
+                        String,
+                    >>(
+                    )?;
+
+                    let mut aggr_exprs = Vec::new();
+                    let mut field_names = Vec::new();
+
+                    // First group-by field names
+                    for expr in &group_exprs {
+                        match expr {
+                            Expr::Column(name) => field_names.push(name.clone()),
+                            _ => field_names.push("group_key".to_string()),
+                        }
+                    }
+
+                    // Extract aggregates from select projection items by rewriting them
+                    let mut rewritten_projection = Vec::new();
+                    for item in &select.projection {
+                        match item {
+                            SelectItem::UnnamedExpr(expr) => {
+                                let mut expr_mut = expr.clone();
+                                rewrite_having_expr(
+                                    &mut expr_mut,
+                                    &mut aggr_exprs,
+                                    &mut field_names,
+                                )?;
+                                rewritten_projection.push(SelectItem::UnnamedExpr(expr_mut));
+                            }
+                            SelectItem::ExprWithAlias { expr, alias } => {
+                                let mut expr_mut = expr.clone();
+                                rewrite_having_expr(
+                                    &mut expr_mut,
+                                    &mut aggr_exprs,
+                                    &mut field_names,
+                                )?;
+                                rewritten_projection.push(SelectItem::ExprWithAlias {
+                                    expr: expr_mut,
+                                    alias: alias.clone(),
+                                });
+                            }
+                            SelectItem::Wildcard(_) => {
+                                return Err(
+                                    "Wildcards not allowed in GROUP BY / Aggregations".to_string()
+                                );
+                            }
+                            _ => return Err(format!("Unsupported select item: {:?}", item)),
+                        }
+                    }
+
+                    // Extract aggregates from HAVING clause and rewrite the HAVING predicate
+                    let planned_having = if let Some(having_expr) = &select.having {
+                        let mut having_mut = having_expr.clone();
+                        rewrite_having_expr(&mut having_mut, &mut aggr_exprs, &mut field_names)?;
+                        Some(plan_expr(&having_mut)?)
+                    } else {
+                        None
+                    };
+
+                    plan = LogicalPlan::Aggregate {
+                        source: Box::new(plan),
+                        group_by: group_exprs,
+                        aggrs: aggr_exprs,
+                        field_names,
+                    };
+
+                    // Apply HAVING filter node if present
+                    if let Some(having_pred) = planned_having {
+                        plan = LogicalPlan::Filter {
+                            source: Box::new(plan),
+                            predicate: having_pred,
+                        };
+                    }
+
+                    // Place a final Projection to select only the requested projection items
+                    let mut expressions = Vec::new();
+                    let mut projection_field_names = Vec::new();
+
+                    for item in &rewritten_projection {
+                        match item {
+                            SelectItem::UnnamedExpr(expr) => {
+                                let planned_expr = plan_expr(expr)?;
+                                let name = match &planned_expr {
+                                    Expr::Column(name) => name.clone(),
+                                    _ => expr.to_string(),
+                                };
+                                expressions.push(planned_expr);
+                                projection_field_names.push(name);
+                            }
+                            SelectItem::ExprWithAlias { expr, alias } => {
+                                let planned_expr = plan_expr(expr)?;
+                                expressions.push(planned_expr);
+                                projection_field_names.push(alias.value.clone());
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+
+                    plan = LogicalPlan::Projection {
+                        source: Box::new(plan),
+                        expressions,
+                        field_names: projection_field_names,
+                    };
+                } else {
+                    // 5. Plan standard SELECT projection
+                    let mut expressions = Vec::new();
+                    let mut field_names = Vec::new();
+
+                    let source_schema = plan.schema();
+
+                    for item in &select.projection {
+                        match item {
+                            SelectItem::UnnamedExpr(expr) => {
+                                let planned_expr = plan_expr(expr)?;
+                                let name = match &planned_expr {
+                                    Expr::Column(name) => name.clone(),
+                                    _ => expr.to_string(),
+                                };
+                                expressions.push(planned_expr);
+                                field_names.push(name);
+                            }
+                            SelectItem::ExprWithAlias { expr, alias } => {
+                                let planned_expr = plan_expr(expr)?;
+                                expressions.push(planned_expr);
+                                field_names.push(alias.value.clone());
+                            }
+                            SelectItem::Wildcard(_) => {
+                                // Expand wildcard to all fields in the source schema
+                                for col in &source_schema.columns {
+                                    expressions.push(Expr::Column(col.name.clone()));
+                                    field_names.push(col.name.clone());
+                                }
+                            }
+                            _ => return Err(format!("Unsupported select item: {:?}", item)),
+                        }
+                    }
+
+                    plan = LogicalPlan::Projection {
+                        source: Box::new(plan),
+                        expressions,
+                        field_names,
+                    };
+                }
+
+                Ok(plan)
+            }
+            SetExpr::Query(query) => self.plan_query(query),
+            SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                let left_plan = self.plan_set_expr(left)?;
+                let right_plan = self.plan_set_expr(right)?;
+
+                validate_set_op_schemas(&left_plan.schema(), &right_plan.schema())?;
+
+                let set_op_type = match op {
+                    sqlparser::ast::SetOperator::Union => SetOpType::Union,
+                    sqlparser::ast::SetOperator::Except => SetOpType::Except,
+                    sqlparser::ast::SetOperator::Intersect => SetOpType::Intersect,
+                };
+
+                let all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
+
+                Ok(LogicalPlan::SetOp {
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    op: set_op_type,
+                    all,
+                })
+            }
+            other => Err(format!("Unsupported set expression: {:?}", other)),
+        }
+    }
+
+    fn plan_select_query(
+        &self,
+        select: &sqlparser::ast::Select,
+        query: &Query,
+    ) -> Result<LogicalPlan, String> {
         // 1. Plan FROM clause (Leaf scan / joins)
         let mut plan = self.plan_from(&select.from)?;
 
@@ -717,7 +1029,6 @@ impl LogicalPlanner {
         } else {
             0
         };
-
         if limit.is_some() || offset > 0 {
             plan = LogicalPlan::Limit {
                 source: Box::new(plan),
@@ -1131,4 +1442,25 @@ fn rewrite_having_expr(
         }
         _ => Ok(()),
     }
+}
+
+fn validate_set_op_schemas(left: &Schema, right: &Schema) -> Result<(), String> {
+    if left.columns.len() != right.columns.len() {
+        return Err(format!(
+            "Set operation queries must have the same number of columns (left: {}, right: {})",
+            left.columns.len(),
+            right.columns.len()
+        ));
+    }
+    for (i, (lc, rc)) in left.columns.iter().zip(right.columns.iter()).enumerate() {
+        if lc.data_type != rc.data_type {
+            return Err(format!(
+                "Column {} type mismatch: left is {:?}, right is {:?}",
+                i + 1,
+                lc.data_type,
+                rc.data_type
+            ));
+        }
+    }
+    Ok(())
 }

@@ -3,7 +3,8 @@ use crate::logical::{JoinType, LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalIndexScan,
-    PhysicalLimit, PhysicalOperator, PhysicalProjection, PhysicalSeqScan, PhysicalSort,
+    PhysicalLimit, PhysicalOperator, PhysicalProjection, PhysicalSeqScan, PhysicalSetOp,
+    PhysicalSort,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -171,6 +172,93 @@ impl SqlEngine {
                     let full_row = Row::new(aligned_vals);
 
                     // Extract the primary key value.
+                    let pk_key = schema
+                        .extract_primary_key(&full_row)
+                        .map_err(|e| e.to_string())?;
+
+                    if tx
+                        .get(&table_name, &pk_key)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                    {
+                        return Err("Duplicate primary key".to_string());
+                    }
+
+                    tx.put(&table_name, pk_key, full_row)
+                        .map_err(|e| e.to_string())?;
+                    insert_count += 1;
+                }
+
+                Ok(ExecutionResult::Insert {
+                    count: insert_count,
+                })
+            }
+            SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query,
+            } => {
+                let table = self
+                    .database
+                    .get_table(&table_name)
+                    .map_err(|e| e.to_string())?;
+
+                let schema = table.schema.clone();
+                let mut insert_count = 0;
+
+                // 1. Optimize the Logical Plan
+                let optimized_plan = Optimizer::new().optimize(query);
+
+                // Collect referenced columns
+                let mut cols = HashSet::new();
+                optimized_plan.collect_columns(&mut cols);
+                let cols_vec: Vec<String> = cols.into_iter().collect();
+
+                // 2. Compile to Volcano Physical Plan
+                let mut physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+
+                // 3. Validate columns count match
+                let subquery_schema = physical_op.schema();
+                if columns.len() != subquery_schema.columns.len() {
+                    return Err(format!(
+                        "INSERT INTO ... SELECT col count mismatch: target columns: {}, SELECT columns: {}",
+                        columns.len(),
+                        subquery_schema.columns.len()
+                    ));
+                }
+
+                // 4. Consume Volcano Iterator streaming rows and insert them
+                while let Some(row) = physical_op.next()? {
+                    let mut aligned_vals = Vec::with_capacity(schema.columns.len());
+                    for col in &schema.columns {
+                        aligned_vals.push(col.default_value.clone().unwrap_or(DbValue::Null));
+                    }
+
+                    for (col_idx, col_name) in columns.iter().enumerate() {
+                        let schema_idx = schema
+                            .column_index(col_name)
+                            .ok_or_else(|| format!("Column '{}' not found in schema", col_name))?;
+                        aligned_vals[schema_idx] = row.values[col_idx].clone();
+                    }
+
+                    // Handle auto-increment columns.
+                    for (col_idx, col) in schema.columns.iter().enumerate() {
+                        if col.is_auto_increment {
+                            if matches!(aligned_vals[col_idx], DbValue::Null) {
+                                let next_val = self
+                                    .database
+                                    .next_sequence_value(&table_name)
+                                    .map_err(|e| e.to_string())?;
+                                aligned_vals[col_idx] = DbValue::Int(next_val);
+                            } else if let DbValue::Int(explicit_val) = aligned_vals[col_idx] {
+                                self.database
+                                    .update_sequence_value(&table_name, explicit_val)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+
+                    let full_row = Row::new(aligned_vals);
                     let pk_key = schema
                         .extract_primary_key(&full_row)
                         .map_err(|e| e.to_string())?;
@@ -563,6 +651,19 @@ impl SqlEngine {
                     group_by,
                     aggrs,
                     aggr_schema,
+                )))
+            }
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => {
+                let left_op = self.compile_physical(*left, tx, columns)?;
+                let right_op = self.compile_physical(*right, tx, columns)?;
+                let schema = left_op.schema().clone();
+                Ok(Box::new(PhysicalSetOp::new(
+                    left_op, right_op, op, all, schema,
                 )))
             }
         }

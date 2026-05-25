@@ -85,6 +85,40 @@ pub enum DbValue {
 
 impl Eq for DbValue {}
 
+impl std::hash::Hash for DbValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            DbValue::Int(v) => {
+                0u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Float(v) => {
+                1u8.hash(state);
+                if v.is_nan() {
+                    0.0f64.to_bits().hash(state);
+                } else {
+                    v.to_bits().hash(state);
+                }
+            }
+            DbValue::String(v) => {
+                2u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Bytes(v) => {
+                3u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Bool(v) => {
+                4u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Null => {
+                5u8.hash(state);
+            }
+        }
+    }
+}
+
 /// CompressionType represents the supported block compression algorithms in DuctTapeDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionType {

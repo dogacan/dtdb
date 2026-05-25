@@ -1,5 +1,5 @@
 use crate::expr::Expr;
-use crate::logical::{AggregateExpr, JoinType};
+use crate::logical::{AggregateExpr, JoinType, SetOpType};
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
 use std::collections::HashMap;
@@ -755,5 +755,167 @@ fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String
             "Type mismatch: cannot compare {:?} and {:?}",
             expected, actual
         )),
+    }
+}
+
+// ==========================================
+// Set Operation Physical Operator (UNION, INTERSECT, EXCEPT)
+// ==========================================
+pub enum SetOpState {
+    Init,
+    UnionDistinct {
+        seen: std::collections::HashSet<Row>,
+        reading_left: bool,
+    },
+    UnionAll {
+        reading_left: bool,
+    },
+    Intersect {
+        right_counts: std::collections::HashMap<Row, usize>,
+        seen: std::collections::HashSet<Row>,
+    },
+    Except {
+        right_counts: std::collections::HashMap<Row, usize>,
+        seen: std::collections::HashSet<Row>,
+    },
+}
+
+pub struct PhysicalSetOp {
+    left: Box<dyn PhysicalOperator>,
+    right: Box<dyn PhysicalOperator>,
+    op: SetOpType,
+    all: bool,
+    schema: Schema,
+    state: SetOpState,
+}
+
+impl PhysicalSetOp {
+    pub fn new(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        op: SetOpType,
+        all: bool,
+        schema: Schema,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            op,
+            all,
+            schema,
+            state: SetOpState::Init,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalSetOp {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        if matches!(self.state, SetOpState::Init) {
+            match self.op {
+                SetOpType::Union => {
+                    if self.all {
+                        self.state = SetOpState::UnionAll { reading_left: true };
+                    } else {
+                        self.state = SetOpState::UnionDistinct {
+                            seen: std::collections::HashSet::new(),
+                            reading_left: true,
+                        };
+                    }
+                }
+                SetOpType::Intersect => {
+                    let mut right_counts = std::collections::HashMap::new();
+                    while let Some(row) = self.right.next()? {
+                        *right_counts.entry(row).or_insert(0) += 1;
+                    }
+                    self.state = SetOpState::Intersect {
+                        right_counts,
+                        seen: std::collections::HashSet::new(),
+                    };
+                }
+                SetOpType::Except => {
+                    let mut right_counts = std::collections::HashMap::new();
+                    while let Some(row) = self.right.next()? {
+                        *right_counts.entry(row).or_insert(0) += 1;
+                    }
+                    self.state = SetOpState::Except {
+                        right_counts,
+                        seen: std::collections::HashSet::new(),
+                    };
+                }
+            }
+        }
+
+        match &mut self.state {
+            SetOpState::UnionAll { reading_left } => {
+                if *reading_left {
+                    if let Some(row) = self.left.next()? {
+                        return Ok(Some(row));
+                    }
+                    *reading_left = false;
+                }
+                self.right.next()
+            }
+            SetOpState::UnionDistinct { seen, reading_left } => {
+                if *reading_left {
+                    while let Some(row) = self.left.next()? {
+                        if seen.insert(row.clone()) {
+                            return Ok(Some(row));
+                        }
+                    }
+                    *reading_left = false;
+                }
+                while let Some(row) = self.right.next()? {
+                    if seen.insert(row.clone()) {
+                        return Ok(Some(row));
+                    }
+                }
+                Ok(None)
+            }
+            SetOpState::Intersect { right_counts, seen } => {
+                while let Some(row) = self.left.next()? {
+                    if self.all {
+                        if let Some(count) = right_counts.get_mut(&row).filter(|c| **c > 0) {
+                            *count -= 1;
+                            return Ok(Some(row));
+                        }
+                    } else if right_counts.contains_key(&row) && seen.insert(row.clone()) {
+                        return Ok(Some(row));
+                    }
+                }
+                Ok(None)
+            }
+            SetOpState::Except { right_counts, seen } => {
+                while let Some(row) = self.left.next()? {
+                    if self.all {
+                        if let Some(count) = right_counts.get_mut(&row).filter(|c| **c > 0) {
+                            *count -= 1;
+                            continue;
+                        }
+                        return Ok(Some(row));
+                    } else if !right_counts.contains_key(&row) && seen.insert(row.clone()) {
+                        return Ok(Some(row));
+                    }
+                }
+                Ok(None)
+            }
+            SetOpState::Init => unreachable!(),
+        }
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        out.push_str(&format!(
+            "{}- PhysicalSetOp: op={:?}, all={}\n",
+            "  ".repeat(indent),
+            self.op,
+            self.all
+        ));
+        out.push_str(&format!("{}  left:\n", "  ".repeat(indent)));
+        self.left.explain(indent + 2, out);
+        out.push_str(&format!("{}  right:\n", "  ".repeat(indent)));
+        self.right.explain(indent + 2, out);
     }
 }

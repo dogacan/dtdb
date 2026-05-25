@@ -4,7 +4,7 @@ use dtdb_storage::DbValue;
 use serde::{Deserialize, Serialize};
 
 /// Row represents a tuple/record in a relational table.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Row {
     pub values: Vec<DbValue>,
 }

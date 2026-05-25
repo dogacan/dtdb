@@ -110,17 +110,27 @@ Removes a secondary index from a table.
 ### Data Manipulation Language (DML) & Queries
 
 #### `INSERT INTO`
-Inserts new rows into a table.
+Inserts new rows into a table, either from explicit literal values or from the results of a query.
 *   **Syntax**:
-    ```sql
-    INSERT INTO <table_name> [(<column_name>, ...)] VALUES (<literal_value>, ...), ...;
-    ```
+    *   **VALUES Syntax**:
+        ```sql
+        INSERT INTO <table_name> [(<column_name>, ...)] VALUES (<literal_value>, ...), ...;
+        ```
+    *   **SELECT Syntax**:
+        ```sql
+        INSERT INTO <table_name> [(<column_name>, ...)] <select_query>;
+        ```
 *   **Notes**:
-    *   If no columns are specified, values must align with the columns in the exact order declared in the `CREATE TABLE` schema.
-    *   Only literal values are allowed (not nested expressions or variables).
-*   **Example**:
+    *   If no columns are specified, values or select columns must align with the columns in the exact order declared in the `CREATE TABLE` schema.
+    *   For VALUES inserts, only literal values are allowed (not nested expressions).
+    *   For SELECT inserts, the select query is evaluated and its resulting rows are inserted dynamically. Missing target columns will receive their default values if defined in the schema.
+*   **Examples**:
     ```sql
+    -- Insert literals
     INSERT INTO Users (id, name, score) VALUES (1, 'Alice', 95.5), (2, 'Bob', 88.0);
+
+    -- Insert from select
+    INSERT INTO dest_table (id, note) SELECT id, note FROM src_table;
     ```
 
 #### `UPDATE`
@@ -186,6 +196,30 @@ Queries rows from table relations.
     FROM Users 
     GROUP BY country
     HAVING COUNT(*) > 2 AND MAX(score) >= 80.0;
+    ```
+
+#### Set Operations
+Combines the result sets of two queries using set operators.
+*   **Syntax**:
+    ```sql
+    <select_query_1> <set_operator> <select_query_2> [ORDER BY ...] [LIMIT ...];
+    ```
+    Where `<set_operator>` is one of:
+    *   `UNION` / `UNION DISTINCT`: Returns distinct combined rows from both queries.
+    *   `UNION ALL`: Returns all combined rows from both queries, retaining duplicates.
+    *   `INTERSECT` / `INTERSECT DISTINCT`: Returns distinct rows that are present in both queries.
+    *   `INTERSECT ALL`: Returns matching rows present in both queries, preserving the minimum occurrence count from either side.
+    *   `EXCEPT` / `EXCEPT DISTINCT`: Returns distinct rows from the first query that do not exist in the second.
+    *   `EXCEPT ALL`: Returns rows from the first query, removing matching rows from the second query on a 1-to-1 occurrence basis.
+*   **Notes**:
+    *   Both select queries must return the same number of columns, and corresponding columns must have matching data types. Otherwise, a schema validation error is thrown.
+*   **Examples**:
+    ```sql
+    -- Distinct Union
+    SELECT id, val FROM set_a UNION SELECT id, val FROM set_b;
+
+    -- Except All
+    SELECT id, val FROM set_a EXCEPT ALL SELECT id, val FROM set_b;
     ```
 
 #### `EXPLAIN`
