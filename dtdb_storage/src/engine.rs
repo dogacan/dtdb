@@ -366,17 +366,18 @@ impl EngineInner {
 
         let _write_lock = self.write_mutex.lock().unwrap();
 
+        let wal_entries = entries.clone();
         {
             let mut wal = self.wal.lock().unwrap();
-            wal.append_batch(entries.clone())?;
+            wal.append_batch(wal_entries)?;
         }
 
         {
             let mem = self.memtable.read().unwrap();
-            for entry in &entries {
+            for entry in entries {
                 match entry {
-                    WalEntry::Put { key, value } => mem.put(key.clone(), value.clone()),
-                    WalEntry::Delete { key } => mem.delete(key.clone()),
+                    WalEntry::Put { key, value } => mem.put(key, value),
+                    WalEntry::Delete { key } => mem.delete(key),
                     WalEntry::Batch(_) => {}
                 }
             }
@@ -784,9 +785,6 @@ impl EngineInner {
                 current_writer_uncompressed_bytes = 0;
             }
 
-            let writer = current_writer.as_mut().unwrap();
-            writer.append(k.clone(), v.clone())?;
-
             let entry_sz = k.byte_size()
                 + match &v {
                     Some(DbValue::Int(_)) => 8,
@@ -798,6 +796,9 @@ impl EngineInner {
                     None => 1,
                 };
             current_writer_uncompressed_bytes += entry_sz;
+
+            let writer = current_writer.as_mut().unwrap();
+            writer.append(k, v)?;
 
             if current_writer_uncompressed_bytes >= self.options.sstable_target_size {
                 let writer = current_writer.take().unwrap();

@@ -341,8 +341,8 @@ pub struct PhysicalHashJoin {
     right_on: Expr,
     join_type: JoinType,
     schema: Schema,
-    // Build phase hash map: string representation of join key -> Right Rows
-    hash_table: Option<HashMap<String, Vec<Row>>>,
+    // Build phase hash map: DbValue representation of join key -> Right Rows
+    hash_table: Option<HashMap<DbValue, Vec<Row>>>,
     // Buffer to hold joined rows from the current probe row
     join_buffer: Vec<Row>,
 }
@@ -383,8 +383,7 @@ impl PhysicalOperator for PhysicalHashJoin {
             while let Some(row) = self.right.next()? {
                 let key_val = self.right_on.eval(&row, &right_schema)?;
                 if key_val != DbValue::Null {
-                    let hash_key = hash_value_to_string(&key_val);
-                    table.entry(hash_key).or_insert_with(Vec::new).push(row);
+                    table.entry(key_val).or_insert_with(Vec::new).push(row);
                 }
             }
             self.hash_table = Some(table);
@@ -397,10 +396,9 @@ impl PhysicalOperator for PhysicalHashJoin {
         // Probe phase: stream left rows one by one
         while let Some(left_row) = self.left.next()? {
             let key_val = self.left_on.eval(&left_row, &left_schema)?;
-            let hash_key = hash_value_to_string(&key_val);
 
             if key_val != DbValue::Null {
-                if let Some(right_rows) = hash_table.get(&hash_key) {
+                if let Some(right_rows) = hash_table.get(&key_val) {
                     // Generate joined rows: combine left row fields + right row fields
                     for right_row in right_rows {
                         let mut merged_values = left_row.values.clone();
@@ -559,24 +557,21 @@ impl PhysicalOperator for PhysicalHashAggregate {
     fn next(&mut self) -> Result<Option<Row>, String> {
         if self.aggregated_rows.is_none() {
             // Blocking phase: group and accumulate aggregates for all source rows
-            let mut groups: HashMap<Vec<String>, (Vec<DbValue>, Vec<Accumulator>)> = HashMap::new();
+            let mut groups: HashMap<Vec<DbValue>, Vec<Accumulator>> = HashMap::new();
 
             let source_schema = self.source.schema().clone();
 
             while let Some(row) = self.source.next()? {
                 // 1. Compute group-by values
                 let mut group_vals = Vec::new();
-                let mut group_hash_keys = Vec::new();
                 for expr in &self.group_by {
                     let val = expr.eval(&row, &source_schema)?;
-                    group_hash_keys.push(hash_value_to_string(&val));
                     group_vals.push(val);
                 }
 
                 // 2. Initialize accumulators if group is seen for the first time
-                let (_, accumulators) = groups.entry(group_hash_keys).or_insert_with(|| {
-                    let accs = self
-                        .aggrs
+                let accumulators = groups.entry(group_vals).or_insert_with(|| {
+                    self.aggrs
                         .iter()
                         .map(|aggr| match aggr {
                             AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
@@ -585,8 +580,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
                             AggregateExpr::Max(_) => Accumulator::Max { max: None },
                             AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
                         })
-                        .collect();
-                    (group_vals, accs)
+                        .collect()
                 });
 
                 // 3. Update accumulators with column values
@@ -604,7 +598,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
             // 4. Construct final output rows
             let mut output_rows = Vec::new();
-            for (group_vals, accumulators) in groups.into_values() {
+            for (group_vals, accumulators) in groups {
                 let mut row_vals = group_vals; // starts with group-by keys
                 for acc in accumulators {
                     row_vals.push(acc.finalize());
@@ -721,17 +715,6 @@ impl Accumulator {
 // ==========================================
 // Helper Utility Functions
 // ==========================================
-
-fn hash_value_to_string(val: &DbValue) -> String {
-    match val {
-        DbValue::Int(v) => format!("I:{}", v),
-        DbValue::Float(v) => format!("F:{}", v),
-        DbValue::String(s) => format!("S:{}", s),
-        DbValue::Bytes(b) => format!("B:{:?}", b),
-        DbValue::Bool(b) => format!("Bo:{}", b),
-        DbValue::Null => "NULL".to_string(),
-    }
-}
 
 fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String> {
     match (l, r) {
