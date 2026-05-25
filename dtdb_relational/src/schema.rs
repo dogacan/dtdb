@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use dtdb_storage::{DbKey, DbValue};
+use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -31,16 +31,73 @@ pub struct Column {
     pub locality_group: Option<String>,
 }
 
+/// LocalityGroupOptions represents overridden storage configurations for a locality group.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LocalityGroupOptions {
+    pub compression: Option<CompressionType>,
+    pub memtable_size_limit: Option<usize>,
+    pub block_size_limit: Option<usize>,
+    pub wal_size_limit: Option<usize>,
+    pub l0_compaction_threshold: Option<usize>,
+    pub sstable_target_size: Option<usize>,
+    pub base_level_size_limit: Option<usize>,
+    pub level_size_multiplier: Option<usize>,
+    pub max_level: Option<usize>,
+}
+
+impl LocalityGroupOptions {
+    /// Applies these options on top of default EngineOptions.
+    pub fn apply_to(&self, defaults: EngineOptions) -> EngineOptions {
+        EngineOptions {
+            compression: self.compression.unwrap_or(defaults.compression),
+            memtable_size_limit: self
+                .memtable_size_limit
+                .unwrap_or(defaults.memtable_size_limit),
+            block_size_limit: self.block_size_limit.unwrap_or(defaults.block_size_limit),
+            wal_size_limit: self.wal_size_limit.unwrap_or(defaults.wal_size_limit),
+            l0_compaction_threshold: self
+                .l0_compaction_threshold
+                .unwrap_or(defaults.l0_compaction_threshold),
+            sstable_target_size: self
+                .sstable_target_size
+                .unwrap_or(defaults.sstable_target_size),
+            base_level_size_limit: self
+                .base_level_size_limit
+                .unwrap_or(defaults.base_level_size_limit),
+            level_size_multiplier: self
+                .level_size_multiplier
+                .unwrap_or(defaults.level_size_multiplier),
+            max_level: self.max_level.unwrap_or(defaults.max_level),
+        }
+    }
+}
+
 /// Schema defines the set of columns and types of a relational table.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub columns: Vec<Column>,
+    #[serde(default)]
+    pub locality_group_options: HashMap<String, LocalityGroupOptions>,
 }
 
 impl Schema {
     /// Creates a new Schema.
     pub fn new(columns: Vec<Column>) -> Self {
-        Self { columns }
+        Self {
+            columns,
+            locality_group_options: HashMap::new(),
+        }
+    }
+
+    /// Creates a new Schema with options.
+    pub fn new_with_options(
+        columns: Vec<Column>,
+        locality_group_options: HashMap<String, LocalityGroupOptions>,
+    ) -> Self {
+        Self {
+            columns,
+            locality_group_options,
+        }
     }
 
     /// Returns the set of all unique locality group names in the table schema.

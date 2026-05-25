@@ -58,6 +58,7 @@ impl LogicalPlanner {
                 let mut cols = Vec::new();
 
                 let mut locality_map = std::collections::HashMap::new();
+                let mut locality_group_options = std::collections::HashMap::new();
                 for opt in with_options {
                     if opt.name.value == "locality_groups"
                         && let sqlparser::ast::Value::SingleQuotedString(ref val_str) = opt.value
@@ -68,11 +69,106 @@ impl LogicalPlanner {
                                 continue;
                             }
                             let sub_parts: Vec<&str> = part.split(':').collect();
-                            if sub_parts.len() == 2 {
+                            if sub_parts.len() >= 2 {
                                 let group_name = sub_parts[0].trim().to_string();
                                 for col_name in sub_parts[1].split(',') {
                                     let col_name = col_name.trim().to_string();
                                     locality_map.insert(col_name, group_name.clone());
+                                }
+                                if sub_parts.len() == 3 {
+                                    let opts =
+                                        locality_group_options.entry(group_name).or_insert_with(
+                                            dtdb_relational::LocalityGroupOptions::default,
+                                        );
+                                    for opt_pair in sub_parts[2].split(',') {
+                                        let kv: Vec<&str> = opt_pair.split('=').collect();
+                                        if kv.len() == 2 {
+                                            let key = kv[0].trim();
+                                            let val = kv[1].trim();
+                                            match key {
+                                                "compression" => {
+                                                    let comp = match val.to_lowercase().as_str() {
+                                                        "lz4" => dtdb_storage::CompressionType::Lz4,
+                                                        "uncompressed" => dtdb_storage::CompressionType::Uncompressed,
+                                                        _ => return Err(format!("Unknown compression type: {}", val)),
+                                                    };
+                                                    opts.compression = Some(comp);
+                                                }
+                                                "memtable_size_limit" => {
+                                                    opts.memtable_size_limit = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!(
+                                                                "Invalid memtable_size_limit: {}",
+                                                                e
+                                                            )
+                                                        })?,
+                                                    );
+                                                }
+                                                "block_size_limit" => {
+                                                    opts.block_size_limit = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!(
+                                                                "Invalid block_size_limit: {}",
+                                                                e
+                                                            )
+                                                        })?,
+                                                    );
+                                                }
+                                                "wal_size_limit" => {
+                                                    opts.wal_size_limit = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!("Invalid wal_size_limit: {}", e)
+                                                        })?,
+                                                    );
+                                                }
+                                                "l0_compaction_threshold" => {
+                                                    opts.l0_compaction_threshold = Some(val.parse::<usize>().map_err(|e| format!("Invalid l0_compaction_threshold: {}", e))?);
+                                                }
+                                                "sstable_target_size" => {
+                                                    opts.sstable_target_size = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!(
+                                                                "Invalid sstable_target_size: {}",
+                                                                e
+                                                            )
+                                                        })?,
+                                                    );
+                                                }
+                                                "base_level_size_limit" => {
+                                                    opts.base_level_size_limit = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!(
+                                                                "Invalid base_level_size_limit: {}",
+                                                                e
+                                                            )
+                                                        })?,
+                                                    );
+                                                }
+                                                "level_size_multiplier" => {
+                                                    opts.level_size_multiplier = Some(
+                                                        val.parse::<usize>().map_err(|e| {
+                                                            format!(
+                                                                "Invalid level_size_multiplier: {}",
+                                                                e
+                                                            )
+                                                        })?,
+                                                    );
+                                                }
+                                                "max_level" => {
+                                                    opts.max_level =
+                                                        Some(val.parse::<usize>().map_err(
+                                                            |e| format!("Invalid max_level: {}", e),
+                                                        )?);
+                                                }
+                                                other => {
+                                                    return Err(format!(
+                                                        "Unknown locality group option: {}",
+                                                        other
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -119,7 +215,7 @@ impl LogicalPlanner {
 
                 Ok(SqlStatement::CreateTable {
                     name: table_name,
-                    schema: Schema::new(cols),
+                    schema: Schema::new_with_options(cols, locality_group_options),
                 })
             }
             Statement::Drop {

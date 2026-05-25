@@ -383,9 +383,13 @@ impl Database {
                         && groups.contains("")
                         && (path.join("manifest.bin").exists() || path.join("wal.log").exists())
                     {
+                        let mut group_opts = engine_opts;
+                        if let Some(opts) = schema.locality_group_options.get("") {
+                            group_opts = opts.apply_to(group_opts);
+                        }
                         let engine = Arc::new(StorageEngine::open_with_spawner(
                             &path,
-                            engine_opts,
+                            group_opts,
                             spawner.clone(),
                         )?);
                         engines.insert("".to_string(), engine);
@@ -393,9 +397,13 @@ impl Database {
                         // Multi-engine / new layout
                         for group in groups {
                             let g_path = Table::group_dir(&path, &group);
+                            let mut group_opts = engine_opts;
+                            if let Some(opts) = schema.locality_group_options.get(&group) {
+                                group_opts = opts.apply_to(group_opts);
+                            }
                             let engine = Arc::new(StorageEngine::open_with_spawner(
                                 &g_path,
-                                engine_opts,
+                                group_opts,
                                 spawner.clone(),
                             )?);
                             engines.insert(group, engine);
@@ -474,18 +482,26 @@ impl Database {
         let mut engines = HashMap::new();
         let groups = schema.locality_groups();
         if groups.len() <= 1 && groups.contains("") {
+            let mut group_opts = engine_opts;
+            if let Some(opts) = schema.locality_group_options.get("") {
+                group_opts = opts.apply_to(group_opts);
+            }
             let engine = Arc::new(StorageEngine::open_with_spawner(
                 &table_path,
-                engine_opts,
+                group_opts,
                 self.spawner.clone(),
             )?);
             engines.insert("".to_string(), engine);
         } else {
             for group in groups {
                 let g_path = Table::group_dir(&table_path, &group);
+                let mut group_opts = engine_opts;
+                if let Some(opts) = schema.locality_group_options.get(&group) {
+                    group_opts = opts.apply_to(group_opts);
+                }
                 let engine = Arc::new(StorageEngine::open_with_spawner(
                     &g_path,
-                    engine_opts,
+                    group_opts,
                     self.spawner.clone(),
                 )?);
                 engines.insert(group, engine);

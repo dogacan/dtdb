@@ -1132,3 +1132,77 @@ fn test_locality_groups_end_to_end() {
     assert!(lg_finance_dir.exists());
     assert!(lg_finance_dir.join("manifest.bin").exists());
 }
+
+#[test]
+fn test_locality_groups_overrides_end_to_end() {
+    let (temp_dir, db, engine) = setup_engine();
+
+    // 1. CREATE TABLE with WITH (locality_groups = '... overrides ...')
+    let tx1 = Transaction::new(1, db.clone());
+    let res = engine
+        .execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name STRING, salary INT, department STRING) WITH (locality_groups = 'lg_name:name:block_size_limit=8192,compression=uncompressed; lg_finance:salary:wal_size_limit=1048576,max_level=5')",
+            &tx1,
+        )
+        .unwrap();
+    assert!(matches!(res, ExecutionResult::CreateTable));
+    tx1.commit().unwrap();
+
+    // 2. Verify Schema columns and their options
+    {
+        let table = db.get_table("employees").unwrap();
+        assert_eq!(table.schema.columns.len(), 4);
+
+        let id_col = &table.schema.columns[0];
+        assert_eq!(id_col.name, "id");
+        assert_eq!(id_col.locality_group, None);
+
+        let name_col = &table.schema.columns[1];
+        assert_eq!(name_col.name, "name");
+        assert_eq!(name_col.locality_group.as_deref(), Some("lg_name"));
+
+        let salary_col = &table.schema.columns[2];
+        assert_eq!(salary_col.name, "salary");
+        assert_eq!(salary_col.locality_group.as_deref(), Some("lg_finance"));
+
+        // Verify the locality group options parsed in Schema
+        let lg_name_opts = table.schema.locality_group_options.get("lg_name").unwrap();
+        assert_eq!(lg_name_opts.block_size_limit, Some(8192));
+        assert_eq!(
+            lg_name_opts.compression,
+            Some(dtdb_storage::CompressionType::Uncompressed)
+        );
+
+        let lg_finance_opts = table
+            .schema
+            .locality_group_options
+            .get("lg_finance")
+            .unwrap();
+        assert_eq!(lg_finance_opts.wal_size_limit, Some(1048576));
+        assert_eq!(lg_finance_opts.max_level, Some(5));
+
+        // 3. Verify on-disk storage engine options.bin for each group
+        let table_path = temp_dir.path().join("employees");
+
+        // lg_name options.bin verification
+        let lg_name_opts_path = table_path.join("lg_lg_name").join("options.bin");
+        assert!(lg_name_opts_path.exists());
+        let lg_name_bytes = std::fs::read(&lg_name_opts_path).unwrap();
+        let lg_name_engine_opts: dtdb_storage::EngineOptions =
+            bincode::deserialize(&lg_name_bytes).unwrap();
+        assert_eq!(lg_name_engine_opts.block_size_limit, 8192);
+        assert_eq!(
+            lg_name_engine_opts.compression,
+            dtdb_storage::CompressionType::Uncompressed
+        );
+
+        // lg_finance options.bin verification
+        let lg_finance_opts_path = table_path.join("lg_lg_finance").join("options.bin");
+        assert!(lg_finance_opts_path.exists());
+        let lg_finance_bytes = std::fs::read(&lg_finance_opts_path).unwrap();
+        let lg_finance_engine_opts: dtdb_storage::EngineOptions =
+            bincode::deserialize(&lg_finance_bytes).unwrap();
+        assert_eq!(lg_finance_engine_opts.wal_size_limit, 1048576);
+        assert_eq!(lg_finance_engine_opts.max_level, 5);
+    }
+}
