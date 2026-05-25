@@ -1580,3 +1580,110 @@ fn test_sql_pass1_scalar_features() {
         panic!("Expected Select");
     }
 }
+
+#[test]
+fn test_sql_pass2_table_and_join_features() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE pass2_test (id INT PRIMARY KEY, cat STRING, price INT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO pass2_test (id, cat, price) VALUES \
+             (1, 'A', 10), \
+             (2, 'A', 20), \
+             (3, 'B', 30)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+
+    // 1. Table Aliasing and join qualification
+    let res = engine
+        .execute(
+            "SELECT t1.cat, t2.price FROM pass2_test t1 JOIN pass2_test t2 ON t1.id = t2.id ORDER BY t1.id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("A".to_string()), DbValue::Int(10)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("A".to_string()), DbValue::Int(20)]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![DbValue::String("B".to_string()), DbValue::Int(30)]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 2. CROSS JOIN
+    let res = engine
+        .execute(
+            "SELECT t1.id, t2.id FROM pass2_test t1 CROSS JOIN pass2_test t2 ORDER BY t1.id ASC, t2.id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 9); // 3 * 3 = 9
+        assert_eq!(rows[0].values, vec![DbValue::Int(1), DbValue::Int(1)]);
+        assert_eq!(rows[1].values, vec![DbValue::Int(1), DbValue::Int(2)]);
+        assert_eq!(rows[2].values, vec![DbValue::Int(1), DbValue::Int(3)]);
+        assert_eq!(rows[3].values, vec![DbValue::Int(2), DbValue::Int(1)]);
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 3. HAVING clause with aggregates not in select and in select
+    let res = engine
+        .execute(
+            "SELECT cat, SUM(price) FROM pass2_test GROUP BY cat HAVING COUNT(*) > 1",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("A".to_string()), DbValue::Float(30.0)]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+
+    let res = engine
+        .execute(
+            "SELECT cat, COUNT(*) FROM pass2_test GROUP BY cat HAVING SUM(price) > 15 ORDER BY cat ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("A".to_string()), DbValue::Int(2)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("B".to_string()), DbValue::Int(1)]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+}

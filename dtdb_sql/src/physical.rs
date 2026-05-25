@@ -451,6 +451,82 @@ impl PhysicalOperator for PhysicalHashJoin {
 }
 
 // ==========================================
+// 6.5. CrossJoin Physical Operator (Cartesian Product)
+// ==========================================
+pub struct PhysicalCrossJoin {
+    left: Box<dyn PhysicalOperator>,
+    right: Box<dyn PhysicalOperator>,
+    schema: Schema,
+    // Build phase buffer: read all right rows into memory
+    right_rows: Option<Vec<Row>>,
+    // Buffer to hold joined rows from the current probe row
+    join_buffer: Vec<Row>,
+}
+
+impl PhysicalCrossJoin {
+    pub fn new(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        schema: Schema,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            schema,
+            right_rows: None,
+            join_buffer: Vec::new(),
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalCrossJoin {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        // If there are rows buffered from the previous probe match, yield them
+        if !self.join_buffer.is_empty() {
+            return Ok(Some(self.join_buffer.remove(0)));
+        }
+
+        // Build phase: read all right rows into memory
+        if self.right_rows.is_none() {
+            let mut rows = Vec::new();
+            while let Some(row) = self.right.next()? {
+                rows.push(row);
+            }
+            self.right_rows = Some(rows);
+        }
+
+        let right_rows = self.right_rows.as_ref().unwrap();
+
+        // Probe phase: stream left rows one by one
+        while let Some(left_row) = self.left.next()? {
+            for right_row in right_rows {
+                let mut merged_values = left_row.values.clone();
+                merged_values.extend(right_row.values.clone());
+                self.join_buffer.push(Row::new(merged_values));
+            }
+
+            if !self.join_buffer.is_empty() {
+                return Ok(Some(self.join_buffer.remove(0)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        out.push_str(&format!("{}- PhysicalCrossJoin\n", "  ".repeat(indent)));
+        out.push_str(&format!("{}  left:\n", "  ".repeat(indent)));
+        self.left.explain(indent + 2, out);
+        out.push_str(&format!("{}  right:\n", "  ".repeat(indent)));
+        self.right.explain(indent + 2, out);
+    }
+}
+
+// ==========================================
 // 7. HashAggregate Physical Operator (Pipeline-Blocking)
 // ==========================================
 pub struct PhysicalHashAggregate {

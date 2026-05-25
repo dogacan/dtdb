@@ -1,9 +1,9 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{LogicalPlan, format_logical_plan};
+use crate::logical::{JoinType, LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
-    PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalIndexScan, PhysicalLimit,
-    PhysicalOperator, PhysicalProjection, PhysicalSeqScan, PhysicalSort,
+    PhysicalCrossJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalIndexScan,
+    PhysicalLimit, PhysicalOperator, PhysicalProjection, PhysicalSeqScan, PhysicalSort,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -495,21 +495,6 @@ impl SqlEngine {
                 let left_op = self.compile_physical(*left, tx, columns)?;
                 let right_op = self.compile_physical(*right, tx, columns)?;
 
-                // Extract left_on and right_on join keys from equality join condition
-                let (left_on, right_on) = match &condition {
-                    Expr::BinaryOp {
-                        left: l,
-                        op: Operator::Eq,
-                        right: r,
-                    } => (l.clone(), r.clone()),
-                    other => {
-                        return Err(format!(
-                            "Only equality join conditions supported, got {:?}",
-                            other
-                        ));
-                    }
-                };
-
                 let joined_schema = LogicalPlan::Join {
                     left: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),
@@ -526,14 +511,37 @@ impl SqlEngine {
                 }
                 .schema();
 
-                Ok(Box::new(PhysicalHashJoin::new(
-                    left_op,
-                    right_op,
-                    *left_on,
-                    *right_on,
-                    join_type,
-                    joined_schema,
-                )))
+                if join_type == JoinType::Cross {
+                    Ok(Box::new(PhysicalCrossJoin::new(
+                        left_op,
+                        right_op,
+                        joined_schema,
+                    )))
+                } else {
+                    // Extract left_on and right_on join keys from equality join condition
+                    let (left_on, right_on) = match &condition {
+                        Expr::BinaryOp {
+                            left: l,
+                            op: Operator::Eq,
+                            right: r,
+                        } => (l.clone(), r.clone()),
+                        other => {
+                            return Err(format!(
+                                "Only equality join conditions supported, got {:?}",
+                                other
+                            ));
+                        }
+                    };
+
+                    Ok(Box::new(PhysicalHashJoin::new(
+                        left_op,
+                        right_op,
+                        *left_on,
+                        *right_on,
+                        join_type,
+                        joined_schema,
+                    )))
+                }
             }
             LogicalPlan::Aggregate {
                 source,

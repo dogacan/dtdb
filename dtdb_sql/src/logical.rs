@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub enum JoinType {
     Inner,
     Left,
+    Cross,
 }
 
 /// AggregateExpr represents aggregate functions (COUNT, SUM, MIN, MAX, AVG).

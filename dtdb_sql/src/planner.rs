@@ -440,6 +440,14 @@ impl LogicalPlanner {
                     sqlparser::ast::JoinOperator::LeftOuter(
                         sqlparser::ast::JoinConstraint::On(expr),
                     ) => (plan_expr(expr)?, JoinType::Left),
+                    sqlparser::ast::JoinOperator::CrossJoin => (
+                        Expr::Literal(dtdb_storage::DbValue::Int(1)),
+                        JoinType::Cross,
+                    ),
+                    sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::None) => (
+                        Expr::Literal(dtdb_storage::DbValue::Int(1)),
+                        JoinType::Cross,
+                    ),
                     other => return Err(format!("Unsupported join type: {:?}", other)),
                 };
                 plan = LogicalPlan::Join {
@@ -460,11 +468,12 @@ impl LogicalPlanner {
             };
         }
 
-        // 4. Plan GROUP BY / aggregations
+        // 4. Plan GROUP BY / aggregations / HAVING
         let has_groupby = !select.group_by.is_empty();
         let has_aggrs = select_items_have_aggrs(&select.projection);
+        let has_having = select.having.is_some();
 
-        if has_groupby || has_aggrs {
+        if has_groupby || has_aggrs || has_having {
             // Aggregate planning
             let group_exprs = select
                 .group_by
@@ -483,37 +492,82 @@ impl LogicalPlanner {
                 }
             }
 
-            // Extract aggregates from select projection items
+            // Extract aggregates from select projection items by rewriting them
+            let mut rewritten_projection = Vec::new();
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        if let Ok(planned) = plan_expr(expr)
-                            && let Some(pos) = group_exprs.iter().position(|ge| ge == &planned)
-                        {
-                            if let SelectItem::ExprWithAlias { alias, .. } = item {
-                                field_names[pos] = alias.value.clone();
-                            }
-                            continue;
-                        }
-
-                        let alias = match item {
-                            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                            _ => expr.to_string(),
-                        };
-                        extract_aggregates(expr, &mut aggr_exprs, &mut field_names, alias)?;
+                    SelectItem::UnnamedExpr(expr) => {
+                        let mut expr_mut = expr.clone();
+                        rewrite_having_expr(&mut expr_mut, &mut aggr_exprs, &mut field_names)?;
+                        rewritten_projection.push(SelectItem::UnnamedExpr(expr_mut));
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        let mut expr_mut = expr.clone();
+                        rewrite_having_expr(&mut expr_mut, &mut aggr_exprs, &mut field_names)?;
+                        rewritten_projection.push(SelectItem::ExprWithAlias {
+                            expr: expr_mut,
+                            alias: alias.clone(),
+                        });
                     }
                     SelectItem::Wildcard(_) => {
                         return Err("Wildcards not allowed in GROUP BY / Aggregations".to_string());
                     }
-                    _ => {}
+                    _ => return Err(format!("Unsupported select item: {:?}", item)),
                 }
             }
+
+            // Extract aggregates from HAVING clause and rewrite the HAVING predicate
+            let planned_having = if let Some(having_expr) = &select.having {
+                let mut having_mut = having_expr.clone();
+                rewrite_having_expr(&mut having_mut, &mut aggr_exprs, &mut field_names)?;
+                Some(plan_expr(&having_mut)?)
+            } else {
+                None
+            };
 
             plan = LogicalPlan::Aggregate {
                 source: Box::new(plan),
                 group_by: group_exprs,
                 aggrs: aggr_exprs,
                 field_names,
+            };
+
+            // Apply HAVING filter node if present
+            if let Some(having_pred) = planned_having {
+                plan = LogicalPlan::Filter {
+                    source: Box::new(plan),
+                    predicate: having_pred,
+                };
+            }
+
+            // Place a final Projection to select only the requested projection items
+            let mut expressions = Vec::new();
+            let mut projection_field_names = Vec::new();
+
+            for item in &rewritten_projection {
+                match item {
+                    SelectItem::UnnamedExpr(expr) => {
+                        let planned_expr = plan_expr(expr)?;
+                        let name = match &planned_expr {
+                            Expr::Column(name) => name.clone(),
+                            _ => expr.to_string(),
+                        };
+                        expressions.push(planned_expr);
+                        projection_field_names.push(name);
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        let planned_expr = plan_expr(expr)?;
+                        expressions.push(planned_expr);
+                        projection_field_names.push(alias.value.clone());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            plan = LogicalPlan::Projection {
+                source: Box::new(plan),
+                expressions,
+                field_names: projection_field_names,
             };
 
             // Plan ORDER BY (Sort) for aggregate query
@@ -631,16 +685,32 @@ impl LogicalPlanner {
 
     fn plan_table_factor(&self, factor: &TableFactor) -> Result<LogicalPlan, String> {
         match factor {
-            TableFactor::Table { name, .. } => {
+            TableFactor::Table { name, alias, .. } => {
                 let name_str = name.to_string();
                 let table = self
                     .database
                     .get_table(&name_str)
                     .map_err(|e| e.to_string())?;
 
+                let qualifier = match alias {
+                    Some(a) => a.name.value.clone(),
+                    None => name_str.clone(),
+                };
+
+                let mut qualified_cols = table.schema.columns.clone();
+                for col in &mut qualified_cols {
+                    col.name = format!("{}.{}", qualifier, col.name);
+                }
+
+                let mut scan_schema = dtdb_relational::Schema::new_with_options(
+                    qualified_cols,
+                    table.schema.locality_group_options,
+                );
+                scan_schema.indexes = table.schema.indexes.clone();
+
                 Ok(LogicalPlan::Scan {
                     table_name: name_str,
-                    schema: table.schema,
+                    schema: scan_schema,
                     range: None, // Configured later by optimizer
                 })
             }
@@ -890,47 +960,80 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
     }
 }
 
-/// Extracts aggregate function calls from a select expression.
-fn extract_aggregates(
-    expr: &SqlExpr,
-    aggrs: &mut Vec<AggregateExpr>,
+fn rewrite_having_expr(
+    expr: &mut SqlExpr,
+    aggr_exprs: &mut Vec<AggregateExpr>,
     field_names: &mut Vec<String>,
-    alias: String,
 ) -> Result<(), String> {
     match expr {
         SqlExpr::Function(func) => {
             let name = func.name.to_string().to_uppercase();
-            let arg_expr = if func.args.is_empty() {
-                Expr::Literal(DbValue::Int(1))
-            } else {
-                match &func.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
-                        plan_expr(inner_expr)?
+            if matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
+                let alias = func.to_string();
+
+                let arg_expr = if func.args.is_empty() {
+                    Expr::Literal(DbValue::Int(1))
+                } else {
+                    match &func.args[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
+                            plan_expr(inner_expr)?
+                        }
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                            Expr::Literal(DbValue::Int(1))
+                        }
+                        other => return Err(format!("Unsupported function argument: {:?}", other)),
                     }
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-                        Expr::Literal(DbValue::Int(1))
-                    }
-                    other => return Err(format!("Unsupported function argument: {:?}", other)),
+                };
+
+                let aggr = match name.as_str() {
+                    "COUNT" => AggregateExpr::Count(arg_expr),
+                    "SUM" => AggregateExpr::Sum(arg_expr),
+                    "MIN" => AggregateExpr::Min(arg_expr),
+                    "MAX" => AggregateExpr::Max(arg_expr),
+                    "AVG" => AggregateExpr::Avg(arg_expr),
+                    _ => unreachable!(),
+                };
+
+                if !aggr_exprs.contains(&aggr) {
+                    aggr_exprs.push(aggr);
+                    field_names.push(alias.clone());
                 }
-            };
 
-            let aggr = match name.as_str() {
-                "COUNT" => AggregateExpr::Count(arg_expr),
-                "SUM" => AggregateExpr::Sum(arg_expr),
-                "MIN" => AggregateExpr::Min(arg_expr),
-                "MAX" => AggregateExpr::Max(arg_expr),
-                "AVG" => AggregateExpr::Avg(arg_expr),
-                other => return Err(format!("Unsupported aggregate function: {}", other)),
-            };
-
-            aggrs.push(aggr);
-            field_names.push(alias);
+                *expr = SqlExpr::Identifier(sqlparser::ast::Ident::new(alias));
+                Ok(())
+            } else {
+                for arg in &mut func.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) = arg {
+                        rewrite_having_expr(inner_expr, aggr_exprs, field_names)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            rewrite_having_expr(left, aggr_exprs, field_names)?;
+            rewrite_having_expr(right, aggr_exprs, field_names)?;
             Ok(())
         }
-        SqlExpr::Nested(inner) => extract_aggregates(inner, aggrs, field_names, alias),
-        other => Err(format!(
-            "Only aggregate function calls allowed in SELECT list when grouping: {:?}",
-            other
-        )),
+        SqlExpr::Nested(inner) => rewrite_having_expr(inner, aggr_exprs, field_names),
+        SqlExpr::UnaryOp { expr: inner, .. } => rewrite_having_expr(inner, aggr_exprs, field_names),
+        SqlExpr::Case {
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            for cond in conditions {
+                rewrite_having_expr(cond, aggr_exprs, field_names)?;
+            }
+            for res in results {
+                rewrite_having_expr(res, aggr_exprs, field_names)?;
+            }
+            if let Some(el) = else_result {
+                rewrite_having_expr(el, aggr_exprs, field_names)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }

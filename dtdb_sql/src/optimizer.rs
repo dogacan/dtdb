@@ -38,8 +38,10 @@ impl Optimizer {
                         let mut index_match = None;
                         for index in &schema.indexes {
                             if let Some(col_name) = index.columns.first()
-                                && let Some(col) =
-                                    schema.columns.iter().find(|c| c.name == *col_name)
+                                && let Some(col) = schema.columns.iter().find(|c| {
+                                    c.name == *col_name
+                                        || c.name.ends_with(&format!(".{}", col_name))
+                                })
                                 && let Some((start, end)) =
                                     extract_bounds_for_column(&predicate, &col.name, &col.data_type)
                             {

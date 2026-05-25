@@ -146,18 +146,21 @@ Queries rows from table relations.
 *   **Syntax**:
     ```sql
     SELECT <projection>
-    FROM <table_name>
-    [JOIN | LEFT JOIN <other_table> ON <join_condition>]
+    FROM <table_name> [AS <alias>]
+    [JOIN | LEFT JOIN | CROSS JOIN <other_table> [AS <alias>] [ON <join_condition>]]
     [WHERE <predicate>]
     [GROUP BY <group_by_columns>]
+    [HAVING <having_predicate>]
     [ORDER BY <sort_columns>]
     [LIMIT <number>] [OFFSET <number>];
     ```
 *   **Clauses Detail**:
+    *   **Table Aliasing**: Supports table aliasing using `[AS] <alias>`. Qualified columns can use the table name or the alias prefix (e.g., `t.name` when using `FROM users AS t`). This also allows self-joins on the same table.
     *   **Projection**: Supports columns, expressions, aliases (`col AS alias`), aggregate functions, and wildcard (`*`).
-    *   **JOIN**: Supports inner and left outer equality joins (e.g. `ON t1.id = t2.user_id` or `LEFT JOIN ... ON ...`). Non-equality joins or right/full outer joins are not supported. Unmatched left rows are padded with type-default values for the right-side columns.
+    *   **JOIN**: Supports inner, left outer equality joins (e.g., `ON t1.id = t2.user_id` or `LEFT JOIN ... ON ...`), and cross joins (`CROSS JOIN` or inner join without `ON`). Non-equality joins (except cross join) or right/full outer joins are not supported. Unmatched left rows in left joins are padded with type-default values for the right-side columns.
     *   **WHERE**: Filters source tuples using comparison and logical operators.
     *   **GROUP BY**: Groups rows by one or more columns for aggregation. When grouping, non-aggregate expressions in the select list are restricted to grouping columns.
+    *   **HAVING**: Filters grouped tuples after aggregation. Supports predicates referencing aggregate functions (e.g., `HAVING COUNT(*) > 5`).
     *   **ORDER BY**: Orders results by one or more expressions in ascending (`ASC`, default) or descending (`DESC`) order. You can sort by columns that are not projected in the select list.
     *   **LIMIT**: Restricts the maximum number of rows returned. Optional `OFFSET` skips a specified number of rows before returning results.
 *   **Examples**:
@@ -165,14 +168,18 @@ Queries rows from table relations.
     -- Simple select with sorting and limit
     SELECT name, score FROM Users WHERE score > 90.0 ORDER BY score DESC LIMIT 10;
     
-    -- Inner Join
-    SELECT Users.name, Orders.amount 
-    FROM Users JOIN Orders ON Users.id = Orders.user_id;
+    -- Inner Join with Table Aliasing
+    SELECT u.name, o.amount 
+    FROM Users AS u JOIN Orders AS o ON u.id = o.user_id;
     
-    -- Grouped Aggregation
+    -- Cross Join
+    SELECT u.name, p.name FROM Users u CROSS JOIN Products p;
+    
+    -- Grouped Aggregation with HAVING
     SELECT country, COUNT(*), MAX(score) 
     FROM Users 
-    GROUP BY country;
+    GROUP BY country
+    HAVING COUNT(*) > 2 AND MAX(score) >= 80.0;
     ```
 
 #### `EXPLAIN`
