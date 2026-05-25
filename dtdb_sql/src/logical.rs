@@ -398,5 +398,6 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
                 _ => DataType::String, // Fallback
             }
         }
+        Expr::Not(_) | Expr::IsNull(_) | Expr::InList { .. } => DataType::Int,
     }
 }

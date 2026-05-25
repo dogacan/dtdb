@@ -41,6 +41,12 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    Not(Box<Expr>),
+    IsNull(Box<Expr>),
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+    },
 }
 
 impl Expr {
@@ -79,6 +85,18 @@ impl Expr {
                     arg.collect_columns(columns);
                 }
             }
+            Expr::Not(inner) => {
+                inner.collect_columns(columns);
+            }
+            Expr::IsNull(inner) => {
+                inner.collect_columns(columns);
+            }
+            Expr::InList { expr, list } => {
+                expr.collect_columns(columns);
+                for item in list {
+                    item.collect_columns(columns);
+                }
+            }
         }
     }
 
@@ -108,6 +126,43 @@ impl Expr {
                 row.get_by_index(idx)
                     .cloned()
                     .ok_or_else(|| format!("Index {} out of bounds for row values", idx))
+            }
+            Expr::Not(inner) => {
+                let val = inner.eval(row, schema)?;
+                if matches!(val, DbValue::Null) {
+                    Ok(DbValue::Null)
+                } else {
+                    let b = to_bool(&val)?;
+                    Ok(DbValue::Int(if b { 0 } else { 1 }))
+                }
+            }
+            Expr::IsNull(inner) => {
+                let val = inner.eval(row, schema)?;
+                Ok(DbValue::Int(if matches!(val, DbValue::Null) {
+                    1
+                } else {
+                    0
+                }))
+            }
+            Expr::InList { expr, list } => {
+                let val = expr.eval(row, schema)?;
+                if matches!(val, DbValue::Null) {
+                    return Ok(DbValue::Null);
+                }
+                let mut has_null = false;
+                for item in list {
+                    let item_val = item.eval(row, schema)?;
+                    if matches!(item_val, DbValue::Null) {
+                        has_null = true;
+                    } else if compare_values(&val, &item_val) == Ok(std::cmp::Ordering::Equal) {
+                        return Ok(DbValue::Int(1));
+                    }
+                }
+                if has_null {
+                    Ok(DbValue::Null)
+                } else {
+                    Ok(DbValue::Int(0))
+                }
             }
             Expr::BinaryOp { left, op, right } => {
                 let l_val = left.eval(row, schema)?;
@@ -328,6 +383,80 @@ impl Expr {
                             final_val = Some(val);
                         }
                         Ok(final_val.unwrap_or(DbValue::Null))
+                    }
+                    "UPPER" => {
+                        if args.len() != 1 {
+                            return Err(format!(
+                                "UPPER expects exactly 1 argument, got {}",
+                                args.len()
+                            ));
+                        }
+                        let val = args[0].eval(row, schema)?;
+                        if matches!(val, DbValue::Null) {
+                            return Ok(DbValue::Null);
+                        }
+                        let s = coerce_to_string(&val);
+                        Ok(DbValue::String(s.to_uppercase()))
+                    }
+                    "LOWER" => {
+                        if args.len() != 1 {
+                            return Err(format!(
+                                "LOWER expects exactly 1 argument, got {}",
+                                args.len()
+                            ));
+                        }
+                        let val = args[0].eval(row, schema)?;
+                        if matches!(val, DbValue::Null) {
+                            return Ok(DbValue::Null);
+                        }
+                        let s = coerce_to_string(&val);
+                        Ok(DbValue::String(s.to_lowercase()))
+                    }
+                    "CONCAT" => {
+                        if args.is_empty() {
+                            return Err("CONCAT expects at least 1 argument".to_string());
+                        }
+                        let mut result = String::new();
+                        for arg in args {
+                            let val = arg.eval(row, schema)?;
+                            if matches!(val, DbValue::Null) {
+                                return Ok(DbValue::Null);
+                            }
+                            result.push_str(&coerce_to_string(&val));
+                        }
+                        Ok(DbValue::String(result))
+                    }
+                    "ABS" => {
+                        if args.len() != 1 {
+                            return Err(format!(
+                                "ABS expects exactly 1 argument, got {}",
+                                args.len()
+                            ));
+                        }
+                        let val = args[0].eval(row, schema)?;
+                        match val {
+                            DbValue::Int(i) => Ok(DbValue::Int(i.abs())),
+                            DbValue::Float(f) => Ok(DbValue::Float(f.abs())),
+                            DbValue::Null => Ok(DbValue::Null),
+                            other => Err(format!("ABS expects numeric argument, got {:?}", other)),
+                        }
+                    }
+                    "ROUND" => {
+                        if args.len() != 1 {
+                            return Err(format!(
+                                "ROUND expects exactly 1 argument, got {}",
+                                args.len()
+                            ));
+                        }
+                        let val = args[0].eval(row, schema)?;
+                        match val {
+                            DbValue::Int(i) => Ok(DbValue::Int(i)),
+                            DbValue::Float(f) => Ok(DbValue::Float(f.round())),
+                            DbValue::Null => Ok(DbValue::Null),
+                            other => {
+                                Err(format!("ROUND expects numeric argument, got {:?}", other))
+                            }
+                        }
                     }
                     other => Err(format!("Unsupported scalar function: {}", other)),
                 }

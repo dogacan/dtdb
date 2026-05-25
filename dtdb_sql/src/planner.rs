@@ -691,14 +691,16 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             pattern,
             escape_char: _,
         } => {
-            if *negated {
-                return Err("NOT LIKE is not supported yet".to_string());
-            }
-            Ok(Expr::BinaryOp {
+            let like_expr = Expr::BinaryOp {
                 left: Box::new(plan_expr(expr)?),
                 op: Operator::Like,
                 right: Box::new(plan_expr(pattern)?),
-            })
+            };
+            if *negated {
+                Ok(Expr::Not(Box::new(like_expr)))
+            } else {
+                Ok(like_expr)
+            }
         }
         SqlExpr::BinaryOp { left, op, right } => {
             let my_op = match op {
@@ -736,7 +738,60 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                     }),
                 },
                 sqlparser::ast::UnaryOperator::Plus => Ok(inner),
+                sqlparser::ast::UnaryOperator::Not => Ok(Expr::Not(Box::new(inner))),
                 other => Err(format!("Unsupported unary operator: {:?}", other)),
+            }
+        }
+        SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(plan_expr(inner)?))),
+        SqlExpr::IsNotNull(inner) => Ok(Expr::Not(Box::new(Expr::IsNull(Box::new(plan_expr(
+            inner,
+        )?))))),
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let planned_expr = plan_expr(expr)?;
+            let planned_low = plan_expr(low)?;
+            let planned_high = plan_expr(high)?;
+            let between_expr = Expr::BinaryOp {
+                left: Box::new(Expr::BinaryOp {
+                    left: Box::new(planned_expr.clone()),
+                    op: Operator::GtEq,
+                    right: Box::new(planned_low),
+                }),
+                op: Operator::And,
+                right: Box::new(Expr::BinaryOp {
+                    left: Box::new(planned_expr),
+                    op: Operator::LtEq,
+                    right: Box::new(planned_high),
+                }),
+            };
+            if *negated {
+                Ok(Expr::Not(Box::new(between_expr)))
+            } else {
+                Ok(between_expr)
+            }
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let planned_expr = plan_expr(expr)?;
+            let planned_list = list
+                .iter()
+                .map(plan_expr)
+                .collect::<Result<Vec<_>, String>>()?;
+            let in_list_expr = Expr::InList {
+                expr: Box::new(planned_expr),
+                list: planned_list,
+            };
+            if *negated {
+                Ok(Expr::Not(Box::new(in_list_expr)))
+            } else {
+                Ok(in_list_expr)
             }
         }
         SqlExpr::Case {
@@ -779,7 +834,15 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             }
             if matches!(
                 name_upper.as_str(),
-                "SUBSTR" | "SUBSTRING" | "LENGTH" | "COALESCE"
+                "SUBSTR"
+                    | "SUBSTRING"
+                    | "LENGTH"
+                    | "COALESCE"
+                    | "UPPER"
+                    | "LOWER"
+                    | "CONCAT"
+                    | "ABS"
+                    | "ROUND"
             ) {
                 let mut args = Vec::new();
                 for arg in &func.args {

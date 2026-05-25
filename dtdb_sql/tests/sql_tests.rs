@@ -1449,3 +1449,134 @@ fn test_sql_secondary_indexing() {
         panic!("Expected ExecutionResult::Select");
     }
 }
+
+#[test]
+fn test_sql_pass1_scalar_features() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE pass1_test (id INT PRIMARY KEY, name STRING, val INT, factor FLOAT, category STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO pass1_test (id, name, val, factor, category) VALUES \
+             (1, 'Alice', 10, 1.5, 'Electronics'), \
+             (2, 'Bob', NULL, 2.5, NULL), \
+             (3, 'Charlie', 30, -3.2, 'Furniture')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+
+    // 1. Unary NOT
+    let res = engine
+        .execute(
+            "SELECT id FROM pass1_test WHERE NOT (id = 1) ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(2));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 2. NOT LIKE
+    let res = engine
+        .execute(
+            "SELECT id FROM pass1_test WHERE name NOT LIKE 'A%' ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(2));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 3. IS NULL & IS NOT NULL
+    let res = engine
+        .execute("SELECT id FROM pass1_test WHERE val IS NULL", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(2));
+    } else {
+        panic!("Expected Select");
+    }
+
+    let res = engine
+        .execute(
+            "SELECT id FROM pass1_test WHERE val IS NOT NULL ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 4. BETWEEN
+    let res = engine
+        .execute(
+            "SELECT id FROM pass1_test WHERE id BETWEEN 2 AND 3 ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(2));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 5. IN list
+    let res = engine
+        .execute(
+            "SELECT id FROM pass1_test WHERE name IN ('Alice', 'Charlie') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 6. Functions: UPPER, LOWER, CONCAT, ABS, ROUND
+    let res = engine
+        .execute("SELECT UPPER(name), LOWER(category), CONCAT(name, '-', category), ABS(factor), ROUND(factor) FROM pass1_test WHERE id = 3", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::String("CHARLIE".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::String("furniture".to_string()));
+        assert_eq!(
+            rows[0].values[2],
+            DbValue::String("Charlie-Furniture".to_string())
+        );
+        assert_eq!(rows[0].values[3], DbValue::Float(3.2));
+        assert_eq!(rows[0].values[4], DbValue::Float(-3.0));
+    } else {
+        panic!("Expected Select");
+    }
+}

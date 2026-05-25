@@ -218,12 +218,18 @@ Used to compare expressions:
 Used to combine boolean expressions:
 *   `AND`: Logical conjunction
 *   `OR`: Logical disjunction
+*   `NOT`: Logical negation (unary)
+
+### Null Checking & Comparison Helpers
+*   `IS NULL`: Checks if an expression evaluates to `NULL`.
+*   `IS NOT NULL`: Checks if an expression does not evaluate to `NULL`.
+*   `BETWEEN` / `NOT BETWEEN`: Checks if a value is within a range (e.g. `col BETWEEN low AND high` or `col NOT BETWEEN low AND high`).
+*   `IN` / `NOT IN`: Checks if a value equals any value in a list of expressions (e.g. `col IN (val1, val2)` or `col NOT IN (val1, val2)`).
 
 ### Pattern Matching
-*   `LIKE`: Performs simple wildcard string matching using `%`.
+*   `LIKE` / `NOT LIKE`: Performs wildcard string matching using `%`.
     *   `%`: Matches zero or more characters.
-    *   *Example*: `WHERE name LIKE 'A%'` (starts with 'A'), `WHERE name LIKE '%b%'` (contains 'b').
-    *   *Note*: `NOT LIKE` is not supported.
+    *   *Example*: `WHERE name LIKE 'A%'` (starts with 'A'), `WHERE name NOT LIKE '%b%'` (does not contain 'b').
 
 ### Arithmetic Operators
 Used for mathematical computations in select projections or predicates:
@@ -285,6 +291,26 @@ Extracts a substring starting at the 1-based index `start`.
 Returns the first non-null argument.
 *   **Behavior**: Evaluation proceeds left-to-right, returning the first argument that is not explicitly `NULL`.
 *   *Example*: `SELECT COALESCE(category, 'Uncategorized') FROM products;`
+
+#### `UPPER(<str>)`
+Returns the uppercase representation of the input value.
+*   *Example*: `SELECT UPPER(name) FROM employees;`
+
+#### `LOWER(<str>)`
+Returns the lowercase representation of the input value.
+*   *Example*: `SELECT LOWER(department) FROM employees;`
+
+#### `CONCAT(<arg1>, <arg2>, ...)`
+Concatenates all arguments coerced to string. Returns `NULL` if any argument is `NULL`.
+*   *Example*: `SELECT CONCAT(first_name, ' ', last_name) FROM users;`
+
+#### `ABS(<num>)`
+Returns the absolute value of a numeric value.
+*   *Example*: `SELECT ABS(score) FROM grades;`
+
+#### `ROUND(<num>)`
+Rounds a float value to the nearest integer. Passes integers through unchanged.
+*   *Example*: `SELECT ROUND(amount) FROM orders;`
 
 ---
 
