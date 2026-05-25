@@ -283,3 +283,61 @@ fn test_engine_compaction() {
         assert_eq!(engine.get(&k_int(2)).unwrap(), None); // Tombstone should have been discarded entirely
     }
 }
+
+#[test]
+fn test_engine_statistics() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    let options = EngineOptions {
+        compression: CompressionType::Uncompressed,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 4,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 1000,
+    };
+    let engine = StorageEngine::open(&db_path, options).unwrap();
+
+    // 1. Initially stats should be empty
+    let stats = engine.get_statistics().unwrap();
+    assert_eq!(stats.num_sstables, 0);
+    assert_eq!(stats.sstable_entries, 0);
+    assert_eq!(stats.memtable_entries, 0);
+
+    // 2. Put some keys in memtable
+    engine.put(k_int(1), v_str("one")).unwrap();
+    engine.put(k_int(2), v_str("two")).unwrap();
+    engine.delete(k_int(1)).unwrap(); // inserts a tombstone
+
+    let stats = engine.get_statistics().unwrap();
+    assert_eq!(stats.num_sstables, 0);
+    assert_eq!(stats.sstable_entries, 0);
+    assert_eq!(stats.memtable_entries, 2); // k=1 (tombstone) + k=2 (value)
+    assert_eq!(stats.memtable_tombstones, 1);
+    assert!(stats.memtable_uncompressed_bytes > 0);
+
+    // 3. Flush memtable to disk
+    engine.flush_memtable().unwrap();
+
+    let stats = engine.get_statistics().unwrap();
+    assert_eq!(stats.num_sstables, 1);
+    assert_eq!(stats.sstable_entries, 2); // k=1 (tombstone) + k=2 (value)
+    assert_eq!(stats.sstable_tombstones, 1);
+    assert!(stats.sstable_uncompressed_bytes > 0);
+    assert_eq!(stats.memtable_entries, 0);
+    assert_eq!(stats.memtable_tombstones, 0);
+
+    // 4. Compact the level - since k=1 was deleted, compaction should clean up tombstones and old versions.
+    engine.compact().unwrap();
+
+    let stats = engine.get_statistics().unwrap();
+    // After compaction, only k=2 is left. k=1 and its tombstone are completely discarded because there are no levels below.
+    assert_eq!(stats.num_sstables, 1);
+    assert_eq!(stats.sstable_entries, 1);
+    assert_eq!(stats.sstable_tombstones, 0);
+}

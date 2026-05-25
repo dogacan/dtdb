@@ -9,6 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StorageEngineStatistics {
+    pub num_sstables: usize,
+    pub total_sstable_size: u64,
+    pub sstable_entries: u64,
+    pub sstable_tombstones: u64,
+    pub sstable_uncompressed_bytes: u64,
+    pub memtable_entries: u64,
+    pub memtable_tombstones: u64,
+    pub memtable_uncompressed_bytes: u64,
+}
+
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
@@ -90,6 +102,10 @@ impl StorageEngine {
 
     pub fn compact_if_needed(&self) -> Result<()> {
         self.inner.compact_if_needed()
+    }
+
+    pub fn get_statistics(&self) -> Result<StorageEngineStatistics> {
+        self.inner.get_statistics()
     }
 }
 
@@ -552,6 +568,42 @@ impl EngineInner {
             self.compact_level(level)?;
         }
         Ok(())
+    }
+
+    pub fn get_statistics(&self) -> Result<StorageEngineStatistics> {
+        let sstables_guard = self.sstables.read().unwrap();
+        let memtable_guard = self.memtable.read().unwrap();
+
+        let mut num_sstables = 0;
+        let mut total_sstable_size = 0;
+        let mut sstable_entries = 0;
+        let mut sstable_tombstones = 0;
+        let mut sstable_uncompressed_bytes = 0;
+
+        for ssts in sstables_guard.values() {
+            for sst in ssts {
+                let reader = sst.lock().unwrap();
+                num_sstables += 1;
+                total_sstable_size += reader.file_size();
+                sstable_entries += reader.stats.num_entries;
+                sstable_tombstones += reader.stats.num_tombstones;
+                sstable_uncompressed_bytes += reader.stats.total_uncompressed_bytes;
+            }
+        }
+
+        let (memtable_entries, memtable_tombstones) = memtable_guard.entry_counts();
+        let memtable_uncompressed_bytes = memtable_guard.byte_size() as u64;
+
+        Ok(StorageEngineStatistics {
+            num_sstables,
+            total_sstable_size,
+            sstable_entries,
+            sstable_tombstones,
+            sstable_uncompressed_bytes,
+            memtable_entries: memtable_entries as u64,
+            memtable_tombstones: memtable_tombstones as u64,
+            memtable_uncompressed_bytes,
+        })
     }
 
     fn find_level_to_compact(&self) -> Option<usize> {

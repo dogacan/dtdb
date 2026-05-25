@@ -8,7 +8,7 @@ pub mod memtable;
 pub mod sstable;
 pub mod wal;
 pub use block_cache::{BlockCache, LruCache};
-pub use engine::StorageEngine;
+pub use engine::{StorageEngine, StorageEngineStatistics};
 pub use wal::WalEntry;
 
 pub trait ThreadSpawner: Send + Sync + 'static {

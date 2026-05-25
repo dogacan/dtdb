@@ -95,6 +95,14 @@ impl MemTable {
         map.clear();
     }
 
+    /// Returns the total number of entries and number of tombstones currently in the MemTable.
+    pub fn entry_counts(&self) -> (usize, usize) {
+        let map = self.map.read().unwrap();
+        let total = map.len();
+        let tombstones = map.values().filter(|v| v.is_none()).count();
+        (total, tombstones)
+    }
+
     /// Estimates the memory usage of the MemTable in bytes.
     /// Used to decide when to flush the MemTable to disk.
     pub fn byte_size(&self) -> usize {

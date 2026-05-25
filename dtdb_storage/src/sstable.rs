@@ -19,11 +19,22 @@ pub struct IndexEntry {
     pub size: u64,
 }
 
+/// StatsBlock tracks statistics for the keys and values written to this SSTable.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatsBlock {
+    pub num_entries: u64,
+    pub num_tombstones: u64,
+    pub total_uncompressed_bytes: u64,
+    pub min_key: Option<DbKey>,
+    pub max_key: Option<DbKey>,
+}
+
 /// IndexBlock represents the index block at the end of the SSTable file, including metadata.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IndexBlock {
     pub entries: Vec<IndexEntry>,
     pub compression: CompressionType,
+    pub stats: StatsBlock,
 }
 
 /// SstableWriter builds an SSTable file on disk.
@@ -40,6 +51,11 @@ pub struct SstableWriter {
     compression: CompressionType,
     final_path: std::path::PathBuf,
     temp_path: std::path::PathBuf,
+    num_entries: u64,
+    num_tombstones: u64,
+    total_uncompressed_bytes: u64,
+    min_key: Option<DbKey>,
+    max_key: Option<DbKey>,
 }
 
 impl SstableWriter {
@@ -70,6 +86,11 @@ impl SstableWriter {
             compression,
             final_path,
             temp_path,
+            num_entries: 0,
+            num_tombstones: 0,
+            total_uncompressed_bytes: 0,
+            min_key: None,
+            max_key: None,
         })
     }
 
@@ -87,6 +108,17 @@ impl SstableWriter {
             Some(DbValue::Bool(_)) => 1,
             None => 1,
         };
+
+        // Update stats
+        self.num_entries += 1;
+        if value.is_none() {
+            self.num_tombstones += 1;
+        }
+        self.total_uncompressed_bytes += (key_sz + val_sz) as u64;
+        if self.min_key.is_none() {
+            self.min_key = Some(key.clone());
+        }
+        self.max_key = Some(key.clone());
 
         if self.current_block.is_empty() {
             // First key of the block becomes the index key.
@@ -159,9 +191,17 @@ impl SstableWriter {
 
         // Write Index block (uncompressed for easy parsing during recovery/startup)
         let index_offset = self.offset;
+        let stats = StatsBlock {
+            num_entries: self.num_entries,
+            num_tombstones: self.num_tombstones,
+            total_uncompressed_bytes: self.total_uncompressed_bytes,
+            min_key: self.min_key.clone(),
+            max_key: self.max_key.clone(),
+        };
         let index_block = IndexBlock {
             entries: self.index.clone(),
             compression: self.compression,
+            stats,
         };
         let index_bytes = bincode::serialize(&index_block)?;
         let index_len = index_bytes.len() as u64;
@@ -194,6 +234,7 @@ pub struct SstableReader {
     pub path: std::path::PathBuf,
     pub last_key: DbKey,
     block_cache: Option<Arc<BlockCache>>,
+    pub stats: StatsBlock,
 }
 
 impl SstableReader {
@@ -243,6 +284,13 @@ impl SstableReader {
                 IndexBlock {
                     entries,
                     compression: CompressionType::Lz4,
+                    stats: StatsBlock {
+                        num_entries: 0,
+                        num_tombstones: 0,
+                        total_uncompressed_bytes: 0,
+                        min_key: None,
+                        max_key: None,
+                    },
                 }
             }
         };
@@ -256,6 +304,7 @@ impl SstableReader {
             path: path_buf,
             last_key: DbKey::Int(0), // Temp placeholder
             block_cache,
+            stats: index_block.stats,
         };
 
         // Cache the last key of the SSTable by reading the last block
