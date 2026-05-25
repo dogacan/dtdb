@@ -329,3 +329,37 @@ fn test_repeatable_read_does_conflict_on_modified_read_key() {
         commit_res
     );
 }
+
+#[test]
+fn test_occ_commit_history_garbage_collection() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    // 1. Start a long-running transaction that will pin the min_start_version
+    let tx_long = Transaction::new(100, db.clone());
+    // Perform a read so that it gets tracked / active version starts
+    let _ = tx_long.get("users", &k_int(1)).unwrap();
+
+    // 2. Commit a series of write transactions
+    for i in 1..=5 {
+        let tx = Transaction::new(i, db.clone());
+        tx.put(
+            "users",
+            k_int(i as i64),
+            r_user(i as i64, &format!("User{}", i)),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 3. Since tx_long is still active and has start_version = 0, no history can be pruned
+    assert_eq!(db.commit_history_len(), 5);
+
+    // 4. Drop the long-running transaction. This should trigger pruning of the history
+    drop(tx_long);
+
+    // 5. The history should be pruned up to the global commit version (which is 5).
+    // The only remaining record in history should be the one with commit_version >= 5 (i.e. version 5).
+    assert_eq!(db.commit_history_len(), 1);
+}

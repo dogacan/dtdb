@@ -832,8 +832,21 @@ impl Database {
     }
 
     pub fn unregister_transaction(&self, tx_id: u64) {
-        let mut active = self.occ_active_transactions.lock().unwrap();
-        active.remove(&tx_id);
+        let min_start_version = {
+            let mut active = self.occ_active_transactions.lock().unwrap();
+            active.remove(&tx_id);
+            active.values().copied().min()
+        };
+
+        let min_version = min_start_version.unwrap_or_else(|| {
+            self.global_commit_version
+                .load(std::sync::atomic::Ordering::SeqCst)
+        });
+
+        {
+            let mut history = self.commit_history.lock().unwrap();
+            history.retain(|r| r.commit_version >= min_version);
+        }
 
         let mut access = self.active_table_access.lock().unwrap();
         for readers in access.values_mut() {
@@ -1168,5 +1181,9 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    pub fn commit_history_len(&self) -> usize {
+        self.commit_history.lock().unwrap().len()
     }
 }
