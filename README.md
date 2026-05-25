@@ -209,11 +209,30 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 
 ---
 
-## 📚 Design Decisions
+## 🌟 Features
 
-* **Optimistic Concurrency Control (OCC)**: Transactions execute concurrently on top of a multi-threaded engine, using an OCC validation phase at commit time (checking read-write, write-write, and phantom conflicts) to guarantee isolation without coarse-grained locking.
-* **Snapshot Isolation**: DuctTableDB only implements snapshot isolation. SI is a well-understood, widely-deployed isolation level (used by PostgreSQL's default READ COMMITTED + REPEATABLE READ modes, Oracle, MySQL InnoDB). It is weaker than SERIALIZABLE but stronger than READ COMMITTED. Full SERIALIZABLE transactions are not supported for now.
-* **In-Memory Sorts**: Sorting and aggregations collect row lists in-memory rather than spilling sorted runs to temporary storage.
-* **Hash Joins**: Equality joins are performed via building temporary hash tables of the left stream and probing them from the right stream.
-* **Single-Statement Query Limitation**: Standard query execution (`execute()`) strictly rejects inputs containing multiple semicolon-separated statements. To run multiple queries atomically, users are required to use the explicit transaction interface (`run_in_transaction` or the gRPC transaction stream), ensuring transaction boundaries are clear and handled safely.
-* **Locality Groups & Column Storage**: Supports grouping table columns into separate physical locality groups stored in independent LSM-tree subdirectories. To guarantee 100% correct transactional updates without complex partial-row merges or concurrency anomalies, the database reads all columns during `UPDATE` operations while optimizing read paths (`SELECT` queries) using query-level column pruning to read only the needed locality groups.
+What DuctTapeDB does well:
+
+*   **Layered, Modular Architecture**: Clean, bottom-up separation between storage (`dtdb_storage`), relation/transaction mapping (`dtdb_relational`), SQL parsing and Volcano execution (`dtdb_sql`), and embedded or gRPC APIs (`dtdb_api`).
+*   **LSM-Tree Storage Engine**: Features memtables with write-ahead logs (WAL) for durability, block-based SSTables with LZ4 compression, binary-searchable indices, and automatic background compaction.
+*   **Snapshot Isolation (SI) Transactions**: Supports atomic, isolated transactions using Optimistic Concurrency Control (OCC) validating read-write, write-write, and phantom conflicts at commit time.
+*   **Rich SQL Support**: Supports DDL (`CREATE`/`DROP` tables and indexes) and DML (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). Features joins (inner and left outer), grouping/aggregation, sorting, conditional expressions (`CASE WHEN`), scalar functions (`SUBSTR`, `LENGTH`, `COALESCE`), and pattern matching (`LIKE`).
+*   **Query Planner & Rule-Based Optimizer**: Translates SQL statements into physical Volcano operator pipelines, optimized with filter pushdown and primary key range scanning.
+*   **Locality Groups (Column Partitioning)**: Allows columns of a table to be physically partitioned and stored in separate LSM-tree subdirectories, optimizing read I/O via query column pruning.
+*   **Flexible Deployment Modes**: Supports both in-process embedded execution and client-server execution over gRPC using a unified client library.
+*   **Native Cross-Language Bindings**: Provides FFI bindings for C++ and Swift, allowing the database to be embedded directly into non-Rust ecosystems.
+
+---
+
+## ⚠️ Caveats & Constraints
+
+Areas where DuctTapeDB has design constraints or is less optimized:
+
+*   **No DDL in Transactions**: Data Definition Language (DDL) statements (such as `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`) are strictly prohibited inside transactions. They must be executed as standalone, auto-committed statements.
+*   **Single-Statement Query Interface**: Standard query execution (`execute()`) rejects multiple semicolon-separated queries. Multi-statement transactions must be initiated via the explicit transaction API (`run_in_transaction` or gRPC streaming transactions).
+*   **Coarse-Grained Locking & Serialization**: Relational and catalog operations are serialized using transaction locks to prioritize conceptual simplicity over high write throughput.
+*   **In-Memory Sorts & Aggregations**: Ordering (`ORDER BY`), sorting, hashing, and group aggregation (`GROUP BY`) operations are performed entirely in-memory. If result sets exceed available RAM, the database does not spill sorted runs to disk, potentially leading to Out-Of-Memory (OOM) errors.
+*   **OCC Conflict Aborts**: Under high write-heavy or read-write concurrent workloads, the optimistic validation phase at commit time may trigger frequent aborts, requiring clients to implement retry loops.
+*   **Equality-Only Hash Joins**: Join operations are limited to equality conditions (`ON t1.id = t2.user_id`) executed using an in-memory hash join. Non-equality joins, right/full outer joins, and parallel join execution are not supported.
+*   **No Read Pruning on Updates**: Although `SELECT` statements use locality groups to prune unnecessary columns from disk reads, `UPDATE` queries must read all columns to safely reconstruct rows before writing them back, bypassing read pruning.
+
