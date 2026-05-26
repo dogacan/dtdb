@@ -1,4 +1,6 @@
 /target
 /my_test_db
 /mytestdb*
+/artifacts
 .DS_Store
+performance_analysis.md
