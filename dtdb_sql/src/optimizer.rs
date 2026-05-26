@@ -423,7 +423,7 @@ impl Optimizer {
                 && let Some(col) = schema
                     .columns
                     .iter()
-                    .find(|c| c.name == *col_name || c.name.ends_with(&format!(".{}", col_name)))
+                    .find(|c| c.name == *col_name || dtdb_relational::schema::ends_with_dot_suffix(&c.name, col_name))
                 && let Some((start, end)) =
                     extract_bounds_for_column(predicate, &col.name, &col.data_type)
             {
@@ -461,8 +461,8 @@ impl Optimizer {
         for col in &schema.columns {
             let matches_query = query_columns.iter().any(|q_col| {
                 q_col == &col.name
-                    || q_col.ends_with(&format!(".{}", col.name))
-                    || col.name.ends_with(&format!(".{}", q_col))
+                    || dtdb_relational::schema::ends_with_dot_suffix(q_col, &col.name)
+                    || dtdb_relational::schema::ends_with_dot_suffix(&col.name, q_col)
             });
             if matches_query {
                 needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
@@ -609,15 +609,15 @@ fn get_column_comparison<'a>(
     match (left, right) {
         (Expr::Column(name, _), Expr::Literal(lit))
             if name == col_name
-                || name.ends_with(&format!(".{}", col_name))
-                || col_name.ends_with(&format!(".{}", name)) =>
+                || dtdb_relational::schema::ends_with_dot_suffix(name, col_name)
+                || dtdb_relational::schema::ends_with_dot_suffix(col_name, name) =>
         {
             Some(lit)
         }
         (Expr::Literal(lit), Expr::Column(name, _))
             if name == col_name
-                || name.ends_with(&format!(".{}", col_name))
-                || col_name.ends_with(&format!(".{}", name)) =>
+                || dtdb_relational::schema::ends_with_dot_suffix(name, col_name)
+                || dtdb_relational::schema::ends_with_dot_suffix(col_name, name) =>
         {
             Some(lit)
         }
@@ -765,8 +765,8 @@ fn cols_subset_of_schema(cols: &HashSet<String>, schema: &Schema) -> bool {
 fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
     schema.columns.iter().any(|col| {
         col.name == col_name
-            || col_name.ends_with(&format!(".{}", col.name))
-            || col.name.ends_with(&format!(".{}", col_name))
+            || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
+            || dtdb_relational::schema::ends_with_dot_suffix(&col.name, col_name)
     })
 }
 

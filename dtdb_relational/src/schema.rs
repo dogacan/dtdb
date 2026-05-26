@@ -468,3 +468,11 @@ impl Schema {
         Ok(schema)
     }
 }
+
+/// Helper to check if a string ends with a suffix preceded by a dot `.`,
+/// avoiding heap allocation from `format!(".{}", suffix)`.
+pub fn ends_with_dot_suffix(full: &str, suffix: &str) -> bool {
+    full.len() > suffix.len()
+        && full.ends_with(suffix)
+        && full.as_bytes()[full.len() - suffix.len() - 1] == b'.'
+}

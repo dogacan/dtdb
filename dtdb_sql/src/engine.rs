@@ -305,16 +305,11 @@ impl SqlEngine {
                 let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut delete_count = 0;
-                let mut keys_to_delete = Vec::new();
                 while let Some(row) = physical_op.next()? {
                     let pk_key = table
                         .schema
                         .extract_primary_key(&row)
                         .map_err(|e| e.to_string())?;
-                    keys_to_delete.push(pk_key);
-                }
-
-                for pk_key in keys_to_delete {
                     tx.delete(&table_name, pk_key).map_err(|e| e.to_string())?;
                     delete_count += 1;
                 }
@@ -351,7 +346,6 @@ impl SqlEngine {
                 let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut update_count = 0;
-                let mut updates = Vec::new();
                 while let Some(row) = physical_op.next()? {
                     let mut updated_values = row.values.clone();
                     for (col_name, expr) in &assignments {
@@ -374,16 +368,12 @@ impl SqlEngine {
                         .extract_primary_key(&updated_row)
                         .map_err(|e| e.to_string())?;
 
-                    updates.push((old_pk_key, new_pk_key, updated_row));
-                }
-
-                for (old_pk, new_pk, updated_row) in updates {
-                    if old_pk != new_pk {
-                        tx.delete(&table_name, old_pk).map_err(|e| e.to_string())?;
-                        tx.put(&table_name, new_pk, updated_row)
+                    if old_pk_key != new_pk_key {
+                        tx.delete(&table_name, old_pk_key).map_err(|e| e.to_string())?;
+                        tx.put(&table_name, new_pk_key, updated_row)
                             .map_err(|e| e.to_string())?;
                     } else {
-                        tx.put(&table_name, new_pk, updated_row)
+                        tx.put(&table_name, new_pk_key, updated_row)
                             .map_err(|e| e.to_string())?;
                     }
                     update_count += 1;
@@ -785,8 +775,8 @@ impl SqlEngine {
 fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
     schema.columns.iter().any(|col| {
         col.name == col_name
-            || col_name.ends_with(&format!(".{}", col.name))
-            || col.name.ends_with(&format!(".{}", col_name))
+            || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
+            || dtdb_relational::schema::ends_with_dot_suffix(&col.name, col_name)
     })
 }
 
