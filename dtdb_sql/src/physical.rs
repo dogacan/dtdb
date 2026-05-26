@@ -359,6 +359,7 @@ pub struct PhysicalHashJoin {
     hash_table: Option<HashMap<DbValue, Vec<Row>>>,
     // Buffer to hold joined rows from the current probe row
     join_buffer: Vec<Row>,
+    join_buffer_index: usize,
 }
 
 impl PhysicalHashJoin {
@@ -379,6 +380,7 @@ impl PhysicalHashJoin {
             schema,
             hash_table: None,
             join_buffer: Vec::new(),
+            join_buffer_index: 0,
         }
     }
 }
@@ -386,8 +388,14 @@ impl PhysicalHashJoin {
 impl PhysicalOperator for PhysicalHashJoin {
     fn next(&mut self) -> Result<Option<Row>, String> {
         // If there are rows buffered from the previous probe match, yield them
-        if !self.join_buffer.is_empty() {
-            return Ok(Some(self.join_buffer.remove(0)));
+        if self.join_buffer_index < self.join_buffer.len() {
+            let row = self.join_buffer[self.join_buffer_index].clone();
+            self.join_buffer_index += 1;
+            if self.join_buffer_index >= self.join_buffer.len() {
+                self.join_buffer.clear();
+                self.join_buffer_index = 0;
+            }
+            return Ok(Some(row));
         }
 
         // Build phase: read all right rows into the hash table
@@ -436,8 +444,14 @@ impl PhysicalOperator for PhysicalHashJoin {
                 self.join_buffer.push(Row::new(merged_values));
             }
 
-            if !self.join_buffer.is_empty() {
-                return Ok(Some(self.join_buffer.remove(0)));
+            if self.join_buffer_index < self.join_buffer.len() {
+                let row = self.join_buffer[self.join_buffer_index].clone();
+                self.join_buffer_index += 1;
+                if self.join_buffer_index >= self.join_buffer.len() {
+                    self.join_buffer.clear();
+                    self.join_buffer_index = 0;
+                }
+                return Ok(Some(row));
             }
         }
 
@@ -472,8 +486,8 @@ pub struct PhysicalCrossJoin {
     schema: Schema,
     // Build phase buffer: read all right rows into memory
     right_rows: Option<Vec<Row>>,
-    // Buffer to hold joined rows from the current probe row
-    join_buffer: Vec<Row>,
+    current_left_row: Option<Row>,
+    right_index: usize,
 }
 
 impl PhysicalCrossJoin {
@@ -487,18 +501,14 @@ impl PhysicalCrossJoin {
             right,
             schema,
             right_rows: None,
-            join_buffer: Vec::new(),
+            current_left_row: None,
+            right_index: 0,
         }
     }
 }
 
 impl PhysicalOperator for PhysicalCrossJoin {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        // If there are rows buffered from the previous probe match, yield them
-        if !self.join_buffer.is_empty() {
-            return Ok(Some(self.join_buffer.remove(0)));
-        }
-
         // Build phase: read all right rows into memory
         if self.right_rows.is_none() {
             let mut rows = Vec::new();
@@ -509,21 +519,31 @@ impl PhysicalOperator for PhysicalCrossJoin {
         }
 
         let right_rows = self.right_rows.as_ref().unwrap();
-
-        // Probe phase: stream left rows one by one
-        while let Some(left_row) = self.left.next()? {
-            for right_row in right_rows {
-                let mut merged_values = left_row.values.clone();
-                merged_values.extend(right_row.values.clone());
-                self.join_buffer.push(Row::new(merged_values));
-            }
-
-            if !self.join_buffer.is_empty() {
-                return Ok(Some(self.join_buffer.remove(0)));
-            }
+        if right_rows.is_empty() {
+            return Ok(None);
         }
 
-        Ok(None)
+        loop {
+            if self.current_left_row.is_none() {
+                self.current_left_row = self.left.next()?;
+                self.right_index = 0;
+                if self.current_left_row.is_none() {
+                    return Ok(None);
+                }
+            }
+
+            let left_row = self.current_left_row.as_ref().unwrap();
+            if self.right_index < right_rows.len() {
+                let right_row = &right_rows[self.right_index];
+                self.right_index += 1;
+
+                let mut merged_values = left_row.values.clone();
+                merged_values.extend(right_row.values.clone());
+                return Ok(Some(Row::new(merged_values)));
+            } else {
+                self.current_left_row = None;
+            }
+        }
     }
 
     fn schema(&self) -> &Schema {

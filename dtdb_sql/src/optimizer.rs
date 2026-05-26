@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::LogicalPlan;
+use crate::logical::{JoinType, LogicalPlan, SetOpType};
 use dtdb_relational::{DataType, Database, Schema};
 use dtdb_storage::DbKey;
 use dtdb_storage::DbValue;
@@ -20,55 +20,281 @@ impl Optimizer {
     pub fn optimize(&self, plan: LogicalPlan) -> LogicalPlan {
         let mut query_columns = HashSet::new();
         plan.collect_columns(&mut query_columns);
-        self.optimize_node(plan, &query_columns)
+        let plan = self.push_down_predicate(plan, Vec::new(), &query_columns);
+        self.optimize_join_order(plan)
     }
 
-    fn optimize_node(&self, plan: LogicalPlan, query_columns: &HashSet<String>) -> LogicalPlan {
+    fn push_down_predicate(
+        &self,
+        plan: LogicalPlan,
+        mut conjuncts: Vec<Expr>,
+        query_columns: &HashSet<String>,
+    ) -> LogicalPlan {
         match plan {
             LogicalPlan::Filter { source, predicate } => {
-                let opt_source = self.optimize_node(*source, query_columns);
-                match opt_source {
-                    LogicalPlan::Scan {
-                        table_name,
-                        schema,
-                        range: _,
-                    } => {
-                        let best_source = self.select_best_scan_path(
-                            &table_name,
-                            &schema,
-                            &predicate,
-                            query_columns,
-                        );
-                        LogicalPlan::Filter {
-                            source: Box::new(best_source),
-                            predicate,
-                        }
+                split_conjuncts_rec(predicate, &mut conjuncts);
+                self.push_down_predicate(*source, conjuncts, query_columns)
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                join_type,
+            } => {
+                let left_schema = left.schema();
+                let right_schema = right.schema();
+                let mut left_conjuncts = Vec::new();
+                let mut right_conjuncts = Vec::new();
+                let mut remaining_conjuncts = Vec::new();
+
+                for conj in conjuncts {
+                    let cols = referenced_columns(&conj);
+                    if cols.is_empty() {
+                        remaining_conjuncts.push(conj);
+                    } else if cols_subset_of_schema(&cols, &left_schema) {
+                        left_conjuncts.push(conj);
+                    } else if cols_subset_of_schema(&cols, &right_schema)
+                        && (join_type == JoinType::Inner || join_type == JoinType::Cross)
+                    {
+                        right_conjuncts.push(conj);
+                    } else {
+                        remaining_conjuncts.push(conj);
                     }
-                    other => LogicalPlan::Filter {
-                        source: Box::new(other),
-                        predicate,
-                    },
+                }
+
+                let opt_left = self.push_down_predicate(*left, left_conjuncts, query_columns);
+                let opt_right = self.push_down_predicate(*right, right_conjuncts, query_columns);
+
+                let join_node = LogicalPlan::Join {
+                    left: Box::new(opt_left),
+                    right: Box::new(opt_right),
+                    condition,
+                    join_type,
+                };
+
+                if let Some(pred) = combine_conjuncts(remaining_conjuncts) {
+                    LogicalPlan::Filter {
+                        source: Box::new(join_node),
+                        predicate: pred,
+                    }
+                } else {
+                    join_node
                 }
             }
             LogicalPlan::Projection {
                 source,
                 expressions,
                 field_names,
-            } => LogicalPlan::Projection {
-                source: Box::new(self.optimize_node(*source, query_columns)),
-                expressions,
+            } => {
+                let opt_source = self.push_down_predicate(*source, Vec::new(), query_columns);
+                let proj_node = LogicalPlan::Projection {
+                    source: Box::new(opt_source),
+                    expressions,
+                    field_names,
+                };
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    LogicalPlan::Filter {
+                        source: Box::new(proj_node),
+                        predicate: pred,
+                    }
+                } else {
+                    proj_node
+                }
+            }
+            LogicalPlan::Aggregate {
+                source,
+                group_by,
+                aggrs,
                 field_names,
-            },
+            } => {
+                let opt_source = self.push_down_predicate(*source, Vec::new(), query_columns);
+                let aggr_node = LogicalPlan::Aggregate {
+                    source: Box::new(opt_source),
+                    group_by,
+                    aggrs,
+                    field_names,
+                };
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    LogicalPlan::Filter {
+                        source: Box::new(aggr_node),
+                        predicate: pred,
+                    }
+                } else {
+                    aggr_node
+                }
+            }
+            LogicalPlan::Sort { source, keys } => {
+                let opt_source = self.push_down_predicate(*source, conjuncts, query_columns);
+                LogicalPlan::Sort {
+                    source: Box::new(opt_source),
+                    keys,
+                }
+            }
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => {
+                let opt_source = self.push_down_predicate(*source, Vec::new(), query_columns);
+                let limit_node = LogicalPlan::Limit {
+                    source: Box::new(opt_source),
+                    limit,
+                    offset,
+                };
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    LogicalPlan::Filter {
+                        source: Box::new(limit_node),
+                        predicate: pred,
+                    }
+                } else {
+                    limit_node
+                }
+            }
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => {
+                let opt_left = self.push_down_predicate(*left, Vec::new(), query_columns);
+                let opt_right = self.push_down_predicate(*right, Vec::new(), query_columns);
+                let setop_node = LogicalPlan::SetOp {
+                    left: Box::new(opt_left),
+                    right: Box::new(opt_right),
+                    op,
+                    all,
+                };
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    LogicalPlan::Filter {
+                        source: Box::new(setop_node),
+                        predicate: pred,
+                    }
+                } else {
+                    setop_node
+                }
+            }
+            LogicalPlan::Scan {
+                table_name,
+                schema,
+                range,
+            } => {
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    let best_source =
+                        self.select_best_scan_path(&table_name, &schema, &pred, query_columns);
+                    LogicalPlan::Filter {
+                        source: Box::new(best_source),
+                        predicate: pred,
+                    }
+                } else {
+                    LogicalPlan::Scan {
+                        table_name,
+                        schema,
+                        range,
+                    }
+                }
+            }
+            LogicalPlan::IndexScan {
+                table_name,
+                index_name,
+                schema,
+                range,
+            } => {
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    let best_source =
+                        self.select_best_scan_path(&table_name, &schema, &pred, query_columns);
+                    LogicalPlan::Filter {
+                        source: Box::new(best_source),
+                        predicate: pred,
+                    }
+                } else {
+                    LogicalPlan::IndexScan {
+                        table_name,
+                        index_name,
+                        schema,
+                        range,
+                    }
+                }
+            }
+        }
+    }
+
+    fn optimize_join_order(&self, plan: LogicalPlan) -> LogicalPlan {
+        match plan {
             LogicalPlan::Join {
                 left,
                 right,
                 condition,
                 join_type,
-            } => LogicalPlan::Join {
-                left: Box::new(self.optimize_node(*left, query_columns)),
-                right: Box::new(self.optimize_node(*right, query_columns)),
-                condition,
-                join_type,
+            } => {
+                let opt_left = self.optimize_join_order(*left);
+                let opt_right = self.optimize_join_order(*right);
+
+                if join_type == JoinType::Inner {
+                    let left_rows = self.estimate_plan_rows(&opt_left);
+                    let right_rows = self.estimate_plan_rows(&opt_right);
+
+                    if left_rows < right_rows {
+                        let original_schema = LogicalPlan::Join {
+                            left: Box::new(opt_left.clone()),
+                            right: Box::new(opt_right.clone()),
+                            condition: condition.clone(),
+                            join_type,
+                        }
+                        .schema();
+
+                        let swapped_cond = swap_join_condition(condition);
+                        let swapped_join = LogicalPlan::Join {
+                            left: Box::new(opt_right),
+                            right: Box::new(opt_left),
+                            condition: swapped_cond,
+                            join_type,
+                        };
+
+                        let expressions = original_schema
+                            .columns
+                            .iter()
+                            .map(|col| Expr::Column(col.name.clone()))
+                            .collect();
+                        let field_names = original_schema
+                            .columns
+                            .iter()
+                            .map(|col| col.name.clone())
+                            .collect();
+
+                        LogicalPlan::Projection {
+                            source: Box::new(swapped_join),
+                            expressions,
+                            field_names,
+                        }
+                    } else {
+                        LogicalPlan::Join {
+                            left: Box::new(opt_left),
+                            right: Box::new(opt_right),
+                            condition,
+                            join_type,
+                        }
+                    }
+                } else {
+                    LogicalPlan::Join {
+                        left: Box::new(opt_left),
+                        right: Box::new(opt_right),
+                        condition,
+                        join_type,
+                    }
+                }
+            }
+            LogicalPlan::Filter { source, predicate } => LogicalPlan::Filter {
+                source: Box::new(self.optimize_join_order(*source)),
+                predicate,
+            },
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                field_names,
+            } => LogicalPlan::Projection {
+                source: Box::new(self.optimize_join_order(*source)),
+                expressions,
+                field_names,
             },
             LogicalPlan::Aggregate {
                 source,
@@ -76,13 +302,13 @@ impl Optimizer {
                 aggrs,
                 field_names,
             } => LogicalPlan::Aggregate {
-                source: Box::new(self.optimize_node(*source, query_columns)),
+                source: Box::new(self.optimize_join_order(*source)),
                 group_by,
                 aggrs,
                 field_names,
             },
             LogicalPlan::Sort { source, keys } => LogicalPlan::Sort {
-                source: Box::new(self.optimize_node(*source, query_columns)),
+                source: Box::new(self.optimize_join_order(*source)),
                 keys,
             },
             LogicalPlan::Limit {
@@ -90,7 +316,7 @@ impl Optimizer {
                 limit,
                 offset,
             } => LogicalPlan::Limit {
-                source: Box::new(self.optimize_node(*source, query_columns)),
+                source: Box::new(self.optimize_join_order(*source)),
                 limit,
                 offset,
             },
@@ -100,12 +326,75 @@ impl Optimizer {
                 op,
                 all,
             } => LogicalPlan::SetOp {
-                left: Box::new(self.optimize_node(*left, query_columns)),
-                right: Box::new(self.optimize_node(*right, query_columns)),
+                left: Box::new(self.optimize_join_order(*left)),
+                right: Box::new(self.optimize_join_order(*right)),
                 op,
                 all,
             },
             other => other,
+        }
+    }
+
+    fn estimate_plan_rows(&self, plan: &LogicalPlan) -> usize {
+        match plan {
+            LogicalPlan::Scan {
+                table_name, range, ..
+            }
+            | LogicalPlan::IndexScan {
+                table_name, range, ..
+            } => {
+                let base = self
+                    .database
+                    .get_table_statistics(table_name)
+                    .map(|s| s.row_count)
+                    .unwrap_or(1000);
+                if range.is_some() {
+                    (base as f64 * 0.1) as usize
+                } else {
+                    base as usize
+                }
+            }
+            LogicalPlan::Filter { source, .. } => {
+                (self.estimate_plan_rows(source) as f64 * 0.2) as usize
+            }
+            LogicalPlan::Projection { source, .. } => self.estimate_plan_rows(source),
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
+                let left_rows = self.estimate_plan_rows(left);
+                let right_rows = self.estimate_plan_rows(right);
+                match join_type {
+                    JoinType::Inner => std::cmp::min(left_rows, right_rows),
+                    JoinType::Left => left_rows,
+                    JoinType::Cross => left_rows * right_rows,
+                }
+            }
+            LogicalPlan::Aggregate {
+                source, group_by, ..
+            } => {
+                if group_by.is_empty() {
+                    1
+                } else {
+                    (self.estimate_plan_rows(source) as f64 * 0.1) as usize
+                }
+            }
+            LogicalPlan::Sort { source, .. } | LogicalPlan::Limit { source, .. } => {
+                self.estimate_plan_rows(source)
+            }
+            LogicalPlan::SetOp {
+                left, right, op, ..
+            } => {
+                let left_rows = self.estimate_plan_rows(left);
+                let right_rows = self.estimate_plan_rows(right);
+                match op {
+                    SetOpType::Union => left_rows + right_rows,
+                    SetOpType::Intersect => std::cmp::min(left_rows, right_rows),
+                    SetOpType::Except => left_rows,
+                }
+            }
         }
     }
 
@@ -457,4 +746,62 @@ fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)
     let pk_idx = schema.primary_key_index()?;
     let pk_col = &schema.columns[pk_idx];
     extract_bounds_for_column(predicate, &pk_col.name, &pk_col.data_type)
+}
+
+fn split_conjuncts_rec(expr: Expr, conjuncts: &mut Vec<Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: Operator::And,
+            right,
+        } => {
+            split_conjuncts_rec(*left, conjuncts);
+            split_conjuncts_rec(*right, conjuncts);
+        }
+        other => conjuncts.push(other),
+    }
+}
+
+fn combine_conjuncts(mut conjuncts: Vec<Expr>) -> Option<Expr> {
+    if conjuncts.is_empty() {
+        return None;
+    }
+    let mut expr = conjuncts.remove(0);
+    for conj in conjuncts {
+        expr = Expr::BinaryOp {
+            left: Box::new(expr),
+            op: Operator::And,
+            right: Box::new(conj),
+        };
+    }
+    Some(expr)
+}
+
+fn referenced_columns(expr: &Expr) -> HashSet<String> {
+    let mut cols = HashSet::new();
+    expr.collect_columns(&mut cols);
+    cols
+}
+
+fn cols_subset_of_schema(cols: &HashSet<String>, schema: &Schema) -> bool {
+    cols.iter().all(|col| schema_contains_col(schema, col))
+}
+
+fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
+    schema.columns.iter().any(|col| {
+        col.name == col_name
+            || col_name.ends_with(&format!(".{}", col.name))
+            || col.name.ends_with(&format!(".{}", col_name))
+    })
+}
+
+fn swap_join_condition(condition: Expr) -> Expr {
+    match condition {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: right,
+            op,
+            right: left,
+        },
+        other => other,
+    }
 }

@@ -559,7 +559,10 @@ impl SqlEngine {
                 )))
             }
             LogicalPlan::Filter { source, predicate } => {
-                let src_op = self.compile_physical(*source, tx, columns)?;
+                let mut predicate_cols = HashSet::new();
+                predicate.collect_columns(&mut predicate_cols);
+                let child_cols = parent_cols_union(columns, &predicate_cols);
+                let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
                 Ok(Box::new(PhysicalFilter::new(src_op, predicate)))
             }
             LogicalPlan::Projection {
@@ -567,7 +570,12 @@ impl SqlEngine {
                 expressions,
                 field_names,
             } => {
-                let src_op = self.compile_physical(*source, tx, columns)?;
+                let mut child_needed = HashSet::new();
+                for expr in &expressions {
+                    expr.collect_columns(&mut child_needed);
+                }
+                let child_cols: Vec<String> = child_needed.into_iter().collect();
+                let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
                 let proj_schema = LogicalPlan::Projection {
                     source: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),
@@ -594,7 +602,12 @@ impl SqlEngine {
                 Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
             LogicalPlan::Sort { source, keys } => {
-                let src_op = self.compile_physical(*source, tx, columns)?;
+                let mut key_cols = HashSet::new();
+                for (expr, _) in &keys {
+                    expr.collect_columns(&mut key_cols);
+                }
+                let child_cols = parent_cols_union(columns, &key_cols);
+                let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
                 Ok(Box::new(PhysicalSort::new(src_op, keys)))
             }
             LogicalPlan::Join {
@@ -603,8 +616,34 @@ impl SqlEngine {
                 condition,
                 join_type,
             } => {
-                let left_op = self.compile_physical(*left, tx, columns)?;
-                let right_op = self.compile_physical(*right, tx, columns)?;
+                let left_schema = left.schema();
+                let right_schema = right.schema();
+
+                let (left_op, right_op) = if let Some(cols) = columns {
+                    let mut cond_cols = HashSet::new();
+                    condition.collect_columns(&mut cond_cols);
+                    let all_needed: HashSet<String> =
+                        cols.iter().cloned().chain(cond_cols).collect();
+
+                    let mut left_cols = Vec::new();
+                    let mut right_cols = Vec::new();
+                    for col in &all_needed {
+                        if schema_contains_col(&left_schema, col) {
+                            left_cols.push(col.clone());
+                        }
+                        if schema_contains_col(&right_schema, col) {
+                            right_cols.push(col.clone());
+                        }
+                    }
+
+                    let l_op = self.compile_physical(*left, tx, Some(&left_cols))?;
+                    let r_op = self.compile_physical(*right, tx, Some(&right_cols))?;
+                    (l_op, r_op)
+                } else {
+                    let l_op = self.compile_physical(*left, tx, None)?;
+                    let r_op = self.compile_physical(*right, tx, None)?;
+                    (l_op, r_op)
+                };
 
                 let joined_schema = LogicalPlan::Join {
                     left: Box::new(LogicalPlan::Scan {
@@ -660,7 +699,23 @@ impl SqlEngine {
                 aggrs,
                 field_names,
             } => {
-                let src_op = self.compile_physical(*source, tx, columns)?;
+                let mut child_needed = HashSet::new();
+                for expr in &group_by {
+                    expr.collect_columns(&mut child_needed);
+                }
+                for aggr in &aggrs {
+                    match aggr {
+                        crate::logical::AggregateExpr::Count(expr)
+                        | crate::logical::AggregateExpr::Sum(expr)
+                        | crate::logical::AggregateExpr::Min(expr)
+                        | crate::logical::AggregateExpr::Max(expr)
+                        | crate::logical::AggregateExpr::Avg(expr) => {
+                            expr.collect_columns(&mut child_needed)
+                        }
+                    }
+                }
+                let child_cols: Vec<String> = child_needed.into_iter().collect();
+                let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
                 let aggr_schema = LogicalPlan::Aggregate {
                     source: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),
@@ -695,4 +750,25 @@ impl SqlEngine {
             }
         }
     }
+}
+
+fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
+    schema.columns.iter().any(|col| {
+        col.name == col_name
+            || col_name.ends_with(&format!(".{}", col.name))
+            || col.name.ends_with(&format!(".{}", col_name))
+    })
+}
+
+fn parent_cols_union(
+    parent_cols: Option<&[String]>,
+    extra_cols: &HashSet<String>,
+) -> Option<Vec<String>> {
+    parent_cols.map(|cols| {
+        let mut set: HashSet<String> = cols.iter().cloned().collect();
+        for col in extra_cols {
+            set.insert(col.clone());
+        }
+        set.into_iter().collect()
+    })
 }

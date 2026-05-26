@@ -2568,3 +2568,243 @@ fn test_cbo_locality_group_pruning_performance() {
     assert!(blocks_pruned < blocks_full);
     assert!(blocks_pruned > 0);
 }
+
+#[test]
+fn test_sql_optimizer_predicate_pushdown_through_joins() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx1)
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE orders (order_id INT PRIMARY KEY, user_id INT, amount FLOAT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')",
+            &tx2,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO orders (order_id, user_id, amount) VALUES (10, 1, 100.5), (20, 2, 250.0)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    engine.execute("ANALYZE TABLE users", &tx3).unwrap();
+    engine.execute("ANALYZE TABLE orders", &tx3).unwrap();
+    tx3.commit().unwrap();
+
+    let tx4 = Transaction::new(4, db.clone());
+
+    // 1. Verify EXPLAIN shows predicate pushed down past the Join
+    let explain_res = engine
+        .execute(
+            "EXPLAIN SELECT users.name, orders.amount \
+             FROM users JOIN orders ON users.id = orders.user_id \
+             WHERE users.id = 2 AND orders.amount > 100.0",
+            &tx4,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = explain_res {
+        let plan_text = match &rows[0].values[0] {
+            DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string plan text"),
+        };
+        println!("PLAN TEXT IS:\n{}", plan_text);
+        // The filter for users.id = 2 should be pushed below the join, selecting a range on table=users Scan.
+        // It should scan users with range=[Int(2), Int(2)].
+        assert!(
+            plan_text.contains("Scan: table=users, range=[Int(2), Int(2)]")
+                || plan_text.contains("Scan: table=users, range=[2, 2]")
+        );
+    } else {
+        panic!("Expected EXPLAIN Select output");
+    }
+
+    // 2. Verify we get correct results
+    let res = engine
+        .execute(
+            "SELECT users.name, orders.amount \
+             FROM users JOIN orders ON users.id = orders.user_id \
+             WHERE users.id = 2 AND orders.amount > 100.0",
+            &tx4,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("Bob".to_string()), DbValue::Float(250.0)]
+        );
+    } else {
+        panic!("Expected Select result");
+    }
+}
+
+#[test]
+fn test_sql_optimizer_join_order_reordering() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t1 (id INT PRIMARY KEY, name STRING)", &tx1)
+        .unwrap();
+    engine
+        .execute("CREATE TABLE t2 (id INT PRIMARY KEY, name STRING)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    // Insert 1 row into t1
+    engine
+        .execute("INSERT INTO t1 (id, name) VALUES (1, 'one')", &tx2)
+        .unwrap();
+    // Insert 3 rows into t2
+    engine
+        .execute(
+            "INSERT INTO t2 (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // Run ANALYZE to collect row count statistics
+    let tx_analyze = Transaction::new(3, db.clone());
+    engine.execute("ANALYZE TABLE t1", &tx_analyze).unwrap();
+    engine.execute("ANALYZE TABLE t2", &tx_analyze).unwrap();
+    tx_analyze.commit().unwrap();
+
+    let tx4 = Transaction::new(4, db.clone());
+
+    let stats1 = db.get_table_statistics("t1");
+    let stats2 = db.get_table_statistics("t2");
+    println!("STATS FOR T1: {:?}", stats1);
+    println!("STATS FOR T2: {:?}", stats2);
+
+    // t1 JOIN t2: left is t1 (1 row), right is t2 (3 rows).
+    // Left size (1) < Right size (3).
+    // Since left is smaller, they should swap so t2 (larger) is left, t1 (smaller) is right (build side).
+    let explain_res = engine
+        .execute(
+            "EXPLAIN SELECT t1.name, t2.name FROM t1 JOIN t2 ON t1.id = t2.id",
+            &tx4,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = explain_res {
+        let plan_text = match &rows[0].values[0] {
+            DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string plan text"),
+        };
+        println!("PLAN TEXT IS:\n{}", plan_text);
+        // Verify that the Physical Plan swaps the children so that t2 is left and t1 is right.
+        // The plan text output for PhysicalHashJoin has left: then right:
+        let optimized_part = plan_text.split("--- Physical Plan ---").nth(1).unwrap();
+        let left_idx = optimized_part.find("left:").unwrap();
+        let right_idx = optimized_part.find("right:").unwrap();
+        let left_part = &optimized_part[left_idx..right_idx];
+        let right_part = &optimized_part[right_idx..];
+
+        assert!(left_part.contains("t2.id"));
+        assert!(right_part.contains("t1.id"));
+    } else {
+        panic!("Expected EXPLAIN Select output");
+    }
+
+    // Verify correct results
+    let res = engine
+        .execute(
+            "SELECT t1.name, t2.name FROM t1 JOIN t2 ON t1.id = t2.id",
+            &tx4,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::String("one".to_string()),
+                DbValue::String("one".to_string())
+            ]
+        );
+    } else {
+        panic!("Expected Select result");
+    }
+}
+
+#[test]
+fn test_sql_cross_join_lazy_and_correctness() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t1 (id INT PRIMARY KEY, val STRING)", &tx1)
+        .unwrap();
+    engine
+        .execute("CREATE TABLE t2 (id INT PRIMARY KEY, val STRING)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute("INSERT INTO t1 (id, val) VALUES (1, 'a'), (2, 'b')", &tx2)
+        .unwrap();
+    engine
+        .execute("INSERT INTO t2 (id, val) VALUES (10, 'x'), (20, 'y')", &tx2)
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT t1.val, t2.val FROM t1 CROSS JOIN t2 ORDER BY t1.val ASC, t2.val ASC",
+            &tx3,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::String("a".to_string()),
+                DbValue::String("x".to_string())
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::String("a".to_string()),
+                DbValue::String("y".to_string())
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                DbValue::String("b".to_string()),
+                DbValue::String("x".to_string())
+            ]
+        );
+        assert_eq!(
+            rows[3].values,
+            vec![
+                DbValue::String("b".to_string()),
+                DbValue::String("y".to_string())
+            ]
+        );
+    } else {
+        panic!("Expected Select result");
+    }
+}
