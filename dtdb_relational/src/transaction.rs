@@ -34,6 +34,7 @@ impl Default for TransactionOptions {
 ///   before falling back to the underlying Layer 1 storage engine.
 /// - `rollback()` clears the write buffer.
 /// - `commit()` flushes all buffered mutations to the table storage engines.
+#[allow(clippy::type_complexity)]
 pub struct Transaction {
     pub tx_id: u64,
     database: Arc<Database>,
@@ -42,8 +43,8 @@ pub struct Transaction {
     // None represents a deletion (tombstone).
     write_buffer: Mutex<HashMap<String, HashMap<DbKey, Option<Row>>>>,
     start_version: u64,
-    read_set: Mutex<HashMap<String, HashSet<DbKey>>>,
-    scan_ranges: Mutex<HashMap<String, Vec<(DbKey, DbKey)>>>,
+    read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
+    scan_ranges: Arc<Mutex<HashMap<String, Vec<(DbKey, DbKey)>>>>,
     pub isolation_level: IsolationLevel,
 }
 
@@ -72,8 +73,8 @@ impl Transaction {
             database,
             write_buffer: Mutex::new(HashMap::new()),
             start_version,
-            read_set: Mutex::new(HashMap::new()),
-            scan_ranges: Mutex::new(HashMap::new()),
+            read_set: Arc::new(Mutex::new(HashMap::new())),
+            scan_ranges: Arc::new(Mutex::new(HashMap::new())),
             isolation_level,
         }
     }
@@ -245,6 +246,53 @@ impl Transaction {
         let results: Vec<Row> = merged.into_values().filter(|row| filter(row)).collect();
 
         Ok(results)
+    }
+
+    pub fn scan_iter(
+        &self,
+        table_name: &str,
+        start: &DbKey,
+        end: &DbKey,
+        columns: Option<&[String]>,
+    ) -> Result<TransactionScanIterator> {
+        let table = self.get_table(table_name)?;
+
+        // Track the scan range.
+        if self.isolation_level == IsolationLevel::SnapshotIsolation {
+            let mut scan_ranges = self.scan_ranges.lock().unwrap();
+            scan_ranges
+                .entry(table_name.to_string())
+                .or_default()
+                .push((start.clone(), end.clone()));
+        }
+
+        // 1. Snapshot and sort write-buffer entries in [start, end] range
+        let mut write_buffer_entries = Vec::new();
+        {
+            let buffer = self.write_buffer.lock().unwrap();
+            if let Some(table_buffer) = buffer.get(table_name) {
+                for (k, v) in table_buffer {
+                    if k >= start && k <= end {
+                        write_buffer_entries.push((k.clone(), v.clone()));
+                    }
+                }
+            }
+        }
+        write_buffer_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 2. Open table scan iterator
+        let table_iter = table.scan_iter(start, end, columns)?;
+
+        // Decision (A): Owned iterator snapshot of write buffer + Arc references for read_set.
+        // No lifetime annotations are required, which dramatically simplifies the Volcano implementation.
+        // Q2 Decision (A): per-key read-set tracking during next() iteration.
+        Ok(TransactionScanIterator::new(
+            table_iter,
+            write_buffer_entries,
+            self.read_set.clone(),
+            table_name.to_string(),
+            self.isolation_level,
+        ))
     }
 
     /// Performs an index range scan, resolving primary keys and fetching corresponding rows,
@@ -422,5 +470,95 @@ impl Transaction {
         let mut buffer = self.write_buffer.lock().unwrap();
         buffer.clear();
         Ok(())
+    }
+}
+
+pub struct TransactionScanIterator {
+    table_iter: crate::database::TableScanIterator,
+    write_buffer_entries: Vec<(DbKey, Option<Row>)>,
+    write_buffer_idx: usize,
+    seen: HashSet<DbKey>,
+    read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
+    table_name: String,
+    isolation_level: IsolationLevel,
+}
+
+impl TransactionScanIterator {
+    pub fn new(
+        table_iter: crate::database::TableScanIterator,
+        write_buffer_entries: Vec<(DbKey, Option<Row>)>,
+        read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
+        table_name: String,
+        isolation_level: IsolationLevel,
+    ) -> Self {
+        Self {
+            table_iter,
+            write_buffer_entries,
+            write_buffer_idx: 0,
+            seen: HashSet::new(),
+            read_set,
+            table_name,
+            isolation_level,
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Row>> {
+        loop {
+            let has_write = self.write_buffer_idx < self.write_buffer_entries.len();
+            let has_storage = self.table_iter.peek().is_some();
+
+            if !has_write && !has_storage {
+                return Ok(None);
+            }
+
+            let choose_write = if has_write && has_storage {
+                let write_key = &self.write_buffer_entries[self.write_buffer_idx].0;
+                let storage_key = &self.table_iter.peek().unwrap().0;
+                write_key <= storage_key
+            } else {
+                has_write
+            };
+
+            if choose_write {
+                let (k, v) = &self.write_buffer_entries[self.write_buffer_idx];
+                self.write_buffer_idx += 1;
+
+                if self.seen.insert(k.clone()) {
+                    // Q2 Decision (A): Record read-set for isolation level repeatable read / snapshot isolation
+                    if self.isolation_level == IsolationLevel::SnapshotIsolation
+                        || self.isolation_level == IsolationLevel::RepeatableRead
+                    {
+                        let mut read_set = self.read_set.lock().unwrap();
+                        read_set
+                            .entry(self.table_name.clone())
+                            .or_default()
+                            .insert(k.clone());
+                    }
+
+                    if let Some(row) = v {
+                        return Ok(Some(row.clone()));
+                    }
+                }
+            } else {
+                let (k, row) = self.table_iter.peek().unwrap().clone();
+                self.table_iter.advance()?;
+
+                if self.seen.insert(k.clone()) {
+                    // Q2 Decision (A): Record read-set
+                    if self.isolation_level == IsolationLevel::SnapshotIsolation
+                        || self.isolation_level == IsolationLevel::RepeatableRead
+                    {
+                        let mut read_set = self.read_set.lock().unwrap();
+                        read_set
+                            .entry(self.table_name.clone())
+                            .or_default()
+                            .insert(k.clone());
+                    }
+
+                    return Ok(Some(row));
+                }
+            }
+        }
     }
 }

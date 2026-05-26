@@ -533,11 +533,30 @@ impl SqlEngine {
                     None => schema.primary_key_bounds().map_err(|e| e.to_string())?,
                 };
 
-                let rows = tx
-                    .filtered_scan_projected(&table_name, &start, &end, columns, |_| true)
+                let iter = tx
+                    .scan_iter(&table_name, &start, &end, columns)
                     .map_err(|e| e.to_string())?;
 
-                Ok(Box::new(PhysicalSeqScan::new(schema, rows)))
+                struct RelationalIteratorAdapter {
+                    iter: dtdb_relational::TransactionScanIterator,
+                }
+
+                impl Iterator for RelationalIteratorAdapter {
+                    type Item = Result<Row, String>;
+
+                    fn next(&mut self) -> Option<Self::Item> {
+                        match self.iter.next() {
+                            Ok(Some(row)) => Some(Ok(row)),
+                            Ok(None) => None,
+                            Err(e) => Some(Err(e.to_string())),
+                        }
+                    }
+                }
+
+                Ok(Box::new(PhysicalSeqScan::from_iter(
+                    schema,
+                    Box::new(RelationalIteratorAdapter { iter }),
+                )))
             }
             LogicalPlan::Filter { source, predicate } => {
                 let src_op = self.compile_physical(*source, tx, columns)?;

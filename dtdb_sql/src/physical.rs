@@ -21,21 +21,28 @@ pub trait PhysicalOperator {
 // ==========================================
 pub struct PhysicalSeqScan {
     schema: Schema,
-    rows_iter: std::vec::IntoIter<Row>,
+    source: Box<dyn Iterator<Item = Result<Row, String>>>,
 }
 
 impl PhysicalSeqScan {
     pub fn new(schema: Schema, rows: Vec<Row>) -> Self {
         Self {
             schema,
-            rows_iter: rows.into_iter(),
+            source: Box::new(rows.into_iter().map(Ok)),
         }
+    }
+
+    pub fn from_iter(
+        schema: Schema,
+        source: Box<dyn Iterator<Item = Result<Row, String>>>,
+    ) -> Self {
+        Self { schema, source }
     }
 }
 
 impl PhysicalOperator for PhysicalSeqScan {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        Ok(self.rows_iter.next())
+        self.source.next().transpose()
     }
 
     fn schema(&self) -> &Schema {
@@ -56,21 +63,28 @@ impl PhysicalOperator for PhysicalSeqScan {
 // ==========================================
 pub struct PhysicalIndexScan {
     schema: Schema,
-    rows_iter: std::vec::IntoIter<Row>,
+    source: Box<dyn Iterator<Item = Result<Row, String>>>,
 }
 
 impl PhysicalIndexScan {
     pub fn new(schema: Schema, rows: Vec<Row>) -> Self {
         Self {
             schema,
-            rows_iter: rows.into_iter(),
+            source: Box::new(rows.into_iter().map(Ok)),
         }
+    }
+
+    pub fn from_iter(
+        schema: Schema,
+        source: Box<dyn Iterator<Item = Result<Row, String>>>,
+    ) -> Self {
+        Self { schema, source }
     }
 }
 
 impl PhysicalOperator for PhysicalIndexScan {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        Ok(self.rows_iter.next())
+        self.source.next().transpose()
     }
 
     fn schema(&self) -> &Schema {

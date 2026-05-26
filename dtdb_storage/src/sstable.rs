@@ -242,7 +242,7 @@ impl SstableWriter {
 /// SstableReader opens and performs lookups/scans on an SSTable file.
 pub struct SstableReader {
     file: File,
-    index: Vec<IndexEntry>,
+    pub(crate) index: Vec<IndexEntry>,
     pub compression: CompressionType,
     pub id: u64,
     pub level: usize,
@@ -395,7 +395,7 @@ impl SstableReader {
 
     /// Reads and decompresses a block by its index, utilizing the block cache if present.
     #[allow(clippy::type_complexity)]
-    fn read_block(&self, idx: usize) -> Result<Arc<Vec<(DbKey, Option<DbValue>)>>> {
+    pub(crate) fn read_block(&self, idx: usize) -> Result<Arc<Vec<(DbKey, Option<DbValue>)>>> {
         if let Some(ref cache) = self.block_cache {
             let mut cache_guard = cache.lock().unwrap();
             let key = (self.id, idx);

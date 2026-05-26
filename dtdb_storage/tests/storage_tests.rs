@@ -346,3 +346,28 @@ fn test_engine_statistics() {
     assert_eq!(stats.sstable_entries, 1);
     assert_eq!(stats.sstable_tombstones, 0);
 }
+
+#[test]
+fn test_memtable_size_tracking() {
+    let mem = MemTable::new();
+    assert_eq!(mem.byte_size(), 0);
+
+    mem.put(k_int(1), v_int(100)); // key=8 bytes, value=8 bytes. Total = 16 bytes
+    assert_eq!(mem.byte_size(), 16);
+
+    // Overwrite existing key
+    mem.put(k_int(1), v_str("hello")); // key=8 bytes, value="hello"=5 bytes. Total = 13 bytes
+    assert_eq!(mem.byte_size(), 13);
+
+    // Add another key
+    mem.put(k_str("a"), v_int(42)); // key="a"=1 byte, value=8 bytes. Total = 9 bytes. Running total = 22 bytes
+    assert_eq!(mem.byte_size(), 22);
+
+    // Delete a key
+    mem.delete(k_int(1)); // key=8 bytes, value=None(tombstone)=1 byte. Total = 9 bytes. Running total = 9 + 9 = 18 bytes
+    assert_eq!(mem.byte_size(), 18);
+
+    // Clear
+    mem.clear();
+    assert_eq!(mem.byte_size(), 0);
+}

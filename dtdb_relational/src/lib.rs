@@ -5,9 +5,10 @@ pub mod schema;
 pub mod transaction;
 
 pub use database::{
-    Database, DatabaseOptions, GroupStats, IndexStats, Table, TableStatistics, TransactionRecord,
+    Database, DatabaseOptions, GroupStats, IndexStats, Table, TableScanIterator, TableStatistics,
+    TransactionRecord,
 };
 pub use error::{RelationalError, Result};
 pub use row::Row;
 pub use schema::{Column, DataType, LocalityGroupOptions, Schema};
-pub use transaction::{IsolationLevel, Transaction, TransactionOptions};
+pub use transaction::{IsolationLevel, Transaction, TransactionOptions, TransactionScanIterator};

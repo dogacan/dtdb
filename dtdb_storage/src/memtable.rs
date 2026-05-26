@@ -1,6 +1,7 @@
 use crate::{DbKey, DbValue};
 use std::collections::BTreeMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// MemTable is an in-memory sorted write buffer.
 ///
@@ -13,6 +14,7 @@ use std::sync::RwLock;
 ///   without requiring a complex lock-free data structure for educational purposes.
 pub struct MemTable {
     map: RwLock<BTreeMap<DbKey, Option<DbValue>>>,
+    size_bytes: AtomicUsize,
 }
 
 impl Default for MemTable {
@@ -21,27 +23,77 @@ impl Default for MemTable {
     }
 }
 
+fn value_byte_size(val: &DbValue) -> usize {
+    match val {
+        DbValue::Int(_) => 8,
+        DbValue::Float(_) => 8,
+        DbValue::String(s) => s.len(),
+        DbValue::Bytes(b) => b.len(),
+        DbValue::Bool(_) => 1,
+        DbValue::Null => 1,
+    }
+}
+
+fn option_value_byte_size(val: &Option<DbValue>) -> usize {
+    match val {
+        Some(v) => value_byte_size(v),
+        None => 1, // Tombstone overhead
+    }
+}
+
 impl MemTable {
     /// Creates a new, empty MemTable.
     pub fn new() -> Self {
         Self {
             map: RwLock::new(BTreeMap::new()),
+            size_bytes: AtomicUsize::new(0),
         }
     }
 
     /// Inserts a key-value pair into the MemTable.
     pub fn put(&self, key: DbKey, value: DbValue) {
-        // `.write()` acquires exclusive write access. If another thread is reading
-        // or writing, this thread will block until the lock is released.
-        // `.unwrap()` handles the case of lock poisoning (when a thread panics while holding the lock).
+        let key_size = key.byte_size();
+        let new_val_size = value_byte_size(&value);
         let mut map = self.map.write().unwrap();
-        map.insert(key, Some(value));
+        let old = map.insert(key, Some(value));
+        match old {
+            Some(old_val) => {
+                let old_val_size = option_value_byte_size(&old_val);
+                let delta = new_val_size as isize - old_val_size as isize;
+                if delta >= 0 {
+                    self.size_bytes.fetch_add(delta as usize, Ordering::Relaxed);
+                } else {
+                    self.size_bytes
+                        .fetch_sub((-delta) as usize, Ordering::Relaxed);
+                }
+            }
+            None => {
+                self.size_bytes
+                    .fetch_add(key_size + new_val_size, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Deletes a key from the MemTable by inserting a tombstone (`None`).
     pub fn delete(&self, key: DbKey) {
+        let key_size = key.byte_size();
         let mut map = self.map.write().unwrap();
-        map.insert(key, None);
+        let old = map.insert(key, None);
+        match old {
+            Some(old_val) => {
+                let old_val_size = option_value_byte_size(&old_val);
+                let delta = 1isize - old_val_size as isize; // Tombstone overhead = 1
+                if delta >= 0 {
+                    self.size_bytes.fetch_add(delta as usize, Ordering::Relaxed);
+                } else {
+                    self.size_bytes
+                        .fetch_sub((-delta) as usize, Ordering::Relaxed);
+                }
+            }
+            None => {
+                self.size_bytes.fetch_add(key_size + 1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Fetches a value from the MemTable.
@@ -61,6 +113,14 @@ impl MemTable {
     pub fn entries(&self) -> Vec<(DbKey, Option<DbValue>)> {
         let map = self.map.read().unwrap();
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// Performs a range scan returning all entries (including tombstones) in the range.
+    pub fn scan_range_raw(&self, start: &DbKey, end: &DbKey) -> Vec<(DbKey, Option<DbValue>)> {
+        let map = self.map.read().unwrap();
+        map.range(start.clone()..=end.clone())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Performs a range scan between `start` and `end` (both inclusive) matching the filter.
@@ -93,6 +153,7 @@ impl MemTable {
     pub fn clear(&self) {
         let mut map = self.map.write().unwrap();
         map.clear();
+        self.size_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Returns the total number of entries and number of tombstones currently in the MemTable.
@@ -106,20 +167,6 @@ impl MemTable {
     /// Estimates the memory usage of the MemTable in bytes.
     /// Used to decide when to flush the MemTable to disk.
     pub fn byte_size(&self) -> usize {
-        let map = self.map.read().unwrap();
-        let mut total = 0;
-        for (key, val) in map.iter() {
-            total += key.byte_size();
-            total += match val {
-                Some(DbValue::Int(_)) => 8,
-                Some(DbValue::Float(_)) => 8,
-                Some(DbValue::String(s)) => s.len(),
-                Some(DbValue::Bytes(b)) => b.len(),
-                Some(DbValue::Bool(_)) => 1,
-                Some(DbValue::Null) => 1,
-                None => 1, // Tombstone overhead
-            };
-        }
-        total
+        self.size_bytes.load(Ordering::Relaxed)
     }
 }

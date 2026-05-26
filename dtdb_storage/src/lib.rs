@@ -6,11 +6,14 @@ pub mod bloom;
 pub mod engine;
 pub mod manifest;
 pub mod memtable;
+pub mod merge_iter;
+pub mod scan_iter;
 pub mod sstable;
 pub mod wal;
 pub use block_cache::{BlockCache, LruCache};
 pub use bloom::BloomFilter;
 pub use engine::{StorageEngine, StorageEngineStatistics};
+pub use scan_iter::ScanIterator;
 pub use wal::WalEntry;
 
 pub trait ThreadSpawner: Send + Sync + 'static {

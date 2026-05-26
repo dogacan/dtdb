@@ -2,7 +2,7 @@ use crate::manifest::Manifest;
 use crate::memtable::MemTable;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
-use crate::{DbKey, DbValue, EngineOptions, Result, ThreadSpawner};
+use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, ThreadSpawner};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,6 +107,10 @@ impl StorageEngine {
         F: Fn(&DbKey, &DbValue) -> bool,
     {
         self.inner.filtered_scan(start, end, filter)
+    }
+
+    pub fn scan_iter(&self, start: &DbKey, end: &DbKey) -> Result<ScanIterator> {
+        self.inner.scan_iter(start, end)
     }
 
     pub fn flush_memtable(&self) -> Result<()> {
@@ -472,6 +476,52 @@ impl EngineInner {
         Ok(None)
     }
 
+    pub fn scan_iter(&self, start: &DbKey, end: &DbKey) -> Result<ScanIterator> {
+        let mem = self.memtable.read().unwrap();
+        let mem_entries = mem.scan_range_raw(start, end);
+
+        let sstables_map = self.sstables.read().unwrap();
+        let mut sst_iters = Vec::new();
+        let mut next_priority = 0;
+
+        if let Some(l0_ssts) = sstables_map.get(&0) {
+            for sstable in l0_ssts.iter() {
+                if let Some(fk) = sstable.first_key() {
+                    let lk = sstable.last_key();
+                    if fk <= end && lk >= start {
+                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new(
+                            sstable.clone(),
+                            next_priority,
+                        )?);
+                    }
+                }
+                next_priority += 1;
+            }
+        }
+
+        for (level, ssts) in sstables_map.iter() {
+            if *level == 0 {
+                continue;
+            }
+            for sstable in ssts.iter() {
+                if let Some(fk) = sstable.first_key() {
+                    let lk = sstable.last_key();
+                    if fk <= end && lk >= start {
+                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new(
+                            sstable.clone(),
+                            next_priority,
+                        )?);
+                        next_priority += 1;
+                    }
+                }
+            }
+        }
+
+        // Decision (A): Owned iterator snapshots memtable range on construction.
+        // No lifetime parameters are needed, avoiding complex lifetime annotations throughout the SQL engine.
+        ScanIterator::new(mem_entries, sst_iters, end.clone())
+    }
+
     pub fn filtered_scan<F>(
         &self,
         start: &DbKey,
@@ -717,8 +767,7 @@ impl EngineInner {
             }
         }
 
-        // 2. Merge-sort all selected files (locks released)
-        let mut merged_data = BTreeMap::new();
+        // 2. Merge-sort all selected files (locks released) using streaming k-way merge iterator
         let mut l0_files_sorted = Vec::new();
         let mut other_files = Vec::new();
         for f in source_files.iter().chain(overlapping_target_files.iter()) {
@@ -731,20 +780,23 @@ impl EngineInner {
         }
         l0_files_sorted.sort_by_key(|f| f.id);
 
-        for f in other_files {
-            let reader = f;
-            let entries = reader.read_all()?;
-            for (k, v) in entries {
-                merged_data.insert(k, v);
-            }
+        let mut sources = Vec::new();
+        let l0_count = l0_files_sorted.len();
+        for (i, f) in other_files.iter().enumerate() {
+            sources.push(crate::merge_iter::SstableBlockIterator::new(
+                f.clone(),
+                l0_count + i,
+            )?);
         }
-        for f in l0_files_sorted {
-            let reader = f;
-            let entries = reader.read_all()?;
-            for (k, v) in entries {
-                merged_data.insert(k, v);
-            }
+        for (i, f) in l0_files_sorted.iter().enumerate().rev() {
+            let priority = l0_count - 1 - i;
+            sources.push(crate::merge_iter::SstableBlockIterator::new(
+                f.clone(),
+                priority,
+            )?);
         }
+
+        let mut merge_iter = crate::merge_iter::MergeIterator::new(sources)?;
 
         // 3. Write merged data to new SSTables
         let mut new_sstables = Vec::new();
@@ -753,34 +805,35 @@ impl EngineInner {
         let mut current_id = 0;
         let mut current_writer_uncompressed_bytes = 0;
 
-        for (k, v) in merged_data {
+        while let Some((k, v)) = merge_iter.next()? {
             if v.is_none() {
-                let mut exists_below = false;
-                let sstables_guard = self.sstables.read().unwrap();
-                for (level, ssts) in sstables_guard.iter() {
-                    if *level > target_level {
-                        for sst in ssts {
-                            let (fk, lk) = {
-                                let r = sst;
-                                (r.first_key().cloned(), r.last_key().clone())
-                            };
-                            if let Some(fk_val) = fk
-                                && k >= fk_val
-                                && k <= lk
-                            {
-                                let r_mut = sst;
-                                if let Ok(Some(_)) = r_mut.get(&k) {
-                                    exists_below = true;
-                                    break;
+                // Decision: To avoid expensive point lookups during compaction, we only
+                // check if any SSTable in lower levels has a key range overlapping with the tombstone.
+                // If there are no overlapping SSTables in lower levels (or if we are at max_level),
+                // the tombstone is safe to drop. This has zero I/O cost as it only uses in-memory range metadata.
+                if target_level < self.options.max_level {
+                    let mut overlaps_below = false;
+                    let sstables_guard = self.sstables.read().unwrap();
+                    for (level, ssts) in sstables_guard.iter() {
+                        if *level > target_level {
+                            for sst in ssts {
+                                if let Some(fk) = sst.first_key() {
+                                    let lk = sst.last_key();
+                                    if &k >= fk && &k <= lk {
+                                        overlaps_below = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        if overlaps_below {
+                            break;
+                        }
                     }
-                    if exists_below {
-                        break;
+                    if !overlaps_below {
+                        continue;
                     }
-                }
-                if !exists_below {
+                } else {
                     continue;
                 }
             }

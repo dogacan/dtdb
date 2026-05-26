@@ -357,6 +357,120 @@ impl Table {
 
         Ok(result)
     }
+
+    pub fn scan_iter(
+        &self,
+        start: &DbKey,
+        end: &DbKey,
+        columns: Option<&[String]>,
+    ) -> Result<TableScanIterator> {
+        let mut needed_groups = HashSet::new();
+        if let Some(cols) = columns {
+            for col_name in cols {
+                if let Some(col) = self.schema.columns.iter().find(|c| {
+                    &c.name == col_name
+                        || col_name.ends_with(&format!(".{}", c.name))
+                        || c.name.ends_with(&format!(".{}", col_name))
+                }) {
+                    needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
+                }
+            }
+            if needed_groups.is_empty() {
+                needed_groups.insert("".to_string());
+            }
+        } else {
+            for g in self.schema.locality_groups() {
+                needed_groups.insert(g);
+            }
+        }
+
+        let needed_groups_vec: Vec<String> = needed_groups.into_iter().collect();
+        let mut group_iters = HashMap::new();
+        for group in &needed_groups_vec {
+            let Some(engine) = self.engines.get(group) else {
+                continue;
+            };
+            let iter = engine.scan_iter(start, end)?;
+            group_iters.insert(group.clone(), iter);
+        }
+
+        TableScanIterator::new(self.schema.clone(), needed_groups_vec, group_iters)
+    }
+}
+
+pub struct TableScanIterator {
+    schema: Schema,
+    needed_groups: Vec<String>,
+    group_iters: HashMap<String, dtdb_storage::ScanIterator>,
+    group_peeks: HashMap<String, Option<(DbKey, DbValue)>>,
+    peeked: Option<(DbKey, Row)>,
+}
+
+impl TableScanIterator {
+    pub fn new(
+        schema: Schema,
+        needed_groups: Vec<String>,
+        mut group_iters: HashMap<String, dtdb_storage::ScanIterator>,
+    ) -> Result<Self> {
+        let mut group_peeks = HashMap::new();
+        for group in &needed_groups {
+            if let Some(iter) = group_iters.get_mut(group) {
+                let peeked = iter.next()?;
+                group_peeks.insert(group.clone(), peeked);
+            }
+        }
+        let mut it = Self {
+            schema,
+            needed_groups,
+            group_iters,
+            group_peeks,
+            peeked: None,
+        };
+        it.advance()?;
+        Ok(it)
+    }
+
+    pub fn peek(&self) -> Option<&(DbKey, Row)> {
+        self.peeked.as_ref()
+    }
+
+    pub fn advance(&mut self) -> Result<()> {
+        let mut min_key: Option<DbKey> = None;
+        for (k, _) in self.group_peeks.values().flatten() {
+            if min_key.is_none() || k < min_key.as_ref().unwrap() {
+                min_key = Some(k.clone());
+            }
+        }
+
+        let Some(k) = min_key else {
+            self.peeked = None;
+            return Ok(());
+        };
+
+        let mut row_parts = HashMap::new();
+        for group in &self.needed_groups {
+            if let Some(Some((peek_k, peek_v))) = self.group_peeks.get(group) {
+                if peek_k == &k {
+                    if let DbValue::Bytes(bytes) = peek_v {
+                        let sub_row = Row::from_bytes(bytes)?;
+                        row_parts.insert(group.clone(), Some(sub_row));
+                    } else {
+                        row_parts.insert(group.clone(), None);
+                    }
+                    let iter = self.group_iters.get_mut(group).unwrap();
+                    self.group_peeks.insert(group.clone(), iter.next()?);
+                } else {
+                    row_parts.insert(group.clone(), None);
+                }
+            } else {
+                row_parts.insert(group.clone(), None);
+            }
+        }
+
+        let merged_row = self.schema.merge_rows(&row_parts);
+        self.peeked = Some((k, merged_row));
+        Ok(())
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
