@@ -402,6 +402,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtdb_benchmark"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "dtdb_relational",
+ "dtdb_sql",
+ "dtdb_storage",
+ "tempfile",
+]
+
+[[package]]
 name = "dtdb_bindings"
 version = "0.1.0"
 dependencies = [

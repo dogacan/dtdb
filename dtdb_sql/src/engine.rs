@@ -369,7 +369,8 @@ impl SqlEngine {
                         .map_err(|e| e.to_string())?;
 
                     if old_pk_key != new_pk_key {
-                        tx.delete(&table_name, old_pk_key).map_err(|e| e.to_string())?;
+                        tx.delete(&table_name, old_pk_key)
+                            .map_err(|e| e.to_string())?;
                         tx.put(&table_name, new_pk_key, updated_row)
                             .map_err(|e| e.to_string())?;
                     } else {

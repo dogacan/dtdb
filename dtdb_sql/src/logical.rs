@@ -145,7 +145,8 @@ impl LogicalPlan {
             let dt = match expr {
                 Expr::Column(col_name, _) => {
                     let pos = source_schema.columns.iter().position(|col| {
-                        col.name == *col_name || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
+                        col.name == *col_name
+                            || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
                     });
                     if let Some(i) = pos {
                         source_schema.columns[i].data_type
@@ -177,7 +178,10 @@ impl LogicalPlan {
                 | AggregateExpr::Avg(expr) => match expr {
                     Expr::Column(col_name, _) => {
                         let pos = source_schema.columns.iter().position(|col| {
-                            col.name == *col_name || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
+                            col.name == *col_name
+                                || dtdb_relational::schema::ends_with_dot_suffix(
+                                    col_name, &col.name,
+                                )
                         });
                         if let Some(i) = pos {
                             source_schema.columns[i].data_type

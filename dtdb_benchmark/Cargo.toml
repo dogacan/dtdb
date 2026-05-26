@@ -1,0 +1,17 @@
+[package]
+name = "dtdb_benchmark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dtdb_storage = { path = "../dtdb_storage" }
+dtdb_relational = { path = "../dtdb_relational" }
+dtdb_sql = { path = "../dtdb_sql" }
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+
+[[bench]]
+name = "dml_benchmark"
+harness = false
