@@ -31,14 +31,16 @@ Bridges the gap between raw key-values and structured schemas.
 * **Relational Schema**: Columns typed as `Int`, `Float`, `String`, or `Bytes` with primary key support.
 * **Row Serialization**: Uses `bincode` to convert tabular rows into serialized bytes stored in Layer 1.
 * **Transactions**: Implements buffered, isolated writes (Read-Your-Own-Writes) that can be committed atomically or rolled back completely.
+* **Table & Index Statistics**: Tracks row count, index entry count, and key distribution details. Statistics are cached and persisted in `statistics.bin` subdirectories.
+* **Background Statistics Collector**: Spawns an asynchronous background thread configured via `analyze_frequency_ms` to periodically refresh stats under `ReadUncommitted` isolation.
 
 ### 3. Layer 3: SQL Engine (`dtdb_sql`)
 
 Parses, plans, optimizes, and executes queries.
 
-* **Dialect Parsing**: Integrates `sqlparser` to compile queries into SQL AST statements.
+* **Dialect Parsing**: Integrates `sqlparser` to compile AST statements, including the `ANALYZE TABLE` command.
 * **Logical Planner**: Converts ASTs into a relational algebra `LogicalPlan` tree.
-* **Optimizer**: Optimizes plans using rules like **Filter Pushdown** and the **Primary Key Range Scanner** (converting filters like `id >= 10 AND id <= 20` into optimized storage scan bounds).
+* **Cost-Based Optimizer (CBO)**: Replaces rule-based heuristics with a cost-based model that uses statistics to estimate physical scan costs, select the best secondary index paths, and prune locality groups.
 * **Volcano Execution Pipeline**: Compiles logical nodes into a streaming physical iterator pipeline (`next()` interface), executing joins via `PhysicalHashJoin` and groupings via `PhysicalHashAggregate`.
 * **SQL Dialect**: For more details on the dialect, data types, expressions, operators, and functions supported, see the [SQL Support Reference](docs/sql_support.md).
 
@@ -134,7 +136,10 @@ INSERT INTO users (id, name, score) VALUES
 -- Standard queries
 SELECT name FROM users WHERE score > 85.0 ORDER BY score DESC;
 
--- View execution plan
+-- Analyze table to generate statistics for CBO
+ANALYZE TABLE users;
+
+-- View cost-based execution plan
 EXPLAIN SELECT name FROM users WHERE id >= 1 AND id <= 2;
 
 -- Quit CLI
@@ -204,8 +209,9 @@ It exposes a clean, synchronous client wrapper (`dtdb::Client`) featuring an exc
 Using `EXPLAIN <query>;` displays the query transformation timeline from planning to execution:
 
 * **Logical Plan**: The raw planned relational algebra tree.
-* **Optimized Plan**: Pushes filters below projections and reduces scan bounds using the primary key index.
+* **Optimized Plan**: Pushes filters below projections and performs cost-based scan path selection (Full scan vs. PK scan vs. Secondary Index scans).
 * **Physical Plan**: The Volcano physical execution iterator pipeline.
+* **Physical Block Reads Diagnostics**: Tracks cache-miss block reads from disk via `dtdb_storage::PHYSICAL_BLOCKS_READ` to empirically measure physical I/O efficiency.
 
 ---
 
@@ -215,7 +221,8 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 * **LSM-Tree Storage Engine**: Features memtables with write-ahead logs (WAL) for durability, block-based SSTables with LZ4 compression, binary-searchable indices, and automatic background compaction.
 * **Snapshot Isolation (SI) Transactions**: Supports atomic, isolated transactions using Optimistic Concurrency Control (OCC) validating read-write, write-write, and phantom conflicts at commit time.
 * **Rich SQL Support**: Supports DDL (`CREATE`/`DROP` tables and indexes) and DML (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). Features joins (inner and left outer), grouping/aggregation, sorting, conditional expressions (`CASE WHEN`), scalar functions (`SUBSTR`, `LENGTH`, `COALESCE`), and pattern matching (`LIKE`).
-* **Query Planner & Rule-Based Optimizer**: Translates SQL statements into physical Volcano operator pipelines, optimized with filter pushdown and primary key range scanning.
+* **Cost-Based Query Optimizer (CBO)**: Evaluates scan costs using real-time database statistics (cardinality, size, and locality group division) to select the optimal index scan path and prune unneeded locality groups.
+* **SQL ANALYZE & Background Collector**: Supports the `ANALYZE TABLE <name>` SQL command to manually compute statistics, and features a background daemon thread to automatically refresh them periodically without blocking concurrent transactions.
 * **Locality Groups (Column Partitioning)**: Allows columns of a table to be physically partitioned and stored in separate LSM-tree subdirectories, optimizing read I/O via query column pruning.
 * **Flexible Deployment Modes**: Supports both in-process embedded execution and client-server execution over gRPC using a unified client library.
 * **Native Cross-Language Bindings**: Provides FFI bindings for C++ and Swift, allowing the database to be embedded directly into non-Rust ecosystems.
