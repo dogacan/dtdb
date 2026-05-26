@@ -104,25 +104,25 @@ impl Table {
         for wrapper in entries {
             match wrapper.entry {
                 WalEntry::Put { key, value } => {
-                    let full_row = match wrapper.row {
-                        Some(r) => r,
-                        None => {
-                            let bytes = match value {
-                                DbValue::Bytes(b) => b,
-                                _ => {
-                                    return Err(RelationalError::Storage(
-                                        dtdb_storage::StorageError::Corruption(
-                                            "Expected bytes for row serialization".to_string(),
-                                        ),
-                                    ));
-                                }
-                            };
-                            Row::from_bytes(&bytes)?
-                        }
-                    };
+                    let mut full_row_opt = wrapper.row;
+                    let need_full_row = self.engines.len() > 1 || !self.schema.indexes.is_empty();
+                    if need_full_row && full_row_opt.is_none() {
+                        let bytes = match &value {
+                            DbValue::Bytes(b) => b,
+                            _ => {
+                                return Err(RelationalError::Storage(
+                                    dtdb_storage::StorageError::Corruption(
+                                        "Expected bytes for row serialization".to_string(),
+                                    ),
+                                ));
+                            }
+                        };
+                        full_row_opt = Some(Row::from_bytes(bytes)?);
+                    }
 
                     // If we have indexes, perform read-before-write maintenance
                     if !self.schema.indexes.is_empty() {
+                        let full_row = full_row_opt.as_ref().unwrap();
                         let old_row_opt = old_rows.get(&key);
                         if let Some(old_row) = old_row_opt {
                             for idx in &self.schema.indexes {
@@ -182,13 +182,26 @@ impl Table {
                         }
                     }
 
-                    for (group, batch) in &mut group_batches {
-                        let sub_row = self.schema.split_row(&full_row, group);
-                        let sub_bytes = sub_row.to_bytes()?;
+                    if self.engines.len() == 1 {
+                        let (_, batch) = group_batches.iter_mut().next().unwrap();
+                        let sub_bytes = match &value {
+                            DbValue::Bytes(b) => b.clone(),
+                            _ => full_row_opt.as_ref().unwrap().to_bytes()?,
+                        };
                         batch.push(WalEntry::Put {
                             key: key.clone(),
                             value: DbValue::Bytes(sub_bytes),
                         });
+                    } else {
+                        let full_row = full_row_opt.as_ref().unwrap();
+                        for (group, batch) in &mut group_batches {
+                            let sub_row = self.schema.split_row(full_row, group);
+                            let sub_bytes = sub_row.to_bytes()?;
+                            batch.push(WalEntry::Put {
+                                key: key.clone(),
+                                value: DbValue::Bytes(sub_bytes),
+                            });
+                        }
                     }
                 }
                 WalEntry::Delete { key } => {
@@ -1097,7 +1110,7 @@ impl Database {
         tables_guard.keys().cloned().collect()
     }
 
-    fn append_record(&self, record: &TransactionRecord) -> Result<()> {
+    fn append_record(&self, record: &TransactionRecord, sync: bool) -> Result<()> {
         let mut file_guard = self.transaction_log_file.lock().unwrap();
         if let Some(ref mut file) = *file_guard {
             use std::io::Seek;
@@ -1108,7 +1121,9 @@ impl Database {
             let len = bytes.len() as u32;
             file.write_all(&len.to_le_bytes())?;
             file.write_all(&bytes)?;
-            file.sync_all()?;
+            if sync {
+                file.sync_all()?;
+            }
         }
         Ok(())
     }
@@ -1119,7 +1134,7 @@ impl Database {
             active.insert(*tx_id);
         }
         drop(active);
-        self.append_record(record)?;
+        self.append_record(record, true)?;
         Ok(())
     }
 
@@ -1136,11 +1151,10 @@ impl Database {
                 file.set_len(0)?;
                 use std::io::Seek;
                 file.seek(std::io::SeekFrom::Start(0))?;
-                file.sync_all()?;
             }
         } else {
             let record = TransactionRecord::Committed { tx_id };
-            self.append_record(&record)?;
+            self.append_record(&record, false)?;
         }
         Ok(())
     }
@@ -1732,12 +1746,11 @@ impl Database {
                 let start_bound = DbKey::Composite(min_idx_keys);
                 let end_bound = DbKey::Composite(max_idx_keys);
 
-                let index_entries =
-                    index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
-
-                let entry_count = index_entries.len() as u64;
+                let mut scan_iter = index_engine.scan_iter(&start_bound, &end_bound)?;
+                let mut entry_count = 0;
                 let mut unique_prefixes = HashSet::new();
-                for (idx_key, _) in &index_entries {
+                while let Some((idx_key, _)) = scan_iter.next()? {
+                    entry_count += 1;
                     if let DbKey::Composite(parts) = idx_key
                         && !parts.is_empty()
                     {

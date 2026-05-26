@@ -573,6 +573,7 @@ impl SqlEngine {
                 source,
                 mut expressions,
                 field_names,
+                ..
             } => {
                 let mut child_needed = HashSet::new();
                 for expr in &expressions {
@@ -583,15 +584,15 @@ impl SqlEngine {
                 for expr in &mut expressions {
                     expr.bind_columns(src_op.schema());
                 }
-                let proj_schema = LogicalPlan::Projection {
-                    source: Box::new(LogicalPlan::Scan {
+                let proj_schema = LogicalPlan::new_projection(
+                    LogicalPlan::Scan {
                         table_name: "".to_string(),
                         schema: src_op.schema().clone(),
                         range: None,
-                    }),
-                    expressions: expressions.clone(),
-                    field_names: field_names.clone(),
-                }
+                    },
+                    expressions.clone(),
+                    field_names.clone(),
+                )
                 .schema();
 
                 Ok(Box::new(PhysicalProjection::new(
@@ -625,6 +626,7 @@ impl SqlEngine {
                 right,
                 condition,
                 join_type,
+                ..
             } => {
                 let left_schema = left.schema();
                 let right_schema = right.schema();
@@ -655,20 +657,20 @@ impl SqlEngine {
                     (l_op, r_op)
                 };
 
-                let joined_schema = LogicalPlan::Join {
-                    left: Box::new(LogicalPlan::Scan {
+                let joined_schema = LogicalPlan::new_join(
+                    LogicalPlan::Scan {
                         table_name: "".to_string(),
                         schema: left_op.schema().clone(),
                         range: None,
-                    }),
-                    right: Box::new(LogicalPlan::Scan {
+                    },
+                    LogicalPlan::Scan {
                         table_name: "".to_string(),
                         schema: right_op.schema().clone(),
                         range: None,
-                    }),
-                    condition: condition.clone(),
+                    },
+                    condition.clone(),
                     join_type,
-                }
+                )
                 .schema();
 
                 if join_type == JoinType::Cross {
@@ -711,6 +713,7 @@ impl SqlEngine {
                 mut group_by,
                 mut aggrs,
                 field_names,
+                ..
             } => {
                 let mut child_needed = HashSet::new();
                 for expr in &group_by {
@@ -743,16 +746,16 @@ impl SqlEngine {
                         }
                     }
                 }
-                let aggr_schema = LogicalPlan::Aggregate {
-                    source: Box::new(LogicalPlan::Scan {
+                let aggr_schema = LogicalPlan::new_aggregate(
+                    LogicalPlan::Scan {
                         table_name: "".to_string(),
                         schema: src_op.schema().clone(),
                         range: None,
-                    }),
-                    group_by: group_by.clone(),
-                    aggrs: aggrs.clone(),
-                    field_names: field_names.clone(),
-                }
+                    },
+                    group_by.clone(),
+                    aggrs.clone(),
+                    field_names.clone(),
+                )
                 .schema();
 
                 Ok(Box::new(PhysicalHashAggregate::new(

@@ -3,7 +3,40 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-pub type BlockCache = Mutex<LruCache<(u64, usize), Arc<Vec<(DbKey, Option<DbValue>)>>>>;
+type CacheValue = Arc<Vec<(DbKey, Option<DbValue>)>>;
+
+pub struct BlockCache {
+    shards: Vec<Mutex<LruCache<(u64, usize), CacheValue>>>,
+}
+
+impl BlockCache {
+    pub fn new(capacity: usize) -> Self {
+        let num_shards = 16;
+        let shard_capacity = capacity.div_ceil(num_shards);
+        let mut shards = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shards.push(Mutex::new(LruCache::new(shard_capacity)));
+        }
+        Self { shards }
+    }
+
+    fn get_shard(&self, key: &(u64, usize)) -> usize {
+        let hash = (key.0 ^ (key.1 as u64)) as usize;
+        hash % self.shards.len()
+    }
+
+    pub fn get(&self, key: &(u64, usize)) -> Option<CacheValue> {
+        let shard_idx = self.get_shard(key);
+        let mut guard = self.shards[shard_idx].lock().unwrap();
+        guard.get(key).cloned()
+    }
+
+    pub fn insert(&self, key: (u64, usize), value: CacheValue) {
+        let shard_idx = self.get_shard(&key);
+        let mut guard = self.shards[shard_idx].lock().unwrap();
+        guard.insert(key, value);
+    }
+}
 
 pub struct LruCache<K, V> {
     map: HashMap<K, usize>,

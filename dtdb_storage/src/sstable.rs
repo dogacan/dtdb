@@ -58,7 +58,7 @@ pub struct SstableWriter {
     total_uncompressed_bytes: u64,
     min_key: Option<DbKey>,
     max_key: Option<DbKey>,
-    keys: Vec<DbKey>,
+    bloom_filter: Option<crate::bloom::BloomFilter>,
 }
 
 impl SstableWriter {
@@ -67,6 +67,7 @@ impl SstableWriter {
         path: impl AsRef<Path>,
         block_size_limit: usize,
         compression: CompressionType,
+        expected_entries: usize,
     ) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let mut temp_path = final_path.clone();
@@ -79,6 +80,12 @@ impl SstableWriter {
         }
 
         let file = File::create(&temp_path)?;
+        let bloom_filter = if expected_entries > 0 {
+            Some(crate::bloom::BloomFilter::new(expected_entries, 0.01))
+        } else {
+            None
+        };
+
         Ok(Self {
             file: Some(file),
             offset: 0,
@@ -94,13 +101,13 @@ impl SstableWriter {
             total_uncompressed_bytes: 0,
             min_key: None,
             max_key: None,
-            keys: Vec::new(),
+            bloom_filter,
         })
     }
 
     /// Appends a key-value entry (or a tombstone, if value is None) to the SSTable.
     /// Keys MUST be appended in strictly sorted order.
-    pub fn append(&mut self, key: DbKey, value: Option<DbValue>) -> Result<()> {
+    pub fn append(&mut self, key: &DbKey, value: Option<&DbValue>) -> Result<()> {
         // Simple heuristic for estimated uncompressed size in memory.
         let key_sz = key.byte_size();
         let val_sz = match &value {
@@ -114,7 +121,9 @@ impl SstableWriter {
         };
 
         // Update stats
-        self.keys.push(key.clone());
+        if let Some(ref mut filter) = self.bloom_filter {
+            filter.insert(key);
+        }
         self.num_entries += 1;
         if value.is_none() {
             self.num_tombstones += 1;
@@ -134,7 +143,7 @@ impl SstableWriter {
             });
         }
 
-        self.current_block.push((key, value));
+        self.current_block.push((key.clone(), value.cloned()));
         self.current_block_uncompressed_bytes += key_sz + val_sz;
 
         // Flush block to disk if it exceeds the limit.
@@ -203,20 +212,11 @@ impl SstableWriter {
             min_key: self.min_key.clone(),
             max_key: self.max_key.clone(),
         };
-        let bloom_filter = if !self.keys.is_empty() {
-            let mut filter = crate::bloom::BloomFilter::new(self.keys.len(), 0.01);
-            for k in &self.keys {
-                filter.insert(k);
-            }
-            Some(filter)
-        } else {
-            None
-        };
         let index_block = IndexBlock {
             entries: self.index.clone(),
             compression: self.compression,
             stats,
-            bloom_filter,
+            bloom_filter: self.bloom_filter.clone(),
         };
         let index_bytes = bincode::serialize(&index_block)?;
         let index_len = index_bytes.len() as u64;
@@ -399,10 +399,9 @@ impl SstableReader {
     #[allow(clippy::type_complexity)]
     pub(crate) fn read_block(&self, idx: usize) -> Result<Arc<Vec<(DbKey, Option<DbValue>)>>> {
         if let Some(ref cache) = self.block_cache {
-            let mut cache_guard = cache.lock().unwrap();
             let key = (self.id, idx);
-            if let Some(block) = cache_guard.get(&key) {
-                return Ok(block.clone());
+            if let Some(block) = cache.get(&key) {
+                return Ok(block);
             }
         }
 
@@ -423,9 +422,8 @@ impl SstableReader {
         let block_arc = Arc::new(block);
 
         if let Some(ref cache) = self.block_cache {
-            let mut cache_guard = cache.lock().unwrap();
             let key = (self.id, idx);
-            cache_guard.insert(key, block_arc.clone());
+            cache.insert(key, block_arc.clone());
         }
 
         Ok(block_arc)

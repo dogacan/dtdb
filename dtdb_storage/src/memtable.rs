@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///   but only a single writer. In Rust, `RwLock` ensures safe concurrent access
 ///   without requiring a complex lock-free data structure for educational purposes.
 pub struct MemTable {
-    map: RwLock<BTreeMap<DbKey, Option<DbValue>>>,
+    pub(crate) map: RwLock<BTreeMap<DbKey, Option<DbValue>>>,
     size_bytes: AtomicUsize,
 }
 
@@ -165,8 +165,20 @@ impl MemTable {
     }
 
     /// Estimates the memory usage of the MemTable in bytes.
-    /// Used to decide when to flush the MemTable to disk.
+    /// Used to decide when to decide when to flush the MemTable to disk.
     pub fn byte_size(&self) -> usize {
         self.size_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of entries in the MemTable.
+    pub fn len(&self) -> usize {
+        let map = self.map.read().unwrap();
+        map.len()
+    }
+
+    /// Returns true if the MemTable is empty.
+    pub fn is_empty(&self) -> bool {
+        let map = self.map.read().unwrap();
+        map.is_empty()
     }
 }

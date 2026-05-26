@@ -46,6 +46,7 @@ pub struct Transaction {
     read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
     scan_ranges: Arc<Mutex<HashMap<String, Vec<(DbKey, DbKey)>>>>,
     pub isolation_level: IsolationLevel,
+    accessed_tables: Mutex<HashSet<String>>,
 }
 
 impl Drop for Transaction {
@@ -76,12 +77,16 @@ impl Transaction {
             read_set: Arc::new(Mutex::new(HashMap::new())),
             scan_ranges: Arc::new(Mutex::new(HashMap::new())),
             isolation_level,
+            accessed_tables: Mutex::new(HashSet::new()),
         }
     }
 
     fn get_table(&self, table_name: &str) -> Result<Table> {
         let table = self.database.get_table(table_name)?;
-        self.database.register_table_access(table_name, self.tx_id);
+        let mut accessed = self.accessed_tables.lock().unwrap();
+        if accessed.insert(table_name.to_string()) {
+            self.database.register_table_access(table_name, self.tx_id);
+        }
         Ok(table)
     }
 
@@ -554,6 +559,7 @@ pub struct TransactionScanIterator {
     read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
     table_name: String,
     isolation_level: IsolationLevel,
+    local_read_keys: HashSet<DbKey>,
 }
 
 impl TransactionScanIterator {
@@ -572,6 +578,7 @@ impl TransactionScanIterator {
             read_set,
             table_name,
             isolation_level,
+            local_read_keys: HashSet::new(),
         }
     }
 
@@ -602,11 +609,7 @@ impl TransactionScanIterator {
                     if self.isolation_level == IsolationLevel::SnapshotIsolation
                         || self.isolation_level == IsolationLevel::RepeatableRead
                     {
-                        let mut read_set = self.read_set.lock().unwrap();
-                        read_set
-                            .entry(self.table_name.clone())
-                            .or_default()
-                            .insert(k.clone());
+                        self.local_read_keys.insert(k.clone());
                     }
 
                     if let Some(row) = v {
@@ -622,15 +625,23 @@ impl TransactionScanIterator {
                     if self.isolation_level == IsolationLevel::SnapshotIsolation
                         || self.isolation_level == IsolationLevel::RepeatableRead
                     {
-                        let mut read_set = self.read_set.lock().unwrap();
-                        read_set
-                            .entry(self.table_name.clone())
-                            .or_default()
-                            .insert(k.clone());
+                        self.local_read_keys.insert(k.clone());
                     }
 
                     return Ok(Some(row));
                 }
+            }
+        }
+    }
+}
+
+impl Drop for TransactionScanIterator {
+    fn drop(&mut self) {
+        if !self.local_read_keys.is_empty() {
+            let mut read_set = self.read_set.lock().unwrap();
+            let entry = read_set.entry(self.table_name.clone()).or_default();
+            for key in self.local_read_keys.drain() {
+                entry.insert(key);
             }
         }
     }

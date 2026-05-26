@@ -40,6 +40,7 @@ impl Optimizer {
                 right,
                 condition,
                 join_type,
+                ..
             } => {
                 let left_schema = left.schema();
                 let right_schema = right.schema();
@@ -65,12 +66,7 @@ impl Optimizer {
                 let opt_left = self.push_down_predicate(*left, left_conjuncts, query_columns);
                 let opt_right = self.push_down_predicate(*right, right_conjuncts, query_columns);
 
-                let join_node = LogicalPlan::Join {
-                    left: Box::new(opt_left),
-                    right: Box::new(opt_right),
-                    condition,
-                    join_type,
-                };
+                let join_node = LogicalPlan::new_join(opt_left, opt_right, condition, join_type);
 
                 if let Some(pred) = combine_conjuncts(remaining_conjuncts) {
                     LogicalPlan::Filter {
@@ -85,13 +81,10 @@ impl Optimizer {
                 source,
                 expressions,
                 field_names,
+                ..
             } => {
                 let opt_source = self.push_down_predicate(*source, Vec::new(), query_columns);
-                let proj_node = LogicalPlan::Projection {
-                    source: Box::new(opt_source),
-                    expressions,
-                    field_names,
-                };
+                let proj_node = LogicalPlan::new_projection(opt_source, expressions, field_names);
                 if let Some(pred) = combine_conjuncts(conjuncts) {
                     LogicalPlan::Filter {
                         source: Box::new(proj_node),
@@ -106,14 +99,11 @@ impl Optimizer {
                 group_by,
                 aggrs,
                 field_names,
+                ..
             } => {
                 let opt_source = self.push_down_predicate(*source, Vec::new(), query_columns);
-                let aggr_node = LogicalPlan::Aggregate {
-                    source: Box::new(opt_source),
-                    group_by,
-                    aggrs,
-                    field_names,
-                };
+                let aggr_node =
+                    LogicalPlan::new_aggregate(opt_source, group_by, aggrs, field_names);
                 if let Some(pred) = combine_conjuncts(conjuncts) {
                     LogicalPlan::Filter {
                         source: Box::new(aggr_node),
@@ -225,6 +215,7 @@ impl Optimizer {
                 right,
                 condition,
                 join_type,
+                ..
             } => {
                 let opt_left = self.optimize_join_order(*left);
                 let opt_right = self.optimize_join_order(*right);
@@ -234,21 +225,17 @@ impl Optimizer {
                     let right_rows = self.estimate_plan_rows(&opt_right);
 
                     if left_rows < right_rows {
-                        let original_schema = LogicalPlan::Join {
-                            left: Box::new(opt_left.clone()),
-                            right: Box::new(opt_right.clone()),
-                            condition: condition.clone(),
+                        let original_schema = LogicalPlan::new_join(
+                            opt_left.clone(),
+                            opt_right.clone(),
+                            condition.clone(),
                             join_type,
-                        }
+                        )
                         .schema();
 
                         let swapped_cond = swap_join_condition(condition);
-                        let swapped_join = LogicalPlan::Join {
-                            left: Box::new(opt_right),
-                            right: Box::new(opt_left),
-                            condition: swapped_cond,
-                            join_type,
-                        };
+                        let swapped_join =
+                            LogicalPlan::new_join(opt_right, opt_left, swapped_cond, join_type);
 
                         let expressions = original_schema
                             .columns
@@ -261,26 +248,12 @@ impl Optimizer {
                             .map(|col| col.name.clone())
                             .collect();
 
-                        LogicalPlan::Projection {
-                            source: Box::new(swapped_join),
-                            expressions,
-                            field_names,
-                        }
+                        LogicalPlan::new_projection(swapped_join, expressions, field_names)
                     } else {
-                        LogicalPlan::Join {
-                            left: Box::new(opt_left),
-                            right: Box::new(opt_right),
-                            condition,
-                            join_type,
-                        }
+                        LogicalPlan::new_join(opt_left, opt_right, condition, join_type)
                     }
                 } else {
-                    LogicalPlan::Join {
-                        left: Box::new(opt_left),
-                        right: Box::new(opt_right),
-                        condition,
-                        join_type,
-                    }
+                    LogicalPlan::new_join(opt_left, opt_right, condition, join_type)
                 }
             }
             LogicalPlan::Filter { source, predicate } => LogicalPlan::Filter {
@@ -291,22 +264,24 @@ impl Optimizer {
                 source,
                 expressions,
                 field_names,
-            } => LogicalPlan::Projection {
-                source: Box::new(self.optimize_join_order(*source)),
+                ..
+            } => LogicalPlan::new_projection(
+                self.optimize_join_order(*source),
                 expressions,
                 field_names,
-            },
+            ),
             LogicalPlan::Aggregate {
                 source,
                 group_by,
                 aggrs,
                 field_names,
-            } => LogicalPlan::Aggregate {
-                source: Box::new(self.optimize_join_order(*source)),
+                ..
+            } => LogicalPlan::new_aggregate(
+                self.optimize_join_order(*source),
                 group_by,
                 aggrs,
                 field_names,
-            },
+            ),
             LogicalPlan::Sort { source, keys } => LogicalPlan::Sort {
                 source: Box::new(self.optimize_join_order(*source)),
                 keys,

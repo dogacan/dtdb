@@ -155,9 +155,9 @@ impl EngineInner {
         };
 
         let block_cache = if active_options.block_cache_capacity > 0 {
-            Some(Arc::new(Mutex::new(crate::LruCache::new(
+            Some(Arc::new(crate::BlockCache::new(
                 active_options.block_cache_capacity,
-            ))))
+            )))
         } else {
             None
         };
@@ -287,9 +287,10 @@ impl EngineInner {
                     &sst_path,
                     active_options.block_size_limit,
                     active_options.compression,
+                    memtable.len(),
                 )?;
                 for (key, val) in memtable.entries() {
-                    writer.append(key, val)?;
+                    writer.append(&key, val.as_ref())?;
                 }
                 writer.finish()?;
 
@@ -889,6 +890,15 @@ impl EngineInner {
 
         let mut merge_iter = crate::merge_iter::MergeIterator::new(sources)?;
 
+        let expected_entries: usize = source_files
+            .iter()
+            .map(|f| f.stats.num_entries as usize)
+            .sum::<usize>()
+            + overlapping_target_files
+                .iter()
+                .map(|f| f.stats.num_entries as usize)
+                .sum::<usize>();
+
         // 3. Write merged data to new SSTables
         let mut new_sstables = Vec::new();
         let mut current_writer: Option<SstableWriter> = None;
@@ -939,6 +949,7 @@ impl EngineInner {
                     &path,
                     self.options.block_size_limit,
                     self.options.compression,
+                    expected_entries,
                 )?);
                 current_writer_uncompressed_bytes = 0;
             }
@@ -956,7 +967,7 @@ impl EngineInner {
             current_writer_uncompressed_bytes += entry_sz;
 
             let writer = current_writer.as_mut().unwrap();
-            writer.append(k, v)?;
+            writer.append(&k, v.as_ref())?;
 
             if current_writer_uncompressed_bytes >= self.options.sstable_target_size {
                 let writer = current_writer.take().unwrap();
@@ -1039,8 +1050,8 @@ impl EngineInner {
     }
 
     fn flush_memtable_internal_no_trigger(&self, mem: &MemTable) -> Result<()> {
-        let entries = mem.entries();
-        if entries.is_empty() {
+        let map = mem.map.read().unwrap();
+        if map.is_empty() {
             return Ok(());
         }
 
@@ -1051,11 +1062,13 @@ impl EngineInner {
             &sst_path,
             self.options.block_size_limit,
             self.options.compression,
+            map.len(),
         )?;
-        for (key, val) in entries {
-            writer.append(key, val)?;
+        for (key, val) in map.iter() {
+            writer.append(key, val.as_ref())?;
         }
         writer.finish()?;
+        drop(map);
 
         // Update manifest under manifest_mutex lock
         {

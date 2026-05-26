@@ -88,11 +88,11 @@ fn test_sstable_write_read() {
 
     // Write to SSTable with small block size (e.g. 50 bytes) to force block splitting
     {
-        let mut writer = SstableWriter::create(&sst_path, 50, CompressionType::Lz4).unwrap();
-        writer.append(k_int(1), Some(v_int(10))).unwrap();
-        writer.append(k_int(2), Some(v_int(20))).unwrap();
-        writer.append(k_int(3), None).unwrap(); // Tombstone
-        writer.append(k_int(4), Some(v_int(40))).unwrap();
+        let mut writer = SstableWriter::create(&sst_path, 50, CompressionType::Lz4, 4).unwrap();
+        writer.append(&k_int(1), Some(&v_int(10))).unwrap();
+        writer.append(&k_int(2), Some(&v_int(20))).unwrap();
+        writer.append(&k_int(3), None).unwrap(); // Tombstone
+        writer.append(&k_int(4), Some(&v_int(40))).unwrap();
         writer.finish().unwrap();
     }
 

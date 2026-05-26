@@ -614,12 +614,7 @@ impl LogicalPlanner {
                                 return Err(format!("Unsupported JOIN operator: {:?}", other));
                             }
                         };
-                        plan = LogicalPlan::Join {
-                            left: Box::new(plan),
-                            right: Box::new(right_scan),
-                            condition: join_cond,
-                            join_type,
-                        };
+                        plan = LogicalPlan::new_join(plan, right_scan, join_cond, join_type);
                     }
                 }
 
@@ -698,12 +693,7 @@ impl LogicalPlanner {
                         None
                     };
 
-                    plan = LogicalPlan::Aggregate {
-                        source: Box::new(plan),
-                        group_by: group_exprs,
-                        aggrs: aggr_exprs,
-                        field_names,
-                    };
+                    plan = LogicalPlan::new_aggregate(plan, group_exprs, aggr_exprs, field_names);
 
                     // Apply HAVING filter node if present
                     if let Some(having_pred) = planned_having {
@@ -737,11 +727,7 @@ impl LogicalPlanner {
                         }
                     }
 
-                    plan = LogicalPlan::Projection {
-                        source: Box::new(plan),
-                        expressions,
-                        field_names: projection_field_names,
-                    };
+                    plan = LogicalPlan::new_projection(plan, expressions, projection_field_names);
                 } else {
                     // 5. Plan standard SELECT projection
                     let mut expressions = Vec::new();
@@ -776,11 +762,7 @@ impl LogicalPlanner {
                         }
                     }
 
-                    plan = LogicalPlan::Projection {
-                        source: Box::new(plan),
-                        expressions,
-                        field_names,
-                    };
+                    plan = LogicalPlan::new_projection(plan, expressions, field_names);
                 }
 
                 Ok(plan)
@@ -846,12 +828,7 @@ impl LogicalPlanner {
                     ),
                     other => return Err(format!("Unsupported join type: {:?}", other)),
                 };
-                plan = LogicalPlan::Join {
-                    left: Box::new(plan),
-                    right: Box::new(right_scan),
-                    condition: join_cond,
-                    join_type,
-                };
+                plan = LogicalPlan::new_join(plan, right_scan, join_cond, join_type);
             }
         }
 
@@ -921,12 +898,7 @@ impl LogicalPlanner {
                 None
             };
 
-            plan = LogicalPlan::Aggregate {
-                source: Box::new(plan),
-                group_by: group_exprs,
-                aggrs: aggr_exprs,
-                field_names,
-            };
+            plan = LogicalPlan::new_aggregate(plan, group_exprs, aggr_exprs, field_names);
 
             // Apply HAVING filter node if present
             if let Some(having_pred) = planned_having {
@@ -960,11 +932,7 @@ impl LogicalPlanner {
                 }
             }
 
-            plan = LogicalPlan::Projection {
-                source: Box::new(plan),
-                expressions,
-                field_names: projection_field_names,
-            };
+            plan = LogicalPlan::new_projection(plan, expressions, projection_field_names);
 
             // Plan ORDER BY (Sort) for aggregate query
             if !query.order_by.is_empty() {
@@ -1027,11 +995,7 @@ impl LogicalPlanner {
                 }
             }
 
-            plan = LogicalPlan::Projection {
-                source: Box::new(plan),
-                expressions,
-                field_names,
-            };
+            plan = LogicalPlan::new_projection(plan, expressions, field_names);
         }
 
         // 7. Plan LIMIT and OFFSET
