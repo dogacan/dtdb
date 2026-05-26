@@ -38,6 +38,7 @@ struct EngineInner {
     next_sst_id: AtomicU64,
     spawner: Arc<dyn ThreadSpawner>,
     block_cache: Option<Arc<crate::BlockCache>>,
+    last_compacted_keys: Mutex<std::collections::HashMap<usize, DbKey>>,
 }
 
 #[derive(Default)]
@@ -320,6 +321,7 @@ impl EngineInner {
             next_sst_id: AtomicU64::new(max_id + 1),
             spawner,
             block_cache,
+            last_compacted_keys: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -818,7 +820,21 @@ impl EngineInner {
             } else if let Some(list) = sstables_guard.get(&source_level)
                 && !list.is_empty()
             {
-                source_files.push(list[0].clone());
+                let last_compacted = self
+                    .last_compacted_keys
+                    .lock()
+                    .unwrap()
+                    .get(&source_level)
+                    .cloned();
+                let selected = if let Some(ref last_key) = last_compacted {
+                    list.iter()
+                        .find(|sst| sst.first_key().is_some_and(|fk| fk > last_key))
+                        .cloned()
+                        .unwrap_or_else(|| list[0].clone())
+                } else {
+                    list[0].clone()
+                };
+                source_files.push(selected);
             }
 
             if source_files.is_empty() {
@@ -1038,6 +1054,16 @@ impl EngineInner {
         for f in source_files.iter().chain(overlapping_target_files.iter()) {
             let reader = f;
             let _ = fs::remove_file(&reader.path);
+        }
+
+        if source_level > 0
+            && let Some(last_file) = source_files.last()
+        {
+            let max_k = last_file.last_key();
+            self.last_compacted_keys
+                .lock()
+                .unwrap()
+                .insert(source_level, max_k.clone());
         }
 
         Ok(())

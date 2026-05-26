@@ -409,3 +409,98 @@ fn test_engine_multi_get() {
     assert_eq!(results[3], Some(v_int(400))); // From memtable
     assert_eq!(results[4], None); // Non-existent key
 }
+
+#[test]
+fn test_engine_compaction_round_robin() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    // 1. Create three files in Level 1 under large limit
+    {
+        let options = EngineOptions {
+            compression: CompressionType::Uncompressed,
+            memtable_size_limit: 1000,
+            block_size_limit: 4096,
+            wal_size_limit: 32 * 1024 * 1024,
+            l0_compaction_threshold: 10,
+            sstable_target_size: 1, // Split into individual files
+            base_level_size_limit: 10 * 1024 * 1024, // 10MB
+            level_size_multiplier: 10,
+            max_level: 4,
+            block_cache_capacity: 0,
+            wal_sync_interval_ms: None,
+        };
+        let engine = StorageEngine::open(&db_path, options).unwrap();
+
+        // Write key 10
+        engine.put(k_int(10), v_int(10)).unwrap();
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap(); // L0 -> L1 (File 1: key 10)
+
+        // Write key 20
+        engine.put(k_int(20), v_int(20)).unwrap();
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap(); // L0 -> L1 (File 2: key 20)
+
+        // Write key 30
+        engine.put(k_int(30), v_int(30)).unwrap();
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap(); // L0 -> L1 (File 3: key 30)
+    }
+
+    // 2. Reopen the engine with a tiny base_level_size_limit to trigger L1 -> L2 compaction
+    let mut l2_keys = Vec::new();
+    {
+        // Delete options.bin so we can change base_level_size_limit
+        std::fs::remove_file(db_path.join("options.bin")).unwrap();
+
+        let options = EngineOptions {
+            compression: CompressionType::Uncompressed,
+            memtable_size_limit: 1000,
+            block_size_limit: 4096,
+            wal_size_limit: 32 * 1024 * 1024,
+            l0_compaction_threshold: 10,
+            sstable_target_size: 1,
+            base_level_size_limit: 400, // Limit of 400 bytes triggers compaction only when >= 3 files are present
+            level_size_multiplier: 1000, // Large multiplier to prevent L2 -> L3 cascading
+            max_level: 4,
+            block_cache_capacity: 0,
+            wal_sync_interval_ms: None,
+        };
+        let engine = StorageEngine::open(&db_path, options).unwrap();
+
+        // This compact run will trigger L1 -> L2 compaction because L1 size > limit (1)
+        // It should pick list[0], which is key 10, and compact it to Level 2.
+        engine.compact().unwrap();
+
+        // Write a new file with key 5 (sorted before key 20 and 30)
+        engine.put(k_int(5), v_int(5)).unwrap();
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap(); // L0 -> L1 (key 5). This also triggers L1 -> L2 compaction again.
+
+        // If round-robin works:
+        // - L1 -> L2 compaction should pick key 20 (since last_compacted was key 10, and 20 > 10).
+        // - Level 2 should now contain key 10 and key 20.
+        // - Level 1 should contain key 5 and key 30.
+        // If it was NOT round-robin (always picking list[0]), it would pick key 5 (since 5 < 20).
+
+        // Let's inspect L2 files on disk
+        for entry in std::fs::read_dir(&db_path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "sst") {
+                let filename = path.file_name().unwrap().to_str().unwrap();
+                if filename.starts_with("L2_") {
+                    // Open the L2 sstable reader
+                    let reader = SstableReader::open(&path, 0, 2, None).unwrap();
+                    if let Some(fk) = reader.first_key() {
+                        l2_keys.push(fk.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    l2_keys.sort();
+    assert_eq!(l2_keys, vec![k_int(10), k_int(20)]);
+}
