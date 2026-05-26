@@ -1,4 +1,4 @@
-use crate::expr::Expr;
+use crate::expr::{Expr, compare_values};
 use crate::logical::{AggregateExpr, JoinType, SetOpType};
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
@@ -348,6 +348,8 @@ pub struct PhysicalHashJoin {
     right_on: Expr,
     join_type: JoinType,
     schema: Schema,
+    left_schema: Schema,
+    right_schema: Schema,
     // Build phase hash map: DbValue representation of join key -> Right Rows
     hash_table: Option<HashMap<DbValue, Vec<Row>>>,
     // Buffer to hold joined rows from the current probe row
@@ -364,6 +366,8 @@ impl PhysicalHashJoin {
         join_type: JoinType,
         schema: Schema,
     ) -> Self {
+        let left_schema = left.schema().clone();
+        let right_schema = right.schema().clone();
         Self {
             left,
             right,
@@ -371,6 +375,8 @@ impl PhysicalHashJoin {
             right_on,
             join_type,
             schema,
+            left_schema,
+            right_schema,
             hash_table: None,
             join_buffer: Vec::new(),
             join_buffer_index: 0,
@@ -394,9 +400,8 @@ impl PhysicalOperator for PhysicalHashJoin {
         // Build phase: read all right rows into the hash table
         if self.hash_table.is_none() {
             let mut table = HashMap::new();
-            let right_schema = self.right.schema().clone();
             while let Some(row) = self.right.next()? {
-                let key_val = self.right_on.eval(&row, &right_schema)?;
+                let key_val = self.right_on.eval(&row, &self.right_schema)?;
                 if key_val != DbValue::Null {
                     table.entry(key_val).or_insert_with(Vec::new).push(row);
                 }
@@ -405,12 +410,10 @@ impl PhysicalOperator for PhysicalHashJoin {
         }
 
         let hash_table = self.hash_table.as_ref().unwrap();
-        let left_schema = self.left.schema().clone();
-        let right_schema = self.right.schema().clone();
 
         // Probe phase: stream left rows one by one
         while let Some(left_row) = self.left.next()? {
-            let key_val = self.left_on.eval(&left_row, &left_schema)?;
+            let key_val = self.left_on.eval(&left_row, &self.left_schema)?;
 
             if key_val != DbValue::Null {
                 if let Some(right_rows) = hash_table.get(&key_val) {
@@ -423,7 +426,7 @@ impl PhysicalOperator for PhysicalHashJoin {
                 } else if self.join_type == JoinType::Left {
                     // Left outer join mismatch: pad right columns with NULL values
                     let mut merged_values = left_row.values.clone();
-                    for _ in &right_schema.columns {
+                    for _ in &self.right_schema.columns {
                         merged_values.push(DbValue::Null);
                     }
                     self.join_buffer.push(Row::new(merged_values));
@@ -431,7 +434,7 @@ impl PhysicalOperator for PhysicalHashJoin {
             } else if self.join_type == JoinType::Left {
                 // Left outer join mismatch: pad right columns with NULL values
                 let mut merged_values = left_row.values.clone();
-                for _ in &right_schema.columns {
+                for _ in &self.right_schema.columns {
                     merged_values.push(DbValue::Null);
                 }
                 self.join_buffer.push(Row::new(merged_values));
@@ -742,31 +745,7 @@ impl Accumulator {
 // ==========================================
 // Helper Utility Functions
 // ==========================================
-
-fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String> {
-    match (l, r) {
-        (DbValue::Null, DbValue::Null) => Ok(std::cmp::Ordering::Equal),
-        (DbValue::Null, _) => Ok(std::cmp::Ordering::Less),
-        (_, DbValue::Null) => Ok(std::cmp::Ordering::Greater),
-        (DbValue::Int(lv), DbValue::Int(rv)) => Ok(lv.cmp(rv)),
-        (DbValue::Float(lv), DbValue::Float(rv)) => lv
-            .partial_cmp(rv)
-            .ok_or_else(|| "NaN float comparison".to_string()),
-        (DbValue::Int(lv), DbValue::Float(rv)) => (*lv as f64)
-            .partial_cmp(rv)
-            .ok_or_else(|| "NaN float comparison".to_string()),
-        (DbValue::Float(lv), DbValue::Int(rv)) => lv
-            .partial_cmp(&(*rv as f64))
-            .ok_or_else(|| "NaN float comparison".to_string()),
-        (DbValue::String(lv), DbValue::String(rv)) => Ok(lv.cmp(rv)),
-        (DbValue::Bytes(lv), DbValue::Bytes(rv)) => Ok(lv.cmp(rv)),
-        (DbValue::Bool(lv), DbValue::Bool(rv)) => Ok(lv.cmp(rv)),
-        (expected, actual) => Err(format!(
-            "Type mismatch: cannot compare {:?} and {:?}",
-            expected, actual
-        )),
-    }
-}
+// compare_values is imported from crate::expr::compare_values
 
 // ==========================================
 // Set Operation Physical Operator (UNION, INTERSECT, EXCEPT)

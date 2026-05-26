@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// A simple, self-contained Bloom Filter for checking set membership probabilistically.
@@ -80,14 +79,15 @@ impl BloomFilter {
         true
     }
 
-    /// Helper to compute two independent 64-bit hashes using DefaultHasher and a salt.
+    /// Helper to compute two independent 64-bit hashes using Xxh64.
     fn get_hashes<T: Hash>(&self, key: &T) -> (u64, u64) {
-        let mut h1 = DefaultHasher::new();
+        use xxhash_rust::xxh64::Xxh64;
+
+        let mut h1 = Xxh64::new(0);
         key.hash(&mut h1);
         let hash1 = h1.finish();
 
-        let mut h2 = DefaultHasher::new();
-        "bloom_salt_123".hash(&mut h2);
+        let mut h2 = Xxh64::new(1234567890u64);
         key.hash(&mut h2);
         let hash2 = h2.finish();
 

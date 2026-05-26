@@ -156,7 +156,7 @@ impl EngineInner {
 
         let block_cache = if active_options.block_cache_capacity > 0 {
             Some(Arc::new(crate::BlockCache::new(
-                active_options.block_cache_capacity,
+                active_options.block_cache_capacity * active_options.block_size_limit,
             )))
         } else {
             None

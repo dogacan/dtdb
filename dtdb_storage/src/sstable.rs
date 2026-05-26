@@ -132,7 +132,6 @@ impl SstableWriter {
         if self.min_key.is_none() {
             self.min_key = Some(key.clone());
         }
-        self.max_key = Some(key.clone());
 
         if self.current_block.is_empty() {
             // First key of the block becomes the index key.
@@ -159,6 +158,8 @@ impl SstableWriter {
         if self.current_block.is_empty() {
             return Ok(());
         }
+
+        self.max_key = Some(self.current_block.last().unwrap().0.clone());
 
         // Serialize block
         let raw_bytes = bincode::serialize(&self.current_block)?;

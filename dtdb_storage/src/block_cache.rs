@@ -9,6 +9,23 @@ pub struct BlockCache {
     shards: Vec<Mutex<LruCache<(u64, usize), CacheValue>>>,
 }
 
+fn block_byte_size(block: &[(DbKey, Option<DbValue>)]) -> usize {
+    let mut size = 0;
+    for (k, v) in block {
+        size += k.byte_size();
+        size += match v {
+            Some(DbValue::Int(_)) => 8,
+            Some(DbValue::Float(_)) => 8,
+            Some(DbValue::String(s)) => s.len(),
+            Some(DbValue::Bytes(b)) => b.len(),
+            Some(DbValue::Null) => 1,
+            Some(DbValue::Bool(_)) => 1,
+            None => 1,
+        };
+    }
+    size
+}
+
 impl BlockCache {
     pub fn new(capacity: usize) -> Self {
         let num_shards = 16;
@@ -33,8 +50,9 @@ impl BlockCache {
 
     pub fn insert(&self, key: (u64, usize), value: CacheValue) {
         let shard_idx = self.get_shard(&key);
+        let size_bytes = block_byte_size(&value);
         let mut guard = self.shards[shard_idx].lock().unwrap();
-        guard.insert(key, value);
+        guard.insert(key, value, size_bytes);
     }
 }
 
@@ -44,7 +62,8 @@ pub struct LruCache<K, V> {
     head: Option<usize>,
     tail: Option<usize>,
     free: Vec<usize>,
-    capacity: usize,
+    capacity_bytes: usize,
+    current_bytes: usize,
 }
 
 struct LruNode<K, V> {
@@ -52,18 +71,20 @@ struct LruNode<K, V> {
     value: Option<V>,
     prev: Option<usize>,
     next: Option<usize>,
+    size: usize,
 }
 
 impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0);
+    pub fn new(capacity_bytes: usize) -> Self {
+        assert!(capacity_bytes > 0);
         Self {
             map: HashMap::new(),
             nodes: Vec::new(),
             head: None,
             tail: None,
             free: Vec::new(),
-            capacity,
+            capacity_bytes,
+            current_bytes: 0,
         }
     }
 
@@ -77,23 +98,24 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: V, size: usize) {
         if let Some(&idx) = self.map.get(&key) {
+            let old_size = self.nodes[idx].size;
+            self.current_bytes = self
+                .current_bytes
+                .saturating_sub(old_size)
+                .saturating_add(size);
             self.nodes[idx].value = Some(value);
+            self.nodes[idx].size = size;
             self.detach(idx);
             self.attach_head(idx);
+            self.evict_if_needed();
             return;
         }
 
-        let idx = if self.map.len() >= self.capacity {
-            // Evict tail
-            let tail_idx = self.tail.expect("cache not empty");
-            self.detach(tail_idx);
-            if let Some(ref old_key) = self.nodes[tail_idx].key {
-                self.map.remove(old_key);
-            }
-            tail_idx
-        } else if let Some(free_idx) = self.free.pop() {
+        self.current_bytes = self.current_bytes.saturating_add(size);
+
+        let idx = if let Some(free_idx) = self.free.pop() {
             free_idx
         } else {
             let new_idx = self.nodes.len();
@@ -102,14 +124,35 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
                 value: None,
                 prev: None,
                 next: None,
+                size: 0,
             });
             new_idx
         };
 
         self.nodes[idx].key = Some(key.clone());
         self.nodes[idx].value = Some(value);
+        self.nodes[idx].size = size;
         self.map.insert(key, idx);
         self.attach_head(idx);
+
+        self.evict_if_needed();
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.current_bytes > self.capacity_bytes && self.tail.is_some() {
+            let tail_idx = self.tail.unwrap();
+            let node_size = self.nodes[tail_idx].size;
+            self.current_bytes = self.current_bytes.saturating_sub(node_size);
+
+            self.detach(tail_idx);
+            if let Some(ref old_key) = self.nodes[tail_idx].key {
+                self.map.remove(old_key);
+            }
+            self.nodes[tail_idx].key = None;
+            self.nodes[tail_idx].value = None;
+            self.nodes[tail_idx].size = 0;
+            self.free.push(tail_idx);
+        }
     }
 
     fn detach(&mut self, idx: usize) {
@@ -152,9 +195,9 @@ mod tests {
     fn test_lru_cache_basic() {
         let mut cache = LruCache::new(3);
 
-        cache.insert("a", 1);
-        cache.insert("b", 2);
-        cache.insert("c", 3);
+        cache.insert("a", 1, 1);
+        cache.insert("b", 2, 1);
+        cache.insert("c", 3, 1);
 
         assert_eq!(cache.get(&"a"), Some(&1));
         assert_eq!(cache.get(&"b"), Some(&2));
@@ -165,9 +208,9 @@ mod tests {
     fn test_lru_cache_eviction() {
         let mut cache = LruCache::new(3);
 
-        cache.insert("a", 1);
-        cache.insert("b", 2);
-        cache.insert("c", 3);
+        cache.insert("a", 1, 1);
+        cache.insert("b", 2, 1);
+        cache.insert("c", 3, 1);
 
         // "a" is accessed, making it most recently used, order is now a -> c -> b (head to tail) or a -> c -> b?
         // Wait, let's see. head is "c", then "b", then "a".
@@ -175,7 +218,7 @@ mod tests {
         assert_eq!(cache.get(&"a"), Some(&1));
 
         // Insert "d", which should evict the tail, which is "b"
-        cache.insert("d", 4);
+        cache.insert("d", 4, 1);
 
         assert_eq!(cache.get(&"b"), None);
         assert_eq!(cache.get(&"a"), Some(&1));
@@ -187,8 +230,8 @@ mod tests {
     fn test_lru_cache_update() {
         let mut cache = LruCache::new(2);
 
-        cache.insert("a", 1);
-        cache.insert("a", 10);
+        cache.insert("a", 1, 1);
+        cache.insert("a", 10, 1);
 
         assert_eq!(cache.get(&"a"), Some(&10));
     }

@@ -554,10 +554,7 @@ fn to_string_val(val: &DbValue) -> Result<String, String> {
     }
 }
 
-/// Helper to compare two DbValues, applying implicit type coercion for numeric types.
-///
-/// For example, comparing an Int with a Float automatically converts the Int to Float.
-fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String> {
+pub(crate) fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Ordering, String> {
     match (l, r) {
         (DbValue::Null, DbValue::Null) => Ok(std::cmp::Ordering::Equal),
         (DbValue::Null, _) => Ok(std::cmp::Ordering::Less),

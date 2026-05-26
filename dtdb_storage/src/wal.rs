@@ -175,8 +175,5 @@ impl Wal {
 }
 
 fn compute_checksum(data: &[u8]) -> u32 {
-    use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(data);
-    hasher.finish() as u32
+    xxhash_rust::xxh32::xxh32(data, 0)
 }
