@@ -29,7 +29,7 @@ struct EngineInner {
     dir_path: PathBuf,
     memtable: RwLock<Arc<MemTable>>,
     wal: Mutex<Wal>,
-    sstables: RwLock<BTreeMap<usize, Vec<Arc<Mutex<SstableReader>>>>>,
+    sstables: RwLock<BTreeMap<usize, Vec<Arc<SstableReader>>>>,
     options: EngineOptions,
     write_mutex: Mutex<()>,
     compaction_mutex: Mutex<()>,
@@ -201,27 +201,27 @@ impl EngineInner {
             let _ = fs::remove_file(p);
         }
 
-        let mut sstables_map: BTreeMap<usize, Vec<Arc<Mutex<SstableReader>>>> = BTreeMap::new();
+        let mut sstables_map: BTreeMap<usize, Vec<Arc<SstableReader>>> = BTreeMap::new();
         for (level, id, path) in discovered_ssts {
             let reader = SstableReader::open(&path, id, level, block_cache.clone())?;
             sstables_map
                 .entry(level)
                 .or_default()
-                .push(Arc::new(Mutex::new(reader)));
+                .push(Arc::new(reader));
         }
 
         // Sort the files in each level:
         for (level, list) in sstables_map.iter_mut() {
             if *level == 0 {
                 list.sort_by(|a, b| {
-                    let id_a = a.lock().unwrap().id;
-                    let id_b = b.lock().unwrap().id;
+                    let id_a = a.id;
+                    let id_b = b.id;
                     id_b.cmp(&id_a)
                 });
             } else {
                 list.sort_by(|a, b| {
-                    let r_a = a.lock().unwrap();
-                    let r_b = b.lock().unwrap();
+                    let r_a = a;
+                    let r_b = b;
                     match (r_a.first_key(), r_b.first_key()) {
                         (Some(k_a), Some(k_b)) => k_a.cmp(k_b),
                         (Some(_), None) => std::cmp::Ordering::Less,
@@ -272,7 +272,7 @@ impl EngineInner {
                 sstables_map
                     .entry(0)
                     .or_default()
-                    .insert(0, Arc::new(Mutex::new(reader)));
+                    .insert(0, Arc::new(reader));
                 memtable.clear();
             }
 
@@ -417,8 +417,7 @@ impl EngineInner {
 
         if let Some(l0_ssts) = sstables_map.get(&0) {
             for sstable in l0_ssts.iter() {
-                let mut reader = sstable.lock().unwrap();
-                if let Some(res) = reader.get(key)? {
+                if let Some(res) = sstable.get(key)? {
                     return Ok(res);
                 }
             }
@@ -433,9 +432,10 @@ impl EngineInner {
             }
 
             let idx_res = ssts.binary_search_by(|sstable| {
-                let r = sstable.lock().unwrap();
-                let f_key = r.first_key().expect("Level 1+ SSTable must not be empty");
-                let l_key = r.last_key();
+                let f_key = sstable
+                    .first_key()
+                    .expect("Level 1+ SSTable must not be empty");
+                let l_key = sstable.last_key();
                 if key < f_key {
                     std::cmp::Ordering::Greater
                 } else if key > l_key {
@@ -445,11 +445,10 @@ impl EngineInner {
                 }
             });
 
-            if let Ok(idx) = idx_res {
-                let mut reader = ssts[idx].lock().unwrap();
-                if let Some(res) = reader.get(key)? {
-                    return Ok(res);
-                }
+            if let Ok(idx) = idx_res
+                && let Some(res) = ssts[idx].get(key)?
+            {
+                return Ok(res);
             }
         }
 
@@ -486,8 +485,7 @@ impl EngineInner {
 
         if let Some(l0_ssts) = sstables_map.get(&0) {
             for sstable in l0_ssts.iter() {
-                let mut reader = sstable.lock().unwrap();
-                let entries = reader.scan_raw(start, end)?;
+                let entries = sstable.scan_raw(start, end)?;
                 for (k, v) in entries {
                     if seen.insert(k.clone())
                         && let Some(val) = v
@@ -504,16 +502,15 @@ impl EngineInner {
                 continue;
             }
             for sstable in ssts.iter() {
-                let mut reader = sstable.lock().unwrap();
-                let f_key = reader
+                let f_key = sstable
                     .first_key()
                     .expect("Level 1+ SSTable must not be empty");
-                let l_key = reader.last_key();
+                let l_key = sstable.last_key();
                 if f_key > end || l_key < start {
                     continue;
                 }
 
-                let entries = reader.scan_raw(start, end)?;
+                let entries = sstable.scan_raw(start, end)?;
                 for (k, v) in entries {
                     if seen.insert(k.clone())
                         && let Some(val) = v
@@ -583,7 +580,7 @@ impl EngineInner {
 
         for ssts in sstables_guard.values() {
             for sst in ssts {
-                let reader = sst.lock().unwrap();
+                let reader = sst;
                 num_sstables += 1;
                 total_sstable_size += reader.file_size();
                 sstable_entries += reader.stats.num_entries;
@@ -618,7 +615,7 @@ impl EngineInner {
 
         for level in 1..self.options.max_level {
             if let Some(ssts) = sstables.get(&level) {
-                let total_size: u64 = ssts.iter().map(|s| s.lock().unwrap().file_size()).sum();
+                let total_size: u64 = ssts.iter().map(|s| s.file_size()).sum();
                 let limit = self.level_size_limit(level);
                 if total_size > limit {
                     return Some(level);
@@ -672,7 +669,7 @@ impl EngineInner {
             let mut min_key = None;
             let mut max_key = None;
             for sstable in &source_files {
-                let reader = sstable.lock().unwrap();
+                let reader = sstable;
                 if let Some(fk) = reader.first_key()
                     && min_key.as_ref().is_none_or(|k| fk < k)
                 {
@@ -689,7 +686,7 @@ impl EngineInner {
             {
                 for sstable in target_list {
                     let overlaps = {
-                        let reader = sstable.lock().unwrap();
+                        let reader = sstable;
                         let fk = reader
                             .first_key()
                             .expect("Target SSTable must not be empty");
@@ -708,24 +705,24 @@ impl EngineInner {
         let mut l0_files_sorted = Vec::new();
         let mut other_files = Vec::new();
         for f in source_files.iter().chain(overlapping_target_files.iter()) {
-            let reader = f.lock().unwrap();
+            let reader = f;
             if reader.level == 0 {
                 l0_files_sorted.push(f.clone());
             } else {
                 other_files.push(f.clone());
             }
         }
-        l0_files_sorted.sort_by_key(|f| f.lock().unwrap().id);
+        l0_files_sorted.sort_by_key(|f| f.id);
 
         for f in other_files {
-            let mut reader = f.lock().unwrap();
+            let reader = f;
             let entries = reader.read_all()?;
             for (k, v) in entries {
                 merged_data.insert(k, v);
             }
         }
         for f in l0_files_sorted {
-            let mut reader = f.lock().unwrap();
+            let reader = f;
             let entries = reader.read_all()?;
             for (k, v) in entries {
                 merged_data.insert(k, v);
@@ -747,14 +744,14 @@ impl EngineInner {
                     if *level > target_level {
                         for sst in ssts {
                             let (fk, lk) = {
-                                let r = sst.lock().unwrap();
+                                let r = sst;
                                 (r.first_key().cloned(), r.last_key().clone())
                             };
                             if let Some(fk_val) = fk
                                 && k >= fk_val
                                 && k <= lk
                             {
-                                let mut r_mut = sst.lock().unwrap();
+                                let r_mut = sst;
                                 if let Ok(Some(_)) = r_mut.get(&k) {
                                     exists_below = true;
                                     break;
@@ -809,7 +806,7 @@ impl EngineInner {
                     target_level,
                     self.block_cache.clone(),
                 )?;
-                new_sstables.push(Arc::new(Mutex::new(reader)));
+                new_sstables.push(Arc::new(reader));
             }
         }
 
@@ -821,7 +818,7 @@ impl EngineInner {
                 target_level,
                 self.block_cache.clone(),
             )?;
-            new_sstables.push(Arc::new(Mutex::new(reader)));
+            new_sstables.push(Arc::new(reader));
         }
 
         // Update manifest under manifest_mutex lock
@@ -830,11 +827,11 @@ impl EngineInner {
             let manifest_path = self.dir_path.join("manifest.bin");
             let mut manifest = Manifest::load(&manifest_path)?;
             for f in source_files.iter().chain(overlapping_target_files.iter()) {
-                let reader = f.lock().unwrap();
+                let reader = f;
                 manifest.active_sstables.remove(&(reader.level, reader.id));
             }
             for f in &new_sstables {
-                let reader = f.lock().unwrap();
+                let reader = f;
                 manifest.active_sstables.insert((reader.level, reader.id));
             }
             manifest.save(&manifest_path)?;
@@ -844,22 +841,18 @@ impl EngineInner {
         {
             let mut sstables_guard = self.sstables.write().unwrap();
 
-            let source_ids: HashSet<u64> =
-                source_files.iter().map(|f| f.lock().unwrap().id).collect();
+            let source_ids: HashSet<u64> = source_files.iter().map(|f| f.id).collect();
             if let Some(source_list) = sstables_guard.get_mut(&source_level) {
-                source_list.retain(|f| !source_ids.contains(&f.lock().unwrap().id));
+                source_list.retain(|f| !source_ids.contains(&f.id));
             }
 
-            let target_ids: HashSet<u64> = overlapping_target_files
-                .iter()
-                .map(|f| f.lock().unwrap().id)
-                .collect();
+            let target_ids: HashSet<u64> = overlapping_target_files.iter().map(|f| f.id).collect();
             let target_list = sstables_guard.entry(target_level).or_default();
-            target_list.retain(|f| !target_ids.contains(&f.lock().unwrap().id));
+            target_list.retain(|f| !target_ids.contains(&f.id));
             target_list.extend(new_sstables);
             target_list.sort_by(|a, b| {
-                let r_a = a.lock().unwrap();
-                let r_b = b.lock().unwrap();
+                let r_a = a;
+                let r_b = b;
                 match (r_a.first_key(), r_b.first_key()) {
                     (Some(k_a), Some(k_b)) => k_a.cmp(k_b),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -871,7 +864,7 @@ impl EngineInner {
 
         // Delete old files from disk
         for f in source_files.iter().chain(overlapping_target_files.iter()) {
-            let reader = f.lock().unwrap();
+            let reader = f;
             let _ = fs::remove_file(&reader.path);
         }
 
@@ -915,9 +908,7 @@ impl EngineInner {
         let reader = SstableReader::open(&sst_path, next_id, 0, self.block_cache.clone())?;
         {
             let mut ssts = self.sstables.write().unwrap();
-            ssts.entry(0)
-                .or_default()
-                .insert(0, Arc::new(Mutex::new(reader)));
+            ssts.entry(0).or_default().insert(0, Arc::new(reader));
         }
 
         let temp_wal_path = self.dir_path.join("active.wal.tmp");

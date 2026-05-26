@@ -97,7 +97,7 @@ fn test_sstable_write_read() {
     }
 
     // Read and verify
-    let mut reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+    let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
     assert_eq!(reader.get(&k_int(1)).unwrap(), Some(Some(v_int(10))));
     assert_eq!(reader.get(&k_int(2)).unwrap(), Some(Some(v_int(20))));
     assert_eq!(reader.get(&k_int(3)).unwrap(), Some(None)); // Tombstone

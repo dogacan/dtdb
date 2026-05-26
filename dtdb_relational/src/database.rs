@@ -407,6 +407,7 @@ pub struct Database {
     tables: RwLock<HashMap<String, Table>>,
     pub options: DatabaseOptions,
     transaction_log_path: PathBuf,
+    transaction_log_file: Mutex<Option<File>>,
     active_transactions: Mutex<HashSet<u64>>,
     global_commit_version: std::sync::atomic::AtomicU64,
     occ_active_transactions: Mutex<HashMap<u64, u64>>,
@@ -597,6 +598,7 @@ impl Database {
         }
 
         let transaction_log_path = dir_path.join("transactions.log");
+        let transaction_log_file = Mutex::new(None);
         let active_transactions = Mutex::new(HashSet::new());
         let global_commit_version = std::sync::atomic::AtomicU64::new(0);
         let occ_active_transactions = Mutex::new(HashMap::new());
@@ -609,6 +611,7 @@ impl Database {
             tables: RwLock::new(tables),
             options,
             transaction_log_path,
+            transaction_log_file,
             active_transactions,
             global_commit_version,
             occ_active_transactions,
@@ -649,6 +652,15 @@ impl Database {
         }
 
         db.recover_transactions()?;
+
+        // Open the persistent log file handle
+        let log_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&db.transaction_log_path)?;
+        *db.transaction_log_file.lock().unwrap() = Some(log_file);
 
         Ok(db)
     }
@@ -869,16 +881,18 @@ impl Database {
     }
 
     fn append_record(&self, record: &TransactionRecord) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.transaction_log_path)?;
-        let bytes = bincode::serialize(record)
-            .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
-        let len = bytes.len() as u32;
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        let mut file_guard = self.transaction_log_file.lock().unwrap();
+        if let Some(ref mut file) = *file_guard {
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::End(0))?;
+            let bytes = bincode::serialize(record).map_err(|e| {
+                RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
+            })?;
+            let len = bytes.len() as u32;
+            file.write_all(&len.to_le_bytes())?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
         Ok(())
     }
 
@@ -887,17 +901,26 @@ impl Database {
         if let TransactionRecord::Prepared { tx_id, .. } = record {
             active.insert(*tx_id);
         }
+        drop(active);
         self.append_record(record)?;
         Ok(())
     }
 
     pub fn commit_transaction(&self, tx_id: u64) -> Result<()> {
-        let mut active = self.active_transactions.lock().unwrap();
-        active.remove(&tx_id);
+        let truncate = {
+            let mut active = self.active_transactions.lock().unwrap();
+            active.remove(&tx_id);
+            active.is_empty()
+        };
 
-        if active.is_empty() {
-            // Truncate the file to zero to keep it compact.
-            let _ = File::create(&self.transaction_log_path)?;
+        if truncate {
+            let mut file_guard = self.transaction_log_file.lock().unwrap();
+            if let Some(ref mut file) = *file_guard {
+                file.set_len(0)?;
+                use std::io::Seek;
+                file.seek(std::io::SeekFrom::Start(0))?;
+                file.sync_all()?;
+            }
         } else {
             let record = TransactionRecord::Committed { tx_id };
             self.append_record(&record)?;
@@ -1365,16 +1388,21 @@ impl Database {
     pub fn analyze_table(&self, table_name: &str, _tx: &Transaction) -> Result<()> {
         let table = self.get_table(table_name)?;
 
-        // 1. Compute logical row count
-        let (start, end) = table.schema.primary_key_bounds()?;
-        let rows = table.filtered_scan(&start, &end, Some(&[]))?;
-        let row_count = rows.len() as u64;
-
-        // 2. Fetch storage engine statistics for locality groups
+        // 1. Fetch storage engine statistics for locality groups and estimate row count
         let mut locality_group_stats = HashMap::new();
         let mut total_size_bytes = 0;
+        let mut estimated_row_count = 0;
+        let mut got_row_count = false;
+
         for (group, engine) in &table.engines {
             let stats = engine.get_statistics()?;
+            let engine_rows = (stats.sstable_entries + stats.memtable_entries)
+                .saturating_sub(stats.sstable_tombstones + stats.memtable_tombstones);
+            if !got_row_count || group.is_empty() {
+                estimated_row_count = engine_rows;
+                got_row_count = true;
+            }
+
             let group_stats = GroupStats {
                 num_sstables: stats.num_sstables,
                 total_sstable_size: stats.total_sstable_size,
@@ -1385,11 +1413,16 @@ impl Database {
             locality_group_stats.insert(group.clone(), group_stats);
         }
 
-        // 3. Fetch index statistics
+        let row_count = estimated_row_count;
+
+        // 2. Fetch index statistics using metadata and scan index keys for uniqueness
         let mut index_stats = HashMap::new();
         let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
         for idx_def in &table.schema.indexes {
             if let Some(index_engine) = table.index_engines.get(&idx_def.name) {
+                let index_engine_stats = index_engine.get_statistics()?;
+                total_size_bytes += index_engine_stats.total_sstable_size;
+
                 let mut min_idx_keys = Vec::new();
                 let mut max_idx_keys = Vec::new();
                 for col_name in &idx_def.columns {
@@ -1416,10 +1449,6 @@ impl Database {
                 let index_entries =
                     index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
 
-                // Track stats for the index engine too
-                let index_engine_stats = index_engine.get_statistics()?;
-                total_size_bytes += index_engine_stats.total_sstable_size;
-
                 let entry_count = index_entries.len() as u64;
                 let mut unique_prefixes = HashSet::new();
                 for (idx_key, _) in &index_entries {
@@ -1431,6 +1460,7 @@ impl Database {
                     }
                 }
                 let unique_values = unique_prefixes.len() as u64;
+
                 let avg_rows_per_value = if unique_values > 0 {
                     entry_count as f64 / unique_values as f64
                 } else {

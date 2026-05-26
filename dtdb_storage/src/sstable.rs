@@ -35,6 +35,8 @@ pub struct IndexBlock {
     pub entries: Vec<IndexEntry>,
     pub compression: CompressionType,
     pub stats: StatsBlock,
+    #[serde(default)]
+    pub bloom_filter: Option<crate::bloom::BloomFilter>,
 }
 
 /// SstableWriter builds an SSTable file on disk.
@@ -56,6 +58,7 @@ pub struct SstableWriter {
     total_uncompressed_bytes: u64,
     min_key: Option<DbKey>,
     max_key: Option<DbKey>,
+    keys: Vec<DbKey>,
 }
 
 impl SstableWriter {
@@ -91,6 +94,7 @@ impl SstableWriter {
             total_uncompressed_bytes: 0,
             min_key: None,
             max_key: None,
+            keys: Vec::new(),
         })
     }
 
@@ -110,6 +114,7 @@ impl SstableWriter {
         };
 
         // Update stats
+        self.keys.push(key.clone());
         self.num_entries += 1;
         if value.is_none() {
             self.num_tombstones += 1;
@@ -198,10 +203,20 @@ impl SstableWriter {
             min_key: self.min_key.clone(),
             max_key: self.max_key.clone(),
         };
+        let bloom_filter = if !self.keys.is_empty() {
+            let mut filter = crate::bloom::BloomFilter::new(self.keys.len(), 0.01);
+            for k in &self.keys {
+                filter.insert(k);
+            }
+            Some(filter)
+        } else {
+            None
+        };
         let index_block = IndexBlock {
             entries: self.index.clone(),
             compression: self.compression,
             stats,
+            bloom_filter,
         };
         let index_bytes = bincode::serialize(&index_block)?;
         let index_len = index_bytes.len() as u64;
@@ -235,6 +250,7 @@ pub struct SstableReader {
     pub last_key: DbKey,
     block_cache: Option<Arc<BlockCache>>,
     pub stats: StatsBlock,
+    pub bloom_filter: Option<crate::bloom::BloomFilter>,
 }
 
 impl SstableReader {
@@ -291,6 +307,7 @@ impl SstableReader {
                         min_key: None,
                         max_key: None,
                     },
+                    bloom_filter: None,
                 }
             }
         };
@@ -305,6 +322,7 @@ impl SstableReader {
             last_key: DbKey::Int(0), // Temp placeholder
             block_cache,
             stats: index_block.stats,
+            bloom_filter: index_block.bloom_filter,
         };
 
         // Cache the last key of the SSTable by reading the last block
@@ -337,8 +355,14 @@ impl SstableReader {
     /// - `Ok(Some(Some(value)))` if the key exists with a value.
     /// - `Ok(Some(None))` if the key exists as a tombstone (deleted).
     /// - `Ok(None)` if the key does not exist in this SSTable.
-    pub fn get(&mut self, key: &DbKey) -> Result<Option<Option<DbValue>>> {
+    pub fn get(&self, key: &DbKey) -> Result<Option<Option<DbValue>>> {
         if self.index.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(ref bloom) = self.bloom_filter
+            && !bloom.contains(key)
+        {
             return Ok(None);
         }
 
@@ -371,7 +395,7 @@ impl SstableReader {
 
     /// Reads and decompresses a block by its index, utilizing the block cache if present.
     #[allow(clippy::type_complexity)]
-    fn read_block(&mut self, idx: usize) -> Result<Arc<Vec<(DbKey, Option<DbValue>)>>> {
+    fn read_block(&self, idx: usize) -> Result<Arc<Vec<(DbKey, Option<DbValue>)>>> {
         if let Some(ref cache) = self.block_cache {
             let mut cache_guard = cache.lock().unwrap();
             let key = (self.id, idx);
@@ -383,10 +407,9 @@ impl SstableReader {
         crate::PHYSICAL_BLOCKS_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let entry = &self.index[idx];
-        self.file.seek(SeekFrom::Start(entry.offset))?;
-
         let mut block_bytes = vec![0u8; entry.size as usize];
-        self.file.read_exact(&mut block_bytes)?;
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(&mut block_bytes, entry.offset)?;
 
         let raw_bytes = match self.compression {
             CompressionType::Lz4 => lz4_flex::decompress_size_prepended(&block_bytes)
@@ -407,12 +430,7 @@ impl SstableReader {
     }
 
     /// Performs a range scan between `start` and `end` (both inclusive) matching the filter.
-    pub fn scan<F>(
-        &mut self,
-        start: &DbKey,
-        end: &DbKey,
-        filter: F,
-    ) -> Result<Vec<(DbKey, DbValue)>>
+    pub fn scan<F>(&self, start: &DbKey, end: &DbKey, filter: F) -> Result<Vec<(DbKey, DbValue)>>
     where
         F: Fn(&DbKey, &DbValue) -> bool,
     {
@@ -459,11 +477,7 @@ impl SstableReader {
     }
 
     /// Performs a raw range scan returning all entries (including tombstones) in the range.
-    pub fn scan_raw(
-        &mut self,
-        start: &DbKey,
-        end: &DbKey,
-    ) -> Result<Vec<(DbKey, Option<DbValue>)>> {
+    pub fn scan_raw(&self, start: &DbKey, end: &DbKey) -> Result<Vec<(DbKey, Option<DbValue>)>> {
         let mut results = Vec::new();
         if self.index.is_empty() {
             return Ok(results);
@@ -501,7 +515,7 @@ impl SstableReader {
     }
 
     /// Reads all entries from the SSTable file. Used for compaction.
-    pub fn read_all(&mut self) -> Result<Vec<(DbKey, Option<DbValue>)>> {
+    pub fn read_all(&self) -> Result<Vec<(DbKey, Option<DbValue>)>> {
         let mut entries = Vec::new();
         for idx in 0..self.index.len() {
             let block = self.read_block(idx)?;

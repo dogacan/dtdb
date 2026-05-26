@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod block_cache;
+pub mod bloom;
 pub mod engine;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
 pub mod wal;
 pub use block_cache::{BlockCache, LruCache};
+pub use bloom::BloomFilter;
 pub use engine::{StorageEngine, StorageEngineStatistics};
 pub use wal::WalEntry;
 
