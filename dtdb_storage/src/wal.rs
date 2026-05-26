@@ -23,6 +23,13 @@ pub struct Wal {
     sync_interval_ms: Option<u64>,
 }
 
+#[derive(Serialize)]
+enum WalEntryRef<'a> {
+    Put { key: &'a DbKey, value: &'a DbValue },
+    Delete { key: &'a DbKey },
+    Batch(&'a [WalEntry]),
+}
+
 impl Wal {
     /// Opens an existing WAL file or creates a new one in append-only mode.
     pub fn open(path: impl AsRef<Path>, sync_interval_ms: Option<u64>) -> Result<Self> {
@@ -38,42 +45,37 @@ impl Wal {
 
     /// Appends a `Put` operation to the log.
     pub fn append_put(&mut self, key: &DbKey, value: &DbValue) -> Result<()> {
-        let entry = WalEntry::Put {
-            key: key.clone(),
-            value: value.clone(),
-        };
-        self.write_entry(&entry)
+        let entry = WalEntryRef::Put { key, value };
+        self.write_entry_ref(&entry)
     }
 
     /// Appends a `Delete` operation to the log.
     pub fn append_delete(&mut self, key: &DbKey) -> Result<()> {
-        let entry = WalEntry::Delete { key: key.clone() };
-        self.write_entry(&entry)
+        let entry = WalEntryRef::Delete { key };
+        self.write_entry_ref(&entry)
     }
 
     /// Appends a batch of operations to the log.
-    pub fn append_batch(&mut self, entries: Vec<WalEntry>) -> Result<()> {
-        let entry = WalEntry::Batch(entries);
-        self.write_entry(&entry)
+    pub fn append_batch(&mut self, entries: &[WalEntry]) -> Result<()> {
+        let entry = WalEntryRef::Batch(entries);
+        self.write_entry_ref(&entry)
     }
 
-    /// Serializes and writes a `WalEntry` to the file, and forces it to disk.
-    fn write_entry(&mut self, entry: &WalEntry) -> Result<()> {
+    /// Serializes and writes a `WalEntryRef` to the file, and forces it to disk.
+    fn write_entry_ref(&mut self, entry: &WalEntryRef) -> Result<()> {
         // Serialize using bincode, which converts the struct to a compact binary format.
         let bytes = bincode::serialize(entry)?;
 
-        // Write the length of the binary payload as a 4-byte integer.
-        // We use `.to_le_bytes()` (Little Endian) to ensure that the byte representation
-        // remains consistent regardless of the host machine's native CPU endianness.
+        // Write length, checksum, and data in a single buffer to avoid multiple syscalls.
         let len = bytes.len() as u32;
-        self.file.write_all(&len.to_le_bytes())?;
-
-        // Calculate and write checksum of the serialized payload
         let checksum = compute_checksum(&bytes);
-        self.file.write_all(&checksum.to_le_bytes())?;
 
-        // Write the serialized data.
-        self.file.write_all(&bytes)?;
+        let mut buffer = Vec::with_capacity(4 + 4 + bytes.len());
+        buffer.extend_from_slice(&len.to_le_bytes());
+        buffer.extend_from_slice(&checksum.to_le_bytes());
+        buffer.extend_from_slice(&bytes);
+
+        self.file.write_all(&buffer)?;
 
         // CRITICAL FOR DURABILITY: `sync_all` forces the OS to flush its file system caches
         // directly to the physical storage media (similar to fsync in C). Without this,

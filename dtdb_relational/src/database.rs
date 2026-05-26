@@ -30,6 +30,12 @@ pub struct CommitRecord {
     pub keys: HashMap<String, HashSet<dtdb_storage::DbKey>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TableWriteEntry {
+    pub entry: WalEntry,
+    pub row: Option<Row>,
+}
+
 /// Table represents a relational table mapping column definitions to an underlying LSM engine.
 ///
 /// We implement `Clone` on `Table`. This is a clean Rust design pattern:
@@ -63,7 +69,7 @@ impl Table {
     }
 
     /// Performs a write batch of mutations to the table, splitting updates across locality groups.
-    pub fn write_batch(&self, entries: Vec<WalEntry>) -> Result<()> {
+    pub fn write_batch(&self, entries: Vec<TableWriteEntry>) -> Result<()> {
         let mut group_batches: HashMap<String, Vec<WalEntry>> = HashMap::new();
         for group in self.engines.keys() {
             group_batches.insert(group.clone(), Vec::new());
@@ -74,24 +80,50 @@ impl Table {
             index_batches.insert(idx.name.clone(), Vec::new());
         }
 
-        for entry in entries {
-            match entry {
+        // Fetch old rows for index maintenance up-front to avoid N+1 point lookups
+        let mut old_rows = HashMap::new();
+        if !self.schema.indexes.is_empty() {
+            let mut keys_to_fetch = Vec::new();
+            for wrapper in &entries {
+                match &wrapper.entry {
+                    WalEntry::Put { key, .. } => keys_to_fetch.push(key.clone()),
+                    WalEntry::Delete { key } => keys_to_fetch.push(key.clone()),
+                    WalEntry::Batch(_) => {}
+                }
+            }
+            if !keys_to_fetch.is_empty() {
+                let rows = self.multi_get(&keys_to_fetch, None)?;
+                for (k, r) in keys_to_fetch.into_iter().zip(rows) {
+                    if let Some(row) = r {
+                        old_rows.insert(k, row);
+                    }
+                }
+            }
+        }
+
+        for wrapper in entries {
+            match wrapper.entry {
                 WalEntry::Put { key, value } => {
-                    let bytes = match value {
-                        DbValue::Bytes(b) => b,
-                        _ => {
-                            return Err(RelationalError::Storage(
-                                dtdb_storage::StorageError::Corruption(
-                                    "Expected bytes for row serialization".to_string(),
-                                ),
-                            ));
+                    let full_row = match wrapper.row {
+                        Some(r) => r,
+                        None => {
+                            let bytes = match value {
+                                DbValue::Bytes(b) => b,
+                                _ => {
+                                    return Err(RelationalError::Storage(
+                                        dtdb_storage::StorageError::Corruption(
+                                            "Expected bytes for row serialization".to_string(),
+                                        ),
+                                    ));
+                                }
+                            };
+                            Row::from_bytes(&bytes)?
                         }
                     };
-                    let full_row = Row::from_bytes(&bytes)?;
 
                     // If we have indexes, perform read-before-write maintenance
                     if !self.schema.indexes.is_empty() {
-                        let old_row_opt = self.get(&key, None)?;
+                        let old_row_opt = old_rows.get(&key);
                         if let Some(old_row) = old_row_opt {
                             for idx in &self.schema.indexes {
                                 let mut old_keys = Vec::new();
@@ -162,7 +194,7 @@ impl Table {
                 WalEntry::Delete { key } => {
                     // If we have indexes, perform read-before-write maintenance
                     if !self.schema.indexes.is_empty() {
-                        let old_row_opt = self.get(&key, None)?;
+                        let old_row_opt = old_rows.get(&key);
                         if let Some(old_row) = old_row_opt {
                             for idx in &self.schema.indexes {
                                 let mut old_keys = Vec::new();
@@ -271,6 +303,72 @@ impl Table {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn multi_get(
+        &self,
+        keys: &[DbKey],
+        columns: Option<&[String]>,
+    ) -> Result<Vec<Option<Row>>> {
+        let mut needed_groups = HashSet::new();
+        if let Some(cols) = columns {
+            for col_name in cols {
+                if let Some(col) = self.schema.columns.iter().find(|c| {
+                    &c.name == col_name
+                        || col_name.ends_with(&format!(".{}", c.name))
+                        || c.name.ends_with(&format!(".{}", col_name))
+                }) {
+                    needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
+                }
+            }
+            if needed_groups.is_empty() {
+                needed_groups.insert("".to_string());
+            }
+        } else {
+            for g in self.schema.locality_groups() {
+                needed_groups.insert(g);
+            }
+        }
+
+        let mut group_results = HashMap::new();
+        for group in &needed_groups {
+            if let Some(engine) = self.engines.get(group) {
+                let db_values = engine.multi_get(keys)?;
+                let mut sub_rows = Vec::with_capacity(keys.len());
+                for val in db_values {
+                    if let Some(DbValue::Bytes(bytes)) = val {
+                        let sub_row = Row::from_bytes(&bytes)?;
+                        sub_rows.push(Some(sub_row));
+                    } else {
+                        sub_rows.push(None);
+                    }
+                }
+                group_results.insert(group.clone(), sub_rows);
+            }
+        }
+
+        let mut final_rows = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let mut group_rows = HashMap::new();
+            let mut found_any = false;
+            for group in &needed_groups {
+                if let Some(sub_rows) = group_results.get(group) {
+                    if let Some(sub_row) = &sub_rows[i] {
+                        group_rows.insert(group.clone(), Some(sub_row.clone()));
+                        found_any = true;
+                    } else {
+                        group_rows.insert(group.clone(), None);
+                    }
+                }
+            }
+            if found_any {
+                final_rows.push(Some(self.schema.merge_rows(&group_rows)));
+            } else {
+                final_rows.push(None);
+            }
+        }
+
+        Ok(final_rows)
     }
 
     /// Performs a range scan across the necessary locality group engines, merge-joining the sorted streams.
@@ -1097,7 +1195,11 @@ impl Database {
                         "Rolling forward transaction {} for table {}",
                         tx_id, table_name
                     );
-                    table.write_batch(entries)?;
+                    let write_entries = entries
+                        .into_iter()
+                        .map(|entry| TableWriteEntry { entry, row: None })
+                        .collect();
+                    table.write_batch(write_entries)?;
                 }
             }
         }

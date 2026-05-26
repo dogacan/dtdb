@@ -164,6 +164,61 @@ impl Transaction {
         table.get(key, columns)
     }
 
+    pub fn multi_get_projected(
+        &self,
+        table_name: &str,
+        keys: &[DbKey],
+        columns: Option<&[String]>,
+    ) -> Result<Vec<Option<Row>>> {
+        let table = self.get_table(table_name)?;
+        let mut results = vec![None; keys.len()];
+        let mut storage_keys = Vec::new();
+        let mut storage_indices = Vec::new();
+
+        // 1. Check transaction write buffer.
+        {
+            let buffer = self.write_buffer.lock().unwrap();
+            if let Some(table_buffer) = buffer.get(table_name) {
+                for (i, key) in keys.iter().enumerate() {
+                    if let Some(buffered_val) = table_buffer.get(key) {
+                        results[i] = buffered_val.clone();
+                    } else {
+                        storage_keys.push(key.clone());
+                        storage_indices.push(i);
+                    }
+                }
+            } else {
+                for (i, key) in keys.iter().enumerate() {
+                    storage_keys.push(key.clone());
+                    storage_indices.push(i);
+                }
+            }
+        }
+
+        if storage_keys.is_empty() {
+            return Ok(results);
+        }
+
+        // 2. Track the keys in our read set.
+        if self.isolation_level == IsolationLevel::SnapshotIsolation
+            || self.isolation_level == IsolationLevel::RepeatableRead
+        {
+            let mut read_set = self.read_set.lock().unwrap();
+            let entry = read_set.entry(table_name.to_string()).or_default();
+            for key in &storage_keys {
+                entry.insert(key.clone());
+            }
+        }
+
+        // 3. Fall back to underlying storage engine.
+        let storage_results = table.multi_get(&storage_keys, columns)?;
+        for (idx, row) in storage_indices.into_iter().zip(storage_results) {
+            results[idx] = row;
+        }
+
+        Ok(results)
+    }
+
     /// Performs a range scan, merging storage engine data and transaction write-buffers.
     ///
     /// The returned rows are sorted by their primary key.
@@ -323,13 +378,21 @@ impl Transaction {
         let mut rows = Vec::new();
         let mut resolved_pks = HashSet::new();
 
-        // 2. Fetch rows by primary key from transaction/main table
+        // 2. Fetch rows by primary key from transaction/main table in batch
+        let mut pks = Vec::new();
         for (idx_key, _) in index_entries {
             if let DbKey::Composite(mut parts) = idx_key
                 && let Some(pk) = parts.pop()
             {
+                pks.push(pk);
+            }
+        }
+
+        if !pks.is_empty() {
+            let batch_rows = self.multi_get_projected(table_name, &pks, columns)?;
+            for (pk, row_opt) in pks.into_iter().zip(batch_rows) {
                 resolved_pks.insert(pk.clone());
-                if let Some(row) = self.get_projected(table_name, &pk, columns)? {
+                if let Some(row) = row_opt {
                     rows.push(row);
                 }
             }
@@ -375,26 +438,36 @@ impl Transaction {
     pub fn commit(&self) -> Result<()> {
         let mut buffer = self.write_buffer.lock().unwrap();
 
-        // 1. Group all buffered mutations by table as WalEntry batches.
+        // 1. Group all buffered mutations by table as WalEntry batches and TableWriteEntry batches.
         let mut table_batches = HashMap::new();
+        let mut table_write_entries = HashMap::new();
         for (table_name, table_buffer) in buffer.iter() {
             let mut entries = Vec::new();
+            let mut write_entries = Vec::new();
             for (key, val) in table_buffer {
                 match val {
                     Some(row) => {
                         let bytes = row.to_bytes()?;
-                        entries.push(WalEntry::Put {
+                        let entry = WalEntry::Put {
                             key: key.clone(),
                             value: DbValue::Bytes(bytes),
+                        };
+                        entries.push(entry.clone());
+                        write_entries.push(crate::database::TableWriteEntry {
+                            entry,
+                            row: Some(row.clone()),
                         });
                     }
                     None => {
-                        entries.push(WalEntry::Delete { key: key.clone() });
+                        let entry = WalEntry::Delete { key: key.clone() };
+                        entries.push(entry.clone());
+                        write_entries.push(crate::database::TableWriteEntry { entry, row: None });
                     }
                 }
             }
             if !entries.is_empty() {
                 table_batches.insert(table_name.clone(), entries);
+                table_write_entries.insert(table_name.clone(), write_entries);
             }
         }
 
@@ -453,7 +526,7 @@ impl Transaction {
         self.database.write_transaction_record(&record)?;
 
         // 3. Write batches to respective table storage engines
-        for (table_name, entries) in table_batches {
+        for (table_name, entries) in table_write_entries {
             let table = self.get_table(&table_name)?;
             table.write_batch(entries)?;
         }

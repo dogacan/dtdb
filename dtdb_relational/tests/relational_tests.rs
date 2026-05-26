@@ -436,3 +436,29 @@ fn test_background_statistics_collector() {
     let stats2 = db.get_table_statistics("users").unwrap();
     assert_eq!(stats2.row_count, 2);
 }
+
+#[test]
+fn test_database_multi_get() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", k_int(1), r_user(1, "alice", 95.5)).unwrap();
+    tx.put("users", k_int(2), r_user(2, "bob", 80.0)).unwrap();
+    tx.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    // Modify one in transaction buffer
+    tx2.put("users", k_int(2), r_user(2, "bob_new", 85.0))
+        .unwrap();
+
+    // Call multi_get_projected
+    let keys = vec![k_int(1), k_int(2), k_int(3)];
+    let rows = tx2.multi_get_projected("users", &keys, None).unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], Some(r_user(1, "alice", 95.5))); // From storage
+    assert_eq!(rows[1], Some(r_user(2, "bob_new", 85.0))); // From transaction write buffer
+    assert_eq!(rows[2], None); // Non-existent key
+}

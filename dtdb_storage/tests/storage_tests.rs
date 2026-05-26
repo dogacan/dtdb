@@ -371,3 +371,41 @@ fn test_memtable_size_tracking() {
     mem.clear();
     assert_eq!(mem.byte_size(), 0);
 }
+
+#[test]
+fn test_engine_multi_get() {
+    let temp_dir = TempDir::new().unwrap();
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 1000,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 4,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 1000,
+        wal_sync_interval_ms: None,
+    };
+    let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
+
+    // Insert keys: some in memtable, some in SSTables
+    engine.put(k_int(1), v_int(100)).unwrap();
+    engine.put(k_int(2), v_int(200)).unwrap();
+    engine.flush_memtable().unwrap(); // Flushes k=1, k=2 to SSTable
+
+    engine.put(k_int(3), v_int(300)).unwrap();
+    engine.put(k_int(4), v_int(400)).unwrap();
+    engine.delete(k_int(2)).unwrap(); // Tombstone in memtable
+
+    // multi_get queries
+    let keys = vec![k_int(1), k_int(2), k_int(3), k_int(4), k_int(5)];
+    let results = engine.multi_get(&keys).unwrap();
+
+    assert_eq!(results[0], Some(v_int(100))); // From SSTable
+    assert_eq!(results[1], None); // Deleted (tombstone in memtable)
+    assert_eq!(results[2], Some(v_int(300))); // From memtable
+    assert_eq!(results[3], Some(v_int(400))); // From memtable
+    assert_eq!(results[4], None); // Non-existent key
+}

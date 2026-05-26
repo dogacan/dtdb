@@ -97,6 +97,10 @@ impl StorageEngine {
         self.inner.get(key)
     }
 
+    pub fn multi_get(&self, keys: &[DbKey]) -> Result<Vec<Option<DbValue>>> {
+        self.inner.multi_get(keys)
+    }
+
     pub fn filtered_scan<F>(
         &self,
         start: &DbKey,
@@ -387,10 +391,9 @@ impl EngineInner {
 
         let _write_lock = self.write_mutex.lock().unwrap();
 
-        let wal_entries = entries.clone();
         {
             let mut wal = self.wal.lock().unwrap();
-            wal.append_batch(wal_entries)?;
+            wal.append_batch(&entries)?;
         }
 
         {
@@ -476,6 +479,96 @@ impl EngineInner {
         Ok(None)
     }
 
+    pub fn multi_get(&self, keys: &[DbKey]) -> Result<Vec<Option<DbValue>>> {
+        let mut results = vec![None; keys.len()];
+        let mut remaining_indices: Vec<usize> = (0..keys.len()).collect();
+
+        // 1. Check Memtable under a single read lock
+        {
+            let mem = self.memtable.read().unwrap();
+            let mut i = 0;
+            while i < remaining_indices.len() {
+                let idx = remaining_indices[i];
+                let key = &keys[idx];
+                if let Some(res) = mem.get(key) {
+                    results[idx] = res;
+                    remaining_indices.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        if remaining_indices.is_empty() {
+            return Ok(results);
+        }
+
+        // 2. Check SSTables under a single read lock
+        let sstables_map = self.sstables.read().unwrap();
+
+        // Check L0
+        if let Some(l0_ssts) = sstables_map.get(&0) {
+            for sstable in l0_ssts.iter() {
+                let mut i = 0;
+                while i < remaining_indices.len() {
+                    let idx = remaining_indices[i];
+                    let key = &keys[idx];
+                    if let Some(res) = sstable.get(key)? {
+                        results[idx] = res;
+                        remaining_indices.swap_remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                if remaining_indices.is_empty() {
+                    return Ok(results);
+                }
+            }
+        }
+
+        // Check Leveled SSTables (Level 1+)
+        for (level, ssts) in sstables_map.iter() {
+            if *level == 0 || ssts.is_empty() {
+                continue;
+            }
+
+            let mut i = 0;
+            while i < remaining_indices.len() {
+                let idx = remaining_indices[i];
+                let key = &keys[idx];
+
+                let idx_res = ssts.binary_search_by(|sstable| {
+                    let f_key = sstable
+                        .first_key()
+                        .expect("Level 1+ SSTable must not be empty");
+                    let l_key = sstable.last_key();
+                    if key < f_key {
+                        std::cmp::Ordering::Greater
+                    } else if key > l_key {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                });
+
+                if let Ok(sst_idx) = idx_res
+                    && let Some(res) = ssts[sst_idx].get(key)?
+                {
+                    results[idx] = res;
+                    remaining_indices.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            if remaining_indices.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        Ok(results)
+    }
+
     pub fn scan_iter(&self, start: &DbKey, end: &DbKey) -> Result<ScanIterator> {
         let mem = self.memtable.read().unwrap();
         let mem_entries = mem.scan_range_raw(start, end);
@@ -536,14 +629,12 @@ impl EngineInner {
 
         {
             let mem = self.memtable.read().unwrap();
-            for (k, v) in mem.entries() {
-                if k >= *start && k <= *end {
-                    seen.insert(k.clone());
-                    if let Some(val) = v
-                        && filter(&k, &val)
-                    {
-                        results.insert(k, val);
-                    }
+            for (k, v) in mem.scan_range_raw(start, end) {
+                seen.insert(k.clone());
+                if let Some(val) = v
+                    && filter(&k, &val)
+                {
+                    results.insert(k, val);
                 }
             }
         }

@@ -251,6 +251,7 @@ pub struct SstableReader {
     block_cache: Option<Arc<BlockCache>>,
     pub stats: StatsBlock,
     pub bloom_filter: Option<crate::bloom::BloomFilter>,
+    pub file_size: u64,
 }
 
 impl SstableReader {
@@ -323,6 +324,7 @@ impl SstableReader {
             block_cache,
             stats: index_block.stats,
             bloom_filter: index_block.bloom_filter,
+            file_size: file_len,
         };
 
         // Cache the last key of the SSTable by reading the last block
@@ -346,7 +348,7 @@ impl SstableReader {
     }
 
     pub fn file_size(&self) -> u64 {
-        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+        self.file_size
     }
 
     /// Performs a point lookup for a key.
