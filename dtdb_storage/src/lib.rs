@@ -141,6 +141,8 @@ pub struct EngineOptions {
     pub level_size_multiplier: usize,
     pub max_level: usize,
     pub block_cache_capacity: usize,
+    #[serde(default)]
+    pub wal_sync_interval_ms: Option<u64>,
 }
 
 impl From<i64> for DbValue {

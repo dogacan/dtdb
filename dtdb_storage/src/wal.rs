@@ -20,15 +20,20 @@ pub struct Wal {
     file: File,
     #[allow(dead_code)]
     path: PathBuf,
+    sync_interval_ms: Option<u64>,
 }
 
 impl Wal {
     /// Opens an existing WAL file or creates a new one in append-only mode.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, sync_interval_ms: Option<u64>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            sync_interval_ms,
+        })
     }
 
     /// Appends a `Put` operation to the log.
@@ -73,6 +78,14 @@ impl Wal {
         // CRITICAL FOR DURABILITY: `sync_all` forces the OS to flush its file system caches
         // directly to the physical storage media (similar to fsync in C). Without this,
         // data could remain in OS memory and be lost during a sudden power outage.
+        if self.sync_interval_ms.is_none() || self.sync_interval_ms == Some(0) {
+            self.file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Explicitly flushes WAL buffers to disk. Used for periodic background syncing.
+    pub fn sync_all(&self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
     }

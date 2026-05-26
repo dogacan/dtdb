@@ -49,6 +49,8 @@ pub struct LocalityGroupOptions {
     pub level_size_multiplier: Option<usize>,
     pub max_level: Option<usize>,
     pub block_cache_capacity: Option<usize>,
+    #[serde(default)]
+    pub wal_sync_interval_ms: Option<Option<u64>>,
 }
 
 impl LocalityGroupOptions {
@@ -77,6 +79,9 @@ impl LocalityGroupOptions {
             block_cache_capacity: self
                 .block_cache_capacity
                 .unwrap_or(defaults.block_cache_capacity),
+            wal_sync_interval_ms: self
+                .wal_sync_interval_ms
+                .unwrap_or(defaults.wal_sync_interval_ms),
         }
     }
 }

@@ -1212,6 +1212,56 @@ fn test_locality_groups_overrides_end_to_end() {
 }
 
 #[test]
+fn test_locality_groups_wal_sync_override() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    // 1. CREATE TABLE with WITH (locality_groups = '... overrides ...')
+    let tx1 = Transaction::new(1, db.clone());
+    let res = engine
+        .execute(
+            "CREATE TABLE test_sync (id INT PRIMARY KEY, name STRING, salary INT) WITH (locality_groups = 'lg_name:name:wal_sync_interval_ms=100; lg_finance:salary:wal_sync_interval_ms=off')",
+            &tx1,
+        )
+        .unwrap();
+    assert!(matches!(res, ExecutionResult::CreateTable));
+    tx1.commit().unwrap();
+
+    // 2. Verify Schema columns and their options
+    let table = db.get_table("test_sync").unwrap();
+
+    let lg_name_opts = table.schema.locality_group_options.get("lg_name").unwrap();
+    assert_eq!(lg_name_opts.wal_sync_interval_ms, Some(Some(100)));
+
+    let lg_finance_opts = table
+        .schema
+        .locality_group_options
+        .get("lg_finance")
+        .unwrap();
+    assert_eq!(lg_finance_opts.wal_sync_interval_ms, Some(None));
+
+    // 3. Verify on-disk storage engine options.bin for each group
+    let table_path = temp_dir.path().join("test_sync");
+
+    // lg_name options.bin verification (should be Some(100))
+    let lg_name_opts_path = table_path.join("lg_lg_name").join("options.bin");
+    assert!(lg_name_opts_path.exists());
+    let lg_name_bytes = std::fs::read(&lg_name_opts_path).unwrap();
+    let lg_name_engine_opts: dtdb_storage::EngineOptions =
+        bincode::deserialize(&lg_name_bytes).unwrap();
+    assert_eq!(lg_name_engine_opts.wal_sync_interval_ms, Some(100));
+
+    // lg_finance options.bin verification (should be None)
+    let lg_finance_opts_path = table_path.join("lg_lg_finance").join("options.bin");
+    assert!(lg_finance_opts_path.exists());
+    let lg_finance_bytes = std::fs::read(&lg_finance_opts_path).unwrap();
+    let lg_finance_engine_opts: dtdb_storage::EngineOptions =
+        bincode::deserialize(&lg_finance_bytes).unwrap();
+    assert_eq!(lg_finance_engine_opts.wal_sync_interval_ms, None);
+}
+
+#[test]
 fn test_sql_secondary_indexing() {
     let (temp_dir, db, engine) = setup_engine();
 
@@ -2331,6 +2381,7 @@ fn test_cbo_index_selection_by_cardinality() {
         max_level: None,
         block_cache_capacity: Some(0),
         analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -2444,6 +2495,7 @@ fn test_cbo_locality_group_pruning_performance() {
         max_level: None,
         block_cache_capacity: Some(0),
         analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);

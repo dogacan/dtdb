@@ -50,7 +50,7 @@ fn test_wal_recovery() {
 
     // Write entries to WAL
     {
-        let mut wal = Wal::open(&wal_path).unwrap();
+        let mut wal = Wal::open(&wal_path, None).unwrap();
         wal.append_put(&k_int(1), &v_int(100)).unwrap();
         wal.append_put(&k_str("a"), &v_str("apple")).unwrap();
         wal.append_delete(&k_int(1)).unwrap();
@@ -133,6 +133,7 @@ fn test_engine_crud() {
         level_size_multiplier: 10,
         max_level: 7,
         block_cache_capacity: 1000,
+        wal_sync_interval_ms: None,
     };
     let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
 
@@ -182,6 +183,7 @@ fn test_engine_crash_recovery() {
             level_size_multiplier: 10,
             max_level: 7,
             block_cache_capacity: 1000,
+            wal_sync_interval_ms: None,
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("one")).unwrap();
@@ -203,6 +205,7 @@ fn test_engine_crash_recovery() {
             level_size_multiplier: 10,
             max_level: 7,
             block_cache_capacity: 1000,
+            wal_sync_interval_ms: None,
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         assert_eq!(engine.get(&k_int(1)).unwrap(), None); // Deleted
@@ -242,6 +245,7 @@ fn test_engine_compaction() {
             level_size_multiplier: 10,
             max_level: 7,
             block_cache_capacity: 1000,
+            wal_sync_interval_ms: None,
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("v1_old")).unwrap(); // Flushes
@@ -300,6 +304,7 @@ fn test_engine_statistics() {
         level_size_multiplier: 10,
         max_level: 7,
         block_cache_capacity: 1000,
+        wal_sync_interval_ms: None,
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 

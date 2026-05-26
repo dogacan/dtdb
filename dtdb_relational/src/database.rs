@@ -399,6 +399,8 @@ pub struct DatabaseOptions {
     pub block_cache_capacity: Option<usize>,
     #[serde(default)]
     pub analyze_frequency_ms: Option<u64>,
+    #[serde(default)]
+    pub wal_sync_interval_ms: Option<u64>,
 }
 
 /// Database represents a catalog of Tables stored in a base directory.
@@ -452,6 +454,7 @@ impl Database {
                 max_level: None,
                 block_cache_capacity: Some(1000),
                 analyze_frequency_ms: None,
+                wal_sync_interval_ms: None,
             }
         };
         Self::open_with_options_and_spawner(dir_path, options, spawner)
@@ -528,6 +531,7 @@ impl Database {
                         level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
                         max_level: options.max_level.unwrap_or(7),
                         block_cache_capacity: options.block_cache_capacity.unwrap_or(1000),
+                        wal_sync_interval_ms: options.wal_sync_interval_ms,
                     };
 
                     let mut engines = HashMap::new();
@@ -696,6 +700,7 @@ impl Database {
             level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
             max_level: self.options.max_level.unwrap_or(7),
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
+            wal_sync_interval_ms: self.options.wal_sync_interval_ms,
         };
 
         let mut engines = HashMap::new();
@@ -1217,6 +1222,7 @@ impl Database {
             level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
             max_level: self.options.max_level.unwrap_or(7),
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
+            wal_sync_interval_ms: self.options.wal_sync_interval_ms,
         };
 
         // 6. Create index directory

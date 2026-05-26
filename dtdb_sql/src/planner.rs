@@ -188,6 +188,20 @@ impl LogicalPlanner {
                                                         })?,
                                                     );
                                                 }
+                                                "wal_sync_interval_ms" => {
+                                                    let val_lower = val.to_lowercase();
+                                                    if val_lower == "off"
+                                                        || val_lower == "none"
+                                                        || val_lower == "sync"
+                                                    {
+                                                        opts.wal_sync_interval_ms = Some(None);
+                                                    } else {
+                                                        let ms = val.parse::<u64>().map_err(|e| {
+                                                            format!("Invalid wal_sync_interval_ms: {}", e)
+                                                        })?;
+                                                        opts.wal_sync_interval_ms = Some(Some(ms));
+                                                    }
+                                                }
                                                 other => {
                                                     return Err(format!(
                                                         "Unknown locality group option: {}",

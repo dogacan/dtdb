@@ -26,6 +26,7 @@ fn get_test_options() -> EngineOptions {
         level_size_multiplier: 10,
         max_level: 7,
         block_cache_capacity: 1000,
+        wal_sync_interval_ms: None,
     }
 }
 
@@ -36,7 +37,7 @@ fn test_wal_tolerant_recovery() {
 
     // 1. Write some valid entries to WAL
     {
-        let mut wal = Wal::open(&wal_path).unwrap();
+        let mut wal = Wal::open(&wal_path, None).unwrap();
         wal.append_put(&k_int(1), &v_str("apple")).unwrap();
         wal.append_put(&k_int(2), &v_str("banana")).unwrap();
     }

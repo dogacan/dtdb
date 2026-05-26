@@ -58,10 +58,27 @@ impl StorageEngine {
         options: EngineOptions,
         spawner: Arc<dyn ThreadSpawner>,
     ) -> Result<Self> {
-        let inner = EngineInner::open(dir_path, options, spawner)?;
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        let inner = Arc::new(EngineInner::open(dir_path, options, spawner.clone())?);
+
+        if let Some(ms) = inner.options.wal_sync_interval_ms
+            && ms > 0
+        {
+            let inner_weak = Arc::downgrade(&inner);
+            spawner.spawn(Box::new(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if let Some(engine) = inner_weak.upgrade() {
+                        if let Err(e) = engine.sync_wal() {
+                            eprintln!("Background WAL sync error: {:?}", e);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        Ok(Self { inner })
     }
 
     pub fn put(&self, key: DbKey, value: DbValue) -> Result<()> {
@@ -279,7 +296,7 @@ impl EngineInner {
             fs::remove_file(&wal_path)?;
         }
 
-        let wal = Wal::open(&wal_path)?;
+        let wal = Wal::open(&wal_path, active_options.wal_sync_interval_ms)?;
 
         Ok(Self {
             dir_path,
@@ -912,7 +929,7 @@ impl EngineInner {
         }
 
         let temp_wal_path = self.dir_path.join("active.wal.tmp");
-        let new_wal = Wal::open(&temp_wal_path)?;
+        let new_wal = Wal::open(&temp_wal_path, self.options.wal_sync_interval_ms)?;
 
         let wal_path = self.dir_path.join("active.wal");
         {
@@ -953,5 +970,11 @@ impl EngineInner {
             }
             sig.pending = false;
         }
+    }
+
+    pub fn sync_wal(&self) -> Result<()> {
+        let wal = self.wal.lock().unwrap();
+        wal.sync_all()?;
+        Ok(())
     }
 }

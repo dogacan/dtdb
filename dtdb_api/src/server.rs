@@ -278,6 +278,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             max_level: None,
             block_cache_capacity: Some(1000),
             analyze_frequency_ms: req.analyze_frequency_ms,
+            wal_sync_interval_ms: None,
         };
 
         let database = Arc::new(

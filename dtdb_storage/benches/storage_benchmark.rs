@@ -23,6 +23,7 @@ fn create_options(cache_capacity: usize, compression: CompressionType) -> Engine
         level_size_multiplier: 10,
         max_level: 7,
         block_cache_capacity: cache_capacity,
+        wal_sync_interval_ms: None,
     }
 }
 
