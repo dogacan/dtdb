@@ -2304,3 +2304,215 @@ fn test_sql_analyze() {
     assert_eq!(idx_stats.unique_values, 2); // 'apple' and 'banana'
     assert_eq!(idx_stats.avg_rows_per_value, 1.5);
 }
+
+fn setup_engine_with_options(
+    options: dtdb_relational::DatabaseOptions,
+) -> (TempDir, Arc<Database>, SqlEngine) {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open_with_options(temp_dir.path(), options).unwrap());
+    let engine = SqlEngine::new(db.clone());
+    (temp_dir, db, engine)
+}
+
+#[test]
+fn test_cbo_index_selection_by_cardinality() {
+    // Construct database options with block_cache_capacity = Some(0) to disable caching
+    // and isolate disk block read diagnostics
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(0),
+        analyze_frequency_ms: None,
+    };
+
+    let (_temp, db, engine) = setup_engine_with_options(options);
+
+    // 1. Create table and two indexes
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE items (id INT PRIMARY KEY, x INT, y INT, z INT)",
+            &tx1,
+        )
+        .unwrap();
+    engine
+        .execute("CREATE INDEX idx_x ON items (x)", &tx1)
+        .unwrap();
+    engine
+        .execute("CREATE INDEX idx_y ON items (y)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    // 2. Insert data: x is highly selective (only 5 rows have x=1),
+    // y is poorly selective (all 500 rows have y=2).
+    let tx2 = Transaction::new(2, db.clone());
+    for i in 1..=500 {
+        let x_val = if i <= 5 { 1 } else { i };
+        let query = format!(
+            "INSERT INTO items (id, x, y, z) VALUES ({}, {}, 2, {})",
+            i, x_val, i
+        );
+        engine.execute(&query, &tx2).unwrap();
+    }
+    tx2.commit().unwrap();
+
+    // Flush tables and indexes to generate SSTables
+    let table = db.get_table("items").unwrap();
+    table.flush_memtable().unwrap();
+
+    // Execute ANALYZE to collect statistics
+    let tx3 = Transaction::new(3, db.clone());
+    engine.execute("ANALYZE TABLE items", &tx3).unwrap();
+    tx3.commit().unwrap();
+
+    // 3. Verify via EXPLAIN that the physical plan selects idx_x for the query:
+    // SELECT id FROM items WHERE x = 1 AND y = 2
+    let tx4 = Transaction::new(4, db.clone());
+    let explain_res = engine
+        .execute("EXPLAIN SELECT id FROM items WHERE x = 1 AND y = 2", &tx4)
+        .unwrap();
+
+    let plan_str = if let ExecutionResult::Select { rows, .. } = explain_res {
+        match &rows[0].values[0] {
+            DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string plan representation"),
+        }
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    };
+
+    assert!(plan_str.contains("- IndexScan: table=items, index=idx_x"));
+    assert!(!plan_str.contains("- IndexScan: table=items, index=idx_y"));
+
+    // 4. Verify blocks read is significantly fewer using CBO (with idx_x) than a query doing full scan
+    // First, let's query WHERE x = 1 AND y = 2. It will use idx_x.
+    dtdb_storage::reset_physical_blocks_read();
+    let res_cbo = engine
+        .execute("SELECT id FROM items WHERE x = 1 AND y = 2", &tx4)
+        .unwrap();
+    let blocks_cbo = dtdb_storage::get_physical_blocks_read();
+
+    if let ExecutionResult::Select { rows, .. } = res_cbo {
+        assert_eq!(rows.len(), 5);
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Now, run a query that forces a full scan (filtering on z, which is not indexed)
+    dtdb_storage::reset_physical_blocks_read();
+    let res_seq = engine
+        .execute("SELECT id FROM items WHERE z = 10", &tx4)
+        .unwrap();
+    let blocks_seq = dtdb_storage::get_physical_blocks_read();
+
+    if let ExecutionResult::Select { rows, .. } = res_seq {
+        assert_eq!(rows.len(), 1);
+    } else {
+        panic!("Expected Select result");
+    }
+
+    println!(
+        "Blocks read: CBO = {}, Full Seq Scan = {}",
+        blocks_cbo, blocks_seq
+    );
+    // CBO index scan on idx_x (fetching 5 rows) should read fewer blocks than scanning the whole 500-row table
+    assert!(blocks_cbo < blocks_seq);
+    assert!(blocks_cbo > 0);
+}
+
+#[test]
+fn test_cbo_locality_group_pruning_performance() {
+    // Construct database options with block_cache_capacity = Some(0) to disable caching
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(0),
+        analyze_frequency_ms: None,
+    };
+
+    let (_temp, db, engine) = setup_engine_with_options(options);
+
+    // 1. Create table with locality groups
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name STRING, salary INT, bio STRING) WITH (locality_groups = 'lg_finance:salary; lg_bio:bio')",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    // 2. Insert data
+    let tx2 = Transaction::new(2, db.clone());
+    for i in 1..=100 {
+        let query = format!(
+            "INSERT INTO employees (id, name, salary, bio) VALUES ({}, 'name_{}', {}, 'biography_{}')",
+            i,
+            i,
+            i * 1000,
+            i
+        );
+        engine.execute(&query, &tx2).unwrap();
+    }
+    tx2.commit().unwrap();
+
+    // Flush tables to generate SSTables for each locality group
+    let table = db.get_table("employees").unwrap();
+    table.flush_memtable().unwrap();
+
+    // Execute ANALYZE to collect statistics
+    let tx3 = Transaction::new(3, db.clone());
+    engine.execute("ANALYZE TABLE employees", &tx3).unwrap();
+    tx3.commit().unwrap();
+
+    // 3. Query only columns in default locality group ("")
+    let tx4 = Transaction::new(4, db.clone());
+    dtdb_storage::reset_physical_blocks_read();
+    let res_pruned = engine
+        .execute("SELECT id, name FROM employees WHERE id > 0", &tx4)
+        .unwrap();
+    let blocks_pruned = dtdb_storage::get_physical_blocks_read();
+
+    if let ExecutionResult::Select { rows, .. } = res_pruned {
+        assert_eq!(rows.len(), 100);
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // 4. Query columns in default group ("") + lg_bio
+    dtdb_storage::reset_physical_blocks_read();
+    let res_full = engine
+        .execute("SELECT id, name, bio FROM employees WHERE id > 0", &tx4)
+        .unwrap();
+    let blocks_full = dtdb_storage::get_physical_blocks_read();
+
+    if let ExecutionResult::Select { rows, .. } = res_full {
+        assert_eq!(rows.len(), 100);
+    } else {
+        panic!("Expected Select result");
+    }
+
+    println!(
+        "Blocks read: Pruned = {}, Full = {}",
+        blocks_pruned, blocks_full
+    );
+    // The pruned query (only scanning default group) should read fewer blocks than scanning default + lg_bio groups
+    assert!(blocks_pruned < blocks_full);
+    assert!(blocks_pruned > 0);
+}

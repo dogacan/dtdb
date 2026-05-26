@@ -208,7 +208,7 @@ impl SqlEngine {
                 let mut insert_count = 0;
 
                 // 1. Optimize the Logical Plan
-                let optimized_plan = Optimizer::new().optimize(query);
+                let optimized_plan = Optimizer::new(self.database.clone()).optimize(query);
 
                 // Collect referenced columns
                 let mut cols = HashSet::new();
@@ -301,7 +301,7 @@ impl SqlEngine {
                     None => scan_plan,
                 };
 
-                let optimized_plan = Optimizer::new().optimize(plan);
+                let optimized_plan = Optimizer::new(self.database.clone()).optimize(plan);
                 let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut delete_count = 0;
@@ -347,7 +347,7 @@ impl SqlEngine {
                     None => scan_plan,
                 };
 
-                let optimized_plan = Optimizer::new().optimize(plan);
+                let optimized_plan = Optimizer::new(self.database.clone()).optimize(plan);
                 let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
 
                 let mut update_count = 0;
@@ -395,7 +395,7 @@ impl SqlEngine {
             }
             SqlStatement::Query(logical_plan) => {
                 // 1. Optimize the Logical Plan
-                let optimized_plan = Optimizer::new().optimize(logical_plan);
+                let optimized_plan = Optimizer::new(self.database.clone()).optimize(logical_plan);
 
                 // Collect referenced columns
                 let mut cols = HashSet::new();
@@ -418,7 +418,8 @@ impl SqlEngine {
             }
             SqlStatement::Explain(logical_plan) => {
                 // 1. Optimize the Logical Plan
-                let optimized_plan = Optimizer::new().optimize(logical_plan.clone());
+                let optimized_plan =
+                    Optimizer::new(self.database.clone()).optimize(logical_plan.clone());
 
                 // 2. Format logical plans as strings
                 let logical_str = format_logical_plan(&logical_plan);

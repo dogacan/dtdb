@@ -183,6 +183,17 @@ impl<'a> From<&'a [u8]> for DbValue {
     }
 }
 
+pub static PHYSICAL_BLOCKS_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn reset_physical_blocks_read() {
+    PHYSICAL_BLOCKS_READ.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn get_physical_blocks_read() -> u64 {
+    PHYSICAL_BLOCKS_READ.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

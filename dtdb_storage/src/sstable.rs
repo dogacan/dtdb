@@ -380,6 +380,8 @@ impl SstableReader {
             }
         }
 
+        crate::PHYSICAL_BLOCKS_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         let entry = &self.index[idx];
         self.file.seek(SeekFrom::Start(entry.offset))?;
 

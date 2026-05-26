@@ -4,7 +4,9 @@ pub mod row;
 pub mod schema;
 pub mod transaction;
 
-pub use database::{Database, DatabaseOptions, Table, TransactionRecord};
+pub use database::{
+    Database, DatabaseOptions, GroupStats, IndexStats, Table, TableStatistics, TransactionRecord,
+};
 pub use error::{RelationalError, Result};
 pub use row::Row;
 pub use schema::{Column, DataType, LocalityGroupOptions, Schema};

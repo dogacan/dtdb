@@ -224,6 +224,9 @@ impl Table {
         for engine in self.engines.values() {
             engine.flush_memtable()?;
         }
+        for engine in self.index_engines.values() {
+            engine.flush_memtable()?;
+        }
         Ok(())
     }
 
