@@ -253,7 +253,7 @@ impl Optimizer {
                         let expressions = original_schema
                             .columns
                             .iter()
-                            .map(|col| Expr::Column(col.name.clone()))
+                            .map(|col| Expr::Column(col.name.clone(), None))
                             .collect();
                         let field_names = original_schema
                             .columns
@@ -632,14 +632,14 @@ fn get_column_comparison<'a>(
     col_name: &str,
 ) -> Option<&'a DbValue> {
     match (left, right) {
-        (Expr::Column(name), Expr::Literal(lit))
+        (Expr::Column(name, _), Expr::Literal(lit))
             if name == col_name
                 || name.ends_with(&format!(".{}", col_name))
                 || col_name.ends_with(&format!(".{}", name)) =>
         {
             Some(lit)
         }
-        (Expr::Literal(lit), Expr::Column(name))
+        (Expr::Literal(lit), Expr::Column(name, _))
             if name == col_name
                 || name.ends_with(&format!(".{}", col_name))
                 || col_name.ends_with(&format!(".{}", name)) =>

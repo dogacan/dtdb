@@ -24,7 +24,7 @@ pub enum Operator {
 /// Expr represents a scalar expression in SQL (column names, literals, binary operations).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Expr {
-    Column(String),
+    Column(String, #[serde(default)] Option<usize>),
     Literal(DbValue),
     BinaryOp {
         left: Box<Expr>,
@@ -53,7 +53,7 @@ impl Expr {
     /// Recursively collects all column names referenced in this expression.
     pub fn collect_columns(&self, columns: &mut HashSet<String>) {
         match self {
-            Expr::Column(name) => {
+            Expr::Column(name, _) => {
                 columns.insert(name.clone());
             }
             Expr::Literal(_) => {}
@@ -100,17 +100,11 @@ impl Expr {
         }
     }
 
-    /// Evaluates the expression against a Row and its Schema.
-    pub fn eval(&self, row: &Row, schema: &Schema) -> Result<DbValue, String> {
+    pub fn bind_columns(&mut self, schema: &Schema) {
         match self {
-            Expr::Literal(val) => Ok(val.clone()),
-            Expr::Column(name) => {
-                // Find column in schema.
-                // We support both exact match "users.name" and suffix match "name" to make queries convenient.
-                let idx = schema
-                    .columns
-                    .iter()
-                    .position(|col| {
+            Expr::Column(name, index) => {
+                if index.is_none() {
+                    let idx = schema.columns.iter().position(|col| {
                         if col.name == *name {
                             true
                         } else if let Some(pos) = name.rfind('.') {
@@ -120,8 +114,78 @@ impl Expr {
                         } else {
                             false
                         }
-                    })
-                    .ok_or_else(|| format!("Column not found in schema: '{}'", name))?;
+                    });
+                    *index = idx;
+                }
+            }
+            Expr::Literal(_) => {}
+            Expr::BinaryOp { left, right, .. } => {
+                left.bind_columns(schema);
+                right.bind_columns(schema);
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    op.bind_columns(schema);
+                }
+                for cond in conditions {
+                    cond.bind_columns(schema);
+                }
+                for res in results {
+                    res.bind_columns(schema);
+                }
+                if let Some(el) = else_result {
+                    el.bind_columns(schema);
+                }
+            }
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    arg.bind_columns(schema);
+                }
+            }
+            Expr::Not(inner) => {
+                inner.bind_columns(schema);
+            }
+            Expr::IsNull(inner) => {
+                inner.bind_columns(schema);
+            }
+            Expr::InList { expr, list } => {
+                expr.bind_columns(schema);
+                for item in list {
+                    item.bind_columns(schema);
+                }
+            }
+        }
+    }
+
+    /// Evaluates the expression against a Row and its Schema.
+    pub fn eval(&self, row: &Row, schema: &Schema) -> Result<DbValue, String> {
+        match self {
+            Expr::Literal(val) => Ok(val.clone()),
+            Expr::Column(name, index) => {
+                let idx = if let Some(idx) = index {
+                    *idx
+                } else {
+                    schema
+                        .columns
+                        .iter()
+                        .position(|col| {
+                            if col.name == *name {
+                                true
+                            } else if let Some(pos) = name.rfind('.') {
+                                col.name == name[pos + 1..]
+                            } else if let Some(col_pos) = col.name.rfind('.') {
+                                col.name[col_pos + 1..] == *name
+                            } else {
+                                false
+                            }
+                        })
+                        .ok_or_else(|| format!("Column not found in schema: '{}'", name))?
+                };
 
                 row.get_by_index(idx)
                     .cloned()

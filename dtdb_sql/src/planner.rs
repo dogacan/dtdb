@@ -650,7 +650,7 @@ impl LogicalPlanner {
                     // First group-by field names
                     for expr in &group_exprs {
                         match expr {
-                            Expr::Column(name) => field_names.push(name.clone()),
+                            Expr::Column(name, _) => field_names.push(name.clone()),
                             _ => field_names.push("group_key".to_string()),
                         }
                     }
@@ -722,7 +722,7 @@ impl LogicalPlanner {
                             SelectItem::UnnamedExpr(expr) => {
                                 let planned_expr = plan_expr(expr)?;
                                 let name = match &planned_expr {
-                                    Expr::Column(name) => name.clone(),
+                                    Expr::Column(name, _) => name.clone(),
                                     _ => expr.to_string(),
                                 };
                                 expressions.push(planned_expr);
@@ -754,7 +754,7 @@ impl LogicalPlanner {
                             SelectItem::UnnamedExpr(expr) => {
                                 let planned_expr = plan_expr(expr)?;
                                 let name = match &planned_expr {
-                                    Expr::Column(name) => name.clone(),
+                                    Expr::Column(name, _) => name.clone(),
                                     _ => expr.to_string(),
                                 };
                                 expressions.push(planned_expr);
@@ -768,7 +768,7 @@ impl LogicalPlanner {
                             SelectItem::Wildcard(_) => {
                                 // Expand wildcard to all fields in the source schema
                                 for col in &source_schema.columns {
-                                    expressions.push(Expr::Column(col.name.clone()));
+                                    expressions.push(Expr::Column(col.name.clone(), None));
                                     field_names.push(col.name.clone());
                                 }
                             }
@@ -883,7 +883,7 @@ impl LogicalPlanner {
             // First group-by field names
             for expr in &group_exprs {
                 match expr {
-                    Expr::Column(name) => field_names.push(name.clone()),
+                    Expr::Column(name, _) => field_names.push(name.clone()),
                     _ => field_names.push("group_key".to_string()),
                 }
             }
@@ -945,7 +945,7 @@ impl LogicalPlanner {
                     SelectItem::UnnamedExpr(expr) => {
                         let planned_expr = plan_expr(expr)?;
                         let name = match &planned_expr {
-                            Expr::Column(name) => name.clone(),
+                            Expr::Column(name, _) => name.clone(),
                             _ => expr.to_string(),
                         };
                         expressions.push(planned_expr);
@@ -1005,7 +1005,7 @@ impl LogicalPlanner {
                     SelectItem::UnnamedExpr(expr) => {
                         let planned_expr = plan_expr(expr)?;
                         let name = match &planned_expr {
-                            Expr::Column(name) => name.clone(),
+                            Expr::Column(name, _) => name.clone(),
                             _ => expr.to_string(),
                         };
                         expressions.push(planned_expr);
@@ -1019,7 +1019,7 @@ impl LogicalPlanner {
                     SelectItem::Wildcard(_) => {
                         // Expand wildcard to all fields in the source schema
                         for col in &source_schema.columns {
-                            expressions.push(Expr::Column(col.name.clone()));
+                            expressions.push(Expr::Column(col.name.clone(), None));
                             field_names.push(col.name.clone());
                         }
                     }
@@ -1121,7 +1121,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             if ident.quote_style == Some('"') {
                 Ok(Expr::Literal(DbValue::String(ident.value.clone())))
             } else {
-                Ok(Expr::Column(ident.value.clone()))
+                Ok(Expr::Column(ident.value.clone(), None))
             }
         }
         SqlExpr::CompoundIdentifier(parts) => {
@@ -1130,7 +1130,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                 .map(|p| p.value.as_str())
                 .collect::<Vec<_>>()
                 .join(".");
-            Ok(Expr::Column(name))
+            Ok(Expr::Column(name, None))
         }
         SqlExpr::Value(val) => {
             let db_val = match val {

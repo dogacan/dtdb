@@ -625,7 +625,7 @@ pub struct Database {
     active_transactions: Mutex<HashSet<u64>>,
     global_commit_version: std::sync::atomic::AtomicU64,
     occ_active_transactions: Mutex<HashMap<u64, u64>>,
-    commit_history: Mutex<Vec<CommitRecord>>,
+    commit_history: RwLock<Vec<CommitRecord>>,
     spawner: Arc<dyn ThreadSpawner>,
     active_table_access: Mutex<HashMap<String, HashSet<u64>>>,
     pub auto_increment_sequences: Mutex<HashMap<String, i64>>,
@@ -818,7 +818,7 @@ impl Database {
         let active_transactions = Mutex::new(HashSet::new());
         let global_commit_version = std::sync::atomic::AtomicU64::new(0);
         let occ_active_transactions = Mutex::new(HashMap::new());
-        let commit_history = Mutex::new(Vec::new());
+        let commit_history = RwLock::new(Vec::new());
         let active_table_access = Mutex::new(HashMap::new());
         let auto_increment_sequences = Mutex::new(HashMap::new());
 
@@ -1239,7 +1239,7 @@ impl Database {
         });
 
         {
-            let mut history = self.commit_history.lock().unwrap();
+            let mut history = self.commit_history.write().unwrap();
             history.retain(|r| r.commit_version >= min_version);
         }
 
@@ -1257,12 +1257,79 @@ impl Database {
         scan_ranges: &HashMap<String, Vec<(dtdb_storage::DbKey, dtdb_storage::DbKey)>>,
         write_keys: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
     ) -> Result<u64> {
-        let mut history = self.commit_history.lock().unwrap();
+        let snapshot_max_version = {
+            let history = self.commit_history.read().unwrap();
 
-        // 1. Perform validation against history for commits > start_version
+            // 1. Perform validation against history for commits > start_version
+            for record in history.iter() {
+                if record.commit_version > start_version {
+                    // Check read-write conflict: Did the committed record modify a key we read?
+                    for (table_name, read_keys) in read_set {
+                        if let Some(committed_keys) = record.keys.get(table_name) {
+                            for k in read_keys {
+                                if committed_keys.contains(k) {
+                                    return Err(RelationalError::TransactionConflict(format!(
+                                        "Conflict detected: Key {:?} in table {} was modified by a concurrent transaction (tx_id: {})",
+                                        k, table_name, tx_id
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
+                    // Check phantom conflict: Did the committed record modify/insert a key in a range we scanned?
+                    for (table_name, ranges) in scan_ranges {
+                        if let Some(committed_keys) = record.keys.get(table_name) {
+                            for k in committed_keys {
+                                for (start, end) in ranges {
+                                    if k >= start && k <= end {
+                                        return Err(RelationalError::TransactionConflict(format!(
+                                            "Phantom read conflict detected: Key {:?} in table {} fell within scanned range [{:?}, {:?}] (tx_id: {})",
+                                            k, table_name, start, end, tx_id
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Check write-write conflict: Did the committed record modify a key we want to write?
+                    for (table_name, w_keys) in write_keys {
+                        if let Some(committed_keys) = record.keys.get(table_name) {
+                            for k in w_keys {
+                                if committed_keys.contains(k) {
+                                    return Err(RelationalError::TransactionConflict(format!(
+                                        "Conflict detected: Key {:?} in table {} was modified by a concurrent transaction (tx_id: {})",
+                                        k, table_name, tx_id
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Find current maximum version in history, or start_version if empty
+            history
+                .iter()
+                .map(|r| r.commit_version)
+                .max()
+                .unwrap_or(start_version)
+        };
+
+        // Get pruning limit version before write-locking commit_history to prevent deadlock
+        let min_start_version = {
+            let active = self.occ_active_transactions.lock().unwrap();
+            active.values().copied().min()
+        };
+
+        // Phase 2: Acquire write lock, perform delta validation, increment, append and prune
+        let mut history = self.commit_history.write().unwrap();
+
+        // Perform delta validation against history for commits > snapshot_max_version
         for record in history.iter() {
-            if record.commit_version > start_version {
-                // Check read-write conflict: Did the committed record modify a key we read?
+            if record.commit_version > snapshot_max_version {
+                // Check read-write conflict
                 for (table_name, read_keys) in read_set {
                     if let Some(committed_keys) = record.keys.get(table_name) {
                         for k in read_keys {
@@ -1276,7 +1343,7 @@ impl Database {
                     }
                 }
 
-                // Check phantom conflict: Did the committed record modify/insert a key in a range we scanned?
+                // Check phantom conflict
                 for (table_name, ranges) in scan_ranges {
                     if let Some(committed_keys) = record.keys.get(table_name) {
                         for k in committed_keys {
@@ -1292,7 +1359,7 @@ impl Database {
                     }
                 }
 
-                // Check write-write conflict: Did the committed record modify a key we want to write?
+                // Check write-write conflict
                 for (table_name, w_keys) in write_keys {
                     if let Some(committed_keys) = record.keys.get(table_name) {
                         for k in w_keys {
@@ -1308,25 +1375,22 @@ impl Database {
             }
         }
 
-        // 2. Increment global commit version to get a unique commit version
+        // Increment global commit version to get a unique commit version
         let commit_version = self
             .global_commit_version
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
 
-        // 3. Append to history
+        // Append to history
         let new_record = CommitRecord {
             commit_version,
             keys: write_keys.clone(),
         };
         history.push(new_record);
 
-        // 4. Prune older history
-        let min_start_version = {
-            let active = self.occ_active_transactions.lock().unwrap();
-            active.values().copied().min().unwrap_or(commit_version)
-        };
-        history.retain(|r| r.commit_version >= min_start_version);
+        // Prune older history
+        let prune_limit = min_start_version.unwrap_or(commit_version);
+        history.retain(|r| r.commit_version >= prune_limit);
 
         Ok(commit_version)
     }
@@ -1338,7 +1402,7 @@ impl Database {
         read_set: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
         scan_ranges: &HashMap<String, Vec<(dtdb_storage::DbKey, dtdb_storage::DbKey)>>,
     ) -> Result<()> {
-        let history = self.commit_history.lock().unwrap();
+        let history = self.commit_history.read().unwrap();
 
         for record in history.iter() {
             if record.commit_version > start_version {
@@ -1571,7 +1635,7 @@ impl Database {
     }
 
     pub fn commit_history_len(&self) -> usize {
-        self.commit_history.lock().unwrap().len()
+        self.commit_history.read().unwrap().len()
     }
 
     /// Triggers background stats collection if options specify it and it hasn't been started.

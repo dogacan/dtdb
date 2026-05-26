@@ -101,6 +101,8 @@ pub struct Schema {
     pub locality_group_options: HashMap<String, LocalityGroupOptions>,
     #[serde(default)]
     pub indexes: Vec<IndexDefinition>,
+    #[serde(skip, default)]
+    pub relative_indices: std::sync::OnceLock<Vec<(String, usize)>>,
 }
 
 impl Schema {
@@ -110,6 +112,7 @@ impl Schema {
             columns,
             locality_group_options: HashMap::new(),
             indexes: Vec::new(),
+            relative_indices: std::sync::OnceLock::new(),
         }
     }
 
@@ -122,6 +125,7 @@ impl Schema {
             columns,
             locality_group_options,
             indexes: Vec::new(),
+            relative_indices: std::sync::OnceLock::new(),
         }
     }
 
@@ -155,22 +159,34 @@ impl Schema {
 
     /// Merges sub-rows from various locality groups back into a single full row.
     /// Columns in groups that are missing/None in the input map will be populated with DbValue::Null.
-    pub fn merge_rows(&self, group_rows: &HashMap<String, Option<Row>>) -> Row {
-        let mut full_values = vec![DbValue::Null; self.columns.len()];
-        for (col_idx, col) in self.columns.iter().enumerate() {
-            let group = col.locality_group.as_deref().unwrap_or("");
-            if let Some(Some(sub_row)) = group_rows.get(group) {
-                // Find the relative index of this column within the sub-row of the group.
+    /// Returns the cached relative indices mapping.
+    pub fn get_relative_indices(&self) -> &[(String, usize)] {
+        self.relative_indices.get_or_init(|| {
+            let mut mapping = Vec::with_capacity(self.columns.len());
+            for col in &self.columns {
+                let group = col.locality_group.as_deref().unwrap_or("").to_string();
                 let relative_idx = self
                     .columns
                     .iter()
                     .filter(|c| c.locality_group.as_deref().unwrap_or("") == group)
-                    .position(|c| c.name == col.name);
-                if let Some(r_idx) = relative_idx
-                    && let Some(val) = sub_row.get_by_index(r_idx)
-                {
-                    full_values[col_idx] = val.clone();
-                }
+                    .position(|c| c.name == col.name)
+                    .unwrap_or(0);
+                mapping.push((group, relative_idx));
+            }
+            mapping
+        })
+    }
+
+    /// Merges sub-rows from various locality groups back into a single full row.
+    /// Columns in groups that are missing/None in the input map will be populated with DbValue::Null.
+    pub fn merge_rows(&self, group_rows: &HashMap<String, Option<Row>>) -> Row {
+        let mut full_values = vec![DbValue::Null; self.columns.len()];
+        let mapping = self.get_relative_indices();
+        for (col_idx, (group, r_idx)) in mapping.iter().enumerate() {
+            if let Some(Some(sub_row)) = group_rows.get(group)
+                && let Some(val) = sub_row.get_by_index(*r_idx)
+            {
+                full_values[col_idx] = val.clone();
             }
         }
         Row::new(full_values)

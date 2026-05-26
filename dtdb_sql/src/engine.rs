@@ -558,16 +558,20 @@ impl SqlEngine {
                     Box::new(RelationalIteratorAdapter { iter }),
                 )))
             }
-            LogicalPlan::Filter { source, predicate } => {
+            LogicalPlan::Filter {
+                source,
+                mut predicate,
+            } => {
                 let mut predicate_cols = HashSet::new();
                 predicate.collect_columns(&mut predicate_cols);
                 let child_cols = parent_cols_union(columns, &predicate_cols);
                 let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
+                predicate.bind_columns(src_op.schema());
                 Ok(Box::new(PhysicalFilter::new(src_op, predicate)))
             }
             LogicalPlan::Projection {
                 source,
-                expressions,
+                mut expressions,
                 field_names,
             } => {
                 let mut child_needed = HashSet::new();
@@ -576,6 +580,9 @@ impl SqlEngine {
                 }
                 let child_cols: Vec<String> = child_needed.into_iter().collect();
                 let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
+                for expr in &mut expressions {
+                    expr.bind_columns(src_op.schema());
+                }
                 let proj_schema = LogicalPlan::Projection {
                     source: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),
@@ -601,13 +608,16 @@ impl SqlEngine {
                 let src_op = self.compile_physical(*source, tx, columns)?;
                 Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
-            LogicalPlan::Sort { source, keys } => {
+            LogicalPlan::Sort { source, mut keys } => {
                 let mut key_cols = HashSet::new();
                 for (expr, _) in &keys {
                     expr.collect_columns(&mut key_cols);
                 }
                 let child_cols = parent_cols_union(columns, &key_cols);
                 let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
+                for (expr, _) in &mut keys {
+                    expr.bind_columns(src_op.schema());
+                }
                 Ok(Box::new(PhysicalSort::new(src_op, keys)))
             }
             LogicalPlan::Join {
@@ -669,12 +679,12 @@ impl SqlEngine {
                     )))
                 } else {
                     // Extract left_on and right_on join keys from equality join condition
-                    let (left_on, right_on) = match &condition {
+                    let (mut left_on, mut right_on) = match &condition {
                         Expr::BinaryOp {
                             left: l,
                             op: Operator::Eq,
                             right: r,
-                        } => (l.clone(), r.clone()),
+                        } => ((*l).clone(), (*r).clone()),
                         other => {
                             return Err(format!(
                                 "Only equality join conditions supported, got {:?}",
@@ -682,6 +692,9 @@ impl SqlEngine {
                             ));
                         }
                     };
+
+                    left_on.bind_columns(left_op.schema());
+                    right_on.bind_columns(right_op.schema());
 
                     Ok(Box::new(PhysicalHashJoin::new(
                         left_op,
@@ -695,8 +708,8 @@ impl SqlEngine {
             }
             LogicalPlan::Aggregate {
                 source,
-                group_by,
-                aggrs,
+                mut group_by,
+                mut aggrs,
                 field_names,
             } => {
                 let mut child_needed = HashSet::new();
@@ -716,6 +729,20 @@ impl SqlEngine {
                 }
                 let child_cols: Vec<String> = child_needed.into_iter().collect();
                 let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
+                for expr in &mut group_by {
+                    expr.bind_columns(src_op.schema());
+                }
+                for aggr in &mut aggrs {
+                    match aggr {
+                        crate::logical::AggregateExpr::Count(expr)
+                        | crate::logical::AggregateExpr::Sum(expr)
+                        | crate::logical::AggregateExpr::Min(expr)
+                        | crate::logical::AggregateExpr::Max(expr)
+                        | crate::logical::AggregateExpr::Avg(expr) => {
+                            expr.bind_columns(src_op.schema());
+                        }
+                    }
+                }
                 let aggr_schema = LogicalPlan::Aggregate {
                     source: Box::new(LogicalPlan::Scan {
                         table_name: "".to_string(),

@@ -367,3 +367,53 @@ fn test_occ_commit_history_garbage_collection() {
     // The only remaining record in history should be the one with commit_version >= 5 (i.e. version 5).
     assert_eq!(db.commit_history_len(), 1);
 }
+
+#[test]
+fn test_occ_concurrency_stress() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    let thread_count = 8;
+    let iterations = 20;
+
+    let mut handles = Vec::new();
+    for t in 0..thread_count {
+        let db_clone = db.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..iterations {
+                let tx_id = (t * 1000 + i + 200) as u64;
+                loop {
+                    let tx = Transaction::new(tx_id, db_clone.clone());
+                    let common_key = k_int(100);
+                    let thread_key = k_int(200 + t as i64);
+
+                    let _val_common = tx.get("users", &common_key).unwrap();
+                    let _val_thread = tx.get("users", &thread_key).unwrap();
+
+                    let name = format!("Val-{}-{}", t, i);
+                    tx.put("users", thread_key.clone(), r_user(200 + t as i64, &name))
+                        .unwrap();
+
+                    if i % 3 == 0 {
+                        tx.put("users", common_key.clone(), r_user(100, &name))
+                            .unwrap();
+                    }
+
+                    match tx.commit() {
+                        Ok(_) => break,
+                        Err(RelationalError::TransactionConflict(_)) => {
+                            // Conflict detected, retry!
+                            std::thread::yield_now();
+                        }
+                        Err(e) => panic!("Unexpected error: {:?}", e),
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+}

@@ -276,32 +276,24 @@ impl PhysicalSort {
 impl PhysicalOperator for PhysicalSort {
     fn next(&mut self) -> Result<Option<Row>, String> {
         if self.sorted_rows.is_none() {
-            // Blocking phase: consume all rows from source and sort them
-            let mut rows = Vec::new();
+            // Blocking phase: consume all rows from source and pre-evaluate sorting keys
+            let source_schema = self.source.schema().clone();
+            let mut eval_rows = Vec::new();
             while let Some(row) = self.source.next()? {
-                rows.push(row);
+                let mut row_keys = Vec::with_capacity(self.keys.len());
+                for (expr, _) in &self.keys {
+                    let val = expr.eval(&row, &source_schema)?;
+                    row_keys.push(val);
+                }
+                eval_rows.push((row, row_keys));
             }
 
-            let source_schema = self.source.schema();
             let mut err = None;
-
-            rows.sort_by(|a, b| {
-                for (expr, asc) in &self.keys {
-                    let a_val = match expr.eval(a, source_schema) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            err = Some(e);
-                            return std::cmp::Ordering::Equal;
-                        }
-                    };
-                    let b_val = match expr.eval(b, source_schema) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            err = Some(e);
-                            return std::cmp::Ordering::Equal;
-                        }
-                    };
-                    match compare_values(&a_val, &b_val) {
+            eval_rows.sort_by(|a, b| {
+                for (idx, (_, asc)) in self.keys.iter().enumerate() {
+                    let a_val = &a.1[idx];
+                    let b_val = &b.1[idx];
+                    match compare_values(a_val, b_val) {
                         Ok(ord) => {
                             if ord != std::cmp::Ordering::Equal {
                                 return if *asc { ord } else { ord.reverse() };
@@ -320,7 +312,8 @@ impl PhysicalOperator for PhysicalSort {
                 return Err(e);
             }
 
-            self.sorted_rows = Some(rows.into_iter());
+            let sorted: Vec<Row> = eval_rows.into_iter().map(|(row, _)| row).collect();
+            self.sorted_rows = Some(sorted.into_iter());
         }
 
         Ok(self.sorted_rows.as_mut().unwrap().next())

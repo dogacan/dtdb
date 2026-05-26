@@ -127,7 +127,7 @@ impl LogicalPlan {
                 // 1. Group-by keys.
                 for (idx, expr) in group_by.iter().enumerate() {
                     let dt = match expr {
-                        Expr::Column(col_name) => {
+                        Expr::Column(col_name, _) => {
                             let pos = source_schema.columns.iter().position(|col| {
                                 col.name == *col_name
                                     || col_name.ends_with(&format!(".{}", col.name))
@@ -160,7 +160,7 @@ impl LogicalPlan {
                         | AggregateExpr::Min(expr)
                         | AggregateExpr::Max(expr)
                         | AggregateExpr::Avg(expr) => match expr {
-                            Expr::Column(col_name) => {
+                            Expr::Column(col_name, _) => {
                                 let pos = source_schema.columns.iter().position(|col| {
                                     col.name == *col_name
                                         || col_name.ends_with(&format!(".{}", col.name))
@@ -391,7 +391,7 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
             dtdb_storage::DbValue::Bool(_) => DataType::Bool,
             dtdb_storage::DbValue::Null => DataType::Null,
         },
-        Expr::Column(col_name) => {
+        Expr::Column(col_name, _) => {
             let idx = source_schema.columns.iter().position(|col| {
                 col.name == *col_name
                     || col_name.ends_with(&format!(".{}", col.name))
