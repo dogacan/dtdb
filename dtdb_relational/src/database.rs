@@ -18,6 +18,8 @@ pub enum TransactionRecord {
     Prepared {
         tx_id: u64,
         mutations: HashMap<String, Vec<WalEntry>>,
+        #[serde(default)]
+        old_rows: Option<HashMap<String, HashMap<DbKey, Row>>>,
     },
     Committed {
         tx_id: u64,
@@ -69,7 +71,11 @@ impl Table {
     }
 
     /// Performs a write batch of mutations to the table, splitting updates across locality groups.
-    pub fn write_batch(&self, entries: Vec<TableWriteEntry>) -> Result<()> {
+    pub fn write_batch(
+        &self,
+        entries: Vec<TableWriteEntry>,
+        preset_old_rows: Option<HashMap<DbKey, Row>>,
+    ) -> Result<()> {
         let mut group_batches: HashMap<String, Vec<WalEntry>> = HashMap::new();
         for group in self.engines.keys() {
             group_batches.insert(group.clone(), Vec::new());
@@ -81,25 +87,30 @@ impl Table {
         }
 
         // Fetch old rows for index maintenance up-front to avoid N+1 point lookups
-        let mut old_rows = HashMap::new();
-        if !self.schema.indexes.is_empty() {
-            let mut keys_to_fetch = Vec::new();
-            for wrapper in &entries {
-                match &wrapper.entry {
-                    WalEntry::Put { key, .. } => keys_to_fetch.push(key.clone()),
-                    WalEntry::Delete { key } => keys_to_fetch.push(key.clone()),
-                    WalEntry::Batch(_) => {}
+        let old_rows = if let Some(preset) = preset_old_rows {
+            preset
+        } else {
+            let mut fetched = HashMap::new();
+            if !self.schema.indexes.is_empty() {
+                let mut keys_to_fetch = Vec::new();
+                for wrapper in &entries {
+                    match &wrapper.entry {
+                        WalEntry::Put { key, .. } => keys_to_fetch.push(key.clone()),
+                        WalEntry::Delete { key } => keys_to_fetch.push(key.clone()),
+                        WalEntry::Batch(_) => {}
+                    }
                 }
-            }
-            if !keys_to_fetch.is_empty() {
-                let rows = self.multi_get(&keys_to_fetch, None)?;
-                for (k, r) in keys_to_fetch.into_iter().zip(rows) {
-                    if let Some(row) = r {
-                        old_rows.insert(k, row);
+                if !keys_to_fetch.is_empty() {
+                    let rows = self.multi_get(&keys_to_fetch, None)?;
+                    for (k, r) in keys_to_fetch.into_iter().zip(rows) {
+                        if let Some(row) = r {
+                            fetched.insert(k, row);
+                        }
                     }
                 }
             }
-        }
+            fetched
+        };
 
         for wrapper in entries {
             match wrapper.entry {
@@ -1297,8 +1308,8 @@ impl Database {
                 RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
             })?;
             match record {
-                TransactionRecord::Prepared { tx_id, mutations } => {
-                    prepared.insert(tx_id, mutations);
+                TransactionRecord::Prepared { tx_id, mutations, old_rows } => {
+                    prepared.insert(tx_id, (mutations, old_rows));
                 }
                 TransactionRecord::Committed { tx_id } => {
                     prepared.remove(&tx_id);
@@ -1312,7 +1323,7 @@ impl Database {
         }
 
         println!("Recovering {} pending transactions...", prepared.len());
-        for (tx_id, mutations) in prepared {
+        for (tx_id, (mutations, old_rows_opt)) in prepared {
             for (table_name, entries) in mutations {
                 if let Ok(table) = self.get_table(&table_name) {
                     println!(
@@ -1323,7 +1334,11 @@ impl Database {
                         .into_iter()
                         .map(|entry| TableWriteEntry { entry, row: None })
                         .collect();
-                    table.write_batch(write_entries)?;
+                    let table_old_rows = old_rows_opt
+                        .as_ref()
+                        .and_then(|m| m.get(&table_name))
+                        .cloned();
+                    table.write_batch(write_entries, table_old_rows)?;
                 }
             }
         }
@@ -1334,6 +1349,7 @@ impl Database {
     }
 
     pub fn register_transaction(&self, tx_id: u64) -> u64 {
+        let _history_lock = self.commit_history.read().unwrap();
         let version = self
             .global_commit_version
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -1373,14 +1389,18 @@ impl Database {
         }
     }
 
-    pub fn validate_and_commit(
+    pub fn validate_and_commit<F>(
         &self,
         tx_id: u64,
         start_version: u64,
         read_set: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
         scan_ranges: &HashMap<String, Vec<(dtdb_storage::DbKey, dtdb_storage::DbKey)>>,
         write_keys: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
-    ) -> Result<u64> {
+        commit_fn: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let snapshot_max_version = {
             let history = self.commit_history.read().unwrap();
 
@@ -1498,6 +1518,9 @@ impl Database {
                 }
             }
         }
+
+        // Execute the commit closure under the write lock
+        commit_fn()?;
 
         // Increment global commit version to get a unique commit version
         let commit_version = self

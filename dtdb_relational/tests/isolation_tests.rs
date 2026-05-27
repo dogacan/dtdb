@@ -417,3 +417,43 @@ fn test_occ_concurrency_stress() {
         h.join().unwrap();
     }
 }
+
+#[test]
+fn test_occ_si_race() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    // 1. Initial write
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Original")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 2. Spawn concurrent committing and reading threads to stress the commit history
+    // and version assignment locks.
+    let db_clone = db.clone();
+    let h1 = std::thread::spawn(move || {
+        for i in 1..50 {
+            let tx = Transaction::new(100 + i, db_clone.clone());
+            tx.put("users", k_int(1), r_user(1, &format!("Val{}", i))).unwrap();
+            let _ = tx.commit();
+        }
+    });
+
+    let db_clone2 = db.clone();
+    let h2 = std::thread::spawn(move || {
+        for i in 1..50 {
+            let tx = Transaction::new(200 + i, db_clone2.clone());
+            if let Some(row) = tx.get("users", &k_int(1)).unwrap() {
+                let _name = row.get_by_index(1).unwrap().clone();
+            }
+            let _ = tx.commit();
+        }
+    });
+
+    h1.join().unwrap();
+    h2.join().unwrap();
+}
+

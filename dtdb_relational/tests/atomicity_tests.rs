@@ -177,7 +177,11 @@ fn test_crash_recovery_roll_forward() {
         }];
         mutations.insert("products".to_string(), prod_entries);
 
-        let record = TransactionRecord::Prepared { tx_id, mutations };
+        let record = TransactionRecord::Prepared {
+            tx_id,
+            mutations,
+            old_rows: None,
+        };
 
         // Write directly to transactions.log
         let log_path = db_path.join("transactions.log");
@@ -249,3 +253,91 @@ fn test_crash_recovery_ignore_corrupt_log() {
         assert_eq!(metadata.len(), 0);
     }
 }
+
+#[test]
+fn test_crash_recovery_secondary_index_maintenance() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    // 1. Setup DB, table, index, and write initial row
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.create_table("users", create_user_schema()).unwrap();
+        db.create_index(
+            "users",
+            "idx_name",
+            vec!["name".to_string()],
+            dtdb_relational::schema::IndexType::BTree,
+            None,
+        )
+        .unwrap();
+
+        let tx = Transaction::new(1, Arc::new(db));
+        tx.put("users", k_int(1), r_user(1, "Douglas")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 2. Simulate a crash where the main table engine has the new value "Adams",
+    // but the index engine was not updated. We manually insert into the main engine.
+    {
+        let db = Database::open(&db_path).unwrap();
+        let table = db.get_table("users").unwrap();
+        
+        // Write the update directly to the main engine (bypassing index engine)
+        let main_engine = table.engines.get("").unwrap();
+        let new_row_bytes = r_user(1, "Adams").to_bytes().unwrap();
+        main_engine.put(k_int(1), DbValue::Bytes(new_row_bytes.clone())).unwrap();
+
+        // Write the Prepared record to transactions.log
+        let tx_id = 999u64;
+        let mut mutations = HashMap::new();
+        mutations.insert(
+            "users".to_string(),
+            vec![WalEntry::Put {
+                key: k_int(1),
+                value: DbValue::Bytes(new_row_bytes),
+            }],
+        );
+
+        // Include old_rows pre-image mapping: key 1 was "Douglas"
+        let mut old_rows_map = HashMap::new();
+        let mut user_old_rows = HashMap::new();
+        user_old_rows.insert(k_int(1), r_user(1, "Douglas"));
+        old_rows_map.insert("users".to_string(), user_old_rows);
+
+        let record = TransactionRecord::Prepared {
+            tx_id,
+            mutations,
+            old_rows: Some(old_rows_map),
+        };
+
+        // Write directly to transactions.log
+        let log_path = db_path.join("transactions.log");
+        let mut file = File::create(&log_path).unwrap();
+        let bytes = bincode::serialize(&record).unwrap();
+        let len = bytes.len() as u32;
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // 3. Reopen DB. Recovery runs and should roll forward using the old_rows from the log.
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        let tx = Transaction::new(1000, db);
+
+        // Verify index works: searching for "Douglas" should yield 0 results
+        let douglas_rows = tx
+            .index_scan("users", "idx_name", &DbKey::String("Douglas".to_string()), &DbKey::String("Douglas".to_string()), None)
+            .unwrap();
+        assert_eq!(douglas_rows.len(), 0);
+
+        // Searching for "Adams" should yield 1 result
+        let adams_rows = tx
+            .index_scan("users", "idx_name", &DbKey::String("Adams".to_string()), &DbKey::String("Adams".to_string()), None)
+            .unwrap();
+        assert_eq!(adams_rows.len(), 1);
+        assert_eq!(adams_rows[0], r_user(1, "Adams"));
+    }
+}
+

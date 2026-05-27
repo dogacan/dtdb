@@ -812,6 +812,37 @@ impl Transaction {
             }
         }
 
+        // Resolve table write entries and table handles first to avoid deadlocks under the lock
+        let mut old_rows = HashMap::new();
+        let mut resolved_batches = Vec::new();
+        for (table_name, entries) in table_write_entries {
+            let table = self.get_table(&table_name)?;
+            
+            // For F05: fetch old rows for index maintenance
+            let mut keys = Vec::new();
+            for wrapper in &entries {
+                match &wrapper.entry {
+                    WalEntry::Put { key, .. } => keys.push(key.clone()),
+                    WalEntry::Delete { key } => keys.push(key.clone()),
+                    WalEntry::Batch(_) => {}
+                }
+            }
+            let mut table_old_rows = HashMap::new();
+            if !keys.is_empty() {
+                let rows = table.multi_get(&keys, None)?;
+                for (k, r) in keys.into_iter().zip(rows) {
+                    if let Some(row) = r {
+                        table_old_rows.insert(k, row);
+                    }
+                }
+            }
+            if !table_old_rows.is_empty() {
+                old_rows.insert(table_name.clone(), table_old_rows.clone());
+            }
+
+            resolved_batches.push((table, entries, table_old_rows));
+        }
+
         // Validate transaction using OCC
         {
             let read_set = self.read_set.lock().unwrap();
@@ -823,6 +854,24 @@ impl Transaction {
                     &read_set,
                     &scan_ranges,
                     &write_keys,
+                    || {
+                        // 2. Write Prepared record to Global Log & fsync
+                        let record = TransactionRecord::Prepared {
+                            tx_id: self.tx_id,
+                            mutations: table_batches.clone(),
+                            old_rows: Some(old_rows.clone()),
+                        };
+                        self.database.write_transaction_record(&record)?;
+
+                        // 3. Write batches to respective table storage engines
+                        for (table, entries, table_old_rows) in resolved_batches {
+                            table.write_batch(entries, Some(table_old_rows))?;
+                        }
+
+                        // 4. Mark Committed & Truncate if clean
+                        self.database.commit_transaction(self.tx_id)?;
+                        Ok(())
+                    }
                 )?;
             } else {
                 self.database.validate_read_only(
@@ -833,27 +882,6 @@ impl Transaction {
                 )?;
             }
         }
-
-        if table_batches.is_empty() {
-            buffer.clear();
-            return Ok(());
-        }
-
-        // 2. Write Prepared record to Global Log & fsync
-        let record = TransactionRecord::Prepared {
-            tx_id: self.tx_id,
-            mutations: table_batches.clone(),
-        };
-        self.database.write_transaction_record(&record)?;
-
-        // 3. Write batches to respective table storage engines
-        for (table_name, entries) in table_write_entries {
-            let table = self.get_table(&table_name)?;
-            table.write_batch(entries)?;
-        }
-
-        // 4. Mark Committed & Truncate if clean
-        self.database.commit_transaction(self.tx_id)?;
 
         buffer.clear();
         Ok(())
