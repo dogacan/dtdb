@@ -7,7 +7,7 @@ edition = "2024"
 dtdb_storage = { path = "../dtdb_storage" }
 dtdb_relational = { path = "../dtdb_relational" }
 dtdb_sql = { path = "../dtdb_sql" }
-tonic = { version = "0.12", features = ["codegen", "transport"] }
+tonic = { version = "0.12", features = ["codegen", "transport", "tls"] }
 prost = "0.13"
 tokio = { version = "1.35", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

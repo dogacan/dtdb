@@ -249,3 +249,194 @@ async fn test_grpc_server_side_parameters() {
     // Clean up server task
     server_handle.abort();
 }
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn test_grpc_security() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    // 1. Generate self-signed cert & key for TLS
+    let ca_key_path = temp_dir.path().join("ca.key");
+    let ca_cert_path = temp_dir.path().join("ca.pem");
+    let server_key_path = temp_dir.path().join("server.key");
+    let server_csr_path = temp_dir.path().join("server.csr");
+    let server_cert_path = temp_dir.path().join("server.pem");
+    let extfile_path = temp_dir.path().join("extfile.cnf");
+
+    // Generate CA key and cert
+    let openssl_status1 = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-new",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            ca_key_path.to_str().unwrap(),
+            "-out",
+            ca_cert_path.to_str().unwrap(),
+            "-sha256",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=MyLocalCA",
+        ])
+        .output()
+        .expect("failed to execute openssl req for CA");
+    assert!(openssl_status1.status.success(), "openssl status1 failed");
+
+    // Generate server key
+    let openssl_status2 = std::process::Command::new("openssl")
+        .args(["genrsa", "-out", server_key_path.to_str().unwrap(), "2048"])
+        .output()
+        .expect("failed to generate server key");
+    assert!(openssl_status2.status.success(), "openssl status2 failed");
+
+    // Generate server CSR
+    let openssl_status3 = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-key",
+            server_key_path.to_str().unwrap(),
+            "-out",
+            server_csr_path.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost",
+        ])
+        .output()
+        .expect("failed to generate server CSR");
+    assert!(openssl_status3.status.success(), "openssl status3 failed");
+
+    // Create extfile
+    std::fs::write(
+        &extfile_path,
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n",
+    )
+    .unwrap();
+
+    // Sign the server CSR with CA
+    let openssl_status4 = std::process::Command::new("openssl")
+        .args([
+            "x509",
+            "-req",
+            "-in",
+            server_csr_path.to_str().unwrap(),
+            "-CA",
+            ca_cert_path.to_str().unwrap(),
+            "-CAkey",
+            ca_key_path.to_str().unwrap(),
+            "-CAcreateserial",
+            "-out",
+            server_cert_path.to_str().unwrap(),
+            "-days",
+            "1",
+            "-sha256",
+            "-extfile",
+            extfile_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to sign server cert");
+    assert!(openssl_status4.status.success(), "openssl status4 failed");
+
+    // 2. Start Secure Server on random port
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let service = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+
+    let cert_str = fs::read_to_string(&server_cert_path).unwrap();
+    let key_str = fs::read_to_string(&server_key_path).unwrap();
+    let identity = tonic::transport::Identity::from_pem(cert_str, key_str);
+    let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+    let auth_token = "secret_token".to_string();
+    let auth_token_clone = auth_token.clone();
+    let interceptor = move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+        match req.metadata().get("authorization") {
+            Some(header_val) => {
+                let expected_header = format!("Bearer {}", auth_token_clone);
+                if header_val.to_str().unwrap_or("") == expected_header {
+                    Ok(req)
+                } else {
+                    Err(tonic::Status::unauthenticated("Invalid auth token"))
+                }
+            }
+            None => Err(tonic::Status::unauthenticated("Missing auth token")),
+        }
+    };
+    let service_server = DuctTapeDbServiceServer::with_interceptor(service, interceptor);
+
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls_config)
+            .unwrap()
+            .add_service(service_server)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    // Let the server spin up
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Set CA cert path for client
+    unsafe {
+        std::env::set_var("DTDB_CA_CERT", &ca_cert_path);
+    }
+
+    // 3. Connect client with WRONG token
+    let client_addr = format!("https://127.0.0.1:{}", port);
+    let mut client_wrong_token =
+        DuctTapeDbClient::connect_with_token(client_addr.clone(), Some("wrong_token".to_string()))
+            .await
+            .unwrap();
+
+    let err = client_wrong_token
+        .create_db("db_secure", CompressionType::Uncompressed)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // 4. Connect client with MISSING token
+    let mut client_missing_token = DuctTapeDbClient::connect_with_token(client_addr.clone(), None)
+        .await
+        .unwrap();
+
+    let err2 = client_missing_token
+        .create_db("db_secure2", CompressionType::Uncompressed)
+        .await
+        .unwrap_err();
+    assert_eq!(err2.code(), tonic::Code::Unauthenticated);
+
+    // 5. Connect client with CORRECT token
+    let mut client_correct =
+        DuctTapeDbClient::connect_with_token(client_addr, Some("secret_token".to_string()))
+            .await
+            .unwrap();
+
+    let res = client_correct
+        .create_db("db_secure3", CompressionType::Uncompressed)
+        .await
+        .unwrap();
+    assert!(res.success);
+
+    // Cleanup env var and abort server
+    unsafe {
+        std::env::remove_var("DTDB_CA_CERT");
+    }
+    server_handle.abort();
+
+    // 6. Verify loopback bind safety checks
+    assert!(dtdb_api::validate_bind_security("127.0.0.1:50051", false, false).is_ok());
+    assert!(dtdb_api::validate_bind_security("[::1]:50051", false, false).is_ok());
+    assert!(dtdb_api::validate_bind_security("0.0.0.0:50051", true, true).is_ok());
+
+    let err_res = dtdb_api::validate_bind_security("0.0.0.0:50051", false, false);
+    assert!(err_res.is_err());
+    let err_msg = err_res.unwrap_err();
+    assert!(err_msg.contains("Security Error") && err_msg.contains("Binding to a non-loopback address"));
+}

@@ -2,6 +2,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use std::path::Path;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use tonic::Status;
 use tonic::transport::Channel;
@@ -20,8 +21,29 @@ use dtdb_sql::SqlEngine;
 use dtdb_storage::{CompressionType, DbValue};
 
 #[derive(Clone)]
+pub struct AuthClientInterceptor {
+    token: Option<String>,
+}
+
+impl tonic::service::Interceptor for AuthClientInterceptor {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if let Some(ref t) = self.token {
+            let auth_header = format!("Bearer {}", t);
+            if let Ok(meta_val) = tonic::metadata::MetadataValue::from_str(&auth_header) {
+                request.metadata_mut().insert("authorization", meta_val);
+            }
+        }
+        Ok(request)
+    }
+}
+
+#[derive(Clone)]
 pub enum ClientMode {
-    Remote(DuctTapeDbServiceClient<Channel>),
+    Remote(
+        DuctTapeDbServiceClient<
+            tonic::service::interceptor::InterceptedService<Channel, AuthClientInterceptor>,
+        >,
+    ),
     InProcess(Arc<crate::server::DuctTapeDbServiceImpl>),
 }
 
@@ -33,7 +55,38 @@ pub struct DuctTapeDbClient {
 impl DuctTapeDbClient {
     /// Connects to a remote DuctTapeDB gRPC server at the specified address.
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
-        let client = DuctTapeDbServiceClient::connect(addr).await?;
+        let token = std::env::var("DTDB_AUTH_TOKEN").ok();
+        Self::connect_with_token(addr, token).await
+    }
+
+    /// Connects to a remote DuctTapeDB gRPC server with a specific authentication token.
+    pub async fn connect_with_token(
+        addr: String,
+        token: Option<String>,
+    ) -> Result<Self, tonic::transport::Error> {
+        let mut endpoint = tonic::transport::Endpoint::from_shared(addr.clone())?;
+
+        if addr.starts_with("https://") {
+            let mut tls_config = tonic::transport::ClientTlsConfig::new();
+            if let Some(pem) = std::env::var("DTDB_CA_CERT")
+                .or_else(|_| std::env::var("DTDB_TLS_CERT"))
+                .ok()
+                .and_then(|ca_path| std::fs::read_to_string(ca_path).ok())
+            {
+                let ca = tonic::transport::Certificate::from_pem(pem);
+                tls_config = tls_config.ca_certificate(ca);
+            }
+            if let Ok(domain) = std::env::var("DTDB_TLS_DOMAIN") {
+                tls_config = tls_config.domain_name(domain);
+            } else if addr.contains("127.0.0.1") || addr.contains("localhost") {
+                tls_config = tls_config.domain_name("localhost");
+            }
+            endpoint = endpoint.tls_config(tls_config)?;
+        }
+
+        let channel = endpoint.connect().await?;
+        let interceptor = AuthClientInterceptor { token };
+        let client = DuctTapeDbServiceClient::with_interceptor(channel, interceptor);
         Ok(Self {
             inner: ClientMode::Remote(client),
         })

@@ -26,14 +26,12 @@ fn db_value_to_sql_expr(val: &DbValue) -> SqlExpr {
 /// Recursively binds parameter values to placeholders in a SqlExpr.
 pub fn bind_expr(expr: &mut SqlExpr, params: &HashMap<String, DbValue>) -> Result<(), String> {
     match expr {
-        SqlExpr::Identifier(ident) => {
-            if ident.value.starts_with('@') {
-                let name = &ident.value[1..];
-                if let Some(val) = params.get(name) {
-                    *expr = db_value_to_sql_expr(val);
-                } else {
-                    return Err(format!("Unbound parameter: @{}", name));
-                }
+        SqlExpr::Identifier(ident) if ident.value.starts_with('@') => {
+            let name = &ident.value[1..];
+            if let Some(val) = params.get(name) {
+                *expr = db_value_to_sql_expr(val);
+            } else {
+                return Err(format!("Unbound parameter: @{}", name));
             }
         }
         SqlExpr::Value(SqlValue::Placeholder(placeholder)) => {
@@ -75,14 +73,16 @@ pub fn bind_expr(expr: &mut SqlExpr, params: &HashMap<String, DbValue>) -> Resul
         SqlExpr::Function(func) => {
             for arg in &mut func.args {
                 match arg {
-                    FunctionArg::Named { arg: arg_expr, .. } => match arg_expr {
-                        FunctionArgExpr::Expr(e) => bind_expr(e, params)?,
-                        _ => {}
-                    },
-                    FunctionArg::Unnamed(arg_expr) => match arg_expr {
-                        FunctionArgExpr::Expr(e) => bind_expr(e, params)?,
-                        _ => {}
-                    },
+                    FunctionArg::Named { arg: arg_expr, .. } => {
+                        if let FunctionArgExpr::Expr(e) = arg_expr {
+                            bind_expr(e, params)?;
+                        }
+                    }
+                    FunctionArg::Unnamed(arg_expr) => {
+                        if let FunctionArgExpr::Expr(e) = arg_expr {
+                            bind_expr(e, params)?;
+                        }
+                    }
                 }
             }
         }
@@ -240,11 +240,15 @@ pub fn bind_statement(
         Statement::Insert { source, .. } => {
             bind_query(source, params)?;
         }
-        Statement::Delete { selection, .. } => {
-            if let Some(expr) = selection {
-                bind_expr(expr, params)?;
-            }
+        Statement::Delete {
+            selection: Some(expr),
+            ..
+        } => {
+            bind_expr(expr, params)?;
         }
+        Statement::Delete {
+            selection: None, ..
+        } => {}
         Statement::Update {
             assignments,
             selection,

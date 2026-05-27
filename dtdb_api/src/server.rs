@@ -776,6 +776,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn proto_params_to_db_params(
     proto_params: Vec<crate::proto::QueryParam>,
 ) -> Result<HashMap<String, DbValue>, Status> {
