@@ -78,7 +78,7 @@ impl DbKey {
 ///
 /// Note that we do not derive `Ord` or `Eq` because values can contain `Float` (f64),
 /// which does not have a total ordering due to NaN.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbValue {
     Int(i64),
     Float(f64),
@@ -86,6 +86,26 @@ pub enum DbValue {
     Bytes(Vec<u8>),
     Bool(bool),
     Null,
+}
+
+impl PartialEq for DbValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DbValue::Int(l), DbValue::Int(r)) => l == r,
+            (DbValue::Float(l), DbValue::Float(r)) => {
+                if l.is_nan() && r.is_nan() {
+                    true
+                } else {
+                    l == r
+                }
+            }
+            (DbValue::String(l), DbValue::String(r)) => l == r,
+            (DbValue::Bytes(l), DbValue::Bytes(r)) => l == r,
+            (DbValue::Bool(l), DbValue::Bool(r)) => l == r,
+            (DbValue::Null, DbValue::Null) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Eq for DbValue {}
@@ -99,7 +119,7 @@ impl std::hash::Hash for DbValue {
             }
             DbValue::Float(v) => {
                 1u8.hash(state);
-                if v.is_nan() {
+                if v.is_nan() || *v == 0.0 {
                     0.0f64.to_bits().hash(state);
                 } else {
                     v.to_bits().hash(state);
@@ -221,5 +241,35 @@ mod tests {
     fn test_composite_key_byte_size() {
         let key = DbKey::Composite(vec![DbKey::Int(10), DbKey::String("hello".to_string())]);
         assert_eq!(key.byte_size(), 8 + 5);
+    }
+
+    #[test]
+    fn test_dbvalue_nan_eq_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let nan1 = DbValue::Float(f64::NAN);
+        let nan2 = DbValue::Float(f64::NAN);
+
+        assert_eq!(nan1, nan2);
+
+        let mut h1 = DefaultHasher::new();
+        nan1.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        nan2.hash(&mut h2);
+
+        assert_eq!(h1.finish(), h2.finish());
+
+        let pos_zero = DbValue::Float(0.0);
+        let neg_zero = DbValue::Float(-0.0);
+
+        assert_eq!(pos_zero, neg_zero);
+
+        let mut h3 = DefaultHasher::new();
+        pos_zero.hash(&mut h3);
+        let mut h4 = DefaultHasher::new();
+        neg_zero.hash(&mut h4);
+
+        assert_eq!(h3.finish(), h4.finish());
     }
 }
