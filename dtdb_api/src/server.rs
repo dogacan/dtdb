@@ -324,6 +324,18 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
 
         let state = {
             let mut dbs = self.databases.write().unwrap();
+            if let Some(true) = dbs
+                .get(db_name)
+                .map(|s| s.database.has_active_transactions())
+            {
+                return Ok(Response::new(DropDbResponse {
+                    success: false,
+                    message: format!(
+                        "Cannot drop database '{}' because it has active transactions",
+                        db_name
+                    ),
+                }));
+            }
             dbs.remove(db_name)
         };
 

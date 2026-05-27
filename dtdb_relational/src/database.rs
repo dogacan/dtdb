@@ -1419,6 +1419,10 @@ impl Database {
         Ok(())
     }
 
+    pub fn has_active_transactions(&self) -> bool {
+        !self.occ_active_transactions.lock().unwrap().is_empty()
+    }
+
     pub fn register_transaction(&self, tx_id: u64) -> u64 {
         let _history_lock = self.commit_history.read().unwrap();
         let version = self

@@ -438,5 +438,107 @@ async fn test_grpc_security() {
     let err_res = dtdb_api::validate_bind_security("0.0.0.0:50051", false, false);
     assert!(err_res.is_err());
     let err_msg = err_res.unwrap_err();
-    assert!(err_msg.contains("Security Error") && err_msg.contains("Binding to a non-loopback address"));
+    assert!(
+        err_msg.contains("Security Error") && err_msg.contains("Binding to a non-loopback address")
+    );
+}
+
+#[tokio::test]
+async fn test_drop_db_active_transactions() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    // 1. Start Server on random port
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let service = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(DuctTapeDbServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    // Let the server spin up
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 2. Connect client
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+
+    // 3. Create database and table
+    client
+        .create_db("db_drop_test", CompressionType::Uncompressed)
+        .await
+        .unwrap();
+
+    {
+        let mut stream = client
+            .execute_query(
+                "db_drop_test",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
+            )
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // Channels to synchronize transaction and drop_db execution
+    let (tx_started_send, tx_started_recv) = tokio::sync::oneshot::channel();
+    let (tx_done_send, tx_done_recv) = tokio::sync::oneshot::channel();
+
+    // 4. Start active transaction in another task
+    let mut client_tx = client.clone();
+    let tx_handle = tokio::spawn(async move {
+        client_tx
+            .run_in_transaction("db_drop_test", |tx| async move {
+                // Signal that we are inside the transaction
+                tx_started_send.send(()).unwrap();
+
+                // Wait for the drop_db attempt to be performed on main thread
+                tx_done_recv.await.unwrap();
+
+                // Run a statement to keep transaction active/meaningful
+                tx.execute_query(dtdb_api::sql_query!(
+                    "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
+                ))
+                .await?;
+
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+
+    // Wait until transaction is registered as active
+    tx_started_recv.await.unwrap();
+
+    // 5. Attempt to drop database with active transaction — should fail
+    let drop_fail = client.drop_db("db_drop_test").await.unwrap();
+    assert!(!drop_fail.success);
+    assert!(drop_fail.message.contains("active transactions"));
+
+    // Check directory still exists
+    let db_path = data_path.join("db_drop_test");
+    assert!(db_path.exists());
+
+    // 6. Signal the transaction to finish and wait for it
+    tx_done_send.send(()).unwrap();
+    tx_handle.await.unwrap();
+
+    // 7. Drop the database now that there are no active transactions — should succeed
+    let drop_success = client.drop_db("db_drop_test").await.unwrap();
+    assert!(drop_success.success);
+
+    // Check directory is deleted
+    assert!(!db_path.exists());
+
+    // Cleanup server
+    server_handle.abort();
 }
