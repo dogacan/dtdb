@@ -234,7 +234,6 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 
 * **No DDL in Transactions**: Data Definition Language (DDL) statements (such as `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`) are strictly prohibited inside transactions. They must be executed as standalone, auto-committed statements.
 * **Single-Statement Query Interface**: Standard query execution (`execute()`) rejects multiple semicolon-separated queries. Multi-statement transactions must be initiated via the explicit transaction API (`run_in_transaction` or gRPC streaming transactions).
-* **Coarse-Grained Locking & Serialization**: Relational and catalog operations are serialized using transaction locks to prioritize conceptual simplicity over high write throughput.
 * **In-Memory Sorts & Aggregations**: Ordering (`ORDER BY`), sorting, hashing, and group aggregation (`GROUP BY`) operations are performed entirely in-memory. If result sets exceed available RAM, the database does not spill sorted runs to disk, potentially leading to Out-Of-Memory (OOM) errors.
 * **OCC Conflict Aborts**: Under high write-heavy or read-write concurrent workloads, the optimistic validation phase at commit time may trigger frequent aborts, requiring clients to implement retry loops.
 * **Equality-Only Hash Joins**: Join operations are limited to equality conditions (`ON t1.id = t2.user_id`) executed using an in-memory hash join. Non-equality joins, right/full outer joins, and parallel join execution are not supported.
