@@ -57,6 +57,68 @@ fn populate_table(db: &Arc<Database>, engine: &SqlEngine, table_name: &str, size
     tx.commit().unwrap();
 }
 
+fn setup_fulltext_table(with_index: bool) -> (TempDir, Arc<Database>, SqlEngine) {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE fts_table (id INT PRIMARY KEY, content STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    if with_index {
+        let tx2 = Transaction::new(2, db.clone());
+        engine
+            .execute(
+                "CREATE FULLTEXT INDEX idx_content ON fts_table(content)",
+                &tx2,
+            )
+            .unwrap();
+        tx2.commit().unwrap();
+    }
+
+    (temp_dir, db, engine)
+}
+
+fn populate_fts_table(db: &Arc<Database>, engine: &SqlEngine, size: usize) {
+    let tx = Transaction::new(3, db.clone());
+    let words = [
+        "quick",
+        "brown",
+        "fox",
+        "jumps",
+        "over",
+        "the",
+        "lazy",
+        "dog",
+        "database",
+        "engine",
+        "rust",
+        "relational",
+        "compaction",
+        "transaction",
+        "isolation",
+        "concurrency",
+    ];
+    for i in 1..=size {
+        let w1 = words[i % words.len()];
+        let w2 = words[(i + 3) % words.len()];
+        let w3 = words[(i + 7) % words.len()];
+        let sentence = format!("{} {} {}", w1, w2, w3);
+        let sql = format!(
+            "INSERT INTO fts_table (id, content) VALUES ({}, '{}')",
+            i, sentence
+        );
+        engine.execute(&sql, &tx).unwrap();
+    }
+    tx.commit().unwrap();
+}
+
 fn benchmark_dml(c: &mut Criterion) {
     // --- INSERT BENCHMARKS ---
     let mut group = c.benchmark_group("INSERT Benchmarks");
@@ -248,6 +310,76 @@ fn benchmark_dml(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+    });
+
+    group.finish();
+
+    // --- FULLTEXT SEARCH BENCHMARKS ---
+    let mut group = c.benchmark_group("FULLTEXT Benchmarks");
+
+    let (_temp_no_idx, db_no_idx, engine_no_idx) = setup_fulltext_table(false);
+    populate_fts_table(&db_no_idx, &engine_no_idx, N);
+
+    let (_temp_idx, db_idx, engine_idx) = setup_fulltext_table(true);
+    populate_fts_table(&db_idx, &engine_idx, N);
+
+    // 1. Single token query
+    group.bench_function("Token Search (No Index)", |b| {
+        let tx = Transaction::new(100, db_no_idx.clone());
+        b.iter(|| {
+            let sql = "SELECT id FROM fts_table WHERE MATCH(content) AGAINST('database')";
+            let res = engine_no_idx.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    group.bench_function("Token Search (Indexed)", |b| {
+        let tx = Transaction::new(100, db_idx.clone());
+        b.iter(|| {
+            let sql = "SELECT id FROM fts_table WHERE MATCH(content) AGAINST('database')";
+            let res = engine_idx.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    // 2. Boolean query (AND)
+    group.bench_function("Boolean Search (No Index)", |b| {
+        let tx = Transaction::new(100, db_no_idx.clone());
+        b.iter(|| {
+            let sql = "SELECT id FROM fts_table WHERE MATCH(content) AGAINST('rust AND database')";
+            let res = engine_no_idx.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    group.bench_function("Boolean Search (Indexed)", |b| {
+        let tx = Transaction::new(100, db_idx.clone());
+        b.iter(|| {
+            let sql = "SELECT id FROM fts_table WHERE MATCH(content) AGAINST('rust AND database')";
+            let res = engine_idx.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    // 3. Phrase query
+    group.bench_function("Phrase Search (No Index)", |b| {
+        let tx = Transaction::new(100, db_no_idx.clone());
+        b.iter(|| {
+            let sql =
+                "SELECT id FROM fts_table WHERE MATCH(content) AGAINST('\"rust transaction\"')";
+            let res = engine_no_idx.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    group.bench_function("Phrase Search (Indexed)", |b| {
+        let tx = Transaction::new(100, db_idx.clone());
+        b.iter(|| {
+            let sql =
+                "SELECT id FROM fts_table WHERE MATCH(content) AGAINST('\"rust transaction\"')";
+            let res = engine_idx.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
     });
 
     group.finish();
