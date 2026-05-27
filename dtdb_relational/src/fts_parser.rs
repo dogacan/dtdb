@@ -7,6 +7,7 @@ pub enum FullTextQuery {
     Token(String),
     And(Box<FullTextQuery>, Box<FullTextQuery>),
     Or(Box<FullTextQuery>, Box<FullTextQuery>),
+    Phrase(Vec<String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +17,7 @@ enum LexToken {
     AndOp,
     OrOp,
     Word(String),
+    PhraseString(String),
 }
 
 impl FullTextQuery {
@@ -35,10 +37,27 @@ impl FullTextQuery {
             } else if c == ')' {
                 lex_tokens.push_back(LexToken::RParen);
                 chars.next();
+            } else if c == '"' {
+                chars.next(); // consume opening quote
+                let mut phrase_content = String::new();
+                let mut found_closing = false;
+                for next_c in chars.by_ref() {
+                    if next_c == '"' {
+                        found_closing = true;
+                        break;
+                    }
+                    phrase_content.push(next_c);
+                }
+                if !found_closing {
+                    return Err(
+                        "Unterminated phrase query (missing closing double quote)".to_string()
+                    );
+                }
+                lex_tokens.push_back(LexToken::PhraseString(phrase_content));
             } else {
                 let mut term = String::new();
                 while let Some(&next_c) = chars.peek() {
-                    if next_c.is_whitespace() || next_c == '(' || next_c == ')' {
+                    if next_c.is_whitespace() || next_c == '(' || next_c == ')' || next_c == '"' {
                         break;
                     }
                     term.push(next_c);
@@ -63,7 +82,10 @@ impl FullTextQuery {
         }
 
         // 2. Parsing phase using recursive descent
-        let mut parser = Parser { tokens: lex_tokens };
+        let mut parser = Parser {
+            tokens: lex_tokens,
+            tokenizer,
+        };
         let ast = parser.parse_or()?;
         if !parser.tokens.is_empty() {
             return Err(format!("Unexpected token: {:?}", parser.tokens[0]));
@@ -72,11 +94,12 @@ impl FullTextQuery {
     }
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: VecDeque<LexToken>,
+    tokenizer: &'a dyn Tokenizer,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&LexToken> {
         self.tokens.front()
     }
@@ -104,7 +127,9 @@ impl Parser {
                     let right = self.parse_primary()?;
                     node = FullTextQuery::And(Box::new(node), Box::new(right));
                 }
-                Some(LexToken::Word(_)) | Some(LexToken::LParen) => {
+                Some(LexToken::Word(_))
+                | Some(LexToken::PhraseString(_))
+                | Some(LexToken::LParen) => {
                     let right = self.parse_primary()?;
                     node = FullTextQuery::And(Box::new(node), Box::new(right));
                 }
@@ -117,6 +142,10 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<FullTextQuery, String> {
         match self.next_token() {
             Some(LexToken::Word(w)) => Ok(FullTextQuery::Token(w)),
+            Some(LexToken::PhraseString(s)) => {
+                let tokens = self.tokenizer.tokenize(&s);
+                Ok(FullTextQuery::Phrase(tokens))
+            }
             Some(LexToken::LParen) => {
                 let node = self.parse_or()?;
                 match self.next_token() {

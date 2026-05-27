@@ -586,6 +586,89 @@ impl Transaction {
                 let right_pks = self.eval_fulltext_query(index_engine, right, min_pk, max_pk)?;
                 Ok(left_pks.union(&right_pks).cloned().collect())
             }
+            crate::fts_parser::FullTextQuery::Phrase(phrase_tokens) => {
+                if phrase_tokens.is_empty() {
+                    return Ok(HashSet::new());
+                }
+                if phrase_tokens.len() == 1 {
+                    let start_bound = DbKey::Composite(vec![
+                        DbKey::String(phrase_tokens[0].clone()),
+                        min_pk.clone(),
+                    ]);
+                    let end_bound = DbKey::Composite(vec![
+                        DbKey::String(phrase_tokens[0].clone()),
+                        max_pk.clone(),
+                    ]);
+                    let index_entries =
+                        index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
+                    let mut pks = HashSet::new();
+                    for (idx_key, _) in index_entries {
+                        if let DbKey::Composite(mut parts) = idx_key
+                            && let Some(pk) = parts.pop()
+                        {
+                            pks.insert(pk);
+                        }
+                    }
+                    return Ok(pks);
+                }
+
+                let mut token_pos_maps: Vec<HashMap<DbKey, Vec<u32>>> = Vec::new();
+                for tok in phrase_tokens {
+                    let start_bound =
+                        DbKey::Composite(vec![DbKey::String(tok.clone()), min_pk.clone()]);
+                    let end_bound =
+                        DbKey::Composite(vec![DbKey::String(tok.clone()), max_pk.clone()]);
+                    let index_entries =
+                        index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
+                    let mut pos_map = HashMap::new();
+                    for (idx_key, val) in index_entries {
+                        if let DbKey::Composite(mut parts) = idx_key
+                            && let Some(pk) = parts.pop()
+                            && let DbValue::Bytes(bytes) = val
+                            && let Ok(positions) = bincode::deserialize::<Vec<u32>>(&bytes)
+                        {
+                            pos_map.insert(pk, positions);
+                        }
+                    }
+                    token_pos_maps.push(pos_map);
+                }
+
+                let mut matched_pks = HashSet::new();
+                if let Some(first_map) = token_pos_maps.first() {
+                    let mut candidate_pks: HashSet<DbKey> = first_map.keys().cloned().collect();
+                    for map in token_pos_maps.iter().skip(1) {
+                        candidate_pks.retain(|pk| map.contains_key(pk));
+                    }
+
+                    for pk in candidate_pks {
+                        let first_positions = &token_pos_maps[0][&pk];
+                        let mut phrase_matched = false;
+                        for &start_pos in first_positions {
+                            let mut contiguous = true;
+                            for (i, map) in token_pos_maps.iter().enumerate().skip(1) {
+                                let expected_pos = start_pos + i as u32;
+                                if let Some(positions) = map.get(&pk) {
+                                    if !positions.contains(&expected_pos) {
+                                        contiguous = false;
+                                        break;
+                                    }
+                                } else {
+                                    contiguous = false;
+                                    break;
+                                }
+                            }
+                            if contiguous {
+                                phrase_matched = true;
+                                break;
+                            }
+                        }
+                        if phrase_matched {
+                            matched_pks.insert(pk);
+                        }
+                    }
+                }
+                Ok(matched_pks)
+            }
         }
     }
 
@@ -612,6 +695,26 @@ impl Transaction {
             crate::fts_parser::FullTextQuery::Or(left, right) => {
                 self.eval_row_fts_query(left, row, col_idx, tokenizer)
                     || self.eval_row_fts_query(right, row, col_idx, tokenizer)
+            }
+            crate::fts_parser::FullTextQuery::Phrase(phrase_tokens) => {
+                if let Some(DbValue::String(s)) = row.get_by_index(col_idx) {
+                    let tokens = tokenizer.tokenize(s.as_str());
+                    if phrase_tokens.is_empty() {
+                        return true;
+                    }
+                    if tokens.len() < phrase_tokens.len() {
+                        return false;
+                    }
+                    for i in 0..=(tokens.len() - phrase_tokens.len()) {
+                        let sub_slice = &tokens[i..(i + phrase_tokens.len())];
+                        if sub_slice == phrase_tokens {
+                            return true;
+                        }
+                    }
+                    false
+                } else {
+                    false
+                }
             }
         }
     }

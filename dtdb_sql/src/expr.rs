@@ -597,6 +597,21 @@ impl Expr {
                                     eval_match_query(left, tokens)
                                         || eval_match_query(right, tokens)
                                 }
+                                dtdb_relational::FullTextQuery::Phrase(phrase_tokens) => {
+                                    if phrase_tokens.is_empty() {
+                                        return true;
+                                    }
+                                    if tokens.len() < phrase_tokens.len() {
+                                        return false;
+                                    }
+                                    for i in 0..=(tokens.len() - phrase_tokens.len()) {
+                                        let sub_slice = &tokens[i..(i + phrase_tokens.len())];
+                                        if sub_slice == phrase_tokens {
+                                            return true;
+                                        }
+                                    }
+                                    false
+                                }
                             }
                         }
                         let matched = eval_match_query(&query, &tokens);

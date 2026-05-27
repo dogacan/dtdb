@@ -3290,3 +3290,270 @@ fn test_fulltext_boolean_search() {
     tx6.commit().unwrap();
     drop(tx6);
 }
+
+#[test]
+fn test_fulltext_phrase_search() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Setup table and insert rows
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE posts (id INT PRIMARY KEY, content STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO posts (id, content) VALUES \
+             (1, 'the quick brown fox jumps over the lazy dog'), \
+             (2, 'the quick lazy dog jumps over the brown fox'), \
+             (3, 'quick brown fox is extremely fast'), \
+             (4, 'lazy dog is very lazy')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // 2. Query WITHOUT FULLTEXT index (Sequential scan fallback)
+    let tx3 = Transaction::new(3, db.clone());
+
+    // Contiguous Phrase: "quick brown fox"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown fox\"') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Contiguous Phrase: "brown fox jumps"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"brown fox jumps\"') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Phrase + Boolean AND: "quick brown" AND jumps
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown\" AND jumps') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Phrase: "lazy dog"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"lazy dog\"') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[2].values[0], DbValue::Int(4));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Non-contiguous Phrase: "lazy jumps" (exist in text but not contiguous)
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"lazy jumps\"') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 0);
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx3);
+
+    // 3. Create FULLTEXT index
+    let tx4 = Transaction::new(4, db.clone());
+    engine
+        .execute("CREATE FULLTEXT INDEX idx_content ON posts (content)", &tx4)
+        .unwrap();
+    tx4.commit().unwrap();
+    drop(tx4);
+
+    // 4. Query WITH FULLTEXT index (Index scan / PhysicalFullTextScan)
+    let tx5 = Transaction::new(5, db.clone());
+
+    // Verify via EXPLAIN that physical plan selects PhysicalFullTextScan
+    let res = engine
+        .execute(
+            "EXPLAIN SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown fox\"')",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(schema.columns[0].name, "Query Plan");
+        let plan_text = match &rows[0].values[0] {
+            DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string plan text"),
+        };
+        assert!(plan_text.contains("FullTextScan: table=posts, index=idx_content"));
+        assert!(plan_text.contains("PhysicalFullTextScan"));
+    } else {
+        panic!("Expected EXPLAIN result");
+    }
+
+    // Contiguous Phrase: "quick brown fox"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown fox\"') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Contiguous Phrase: "brown fox jumps"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"brown fox jumps\"') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Phrase: "lazy dog"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"lazy dog\"') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[2].values[0], DbValue::Int(4));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Non-contiguous Phrase: "lazy jumps"
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"lazy jumps\"') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 0);
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx5);
+
+    // 5. OCC / Transaction write updates and deletes with phrase queries
+    let tx6 = Transaction::new(6, db.clone());
+
+    // Insert new row matching: "quick brown fox"
+    engine
+        .execute(
+            "INSERT INTO posts (id, content) VALUES (5, 'quick brown fox query phrase')",
+            &tx6,
+        )
+        .unwrap();
+
+    // Query within transaction should scan write buffer and return Row 1, 3, and 5
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown fox\"') ORDER BY id ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+        assert_eq!(rows[2].values[0], DbValue::Int(5));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Delete Row 3 within transaction
+    engine
+        .execute("DELETE FROM posts WHERE id = 3", &tx6)
+        .unwrap();
+
+    // Query again - Row 3 should be gone, Row 1 and 5 should be returned
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown fox\"') ORDER BY id ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(5));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Update Row 1 to match something else
+    engine
+        .execute(
+            "UPDATE posts SET content = 'the slow brown fox jumps over the lazy dog' WHERE id = 1",
+            &tx6,
+        )
+        .unwrap();
+
+    // Query again - Row 1 should no longer match, only Row 5 should be returned
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('\"quick brown fox\"') ORDER BY id ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(5));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    tx6.commit().unwrap();
+    drop(tx6);
+}

@@ -191,18 +191,28 @@ impl Table {
                                     if let Some(tokenizer) =
                                         crate::tokenizer::get_tokenizer(tokenizer_name)
                                     {
-                                        let mut tokens = tokenizer.tokenize(new_text);
-                                        tokens.sort();
-                                        tokens.dedup();
-                                        for token in tokens {
+                                        let tokens = tokenizer.tokenize(new_text);
+                                        let mut token_positions: std::collections::HashMap<
+                                            String,
+                                            Vec<u32>,
+                                        > = std::collections::HashMap::new();
+                                        for (pos, token) in tokens.into_iter().enumerate() {
+                                            token_positions
+                                                .entry(token)
+                                                .or_default()
+                                                .push(pos as u32);
+                                        }
+                                        for (token, positions) in token_positions {
                                             let idx_key = DbKey::Composite(vec![
                                                 DbKey::String(token),
                                                 key.clone(),
                                             ]);
+                                            let value_bytes =
+                                                bincode::serialize(&positions).unwrap();
                                             index_batches.get_mut(&idx.name).unwrap().push(
                                                 WalEntry::Put {
                                                     key: idx_key,
-                                                    value: DbValue::Null,
+                                                    value: DbValue::Bytes(value_bytes),
                                                 },
                                             );
                                         }
@@ -1673,14 +1683,18 @@ impl Database {
                 if let DbValue::String(text) = col_val {
                     let tokenizer_name = tokenizer.as_deref().unwrap_or("simple");
                     let tok = crate::tokenizer::get_tokenizer(tokenizer_name).unwrap();
-                    let mut tokens = tok.tokenize(text);
-                    tokens.sort();
-                    tokens.dedup();
-                    for token in tokens {
+                    let tokens = tok.tokenize(text);
+                    let mut token_positions: std::collections::HashMap<String, Vec<u32>> =
+                        std::collections::HashMap::new();
+                    for (pos, token) in tokens.into_iter().enumerate() {
+                        token_positions.entry(token).or_default().push(pos as u32);
+                    }
+                    for (token, positions) in token_positions {
                         let idx_key = DbKey::Composite(vec![DbKey::String(token), pk_key.clone()]);
+                        let value_bytes = bincode::serialize(&positions).unwrap();
                         index_entries.push(WalEntry::Put {
                             key: idx_key,
-                            value: DbValue::Null,
+                            value: DbValue::Bytes(value_bytes),
                         });
                     }
                 }
