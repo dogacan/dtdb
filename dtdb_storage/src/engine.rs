@@ -295,6 +295,14 @@ impl EngineInner {
                 }
                 writer.finish()?;
 
+                // Update manifest
+                {
+                    let manifest_path = dir_path.join("manifest.bin");
+                    let mut manifest = Manifest::load(&manifest_path)?;
+                    manifest.active_sstables.insert((0, next_id));
+                    manifest.save(&manifest_path)?;
+                }
+
                 let reader = SstableReader::open(&sst_path, next_id, 0, block_cache.clone())?;
                 sstables_map
                     .entry(0)

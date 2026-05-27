@@ -504,3 +504,43 @@ fn test_engine_compaction_round_robin() {
     l2_keys.sort();
     assert_eq!(l2_keys, vec![k_int(10), k_int(20)]);
 }
+
+#[test]
+fn test_engine_crash_recovery_multiple_restarts() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 4,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 1000,
+        wal_sync_interval_ms: None,
+    };
+
+    // 1. Open engine, write some keys, and drop it (leaving WAL).
+    {
+        let engine = StorageEngine::open(&db_path, options).unwrap();
+        engine.put(k_int(42), v_str("forty-two")).unwrap();
+        engine.put(k_int(43), v_str("forty-three")).unwrap();
+    }
+
+    // 2. Re-open engine (WAL replay creates L0 SSTable, deletes WAL). Drop it immediately.
+    {
+        let engine = StorageEngine::open(&db_path, options).unwrap();
+        assert_eq!(engine.get(&k_int(42)).unwrap(), Some(v_str("forty-two")));
+    }
+
+    // 3. Re-open engine again. Verify that the recovered data is still there!
+    {
+        let engine = StorageEngine::open(&db_path, options).unwrap();
+        assert_eq!(engine.get(&k_int(42)).unwrap(), Some(v_str("forty-two")));
+        assert_eq!(engine.get(&k_int(43)).unwrap(), Some(v_str("forty-three")));
+    }
+}
+
