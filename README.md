@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let mut client = DuctTapeDbClient::connect("http://127.0.0.1:50051").await?;
 
     // 2. Create a database
-    client.create_db("mydb", CompressionType::Uncompressed).await?;
+    client.create_db("mydb", CompressionType::Lz4).await?;
 
     // 3. Execute queries (streams result rows)
     let mut stream = client
