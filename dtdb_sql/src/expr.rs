@@ -51,7 +51,7 @@ pub enum Expr {
         column: String,
         #[serde(default)]
         index: Option<usize>,
-        token: String,
+        query_str: String,
     },
 }
 
@@ -549,7 +549,7 @@ impl Expr {
             Expr::Match {
                 column,
                 index,
-                token,
+                query_str,
             } => {
                 let idx = if let Some(idx) = index {
                     *idx
@@ -579,8 +579,28 @@ impl Expr {
                     if let Some(tokenizer) =
                         dtdb_relational::tokenizer::get_tokenizer(tokenizer_name)
                     {
+                        let query =
+                            dtdb_relational::FullTextQuery::parse(query_str, tokenizer.as_ref())
+                                .map_err(|e| e.to_string())?;
                         let tokens = tokenizer.tokenize(&s);
-                        Ok(DbValue::Bool(tokens.contains(token)))
+                        fn eval_match_query(
+                            query: &dtdb_relational::FullTextQuery,
+                            tokens: &[String],
+                        ) -> bool {
+                            match query {
+                                dtdb_relational::FullTextQuery::Token(tok) => tokens.contains(tok),
+                                dtdb_relational::FullTextQuery::And(left, right) => {
+                                    eval_match_query(left, tokens)
+                                        && eval_match_query(right, tokens)
+                                }
+                                dtdb_relational::FullTextQuery::Or(left, right) => {
+                                    eval_match_query(left, tokens)
+                                        || eval_match_query(right, tokens)
+                                }
+                            }
+                        }
+                        let matched = eval_match_query(&query, &tokens);
+                        Ok(DbValue::Bool(matched))
                     } else {
                         Err(format!("Tokenizer '{}' not found", tokenizer_name))
                     }

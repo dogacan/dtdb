@@ -1137,11 +1137,11 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
         } => {
             if columns.len() != 1 {
                 return Err(
-                    "MATCH against multiple columns is not supported in Phase 1".to_string()
+                    "MATCH against multiple columns is not supported in Phase 2".to_string()
                 );
             }
             let col_name = columns[0].value.clone();
-            let token_str = match match_value {
+            let query_str = match match_value {
                 sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
                 other => {
                     return Err(format!(
@@ -1153,7 +1153,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             Ok(Expr::Match {
                 column: col_name,
                 index: None,
-                token: token_str,
+                query_str,
             })
         }
         other => Err(format!("Unsupported expression: {:?}", other)),

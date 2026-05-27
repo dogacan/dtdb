@@ -101,6 +101,44 @@ impl PhysicalOperator for PhysicalIndexScan {
 }
 
 // ==========================================
+// 1.7. FullTextScan Physical Operator
+// ==========================================
+pub struct PhysicalFullTextScan {
+    schema: Schema,
+    query_str: String,
+    source: Box<dyn Iterator<Item = Result<Row, String>>>,
+}
+
+impl PhysicalFullTextScan {
+    pub fn new(schema: Schema, query_str: String, rows: Vec<Row>) -> Self {
+        Self {
+            schema,
+            query_str,
+            source: Box::new(rows.into_iter().map(Ok)),
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalFullTextScan {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        self.source.next().transpose()
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        out.push_str(&format!(
+            "{}- PhysicalFullTextScan: query={:?}, schema={:?}\n",
+            "  ".repeat(indent),
+            self.query_str,
+            self.schema
+        ));
+    }
+}
+
+// ==========================================
 // 2. Filter Physical Operator
 // ==========================================
 pub struct PhysicalFilter {

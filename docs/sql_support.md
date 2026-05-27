@@ -297,9 +297,14 @@ Used to combine boolean expressions:
     *   *Example*: `WHERE name LIKE 'A%'` (starts with 'A'), `WHERE name NOT LIKE '%b%'` (does not contain 'b').
 
 ### Full-Text Search
-*   `MATCH(<column_name>) AGAINST('<token_literal>')`: Evaluates to `TRUE` if the tokenizer matching `<column_name>` contains the exact lowercase word `<token_literal>`.
-    *   *Note*: If a `FULLTEXT` index exists on `<column_name>`, the query optimizer automatically chooses an `IndexScan` path to accelerate execution. If no index is present, it falls back to a sequential table scan evaluating the tokenizer dynamically.
-    *   *Example*: `WHERE MATCH(content) AGAINST('database')`
+*   `MATCH(<column_name>) AGAINST('<query_string>')`: Evaluates to `TRUE` if the string in `<column_name>` matches the boolean expression `<query_string>`.
+    *   *Supported Query Operators*:
+        *   `AND` (case-insensitive): Both terms must match.
+        *   `OR` (case-insensitive): At least one term must match.
+        *   Parentheses `( )`: Used to override operator precedence (e.g., `(rust OR c++) AND database`).
+        *   Implicit `AND`: Space-separated words without explicit operators are treated as implicit `AND` (e.g., `rust database` parses as `rust AND database`).
+    *   *Note*: If a `FULLTEXT` index exists on `<column_name>`, the query optimizer automatically chooses the `FullTextScan` path (visible as `PhysicalFullTextScan` in `EXPLAIN`) to accelerate execution using inverted index set operations. If no index is present, it falls back to a sequential table scan evaluating the boolean query tree dynamically.
+    *   *Example*: `WHERE MATCH(content) AGAINST('(rust OR c++) AND database')`
 
 ### Arithmetic Operators
 Used for mathematical computations in select projections or predicates:

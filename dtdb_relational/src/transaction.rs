@@ -458,6 +458,164 @@ impl Transaction {
         Ok(rows)
     }
 
+    /// Performs a full-text boolean query scan, resolving matching primary keys using the inverted index,
+    /// and applying the transaction's write buffer modifications.
+    pub fn fulltext_scan(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        query_str: &str,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<Row>> {
+        let table = self.get_table(table_name)?;
+        let index_engine = table.index_engines.get(index_name).ok_or_else(|| {
+            RelationalError::SchemaMismatch(format!("Index '{}' not found", index_name))
+        })?;
+
+        let index_def = table
+            .schema
+            .indexes
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .ok_or_else(|| {
+                RelationalError::SchemaMismatch(format!(
+                    "Index '{}' definition not found",
+                    index_name
+                ))
+            })?;
+        let tokenizer_name = index_def.tokenizer.as_deref().unwrap_or("simple");
+        let tokenizer = crate::tokenizer::get_tokenizer(tokenizer_name).ok_or_else(|| {
+            RelationalError::SchemaMismatch(format!("Tokenizer '{}' not found", tokenizer_name))
+        })?;
+
+        let query = crate::fts_parser::FullTextQuery::parse(query_str, tokenizer.as_ref())
+            .map_err(RelationalError::SchemaMismatch)?;
+
+        // 1. Recursively resolve primary key set matching the query from the index engine
+        let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
+        let matched_pks = self.eval_fulltext_query(index_engine, &query, &min_pk, &max_pk)?;
+
+        // 2. Fetch rows by primary key from storage
+        let mut pks: Vec<DbKey> = matched_pks.into_iter().collect();
+        pks.sort();
+
+        let mut rows = Vec::new();
+        let mut resolved_pks = HashSet::new();
+
+        if !pks.is_empty() {
+            let batch_rows = self.multi_get_projected(table_name, &pks, columns)?;
+            for (pk, row_opt) in pks.into_iter().zip(batch_rows) {
+                resolved_pks.insert(pk.clone());
+                if let Some(row) = row_opt {
+                    rows.push(row);
+                }
+            }
+        }
+
+        // 3. Scan the transaction `write_buffer` for any matching rows not already resolved by index scan,
+        // and remove any rows that have been deleted in this transaction.
+        let buffer = self.write_buffer.lock().unwrap();
+        if let Some(table_buffer) = buffer.get(table_name) {
+            rows.retain(|row| {
+                if let Ok(pk) = table.schema.extract_primary_key(row)
+                    && let Some(row_opt) = table_buffer.get(&pk)
+                {
+                    return row_opt.is_some();
+                }
+                true
+            });
+
+            if let Some(idx_def) = table
+                .schema
+                .indexes
+                .iter()
+                .find(|idx| idx.name == index_name)
+                && let Some(col_name) = idx_def.columns.first()
+                && let Some(col_idx) = table.schema.column_index(col_name)
+            {
+                let tokenizer_name = idx_def.tokenizer.as_deref().unwrap_or("simple");
+                if let Some(tokenizer) = crate::tokenizer::get_tokenizer(tokenizer_name) {
+                    for (pk, row_opt) in table_buffer {
+                        if resolved_pks.contains(pk) {
+                            continue;
+                        }
+                        if let Some(row) = row_opt
+                            && self.eval_row_fts_query(&query, row, col_idx, tokenizer.as_ref())
+                        {
+                            rows.push(row.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn eval_fulltext_query(
+        &self,
+        index_engine: &Arc<dtdb_storage::StorageEngine>,
+        query: &crate::fts_parser::FullTextQuery,
+        min_pk: &DbKey,
+        max_pk: &DbKey,
+    ) -> Result<HashSet<DbKey>> {
+        match query {
+            crate::fts_parser::FullTextQuery::Token(tok) => {
+                let start_bound =
+                    DbKey::Composite(vec![DbKey::String(tok.clone()), min_pk.clone()]);
+                let end_bound = DbKey::Composite(vec![DbKey::String(tok.clone()), max_pk.clone()]);
+                let index_entries =
+                    index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
+                let mut pks = HashSet::new();
+                for (idx_key, _) in index_entries {
+                    if let DbKey::Composite(mut parts) = idx_key
+                        && let Some(pk) = parts.pop()
+                    {
+                        pks.insert(pk);
+                    }
+                }
+                Ok(pks)
+            }
+            crate::fts_parser::FullTextQuery::And(left, right) => {
+                let left_pks = self.eval_fulltext_query(index_engine, left, min_pk, max_pk)?;
+                let right_pks = self.eval_fulltext_query(index_engine, right, min_pk, max_pk)?;
+                Ok(left_pks.intersection(&right_pks).cloned().collect())
+            }
+            crate::fts_parser::FullTextQuery::Or(left, right) => {
+                let left_pks = self.eval_fulltext_query(index_engine, left, min_pk, max_pk)?;
+                let right_pks = self.eval_fulltext_query(index_engine, right, min_pk, max_pk)?;
+                Ok(left_pks.union(&right_pks).cloned().collect())
+            }
+        }
+    }
+
+    fn eval_row_fts_query(
+        &self,
+        query: &crate::fts_parser::FullTextQuery,
+        row: &Row,
+        col_idx: usize,
+        tokenizer: &dyn crate::tokenizer::Tokenizer,
+    ) -> bool {
+        match query {
+            crate::fts_parser::FullTextQuery::Token(tok) => {
+                if let Some(DbValue::String(s)) = row.get_by_index(col_idx) {
+                    let tokens = tokenizer.tokenize(s.as_str());
+                    tokens.contains(tok)
+                } else {
+                    false
+                }
+            }
+            crate::fts_parser::FullTextQuery::And(left, right) => {
+                self.eval_row_fts_query(left, row, col_idx, tokenizer)
+                    && self.eval_row_fts_query(right, row, col_idx, tokenizer)
+            }
+            crate::fts_parser::FullTextQuery::Or(left, right) => {
+                self.eval_row_fts_query(left, row, col_idx, tokenizer)
+                    || self.eval_row_fts_query(right, row, col_idx, tokenizer)
+            }
+        }
+    }
+
     /// Commits all buffered mutations in this transaction to the tables.
     pub fn commit(&self) -> Result<()> {
         let mut buffer = self.write_buffer.lock().unwrap();

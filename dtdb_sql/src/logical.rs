@@ -36,6 +36,12 @@ pub enum LogicalPlan {
         // Optional key range bounds (start_key, end_key) on the indexed columns pushed down by the optimizer.
         range: Option<(dtdb_storage::DbKey, dtdb_storage::DbKey)>,
     },
+    FullTextScan {
+        table_name: String,
+        index_name: String,
+        schema: Schema,
+        query_str: String,
+    },
     Filter {
         source: Box<LogicalPlan>,
         predicate: Expr,
@@ -225,6 +231,7 @@ impl LogicalPlan {
             LogicalPlan::Aggregate { schema, .. } => schema.clone(),
             LogicalPlan::Sort { source, .. } => source.schema(),
             LogicalPlan::IndexScan { schema, .. } => schema.clone(),
+            LogicalPlan::FullTextScan { schema, .. } => schema.clone(),
             LogicalPlan::SetOp { left, .. } => left.schema(),
         }
     }
@@ -287,6 +294,7 @@ impl LogicalPlan {
                 source.collect_columns(columns);
             }
             LogicalPlan::IndexScan { .. } => {}
+            LogicalPlan::FullTextScan { .. } => {}
             LogicalPlan::SetOp { left, right, .. } => {
                 left.collect_columns(columns);
                 right.collect_columns(columns);
@@ -399,6 +407,17 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!(
                 "{}- IndexScan: table={}, index={}, {}\n",
                 indent_str, table_name, index_name, range_str
+            ));
+        }
+        LogicalPlan::FullTextScan {
+            table_name,
+            index_name,
+            query_str,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{}- FullTextScan: table={}, index={}, query={:?}\n",
+                indent_str, table_name, index_name, query_str
             ));
         }
         LogicalPlan::SetOp {

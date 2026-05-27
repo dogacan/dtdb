@@ -3033,3 +3033,260 @@ fn test_fulltext_search() {
     }
     drop(tx11);
 }
+
+#[test]
+fn test_fulltext_boolean_search() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Setup table and insert rows
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE posts (id INT PRIMARY KEY, content STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO posts (id, content) VALUES \
+             (1, 'Rust database engines are built using LSM-trees'), \
+             (2, 'C++ database structures include B-Trees'), \
+             (3, 'Rust compilers parse source code into an AST'), \
+             (4, 'Java database connection is established via JDBC')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // 2. Query WITHOUT FULLTEXT index (Sequential scan fallback)
+    let tx3 = Transaction::new(3, db.clone());
+
+    // Explicit OR: rust OR c++
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('rust OR c++') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[2].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Explicit AND with grouping: (rust OR c++) AND database
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) AND database') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Implicit AND: rust database
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('rust database') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Query non-matching query: rust c++ (implicit AND)
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('rust c++') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 0);
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx3);
+
+    // 3. Create FULLTEXT index
+    let tx4 = Transaction::new(4, db.clone());
+    engine
+        .execute("CREATE FULLTEXT INDEX idx_content ON posts (content)", &tx4)
+        .unwrap();
+    tx4.commit().unwrap();
+    drop(tx4);
+
+    // 4. Query WITH FULLTEXT index (Index scan)
+    let tx5 = Transaction::new(5, db.clone());
+
+    // Verify via EXPLAIN that the physical plan selects PhysicalFullTextScan
+    let res = engine
+        .execute(
+            "EXPLAIN SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) AND database')",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(schema.columns[0].name, "Query Plan");
+        assert_eq!(rows.len(), 1);
+        let plan_text = match &rows[0].values[0] {
+            DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string plan text"),
+        };
+        assert!(plan_text.contains("FullTextScan: table=posts, index=idx_content"));
+        assert!(plan_text.contains("PhysicalFullTextScan"));
+    } else {
+        panic!("Expected EXPLAIN result");
+    }
+
+    // Test: rust OR c++ (explicit OR)
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('rust OR c++') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[2].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Test: (rust OR c++) AND database
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) AND database') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Test: rust database (implicit AND)
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('rust database') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Test: (rust OR c++) (database OR AST) (implicit AND between groupings)
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) (database OR AST)') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[2].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx5);
+
+    // 5. OCC / Transaction write updates and deletes with boolean queries
+    let tx6 = Transaction::new(6, db.clone());
+
+    // Insert new row matching: '(rust OR c++) AND database'
+    engine
+        .execute(
+            "INSERT INTO posts (id, content) VALUES (5, 'Rust database query parser')",
+            &tx6,
+        )
+        .unwrap();
+
+    // Query within transaction should scan write buffer and return Row 1, 2, and 5
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) AND database') ORDER BY id ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(2));
+        assert_eq!(rows[2].values[0], DbValue::Int(5));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Delete Row 2 within transaction
+    engine
+        .execute("DELETE FROM posts WHERE id = 2", &tx6)
+        .unwrap();
+
+    // Query again - Row 2 should be gone, Row 1 and 5 should be returned
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) AND database') ORDER BY id ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(5));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Update Row 1 to match something else
+    engine
+        .execute(
+            "UPDATE posts SET content = 'Go database engines' WHERE id = 1",
+            &tx6,
+        )
+        .unwrap();
+
+    // Query again - Row 1 should no longer match, only Row 5 should be returned
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('(rust OR c++) AND database') ORDER BY id ASC",
+            &tx6,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(5));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    tx6.commit().unwrap();
+    drop(tx6);
+}

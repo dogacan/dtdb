@@ -205,6 +205,28 @@ impl Optimizer {
                     }
                 }
             }
+            LogicalPlan::FullTextScan {
+                table_name,
+                index_name,
+                schema,
+                query_str,
+            } => {
+                if let Some(pred) = combine_conjuncts(conjuncts) {
+                    let best_source =
+                        self.select_best_scan_path(&table_name, &schema, &pred, query_columns);
+                    LogicalPlan::Filter {
+                        source: Box::new(best_source),
+                        predicate: pred,
+                    }
+                } else {
+                    LogicalPlan::FullTextScan {
+                        table_name,
+                        index_name,
+                        schema,
+                        query_str,
+                    }
+                }
+            }
         }
     }
 
@@ -329,6 +351,14 @@ impl Optimizer {
                     base as usize
                 }
             }
+            LogicalPlan::FullTextScan { table_name, .. } => {
+                let base = self
+                    .database
+                    .get_table_statistics(table_name)
+                    .map(|s| s.row_count)
+                    .unwrap_or(1000);
+                (base as f64 * 0.05) as usize
+            }
             LogicalPlan::Filter { source, .. } => {
                 (self.estimate_plan_rows(source) as f64 * 0.2) as usize
             }
@@ -432,27 +462,46 @@ impl Optimizer {
                     continue;
                 }
 
-                if let Some((start, end)) =
-                    extract_bounds_for_column(predicate, &col.name, &col.data_type)
-                {
-                    let idx_plan = LogicalPlan::IndexScan {
-                        table_name: table_name.to_string(),
-                        index_name: index.name.clone(),
-                        schema: schema.clone(),
-                        range: Some((start.clone(), end.clone())),
-                    };
-                    let cost = self.estimate_index_scan_cost(
-                        table_name,
-                        &index.name,
-                        schema,
-                        stats_opt.as_ref(),
-                        &start,
-                        &end,
-                        query_columns,
-                    );
-                    if cost < min_cost {
-                        min_cost = cost;
-                        best_plan = idx_plan;
+                if is_fulltext {
+                    if let Some(query_str) =
+                        Self::extract_fulltext_query_str_for_col(predicate, &col.name)
+                    {
+                        let fts_plan = LogicalPlan::FullTextScan {
+                            table_name: table_name.to_string(),
+                            index_name: index.name.clone(),
+                            schema: schema.clone(),
+                            query_str,
+                        };
+                        // FullTextScan has a very low cost as it resolves boolean terms using index set operations
+                        let cost = 5.0;
+                        if cost < min_cost {
+                            min_cost = cost;
+                            best_plan = fts_plan;
+                        }
+                    }
+                } else {
+                    if let Some((start, end)) =
+                        extract_bounds_for_column(predicate, &col.name, &col.data_type)
+                    {
+                        let idx_plan = LogicalPlan::IndexScan {
+                            table_name: table_name.to_string(),
+                            index_name: index.name.clone(),
+                            schema: schema.clone(),
+                            range: Some((start.clone(), end.clone())),
+                        };
+                        let cost = self.estimate_index_scan_cost(
+                            table_name,
+                            &index.name,
+                            schema,
+                            stats_opt.as_ref(),
+                            &start,
+                            &end,
+                            query_columns,
+                        );
+                        if cost < min_cost {
+                            min_cost = cost;
+                            best_plan = idx_plan;
+                        }
                     }
                 }
             }
@@ -463,7 +512,11 @@ impl Optimizer {
 
     fn has_match_predicate_for_col(predicate: &Expr, col_name: &str) -> bool {
         match predicate {
-            Expr::Match { column, .. } => column == col_name,
+            Expr::Match { column, .. } => {
+                column == col_name
+                    || dtdb_relational::schema::ends_with_dot_suffix(column, col_name)
+                    || dtdb_relational::schema::ends_with_dot_suffix(col_name, column)
+            }
             Expr::BinaryOp {
                 left,
                 op: Operator::And,
@@ -474,6 +527,31 @@ impl Optimizer {
             }
             Expr::Not(inner) => Self::has_match_predicate_for_col(inner, col_name),
             _ => false,
+        }
+    }
+
+    fn extract_fulltext_query_str_for_col(predicate: &Expr, col_name: &str) -> Option<String> {
+        match predicate {
+            Expr::Match {
+                column, query_str, ..
+            } => {
+                if column == col_name
+                    || dtdb_relational::schema::ends_with_dot_suffix(column, col_name)
+                    || dtdb_relational::schema::ends_with_dot_suffix(col_name, column)
+                {
+                    Some(query_str.clone())
+                } else {
+                    None
+                }
+            }
+            Expr::BinaryOp {
+                left,
+                op: Operator::And,
+                right,
+            } => Self::extract_fulltext_query_str_for_col(left, col_name)
+                .or_else(|| Self::extract_fulltext_query_str_for_col(right, col_name)),
+            Expr::Not(inner) => Self::extract_fulltext_query_str_for_col(inner, col_name),
+            _ => None,
         }
     }
 
@@ -737,14 +815,7 @@ fn extract_bounds_for_column(
                 None
             }
         }
-        Expr::Match { column, token, .. } => {
-            if column == col_name {
-                let key = DbKey::String(token.clone());
-                Some((key.clone(), key))
-            } else {
-                None
-            }
-        }
+        Expr::Match { .. } => None,
         _ => None,
     }
 }
