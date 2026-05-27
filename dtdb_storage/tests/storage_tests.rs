@@ -544,3 +544,39 @@ fn test_engine_crash_recovery_multiple_restarts() {
     }
 }
 
+#[test]
+fn test_scan_iter_lower_bound() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 1000,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 4,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+    };
+    let engine = StorageEngine::open(&db_path, options).unwrap();
+
+    // Write keys: 10, 20, 30, 40 to L0 SSTable
+    engine.put(k_int(10), v_int(10)).unwrap();
+    engine.put(k_int(20), v_int(20)).unwrap();
+    engine.put(k_int(30), v_int(30)).unwrap();
+    engine.put(k_int(40), v_int(40)).unwrap();
+    engine.flush_memtable().unwrap();
+
+    // scan_iter from 25 to 35. Should only yield key 30.
+    let mut iter = engine.scan_iter(&k_int(25), &k_int(35)).unwrap();
+    let mut results = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        results.push(entry);
+    }
+    assert_eq!(results, vec![(k_int(30), v_int(30))]);
+}
+
+

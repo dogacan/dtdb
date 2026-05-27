@@ -13,20 +13,45 @@ pub struct SstableBlockIterator {
 }
 
 impl SstableBlockIterator {
-    pub fn new(reader: Arc<SstableReader>, priority: usize) -> Result<Self> {
-        let mut it = Self {
-            reader,
-            current_block_idx: 0,
-            current_entries: Arc::new(Vec::new()),
-            entry_idx: 0,
-            priority,
-        };
-        if !it.reader.index.is_empty() {
-            it.current_entries = it.reader.read_block(0)?;
-            if it.current_entries.is_empty() {
-                it.advance()?;
+    pub fn new(reader: Arc<SstableReader>, start: Option<&DbKey>, priority: usize) -> Result<Self> {
+        let mut current_block_idx = 0;
+        let mut entry_idx = 0;
+        let mut current_entries = Arc::new(Vec::new());
+
+        if !reader.index.is_empty() {
+            if let Some(start_key) = start {
+                current_block_idx = match reader.index.binary_search_by(|entry| entry.first_key.cmp(start_key)) {
+                    Ok(idx) => idx,
+                    Err(idx) => {
+                        if idx == 0 {
+                            0
+                        } else {
+                            idx - 1
+                        }
+                    }
+                };
+                current_entries = reader.read_block(current_block_idx)?;
+                entry_idx = match current_entries.binary_search_by(|(k, _)| k.cmp(start_key)) {
+                    Ok(idx) => idx,
+                    Err(idx) => idx,
+                };
+            } else {
+                current_entries = reader.read_block(0)?;
             }
         }
+
+        let mut it = Self {
+            reader,
+            current_block_idx,
+            current_entries,
+            entry_idx,
+            priority,
+        };
+
+        if !it.reader.index.is_empty() && it.entry_idx >= it.current_entries.len() {
+            it.advance()?;
+        }
+
         Ok(it)
     }
 

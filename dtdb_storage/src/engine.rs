@@ -595,6 +595,7 @@ impl EngineInner {
                     if fk <= end && lk >= start {
                         sst_iters.push(crate::merge_iter::SstableBlockIterator::new(
                             sstable.clone(),
+                            Some(start),
                             next_priority,
                         )?);
                     }
@@ -613,6 +614,7 @@ impl EngineInner {
                     if fk <= end && lk >= start {
                         sst_iters.push(crate::merge_iter::SstableBlockIterator::new(
                             sstable.clone(),
+                            Some(start),
                             next_priority,
                         )?);
                         next_priority += 1;
@@ -901,6 +903,7 @@ impl EngineInner {
         for (i, f) in other_files.iter().enumerate() {
             sources.push(crate::merge_iter::SstableBlockIterator::new(
                 f.clone(),
+                None,
                 l0_count + i,
             )?);
         }
@@ -908,6 +911,7 @@ impl EngineInner {
             let priority = l0_count - 1 - i;
             sources.push(crate::merge_iter::SstableBlockIterator::new(
                 f.clone(),
+                None,
                 priority,
             )?);
         }
