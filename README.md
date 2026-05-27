@@ -225,7 +225,8 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 * **SQL ANALYZE & Background Collector**: Supports the `ANALYZE TABLE <name>` SQL command to manually compute statistics, and features a background daemon thread to automatically refresh them periodically without blocking concurrent transactions.
 * **Locality Groups (Column Partitioning)**: Allows columns of a table to be physically partitioned and stored in separate LSM-tree subdirectories, optimizing read I/O via query column pruning.
 * **Flexible Deployment Modes**: Supports both in-process embedded execution and client-server execution over gRPC using a unified client library.
-* **Native Cross-Language Bindings**: Provides FFI bindings for C++ and Swift, allowing the database to be embedded directly into non-Rust ecosystems.
+* **Native Cross-Language Bindings**: Provides FFI bindings in the `dtdb_bindings` crate, allowing the database to be embedded directly into non‑Rust ecosystems.
+* **Full-Text Search**: Supports `MATCH ... AGAINST` syntax with token, boolean, and phrase queries via a secondary index, enabling efficient text search.
 
 ---
 
