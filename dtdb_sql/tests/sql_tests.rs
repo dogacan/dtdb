@@ -4176,3 +4176,82 @@ fn test_sql_integer_overflow_prevention() {
         )
         .unwrap();
 }
+
+#[test]
+fn test_sql_join_order_orientation() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING)",
+            &tx_ddl,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)",
+            &tx_ddl,
+        )
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')",
+            &tx_insert,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO orders (id, user_id, amount) VALUES (10, 1, 100), (20, 2, 200)",
+            &tx_insert,
+        )
+        .unwrap();
+    tx_insert.commit().unwrap();
+
+    let tx_query = Transaction::new(3, db.clone());
+
+    // 1. Join with standard order: ON users.id = orders.user_id (left=left, right=right)
+    let res1 = engine
+        .execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.id",
+            &tx_query,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res1 {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("Alice".to_string()), DbValue::Int(100)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("Bob".to_string()), DbValue::Int(200)]
+        );
+    } else {
+        panic!("Expected SELECT result");
+    }
+
+    // 2. Join with reversed order: ON orders.user_id = users.id (left=right, right=left)
+    let res2 = engine
+        .execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON orders.user_id = users.id ORDER BY users.id",
+            &tx_query,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res2 {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::String("Alice".to_string()), DbValue::Int(100)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("Bob".to_string()), DbValue::Int(200)]
+        );
+    } else {
+        panic!("Expected SELECT result");
+    }
+}

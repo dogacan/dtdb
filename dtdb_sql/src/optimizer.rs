@@ -1115,11 +1115,22 @@ fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
 
 fn swap_join_condition(condition: Expr) -> Expr {
     match condition {
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: right,
-            op,
-            right: left,
-        },
+        Expr::BinaryOp { left, op, right } => {
+            let new_op = match op {
+                Operator::Eq => Operator::Eq,
+                Operator::NotEq => Operator::NotEq,
+                Operator::Lt => Operator::Gt,
+                Operator::LtEq => Operator::GtEq,
+                Operator::Gt => Operator::Lt,
+                Operator::GtEq => Operator::LtEq,
+                other => other,
+            };
+            Expr::BinaryOp {
+                left: right,
+                op: new_op,
+                right: left,
+            }
+        }
         other => other,
     }
 }

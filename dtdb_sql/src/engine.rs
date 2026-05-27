@@ -727,7 +727,7 @@ impl SqlEngine {
                     )))
                 } else {
                     // Extract left_on and right_on join keys from equality join condition
-                    let (mut left_on, mut right_on) = match &condition {
+                    let (l_expr, r_expr) = match &condition {
                         Expr::BinaryOp {
                             left: l,
                             op: Operator::Eq,
@@ -741,8 +741,39 @@ impl SqlEngine {
                         }
                     };
 
-                    left_on.bind_columns(left_op.schema());
-                    right_on.bind_columns(right_op.schema());
+                    let mut l_cols = HashSet::new();
+                    l_expr.collect_columns(&mut l_cols);
+                    let mut r_cols = HashSet::new();
+                    r_expr.collect_columns(&mut r_cols);
+
+                    let left_schema = left_op.schema();
+                    let right_schema = right_op.schema();
+
+                    let l_in_left = l_cols
+                        .iter()
+                        .all(|col| schema_contains_col(left_schema, col));
+                    let r_in_right = r_cols
+                        .iter()
+                        .all(|col| schema_contains_col(right_schema, col));
+
+                    let r_in_left = r_cols
+                        .iter()
+                        .all(|col| schema_contains_col(left_schema, col));
+                    let l_in_right = l_cols
+                        .iter()
+                        .all(|col| schema_contains_col(right_schema, col));
+
+                    let (mut left_on, mut right_on) = if l_in_left && r_in_right {
+                        (l_expr, r_expr)
+                    } else if r_in_left && l_in_right {
+                        (r_expr, l_expr)
+                    } else {
+                        // Fallback: use original order
+                        (l_expr, r_expr)
+                    };
+
+                    left_on.bind_columns(left_schema);
+                    right_on.bind_columns(right_schema);
 
                     Ok(Box::new(PhysicalHashJoin::new(
                         left_op,
