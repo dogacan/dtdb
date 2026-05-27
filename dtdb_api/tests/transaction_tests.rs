@@ -358,6 +358,7 @@ async fn test_grpc_protocol_misuse() {
         tx.send(TransactionRequest {
             command: Some(Command::Execute(ExecuteTxQuery {
                 sql_query: "SELECT * FROM Users;".to_string(),
+                parameters: Vec::new(),
             })),
         })
         .await
@@ -486,6 +487,7 @@ async fn test_grpc_protocol_misuse() {
         tx.send(TransactionRequest {
             command: Some(Command::Execute(ExecuteTxQuery {
                 sql_query: "SELECT * FROM Users;".to_string(),
+                parameters: Vec::new(),
             })),
         })
         .await

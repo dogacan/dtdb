@@ -75,6 +75,7 @@ message FlushDbResponse {
 message ExecuteQueryRequest {
     string db_name = 1;
     string sql_query = 2;
+    repeated QueryParam parameters = 3;
 }
 
 message ExecuteQueryResponse {
@@ -111,6 +112,7 @@ message StartTransaction {
 
 message ExecuteTxQuery {
     string sql_query = 1;
+    repeated QueryParam parameters = 2;
 }
 
 message CommitTransaction {}
@@ -128,4 +130,20 @@ message TransactionResponse {
 message CommitResult {
     bool success = 1;
     string message = 2;
+}
+
+message ParamValue {
+    oneof val {
+        int64 int_val = 1;
+        double float_val = 2;
+        bool bool_val = 3;
+        string string_val = 4;
+        bytes bytes_val = 5;
+        bool null_val = 6;
+    }
+}
+
+message QueryParam {
+    string name = 1;
+    ParamValue value = 2;
 }

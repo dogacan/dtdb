@@ -17,7 +17,7 @@ use crate::proto::{
 use dtdb_relational::{DatabaseOptions, Transaction};
 pub use dtdb_relational::{IsolationLevel, TransactionOptions};
 use dtdb_sql::SqlEngine;
-use dtdb_storage::CompressionType;
+use dtdb_storage::{CompressionType, DbValue};
 
 #[derive(Clone)]
 pub enum ClientMode {
@@ -174,10 +174,10 @@ impl DuctTapeDbClient {
         Pin<Box<dyn Stream<Item = Result<ExecuteQueryResponse, Status>> + Send + 'static>>,
         Status,
     > {
-        let sql = query.interpolate().map_err(Status::invalid_argument)?;
         let request = ExecuteQueryRequest {
             db_name: db_name.to_string(),
-            sql_query: sql,
+            sql_query: query.text().to_string(),
+            parameters: db_params_to_proto_params(query.bindings()),
         };
 
         match &mut self.inner {
@@ -411,15 +411,18 @@ impl TransactionClient {
         &self,
         query: crate::query::SqlQuery,
     ) -> Result<Vec<ExecuteQueryResponse>, Status> {
-        let sql = query.interpolate().map_err(Status::invalid_argument)?;
         match &self.mode {
             TransactionClientMode::InProcess { tx, sql_engine } => {
-                if sql_engine.is_ddl(&sql) {
+                if sql_engine.is_ddl(query.text()) {
                     return Err(Status::invalid_argument(
                         "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions.",
                     ));
                 }
-                match sql_engine.execute(&sql, tx) {
+                let mut params = std::collections::HashMap::new();
+                for (name, val) in query.bindings() {
+                    params.insert(name.clone(), val.clone());
+                }
+                match sql_engine.execute_with_params(query.text(), tx, &params) {
                     Ok(result) => Ok(crate::server::execution_result_to_responses(result)),
                     Err(e) => Err(Status::invalid_argument(format!("SQL Error: {}", e))),
                 }
@@ -432,7 +435,10 @@ impl TransactionClient {
                 req_tx
                     .send(TransactionRequest {
                         command: Some(crate::proto::transaction_request::Command::Execute(
-                            ExecuteTxQuery { sql_query: sql },
+                            ExecuteTxQuery {
+                                sql_query: query.text().to_string(),
+                                parameters: db_params_to_proto_params(query.bindings()),
+                            },
                         )),
                     })
                     .await
@@ -520,4 +526,23 @@ impl TransactionClient {
             ))
         }
     }
+}
+
+fn db_params_to_proto_params(bindings: &[(String, DbValue)]) -> Vec<crate::proto::QueryParam> {
+    bindings
+        .iter()
+        .map(|(name, val)| crate::proto::QueryParam {
+            name: name.clone(),
+            value: Some(crate::proto::ParamValue {
+                val: Some(match val {
+                    DbValue::Int(i) => crate::proto::param_value::Val::IntVal(*i),
+                    DbValue::Float(f) => crate::proto::param_value::Val::FloatVal(*f),
+                    DbValue::Bool(b) => crate::proto::param_value::Val::BoolVal(*b),
+                    DbValue::String(s) => crate::proto::param_value::Val::StringVal(s.clone()),
+                    DbValue::Bytes(b) => crate::proto::param_value::Val::BytesVal(b.clone()),
+                    DbValue::Null => crate::proto::param_value::Val::NullVal(true),
+                }),
+            }),
+        })
+        .collect()
 }

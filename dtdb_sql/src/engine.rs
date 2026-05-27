@@ -102,11 +102,40 @@ impl SqlEngine {
     ///   transaction boundaries with commit/rollback semantics.
     ///
     /// This restriction ensures that every `execute()` call has clear, predictable
+    /// Parses, plans, optimizes, and executes a single SQL statement within the given transaction.
+    ///
+    /// # Single-Statement Restriction
+    ///
+    /// This method intentionally rejects inputs containing multiple SQL statements
+    /// (e.g. "INSERT ...; INSERT ...;"). This is a deliberate design choice:
+    ///
+    /// - **Atomicity**: Each `execute()` call runs as a single auto-committed transaction.
+    ///   Silently executing only the first statement of a multi-statement input would
+    ///   cause data loss. Executing all statements without transaction boundaries would
+    ///   leave partial results on failure.
+    ///
+    /// - **Explicit transactions**: Callers who need to execute multiple statements
+    ///   atomically should use `DuctTapeDbClient::run_in_transaction()` (client API)
+    ///   or the `Transaction` bidirectional streaming RPC, which provide proper
+    ///   transaction boundaries with commit/rollback semantics.
+    ///
+    /// This restriction ensures that every `execute()` call has clear, predictable
     /// atomicity semantics: exactly one statement, exactly one transaction.
     pub fn execute(&self, sql: &str, tx: &Transaction) -> Result<ExecutionResult, String> {
+        self.execute_with_params(sql, tx, &std::collections::HashMap::new())
+    }
+
+    /// Parses, plans, optimizes, and executes a single SQL statement with parameters within the given transaction.
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<ExecutionResult, String> {
         let preprocessed = preprocess_sql(sql);
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
+        let mut statements =
+            Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
         if statements.is_empty() {
             return Err("No SQL statements found".to_string());
         }
@@ -123,8 +152,9 @@ impl SqlEngine {
             );
         }
 
-        let statement = &statements[0];
-        let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(statement)?;
+        let mut statement = statements.remove(0);
+        crate::parameters::bind_statement(&mut statement, params)?;
+        let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
 
         match planned_stmt {
             SqlStatement::CreateTable { name, schema } => {

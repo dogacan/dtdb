@@ -157,3 +157,95 @@ async fn test_grpc_client_server_integration() {
     // Clean up server task
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_grpc_server_side_parameters() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    // 1. Start Server on random port
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let service = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(DuctTapeDbServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    // Let the server spin up
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 2. Connect client
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+
+    // 3. Create database
+    client
+        .create_db("db_params", CompressionType::Uncompressed)
+        .await
+        .unwrap();
+
+    // 4. Create table
+    {
+        let mut stream = client
+            .execute_query(
+                "db_params",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
+            )
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // 5. Insert row with parameters
+    {
+        let mut stream = client
+            .execute_query(
+                "db_params",
+                dtdb_api::sql_query!("INSERT INTO Users (id, name) VALUES (:id, :name);")
+                    .bind("id", 42i64)
+                    .bind("name", "Bob"),
+            )
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    // 6. Select row with parameters
+    {
+        let mut stream = client
+            .execute_query(
+                "db_params",
+                dtdb_api::sql_query!("SELECT id, name FROM Users WHERE id = :id;")
+                    .bind("id", 42i64),
+            )
+            .await
+            .unwrap();
+        let mut payloads = Vec::new();
+        while let Some(res) = stream.next().await {
+            payloads.push(res.unwrap());
+        }
+        assert_eq!(payloads.len(), 2); // Header + Row
+
+        // Row validation
+        match payloads[1].payload.as_ref().unwrap() {
+            dtdb_api::proto::execute_query_response::Payload::Row(row) => {
+                assert_eq!(row.values, vec!["42", "Bob"]);
+            }
+            _ => panic!("Expected row payload"),
+        }
+    }
+
+    // Clean up server task
+    server_handle.abort();
+}

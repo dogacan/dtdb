@@ -4524,3 +4524,54 @@ fn test_sql_binary_short_circuit() {
         panic!("Expected SELECT");
     }
 }
+
+#[test]
+fn test_sql_server_side_parameters() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT)",
+            &tx_ddl,
+        )
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), DbValue::Int(1));
+    params.insert("name".to_string(), DbValue::String("Alice".to_string()));
+    params.insert("age".to_string(), DbValue::Int(30));
+
+    // Test insert with parameters
+    engine
+        .execute_with_params(
+            "INSERT INTO users (id, name, age) VALUES (:id, :name, :age)",
+            &tx_insert,
+            &params,
+        )
+        .unwrap();
+    tx_insert.commit().unwrap();
+
+    let tx_query = Transaction::new(3, db.clone());
+    let mut q_params = std::collections::HashMap::new();
+    q_params.insert("name".to_string(), DbValue::String("Alice".to_string()));
+    q_params.insert("min_age".to_string(), DbValue::Int(25));
+
+    // Test select with parameters
+    let res = engine
+        .execute_with_params(
+            "SELECT id, age FROM users WHERE name = :name AND age >= :min_age",
+            &tx_query,
+            &q_params,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Int(1), DbValue::Int(30)]);
+    } else {
+        panic!("Expected SELECT result");
+    }
+}

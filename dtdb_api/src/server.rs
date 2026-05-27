@@ -409,6 +409,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let req = request.into_inner();
         let db_name = req.db_name.trim();
         let sql_query = req.sql_query.trim();
+        let params = proto_params_to_db_params(req.parameters)?;
 
         // 1. Get db state
         let (database, sql_engine) = {
@@ -430,7 +431,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let (tx_chan, rx_chan) = mpsc::channel(128);
 
         // Execute query
-        match sql_engine.execute(sql_query, &tx) {
+        match sql_engine.execute_with_params(sql_query, &tx, &params) {
             Ok(result) => {
                 if let Err(e) = tx.commit() {
                     return Err(Status::aborted(format!("Transaction commit failed: {}", e)));
@@ -645,7 +646,21 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                 .await;
                             continue;
                         }
-                        match sql_engine.execute(sql_query, tx) {
+                        let params = match proto_params_to_db_params(exec.parameters) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        format!("Failed to parse query parameters: {}", e),
+                                    )),
+                                })).await;
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::QueryFinished(true)),
+                                })).await;
+                                continue;
+                            }
+                        };
+                        match sql_engine.execute_with_params(sql_query, tx, &params) {
                             Ok(result) => {
                                 let responses = execution_result_to_responses(result);
                                 for resp in responses {
@@ -759,4 +774,27 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let stream = ReceiverStream::new(rx_chan);
         Ok(Response::new(Box::pin(stream) as Self::TransactionStream))
     }
+}
+
+fn proto_params_to_db_params(
+    proto_params: Vec<crate::proto::QueryParam>,
+) -> Result<HashMap<String, DbValue>, Status> {
+    let mut params = HashMap::new();
+    for p in proto_params {
+        let name = p.name;
+        let value = match p.value {
+            Some(pv) => match pv.val {
+                Some(crate::proto::param_value::Val::IntVal(i)) => DbValue::Int(i),
+                Some(crate::proto::param_value::Val::FloatVal(f)) => DbValue::Float(f),
+                Some(crate::proto::param_value::Val::BoolVal(b)) => DbValue::Bool(b),
+                Some(crate::proto::param_value::Val::StringVal(s)) => DbValue::String(s),
+                Some(crate::proto::param_value::Val::BytesVal(b)) => DbValue::Bytes(b),
+                Some(crate::proto::param_value::Val::NullVal(_)) => DbValue::Null,
+                None => DbValue::Null,
+            },
+            None => DbValue::Null,
+        };
+        params.insert(name, value);
+    }
+    Ok(params)
 }
