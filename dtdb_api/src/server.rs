@@ -279,6 +279,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             block_cache_capacity: Some(1000),
             analyze_frequency_ms: req.analyze_frequency_ms,
             wal_sync_interval_ms: None,
+            sort_memory_budget: None,
         };
 
         let database = Arc::new(

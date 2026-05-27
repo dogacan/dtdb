@@ -719,6 +719,8 @@ pub struct DatabaseOptions {
     pub analyze_frequency_ms: Option<u64>,
     #[serde(default)]
     pub wal_sync_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub sort_memory_budget: Option<usize>,
 }
 
 /// Database represents a catalog of Tables stored in a base directory.
@@ -745,6 +747,10 @@ impl Database {
     /// It scans the base directory for table subdirectories containing `schema.bin`.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_spawner(dir_path, Arc::new(dtdb_storage::DefaultSpawner))
+    }
+
+    pub fn dir_path(&self) -> &Path {
+        &self.dir_path
     }
 
     pub fn register_tokenizer(&self, name: &str, tokenizer: Arc<dyn crate::tokenizer::Tokenizer>) {
@@ -777,6 +783,7 @@ impl Database {
                 block_cache_capacity: Some(1000),
                 analyze_frequency_ms: None,
                 wal_sync_interval_ms: None,
+                sort_memory_budget: None,
             }
         };
         Self::open_with_options_and_spawner(dir_path, options, spawner)
@@ -810,6 +817,12 @@ impl Database {
             {
                 let _ = fs::remove_dir_all(&path);
             }
+        }
+
+        // Clean up stale temp sort spill directory from previous crashes
+        let tmp_dir = dir_path.join("_tmp");
+        if tmp_dir.exists() {
+            let _ = fs::remove_dir_all(&tmp_dir);
         }
 
         let db_options_path = dir_path.join("db_options.bin");

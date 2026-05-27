@@ -454,6 +454,42 @@ impl Transaction {
                 }
             }
         }
+        // Sort the final rows by the index columns to maintain sorted order even with write buffer insertions.
+        if let Some(idx_def) = table
+            .schema
+            .indexes
+            .iter()
+            .find(|idx| idx.name == index_name)
+            && let Some(col_name) = idx_def.columns.first()
+            && let Some(col_idx) = table.schema.column_index(col_name)
+        {
+            let row_val_to_key = |val: &DbValue| -> DbKey {
+                match val {
+                    DbValue::Int(v) => DbKey::Int(*v),
+                    DbValue::String(s) => DbKey::String(s.clone()),
+                    DbValue::Bool(b) => DbKey::Bool(*b),
+                    _ => DbKey::Int(0),
+                }
+            };
+
+            rows.sort_by(|a, b| {
+                let a_val = a.get_by_index(col_idx).unwrap_or(&DbValue::Null);
+                let b_val = b.get_by_index(col_idx).unwrap_or(&DbValue::Null);
+                let a_key = row_val_to_key(a_val);
+                let b_key = row_val_to_key(b_val);
+                let ord = a_key.cmp(&b_key);
+                if ord != std::cmp::Ordering::Equal {
+                    ord
+                } else {
+                    let a_pk = table.schema.extract_primary_key(a);
+                    let b_pk = table.schema.extract_primary_key(b);
+                    match (a_pk, b_pk) {
+                        (Ok(apk), Ok(bpk)) => apk.cmp(&bpk),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                }
+            });
+        }
 
         Ok(rows)
     }

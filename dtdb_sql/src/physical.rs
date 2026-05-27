@@ -2,7 +2,12 @@ use crate::expr::{Expr, compare_values};
 use crate::logical::{AggregateExpr, JoinType, SetOpType};
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// PhysicalOperator defines the Volcano Iterator interface for query execution.
 pub trait PhysicalOperator {
@@ -295,66 +300,325 @@ impl PhysicalOperator for PhysicalLimit {
 // ==========================================
 // 5. Sort Physical Operator (Pipeline-Blocking)
 // ==========================================
+/// A sorted run stored as a temporary file on disk.
+struct SortedRun {
+    path: PathBuf,
+    reader: Option<BufReader<File>>,
+    peeked: Option<(Vec<DbValue>, Row)>,
+    remaining: usize,
+}
+
+impl SortedRun {
+    fn new(path: PathBuf, count: usize) -> Self {
+        Self {
+            path,
+            reader: None,
+            peeked: None,
+            remaining: count,
+        }
+    }
+
+    fn open(&mut self) -> Result<(), String> {
+        let file = File::open(&self.path)
+            .map_err(|e| format!("Failed to open temp file {:?}: {}", self.path, e))?;
+        let mut reader = BufReader::new(file);
+        let count: u64 = bincode::deserialize_from(&mut reader)
+            .map_err(|e| format!("Failed to read count from run file: {}", e))?;
+        self.remaining = count as usize;
+        self.reader = Some(reader);
+        self.advance()?;
+        Ok(())
+    }
+
+    fn advance(&mut self) -> Result<(), String> {
+        if self.remaining == 0 {
+            self.peeked = None;
+            self.reader = None; // Close file handle early
+            return Ok(());
+        }
+
+        let reader = self.reader.as_mut().ok_or("Advance called on closed run")?;
+        let keys: Vec<DbValue> = bincode::deserialize_from(&mut *reader)
+            .map_err(|e| format!("Failed to deserialize keys: {}", e))?;
+        let row: Row = bincode::deserialize_from(&mut *reader)
+            .map_err(|e| format!("Failed to deserialize row: {}", e))?;
+
+        self.peeked = Some((keys, row));
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
+impl Drop for SortedRun {
+    fn drop(&mut self) {
+        self.reader = None; // Explicitly drop the reader to release the file lock
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct HeapEntry {
+    sort_keys: Vec<DbValue>,
+    row: Row,
+    run_index: usize,
+    directions: Arc<Vec<bool>>,
+    error_slot: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (idx, &asc) in self.directions.iter().enumerate() {
+            let a_val = &self.sort_keys[idx];
+            let b_val = &other.sort_keys[idx];
+            match compare_values(a_val, b_val) {
+                Ok(ord) => {
+                    if ord != std::cmp::Ordering::Equal {
+                        return if asc { ord.reverse() } else { ord };
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut guard) = self.error_slot.lock() {
+                        let _ = guard.get_or_insert(e);
+                    }
+                    return std::cmp::Ordering::Equal;
+                }
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for HeapEntry {}
+
+struct KWayMerge {
+    heap: BinaryHeap<HeapEntry>,
+    runs: Vec<SortedRun>,
+    directions: Arc<Vec<bool>>,
+    error_slot: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl KWayMerge {
+    fn new(mut runs: Vec<SortedRun>, keys: &[(Expr, bool)]) -> Result<Self, String> {
+        let directions = Arc::new(keys.iter().map(|(_, asc)| *asc).collect::<Vec<_>>());
+        let error_slot = Arc::new(std::sync::Mutex::new(None));
+        let mut heap = BinaryHeap::new();
+
+        for (idx, run) in runs.iter_mut().enumerate() {
+            run.open()?;
+            if let Some((sort_keys, row)) = run.peeked.take() {
+                heap.push(HeapEntry {
+                    sort_keys,
+                    row,
+                    run_index: idx,
+                    directions: Arc::clone(&directions),
+                    error_slot: Arc::clone(&error_slot),
+                });
+            }
+        }
+
+        Ok(Self {
+            heap,
+            runs,
+            directions,
+            error_slot,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        if let Some(err) = self.error_slot.lock().ok().and_then(|g| g.clone()) {
+            return Err(err);
+        }
+
+        let entry = match self.heap.pop() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let run_idx = entry.run_index;
+        self.runs[run_idx].advance()?;
+
+        if let Some((sort_keys, row)) = self.runs[run_idx].peeked.take() {
+            self.heap.push(HeapEntry {
+                sort_keys,
+                row,
+                run_index: run_idx,
+                directions: Arc::clone(&self.directions),
+                error_slot: Arc::clone(&self.error_slot),
+            });
+        }
+
+        Ok(Some(entry.row))
+    }
+}
+
+enum MergeState {
+    InMemory(std::vec::IntoIter<Row>),
+    External(KWayMerge),
+}
+
+fn estimate_row_size(keys: &[DbValue], row: &Row) -> usize {
+    let mut size = std::mem::size_of::<Row>() + row.values.len() * std::mem::size_of::<DbValue>();
+    for val in &row.values {
+        size += match val {
+            DbValue::String(s) => s.len(),
+            DbValue::Bytes(b) => b.len(),
+            _ => 0,
+        };
+    }
+    size += std::mem::size_of::<Vec<DbValue>>() + std::mem::size_of_val(keys);
+    for val in keys {
+        size += match val {
+            DbValue::String(s) => s.len(),
+            DbValue::Bytes(b) => b.len(),
+            _ => 0,
+        };
+    }
+    size
+}
+
 pub struct PhysicalSort {
     source: Box<dyn PhysicalOperator>,
     keys: Vec<(Expr, bool)>, // (expression, asc)
-    sorted_rows: Option<std::vec::IntoIter<Row>>,
+    temp_dir: PathBuf,
+    memory_budget: usize,
+    merge_state: Option<MergeState>,
 }
 
 impl PhysicalSort {
-    pub fn new(source: Box<dyn PhysicalOperator>, keys: Vec<(Expr, bool)>) -> Self {
+    pub fn new(
+        source: Box<dyn PhysicalOperator>,
+        keys: Vec<(Expr, bool)>,
+        temp_dir: PathBuf,
+        memory_budget: usize,
+    ) -> Self {
         Self {
             source,
             keys,
-            sorted_rows: None,
+            temp_dir,
+            memory_budget,
+            merge_state: None,
         }
+    }
+
+    fn sort_buffer(&self, buffer: &mut [(Vec<DbValue>, Row)]) -> Result<(), String> {
+        let mut err = None;
+        buffer.sort_by(|a, b| {
+            for (idx, (_, asc)) in self.keys.iter().enumerate() {
+                let a_val = &a.0[idx];
+                let b_val = &b.0[idx];
+                match compare_values(a_val, b_val) {
+                    Ok(ord) => {
+                        if ord != std::cmp::Ordering::Equal {
+                            return if *asc { ord } else { ord.reverse() };
+                        }
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        return std::cmp::Ordering::Equal;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn flush_to_disk(&self, buffer: &[(Vec<DbValue>, Row)]) -> Result<SortedRun, String> {
+        static RUN_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let run_id = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = self
+            .temp_dir
+            .join(format!("sort_run_{}_{}.bin", std::process::id(), run_id));
+
+        let file = File::create(&path)
+            .map_err(|e| format!("Failed to create temp file {:?}: {}", path, e))?;
+        let mut writer = BufWriter::new(file);
+
+        bincode::serialize_into(&mut writer, &(buffer.len() as u64))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+
+        for (keys, row) in buffer {
+            bincode::serialize_into(&mut writer, keys)
+                .map_err(|e| format!("Serialization error: {}", e))?;
+            bincode::serialize_into(&mut writer, row)
+                .map_err(|e| format!("Serialization error: {}", e))?;
+        }
+
+        writer
+            .flush()
+            .map_err(|e| format!("Failed to flush temp file: {}", e))?;
+
+        Ok(SortedRun::new(path, buffer.len()))
     }
 }
 
 impl PhysicalOperator for PhysicalSort {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        if self.sorted_rows.is_none() {
-            // Blocking phase: consume all rows from source and pre-evaluate sorting keys
+        if self.merge_state.is_none() {
             let source_schema = self.source.schema().clone();
-            let mut eval_rows = Vec::new();
+            let mut buffer: Vec<(Vec<DbValue>, Row)> = Vec::new();
+            let mut buffer_bytes: usize = 0;
+            let mut runs: Vec<SortedRun> = Vec::new();
+
             while let Some(row) = self.source.next()? {
                 let mut row_keys = Vec::with_capacity(self.keys.len());
                 for (expr, _) in &self.keys {
                     let val = expr.eval(&row, &source_schema)?;
                     row_keys.push(val);
                 }
-                eval_rows.push((row, row_keys));
-            }
 
-            let mut err = None;
-            eval_rows.sort_by(|a, b| {
-                for (idx, (_, asc)) in self.keys.iter().enumerate() {
-                    let a_val = &a.1[idx];
-                    let b_val = &b.1[idx];
-                    match compare_values(a_val, b_val) {
-                        Ok(ord) => {
-                            if ord != std::cmp::Ordering::Equal {
-                                return if *asc { ord } else { ord.reverse() };
-                            }
-                        }
-                        Err(e) => {
-                            err = Some(e);
-                            return std::cmp::Ordering::Equal;
-                        }
-                    }
+                let size = estimate_row_size(&row_keys, &row);
+                buffer_bytes += size;
+                buffer.push((row_keys, row));
+
+                if buffer_bytes >= self.memory_budget {
+                    self.sort_buffer(&mut buffer)?;
+                    let run = self.flush_to_disk(&buffer)?;
+                    runs.push(run);
+                    buffer.clear();
+                    buffer_bytes = 0;
                 }
-                std::cmp::Ordering::Equal
-            });
-
-            if let Some(e) = err {
-                return Err(e);
             }
 
-            let sorted: Vec<Row> = eval_rows.into_iter().map(|(row, _)| row).collect();
-            self.sorted_rows = Some(sorted.into_iter());
+            if runs.is_empty() {
+                self.sort_buffer(&mut buffer)?;
+                self.merge_state = Some(MergeState::InMemory(
+                    buffer
+                        .into_iter()
+                        .map(|(_, row)| row)
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                ));
+            } else {
+                if !buffer.is_empty() {
+                    self.sort_buffer(&mut buffer)?;
+                    let run = self.flush_to_disk(&buffer)?;
+                    runs.push(run);
+                }
+                let merger = KWayMerge::new(runs, &self.keys)?;
+                self.merge_state = Some(MergeState::External(merger));
+            }
         }
 
-        Ok(self.sorted_rows.as_mut().unwrap().next())
+        match self.merge_state.as_mut().unwrap() {
+            MergeState::InMemory(iter) => Ok(iter.next()),
+            MergeState::External(merger) => merger.next(),
+        }
     }
 
     fn schema(&self) -> &Schema {
@@ -687,6 +951,147 @@ impl PhysicalOperator for PhysicalHashAggregate {
     fn explain(&self, indent: usize, out: &mut String) {
         out.push_str(&format!(
             "{}- PhysicalHashAggregate: group_by={:?}, aggrs={:?}\n",
+            "  ".repeat(indent),
+            self.group_by,
+            self.aggrs
+        ));
+        self.source.explain(indent + 1, out);
+    }
+}
+
+// ==========================================
+// 7.5. SortedAggregate Physical Operator (Streaming)
+// ==========================================
+pub struct PhysicalSortedAggregate {
+    source: Box<dyn PhysicalOperator>,
+    group_by: Vec<Expr>,
+    aggrs: Vec<AggregateExpr>,
+    schema: Schema,
+    active_group_keys: Option<Vec<DbValue>>,
+    active_accumulators: Vec<Accumulator>,
+    next_row: Option<Row>,
+    source_exhausted: bool,
+}
+
+impl PhysicalSortedAggregate {
+    pub fn new(
+        source: Box<dyn PhysicalOperator>,
+        group_by: Vec<Expr>,
+        aggrs: Vec<AggregateExpr>,
+        schema: Schema,
+    ) -> Self {
+        Self {
+            source,
+            group_by,
+            aggrs,
+            schema,
+            active_group_keys: None,
+            active_accumulators: Vec::new(),
+            next_row: None,
+            source_exhausted: false,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalSortedAggregate {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        let source_schema = self.source.schema().clone();
+
+        if self.next_row.is_none() && !self.source_exhausted {
+            self.next_row = self.source.next()?;
+            if self.next_row.is_none() {
+                self.source_exhausted = true;
+            }
+        }
+
+        loop {
+            let row = match self.next_row.take() {
+                Some(r) => r,
+                None => {
+                    if let Some(keys) = self.active_group_keys.take() {
+                        let mut row_vals = keys;
+                        for acc in self.active_accumulators.drain(..) {
+                            row_vals.push(acc.finalize());
+                        }
+                        return Ok(Some(Row::new(row_vals)));
+                    }
+                    return Ok(None);
+                }
+            };
+
+            let mut group_vals = Vec::with_capacity(self.group_by.len());
+            for expr in &self.group_by {
+                let val = expr.eval(&row, &source_schema)?;
+                group_vals.push(val);
+            }
+
+            if let Some(active_keys) = &self.active_group_keys {
+                if group_vals == *active_keys {
+                    for (idx, aggr) in self.aggrs.iter().enumerate() {
+                        let val = match aggr {
+                            AggregateExpr::Count(expr)
+                            | AggregateExpr::Sum(expr)
+                            | AggregateExpr::Min(expr)
+                            | AggregateExpr::Max(expr)
+                            | AggregateExpr::Avg(expr) => expr.eval(&row, &source_schema)?,
+                        };
+                        self.active_accumulators[idx].update(&val)?;
+                    }
+
+                    self.next_row = self.source.next()?;
+                    if self.next_row.is_none() {
+                        self.source_exhausted = true;
+                    }
+                } else {
+                    self.next_row = Some(row);
+
+                    let keys = self.active_group_keys.take().unwrap();
+                    let mut row_vals = keys;
+                    for acc in self.active_accumulators.drain(..) {
+                        row_vals.push(acc.finalize());
+                    }
+                    return Ok(Some(Row::new(row_vals)));
+                }
+            } else {
+                self.active_group_keys = Some(group_vals);
+                self.active_accumulators = self
+                    .aggrs
+                    .iter()
+                    .map(|aggr| match aggr {
+                        AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
+                        AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                        AggregateExpr::Min(_) => Accumulator::Min { min: None },
+                        AggregateExpr::Max(_) => Accumulator::Max { max: None },
+                        AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
+                    })
+                    .collect();
+
+                for (idx, aggr) in self.aggrs.iter().enumerate() {
+                    let val = match aggr {
+                        AggregateExpr::Count(expr)
+                        | AggregateExpr::Sum(expr)
+                        | AggregateExpr::Min(expr)
+                        | AggregateExpr::Max(expr)
+                        | AggregateExpr::Avg(expr) => expr.eval(&row, &source_schema)?,
+                    };
+                    self.active_accumulators[idx].update(&val)?;
+                }
+
+                self.next_row = self.source.next()?;
+                if self.next_row.is_none() {
+                    self.source_exhausted = true;
+                }
+            }
+        }
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        out.push_str(&format!(
+            "{}- PhysicalSortedAggregate: group_by={:?}, aggrs={:?}\n",
             "  ".repeat(indent),
             self.group_by,
             self.aggrs

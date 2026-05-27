@@ -4,7 +4,7 @@ use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalFilter, PhysicalFullTextScan, PhysicalHashAggregate,
     PhysicalHashJoin, PhysicalIndexScan, PhysicalLimit, PhysicalOperator, PhysicalProjection,
-    PhysicalSeqScan, PhysicalSetOp, PhysicalSort,
+    PhysicalSeqScan, PhysicalSetOp, PhysicalSort, PhysicalSortedAggregate,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -28,6 +28,20 @@ pub enum ExecutionResult {
     Analyze,
 }
 
+fn is_plan_sorted_by(plan: &LogicalPlan, group_by: &[Expr]) -> bool {
+    if group_by.len() != 1 {
+        return false;
+    }
+    if let Expr::Column(group_col, _) = &group_by[0]
+        && let Some(child_sort_col) = Optimizer::get_plan_sort_key(plan)
+    {
+        return group_col == &child_sort_col
+            || dtdb_relational::schema::ends_with_dot_suffix(group_col, &child_sort_col)
+            || dtdb_relational::schema::ends_with_dot_suffix(&child_sort_col, group_col);
+    }
+    false
+}
+
 /// SqlEngine orchestrates the parser, logical planner, optimizer, and physical execution pipeline.
 pub struct SqlEngine {
     database: Arc<Database>,
@@ -36,6 +50,21 @@ pub struct SqlEngine {
 impl SqlEngine {
     pub fn new(database: Arc<Database>) -> Self {
         Self { database }
+    }
+
+    /// Returns the temp directory for spill files, creating it if needed.
+    fn temp_dir(&self) -> std::path::PathBuf {
+        let dir = self.database.dir_path().join("_tmp");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Returns the per-sort memory budget in bytes.
+    fn sort_memory_budget(&self) -> usize {
+        self.database
+            .options
+            .sort_memory_budget
+            .unwrap_or(8 * 1024 * 1024)
     }
 
     /// Checks if the SQL string contains a DDL statement (CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX).
@@ -496,7 +525,12 @@ impl SqlEngine {
                         let col = schema
                             .columns
                             .iter()
-                            .find(|c| &c.name == col_name)
+                            .find(|c| {
+                                &c.name == col_name
+                                    || dtdb_relational::schema::ends_with_dot_suffix(
+                                        &c.name, col_name,
+                                    )
+                            })
                             .ok_or_else(|| {
                                 format!("Indexed column '{}' not found in schema", col_name)
                             })?;
@@ -626,7 +660,12 @@ impl SqlEngine {
                 for (expr, _) in &mut keys {
                     expr.bind_columns(src_op.schema());
                 }
-                Ok(Box::new(PhysicalSort::new(src_op, keys)))
+                Ok(Box::new(PhysicalSort::new(
+                    src_op,
+                    keys,
+                    self.temp_dir(),
+                    self.sort_memory_budget(),
+                )))
             }
             LogicalPlan::Join {
                 left,
@@ -722,6 +761,7 @@ impl SqlEngine {
                 field_names,
                 ..
             } => {
+                let use_sorted_agg = is_plan_sorted_by(&source, &group_by);
                 let mut child_needed = HashSet::new();
                 for expr in &group_by {
                     expr.collect_columns(&mut child_needed);
@@ -765,12 +805,21 @@ impl SqlEngine {
                 )
                 .schema();
 
-                Ok(Box::new(PhysicalHashAggregate::new(
-                    src_op,
-                    group_by,
-                    aggrs,
-                    aggr_schema,
-                )))
+                if use_sorted_agg {
+                    Ok(Box::new(PhysicalSortedAggregate::new(
+                        src_op,
+                        group_by,
+                        aggrs,
+                        aggr_schema,
+                    )))
+                } else {
+                    Ok(Box::new(PhysicalHashAggregate::new(
+                        src_op,
+                        group_by,
+                        aggrs,
+                        aggr_schema,
+                    )))
+                }
             }
             LogicalPlan::SetOp {
                 left,

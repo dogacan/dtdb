@@ -2382,6 +2382,7 @@ fn test_cbo_index_selection_by_cardinality() {
         block_cache_capacity: Some(0),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
+        sort_memory_budget: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -2496,6 +2497,7 @@ fn test_cbo_locality_group_pruning_performance() {
         block_cache_capacity: Some(0),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
+        sort_memory_budget: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -3556,4 +3558,549 @@ fn test_fulltext_phrase_search() {
 
     tx6.commit().unwrap();
     drop(tx6);
+}
+
+#[test]
+fn test_sql_sort_elimination_and_promotion() {
+    let (_temp_dir, db, engine) = setup_engine();
+
+    // 1. Create table and insert data
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE products (id INT PRIMARY KEY, name STRING, price INT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO products (id, name, price) VALUES (1, 'Apple', 10), (2, 'Banana', 5), (3, 'Orange', 8)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // Create index on price
+    let tx3 = Transaction::new(3, db.clone());
+    engine
+        .execute("CREATE INDEX idx_price ON products (price)", &tx3)
+        .unwrap();
+    tx3.commit().unwrap();
+    drop(tx3);
+
+    // 2. Test Primary Key Sort Elimination
+    let tx4 = Transaction::new(4, db.clone());
+    let explain_pk = engine
+        .execute("EXPLAIN SELECT name FROM products ORDER BY id ASC", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_pk {
+        let plan_str = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected string plan representation"),
+        };
+        // Should use SeqScan and eliminate Sort
+        assert!(plan_str.contains("- PhysicalSeqScan"));
+        assert!(!plan_str.contains("- PhysicalSort"));
+    } else {
+        panic!("Expected Select");
+    }
+
+    let query_pk = engine
+        .execute("SELECT name FROM products ORDER BY id ASC", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_pk {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::String("Apple".to_string()));
+        assert_eq!(rows[1].values[0], DbValue::String("Banana".to_string()));
+        assert_eq!(rows[2].values[0], DbValue::String("Orange".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 3. Test Index Scan Promotion and Sort Elimination
+    let explain_idx = engine
+        .execute("EXPLAIN SELECT name FROM products ORDER BY price ASC", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_idx {
+        let plan_str = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected string plan representation"),
+        };
+        // Should promote to IndexScan and eliminate Sort
+        assert!(plan_str.contains("- PhysicalIndexScan"));
+        assert!(!plan_str.contains("- PhysicalSort"));
+    } else {
+        panic!("Expected Select");
+    }
+
+    let query_idx = engine
+        .execute("SELECT name FROM products ORDER BY price ASC", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_idx {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::String("Banana".to_string()));
+        assert_eq!(rows[1].values[0], DbValue::String("Orange".to_string()));
+        assert_eq!(rows[2].values[0], DbValue::String("Apple".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 4. Verify sort is NOT eliminated for DESC order
+    let explain_desc = engine
+        .execute(
+            "EXPLAIN SELECT name FROM products ORDER BY price DESC",
+            &tx4,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_desc {
+        let plan_str = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected string plan representation"),
+        };
+        // Should still contain PhysicalSort since DESC is not optimized yet
+        assert!(plan_str.contains("- PhysicalSort"));
+    } else {
+        panic!("Expected Select");
+    }
+
+    let query_desc = engine
+        .execute("SELECT name FROM products ORDER BY price DESC", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_desc {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::String("Apple".to_string()));
+        assert_eq!(rows[1].values[0], DbValue::String("Orange".to_string()));
+        assert_eq!(rows[2].values[0], DbValue::String("Banana".to_string()));
+    } else {
+        panic!("Expected Select");
+    }
+
+    drop(tx4);
+}
+
+#[test]
+fn test_external_sort_basic() {
+    // Set a very small sort memory budget (200 bytes) to force spilling to disk
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
+        sort_memory_budget: Some(200), // very small budget to force spills
+    };
+
+    let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    // Create table
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t1 (id INT PRIMARY KEY, val INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    // Insert 10 rows in unsorted order
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute(
+        "INSERT INTO t1 (id, val) VALUES (1, 50), (2, 10), (3, 80), (4, 20), (5, 90), (6, 30), (7, 70), (8, 40), (9, 100), (10, 60)",
+        &tx2,
+    ).unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // Query with ORDER BY on unindexed column (forces PhysicalSort)
+    let tx3 = Transaction::new(3, db.clone());
+    let explain_res = engine
+        .execute("EXPLAIN SELECT val FROM t1 ORDER BY val ASC", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_res {
+        let plan = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected explain plan string"),
+        };
+        assert!(plan.contains("- PhysicalSort"));
+    } else {
+        panic!("Expected EXPLAIN SELECT");
+    }
+
+    let query_res = engine
+        .execute("SELECT val FROM t1 ORDER BY val ASC", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_res {
+        assert_eq!(rows.len(), 10);
+        let sorted_vals: Vec<i64> = rows
+            .into_iter()
+            .map(|r| match r.values[0] {
+                DbValue::Int(v) => v,
+                _ => panic!("Expected Int value"),
+            })
+            .collect();
+        assert_eq!(sorted_vals, vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+    } else {
+        panic!("Expected SELECT result");
+    }
+
+    // Verify cleanup: temp dir should be empty after query is finished
+    let tmp_path = db.dir_path().join("_tmp");
+    if tmp_path.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&tmp_path).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "Temp directory should be empty but has entries: {:?}",
+            entries
+        );
+    }
+
+    drop(tx3);
+}
+
+#[test]
+fn test_external_sort_desc() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
+        sort_memory_budget: Some(200), // force spills
+    };
+
+    let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t2 (id INT PRIMARY KEY, val INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO t2 (id, val) VALUES (1, 50), (2, 10), (3, 80), (4, 20), (5, 90)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let tx3 = Transaction::new(3, db.clone());
+    let query_res = engine
+        .execute("SELECT val FROM t2 ORDER BY val DESC", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_res {
+        assert_eq!(rows.len(), 5);
+        let sorted_vals: Vec<i64> = rows
+            .into_iter()
+            .map(|r| match r.values[0] {
+                DbValue::Int(v) => v,
+                _ => panic!("Expected Int value"),
+            })
+            .collect();
+        assert_eq!(sorted_vals, vec![90, 80, 50, 20, 10]);
+    } else {
+        panic!("Expected SELECT result");
+    }
+
+    drop(tx3);
+}
+
+#[test]
+fn test_external_sort_multi_key() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
+        sort_memory_budget: Some(100), // force spills
+    };
+
+    let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t3 (id INT PRIMARY KEY, a INT, b INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine.execute(
+        "INSERT INTO t3 (id, a, b) VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300), (4, 20, 50), (5, 10, 200)",
+        &tx2,
+    ).unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let tx3 = Transaction::new(3, db.clone());
+    let query_res = engine
+        .execute("SELECT a, b FROM t3 ORDER BY a ASC, b DESC", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_res {
+        assert_eq!(rows.len(), 5);
+        let sorted_vals: Vec<(i64, i64)> = rows
+            .into_iter()
+            .map(|r| match (&r.values[0], &r.values[1]) {
+                (DbValue::Int(av), DbValue::Int(bv)) => (*av, *bv),
+                _ => panic!("Expected Int values"),
+            })
+            .collect();
+        assert_eq!(
+            sorted_vals,
+            vec![(10, 300), (10, 200), (10, 100), (20, 200), (20, 50),]
+        );
+    } else {
+        panic!("Expected SELECT result");
+    }
+
+    drop(tx3);
+}
+
+#[test]
+fn test_external_sort_empty_and_single() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    let options = dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
+        sort_memory_budget: Some(200),
+    };
+
+    let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t4 (id INT PRIMARY KEY, val INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    // Test 1: Empty table sort
+    let tx2 = Transaction::new(2, db.clone());
+    let query_empty = engine
+        .execute("SELECT val FROM t4 ORDER BY val ASC", &tx2)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_empty {
+        assert!(rows.is_empty());
+    } else {
+        panic!("Expected Select");
+    }
+    drop(tx2);
+
+    // Test 2: Single row sort
+    let tx3 = Transaction::new(3, db.clone());
+    engine
+        .execute("INSERT INTO t4 (id, val) VALUES (1, 42)", &tx3)
+        .unwrap();
+    tx3.commit().unwrap();
+    drop(tx3);
+
+    let tx4 = Transaction::new(4, db.clone());
+    let query_single = engine
+        .execute("SELECT val FROM t4 ORDER BY val ASC", &tx4)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_single {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(42));
+    } else {
+        panic!("Expected Select");
+    }
+    drop(tx4);
+}
+
+#[test]
+fn test_sql_sorted_aggregate() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create table and insert data
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE sales (id INT PRIMARY KEY, dept STRING, amount FLOAT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO sales (id, dept, amount) VALUES \
+             (1, 'Sales', 10.0), \
+             (2, 'Sales', 20.0), \
+             (3, 'Engineering', 50.0), \
+             (4, 'Engineering', 60.0), \
+             (5, 'HR', 30.0)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // 2. Query grouping by Primary Key (id) which guarantees sorted input.
+    // This should compile to PhysicalSortedAggregate.
+    let tx3 = Transaction::new(3, db.clone());
+    let explain_res = engine
+        .execute(
+            "EXPLAIN SELECT id, SUM(amount) FROM sales GROUP BY id",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_res {
+        let plan = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected plan string"),
+        };
+        assert!(plan.contains("- PhysicalSortedAggregate"));
+        assert!(!plan.contains("- PhysicalHashAggregate"));
+    } else {
+        panic!("Expected Select");
+    }
+
+    let query_res = engine
+        .execute(
+            "SELECT id, SUM(amount) FROM sales GROUP BY id ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_res {
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].values, vec![DbValue::Int(1), DbValue::Float(10.0)]);
+        assert_eq!(rows[1].values, vec![DbValue::Int(2), DbValue::Float(20.0)]);
+    } else {
+        panic!("Expected Select");
+    }
+
+    // 3. Grouping by unindexed column (amount) should fallback to PhysicalHashAggregate.
+    let explain_hash = engine
+        .execute(
+            "EXPLAIN SELECT amount, COUNT(id) FROM sales GROUP BY amount",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_hash {
+        let plan = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected plan string"),
+        };
+        assert!(plan.contains("- PhysicalHashAggregate"));
+        assert!(!plan.contains("- PhysicalSortedAggregate"));
+    } else {
+        panic!("Expected Select");
+    }
+    tx3.commit().unwrap();
+    drop(tx3);
+
+    // 4. Create secondary index on dept, then query grouping by dept (which promotes to IndexScan).
+    // This should also compile to PhysicalSortedAggregate.
+    let tx4 = Transaction::new(4, db.clone());
+    engine
+        .execute("CREATE INDEX idx_dept ON sales (dept)", &tx4)
+        .unwrap();
+    tx4.commit().unwrap();
+    drop(tx4);
+
+    let tx5 = Transaction::new(5, db.clone());
+    let explain_idx = engine
+        .execute(
+            "EXPLAIN SELECT dept, SUM(amount) FROM sales GROUP BY dept",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain_idx {
+        let plan = match &rows[0].values[0] {
+            DbValue::String(s) => s,
+            _ => panic!("Expected plan string"),
+        };
+        assert!(plan.contains("- PhysicalSortedAggregate"));
+        assert!(!plan.contains("- PhysicalHashAggregate"));
+    } else {
+        panic!("Expected Select");
+    }
+
+    let query_idx = engine
+        .execute(
+            "SELECT dept, SUM(amount) FROM sales GROUP BY dept ORDER BY dept ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = query_idx {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::String("Engineering".to_string()),
+                DbValue::Float(110.0)
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::String("HR".to_string()), DbValue::Float(30.0)]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![DbValue::String("Sales".to_string()), DbValue::Float(30.0)]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+
+    drop(tx5);
 }

@@ -16,12 +16,12 @@ impl Optimizer {
         Self { database }
     }
 
-    /// Optimizes a LogicalPlan recursively.
     pub fn optimize(&self, plan: LogicalPlan) -> LogicalPlan {
         let mut query_columns = HashSet::new();
         plan.collect_columns(&mut query_columns);
         let plan = self.push_down_predicate(plan, Vec::new(), &query_columns);
-        self.optimize_join_order(plan)
+        let plan = self.optimize_join_order(plan);
+        self.eliminate_sorts(plan)
     }
 
     fn push_down_predicate(
@@ -683,6 +683,245 @@ impl Optimizer {
         }
 
         index_io + table_io + n_match * 0.1
+    }
+
+    fn eliminate_sorts(&self, plan: LogicalPlan) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Sort { source, keys } => {
+                let opt_source = self.eliminate_sorts(*source);
+
+                if keys.len() == 1 && keys[0].1 {
+                    let sort_expr = &keys[0].0;
+                    if let Expr::Column(sort_col, _) = sort_expr {
+                        // 1. Check if opt_source is already sorted by sort_col (ASC)
+                        if let Some(sorted_col) = Self::get_plan_sort_key(&opt_source)
+                            && (sorted_col == *sort_col
+                                || dtdb_relational::schema::ends_with_dot_suffix(
+                                    sort_col,
+                                    &sorted_col,
+                                )
+                                || dtdb_relational::schema::ends_with_dot_suffix(
+                                    &sorted_col,
+                                    sort_col,
+                                ))
+                        {
+                            return opt_source;
+                        }
+
+                        // 2. Otherwise, check if we can promote the underlying scan to an IndexScan on sort_col.
+                        if let Some(promoted) =
+                            self.try_promote_to_index_scan(opt_source.clone(), sort_col)
+                        {
+                            return promoted;
+                        }
+                    }
+                }
+
+                LogicalPlan::Sort {
+                    source: Box::new(opt_source),
+                    keys,
+                }
+            }
+            LogicalPlan::Filter { source, predicate } => LogicalPlan::Filter {
+                source: Box::new(self.eliminate_sorts(*source)),
+                predicate,
+            },
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                field_names,
+                schema,
+            } => LogicalPlan::Projection {
+                source: Box::new(self.eliminate_sorts(*source)),
+                expressions,
+                field_names,
+                schema,
+            },
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                join_type,
+                schema,
+            } => LogicalPlan::Join {
+                left: Box::new(self.eliminate_sorts(*left)),
+                right: Box::new(self.eliminate_sorts(*right)),
+                condition,
+                join_type,
+                schema,
+            },
+            LogicalPlan::Aggregate {
+                source,
+                group_by,
+                aggrs,
+                field_names,
+                schema,
+            } => {
+                let opt_source = self.eliminate_sorts(*source);
+                if group_by.len() == 1
+                    && let Expr::Column(group_col, _) = &group_by[0]
+                    && let Some(promoted) =
+                        self.try_promote_to_index_scan(opt_source.clone(), group_col)
+                {
+                    return LogicalPlan::Aggregate {
+                        source: Box::new(promoted),
+                        group_by,
+                        aggrs,
+                        field_names,
+                        schema,
+                    };
+                }
+                LogicalPlan::Aggregate {
+                    source: Box::new(opt_source),
+                    group_by,
+                    aggrs,
+                    field_names,
+                    schema,
+                }
+            }
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => LogicalPlan::Limit {
+                source: Box::new(self.eliminate_sorts(*source)),
+                limit,
+                offset,
+            },
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => LogicalPlan::SetOp {
+                left: Box::new(self.eliminate_sorts(*left)),
+                right: Box::new(self.eliminate_sorts(*right)),
+                op,
+                all,
+            },
+            other => other,
+        }
+    }
+
+    pub(crate) fn get_plan_sort_key(plan: &LogicalPlan) -> Option<String> {
+        match plan {
+            LogicalPlan::Scan {
+                schema, range: _, ..
+            } => schema
+                .primary_key_index()
+                .map(|pk_idx| schema.columns[pk_idx].name.clone()),
+            LogicalPlan::IndexScan {
+                schema, index_name, ..
+            } => {
+                if let Some(index) = schema.indexes.iter().find(|idx| &idx.name == index_name)
+                    && let Some(first_col) = index.columns.first()
+                {
+                    Some(first_col.clone())
+                } else {
+                    None
+                }
+            }
+            LogicalPlan::Filter { source, .. } => Self::get_plan_sort_key(source),
+            LogicalPlan::Limit { source, .. } => Self::get_plan_sort_key(source),
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                field_names,
+                ..
+            } => {
+                let child_sort_key = Self::get_plan_sort_key(source)?;
+                for (idx, expr) in expressions.iter().enumerate() {
+                    if let Expr::Column(name, _) = expr
+                        && (name == &child_sort_key
+                            || dtdb_relational::schema::ends_with_dot_suffix(name, &child_sort_key)
+                            || dtdb_relational::schema::ends_with_dot_suffix(&child_sort_key, name))
+                    {
+                        return Some(field_names[idx].clone());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn try_promote_to_index_scan(&self, plan: LogicalPlan, sort_col: &str) -> Option<LogicalPlan> {
+        match plan {
+            LogicalPlan::Scan {
+                table_name,
+                schema,
+                range,
+            } => {
+                if range.is_none() {
+                    for index in &schema.indexes {
+                        if let Some(first_col) = index.columns.first()
+                            && (first_col == sort_col
+                                || dtdb_relational::schema::ends_with_dot_suffix(
+                                    first_col, sort_col,
+                                )
+                                || dtdb_relational::schema::ends_with_dot_suffix(
+                                    sort_col, first_col,
+                                ))
+                        {
+                            return Some(LogicalPlan::IndexScan {
+                                table_name: table_name.clone(),
+                                index_name: index.name.clone(),
+                                schema: schema.clone(),
+                                range: None,
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            LogicalPlan::Filter { source, predicate } => {
+                let promoted_source = self.try_promote_to_index_scan(*source, sort_col)?;
+                Some(LogicalPlan::Filter {
+                    source: Box::new(promoted_source),
+                    predicate,
+                })
+            }
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => {
+                let promoted_source = self.try_promote_to_index_scan(*source, sort_col)?;
+                Some(LogicalPlan::Limit {
+                    source: Box::new(promoted_source),
+                    limit,
+                    offset,
+                })
+            }
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                field_names,
+                schema,
+            } => {
+                let mut source_col_name = None;
+                for (idx, expr) in expressions.iter().enumerate() {
+                    if field_names[idx] == sort_col
+                        && let Expr::Column(orig_name, _) = expr
+                    {
+                        source_col_name = Some(orig_name.clone());
+                        break;
+                    }
+                }
+                if let Some(orig_col) = source_col_name {
+                    let promoted_source = self.try_promote_to_index_scan(*source, &orig_col)?;
+                    Some(LogicalPlan::Projection {
+                        source: Box::new(promoted_source),
+                        expressions,
+                        field_names,
+                        schema,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 

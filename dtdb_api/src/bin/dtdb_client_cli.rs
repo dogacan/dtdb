@@ -164,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     block_cache_capacity: Some(1000),
                     analyze_frequency_ms: None,
                     wal_sync_interval_ms: None,
+                    sort_memory_budget: None,
                 };
 
                 match client.create_db_with_options(db_name, options).await {
