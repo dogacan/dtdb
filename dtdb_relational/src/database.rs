@@ -70,6 +70,62 @@ impl Table {
         table_path.join(format!("index_{}", index_name))
     }
 
+    /// Helper to generate the index keys for a row.
+    pub fn get_index_keys(
+        &self,
+        index_name: &str,
+        row: &Row,
+        pk_key: &DbKey,
+    ) -> Result<Vec<DbKey>> {
+        let idx = self
+            .schema
+            .indexes
+            .iter()
+            .find(|i| i.name == index_name)
+            .ok_or_else(|| {
+                RelationalError::SchemaMismatch(format!("Index '{}' not found", index_name))
+            })?;
+        let mut keys = Vec::new();
+        if idx.index_type == IndexType::FullText {
+            let col_name = &idx.columns[0];
+            let col_idx = self.schema.column_index(col_name).unwrap();
+            let col_val = &row.values[col_idx];
+            if let DbValue::String(text) = col_val {
+                let tokenizer_name = idx.tokenizer.as_deref().unwrap_or("simple");
+                if let Some(tokenizer) = crate::tokenizer::get_tokenizer(tokenizer_name) {
+                    let mut tokens = tokenizer.tokenize(text);
+                    tokens.sort();
+                    tokens.dedup();
+                    for token in tokens {
+                        let idx_key = DbKey::Composite(vec![DbKey::String(token), pk_key.clone()]);
+                        keys.push(idx_key);
+                    }
+                }
+            }
+        } else {
+            let mut col_keys = Vec::new();
+            for col_name in &idx.columns {
+                let col_idx = self.schema.column_index(col_name).unwrap();
+                let col_val = &row.values[col_idx];
+                if matches!(col_val, DbValue::Null) {
+                    continue;
+                }
+                let k = match col_val {
+                    DbValue::Int(v) => DbKey::Int(*v),
+                    DbValue::String(s) => DbKey::String(s.clone()),
+                    DbValue::Bool(b) => DbKey::Bool(*b),
+                    _ => continue,
+                };
+                col_keys.push(k);
+            }
+            if col_keys.len() == idx.columns.len() {
+                col_keys.push(pk_key.clone());
+                keys.push(DbKey::Composite(col_keys));
+            }
+        }
+        Ok(keys)
+    }
+
     /// Performs a write batch of mutations to the table, splitting updates across locality groups.
     pub fn write_batch(
         &self,
@@ -1095,13 +1151,24 @@ impl Database {
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
         fs::write(stats_path, bytes)?;
 
+        let mut index_engines = HashMap::new();
+        for idx_def in &schema.indexes {
+            let idx_path = Table::index_dir(&table_path, &idx_def.name);
+            let engine = Arc::new(StorageEngine::open_with_spawner(
+                &idx_path,
+                engine_opts,
+                self.spawner.clone(),
+            )?);
+            index_engines.insert(idx_def.name.clone(), engine);
+        }
+
         tables_guard.insert(
             name.to_string(),
             Table {
                 name: name.to_string(),
                 schema,
                 engines,
-                index_engines: HashMap::new(),
+                index_engines,
             },
         );
 
@@ -1308,7 +1375,11 @@ impl Database {
                 RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
             })?;
             match record {
-                TransactionRecord::Prepared { tx_id, mutations, old_rows } => {
+                TransactionRecord::Prepared {
+                    tx_id,
+                    mutations,
+                    old_rows,
+                } => {
                     prepared.insert(tx_id, (mutations, old_rows));
                 }
                 TransactionRecord::Committed { tx_id } => {

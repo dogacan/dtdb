@@ -1,3 +1,4 @@
+use dtdb_relational::schema::{IndexDefinition, IndexType};
 use dtdb_relational::{Column, DataType, Database, RelationalError, Row, Schema, Transaction};
 use dtdb_storage::{DbKey, DbValue};
 use std::sync::Arc;
@@ -437,7 +438,8 @@ fn test_occ_si_race() {
     let h1 = std::thread::spawn(move || {
         for i in 1..50 {
             let tx = Transaction::new(100 + i, db_clone.clone());
-            tx.put("users", k_int(1), r_user(1, &format!("Val{}", i))).unwrap();
+            tx.put("users", k_int(1), r_user(1, &format!("Val{}", i)))
+                .unwrap();
             let _ = tx.commit();
         }
     });
@@ -457,3 +459,162 @@ fn test_occ_si_race() {
     h2.join().unwrap();
 }
 
+fn create_user_index_schema() -> Schema {
+    let mut s = Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            name: "age".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ]);
+    s.indexes.push(IndexDefinition {
+        name: "idx_age".to_string(),
+        columns: vec!["age".to_string()],
+        index_type: IndexType::BTree,
+        tokenizer: None,
+    });
+    s
+}
+
+#[test]
+fn test_occ_phantom_read_index_scan() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_index_schema())
+        .unwrap();
+
+    // 1. Initial rows
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put(
+            "users",
+            k_int(1),
+            Row::new(vec![DbValue::Int(1), DbValue::Int(20)]),
+        )
+        .unwrap();
+        tx.put(
+            "users",
+            k_int(3),
+            Row::new(vec![DbValue::Int(3), DbValue::Int(40)]),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 2. Tx1 starts and performs an index range scan on age in [10, 30]
+    let tx1 = Transaction::new(2, db.clone());
+    let scan1 = tx1
+        .index_scan("users", "idx_age", &k_int(10), &k_int(30), None)
+        .unwrap();
+    assert_eq!(scan1.len(), 1);
+    assert_eq!(scan1[0].values[0], DbValue::Int(1)); // id = 1, age = 20
+
+    // 3. Tx2 starts concurrently, inserts a new user with age = 25 (falls in [10, 30]) and commits
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put(
+        "users",
+        k_int(2),
+        Row::new(vec![DbValue::Int(2), DbValue::Int(25)]),
+    )
+    .unwrap();
+    tx2.commit().unwrap();
+
+    // 4. Tx1 attempts to commit and must fail due to phantom read conflict on index scan range
+    let commit_res = tx1.commit();
+    assert!(
+        matches!(commit_res, Err(RelationalError::TransactionConflict(_))),
+        "Expected TransactionConflict due to index scan phantom read, got {:?}",
+        commit_res
+    );
+}
+
+fn create_user_fts_schema() -> Schema {
+    let mut s = Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            name: "bio".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ]);
+    s.indexes.push(IndexDefinition {
+        name: "idx_bio".to_string(),
+        columns: vec!["bio".to_string()],
+        index_type: IndexType::FullText,
+        tokenizer: Some("simple".to_string()),
+    });
+    s
+}
+
+#[test]
+fn test_occ_phantom_read_fts_scan() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_fts_schema()).unwrap();
+
+    // 1. Initial rows
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put(
+            "users",
+            k_int(1),
+            Row::new(vec![
+                DbValue::Int(1),
+                DbValue::String("hello world".to_string()),
+            ]),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 2. Tx1 starts and performs fulltext scan for "rust"
+    let tx1 = Transaction::new(2, db.clone());
+    let scan1 = tx1.fulltext_scan("users", "idx_bio", "rust", None).unwrap();
+    assert_eq!(scan1.len(), 0);
+
+    // 3. Tx2 starts concurrently, inserts a new user with "rust is fast" and commits
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put(
+        "users",
+        k_int(2),
+        Row::new(vec![
+            DbValue::Int(2),
+            DbValue::String("rust is fast".to_string()),
+        ]),
+    )
+    .unwrap();
+    tx2.commit().unwrap();
+
+    // 4. Tx1 attempts to commit and must fail due to phantom read conflict on fts token
+    let commit_res = tx1.commit();
+    assert!(
+        matches!(commit_res, Err(RelationalError::TransactionConflict(_))),
+        "Expected TransactionConflict due to fts scan phantom read, got {:?}",
+        commit_res
+    );
+}

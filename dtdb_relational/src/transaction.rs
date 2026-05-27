@@ -377,6 +377,15 @@ impl Transaction {
         let start_bound = DbKey::Composite(vec![start_val.clone(), min_pk]);
         let end_bound = DbKey::Composite(vec![end_val.clone(), max_pk]);
 
+        // Track the scan range for the index
+        if self.isolation_level == IsolationLevel::SnapshotIsolation {
+            let mut scan_ranges = self.scan_ranges.lock().unwrap();
+            scan_ranges
+                .entry(format!("{}.index.{}", table_name, index_name))
+                .or_default()
+                .push((start_bound.clone(), end_bound.clone()));
+        }
+
         // Scan the index engine
         let index_entries = index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
 
@@ -529,7 +538,14 @@ impl Transaction {
 
         // 1. Recursively resolve primary key set matching the query from the index engine
         let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
-        let matched_pks = self.eval_fulltext_query(index_engine, &query, &min_pk, &max_pk)?;
+        let matched_pks = self.eval_fulltext_query(
+            table_name,
+            index_name,
+            index_engine,
+            &query,
+            &min_pk,
+            &max_pk,
+        )?;
 
         // 2. Fetch rows by primary key from storage
         let mut pks: Vec<DbKey> = matched_pks.into_iter().collect();
@@ -590,6 +606,8 @@ impl Transaction {
 
     fn eval_fulltext_query(
         &self,
+        table_name: &str,
+        index_name: &str,
         index_engine: &Arc<dtdb_storage::StorageEngine>,
         query: &crate::fts_parser::FullTextQuery,
         min_pk: &DbKey,
@@ -600,6 +618,15 @@ impl Transaction {
                 let start_bound =
                     DbKey::Composite(vec![DbKey::String(tok.clone()), min_pk.clone()]);
                 let end_bound = DbKey::Composite(vec![DbKey::String(tok.clone()), max_pk.clone()]);
+
+                if self.isolation_level == IsolationLevel::SnapshotIsolation {
+                    let mut scan_ranges = self.scan_ranges.lock().unwrap();
+                    scan_ranges
+                        .entry(format!("{}.index.{}", table_name, index_name))
+                        .or_default()
+                        .push((start_bound.clone(), end_bound.clone()));
+                }
+
                 let index_entries =
                     index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
                 let mut pks = HashSet::new();
@@ -613,13 +640,41 @@ impl Transaction {
                 Ok(pks)
             }
             crate::fts_parser::FullTextQuery::And(left, right) => {
-                let left_pks = self.eval_fulltext_query(index_engine, left, min_pk, max_pk)?;
-                let right_pks = self.eval_fulltext_query(index_engine, right, min_pk, max_pk)?;
+                let left_pks = self.eval_fulltext_query(
+                    table_name,
+                    index_name,
+                    index_engine,
+                    left,
+                    min_pk,
+                    max_pk,
+                )?;
+                let right_pks = self.eval_fulltext_query(
+                    table_name,
+                    index_name,
+                    index_engine,
+                    right,
+                    min_pk,
+                    max_pk,
+                )?;
                 Ok(left_pks.intersection(&right_pks).cloned().collect())
             }
             crate::fts_parser::FullTextQuery::Or(left, right) => {
-                let left_pks = self.eval_fulltext_query(index_engine, left, min_pk, max_pk)?;
-                let right_pks = self.eval_fulltext_query(index_engine, right, min_pk, max_pk)?;
+                let left_pks = self.eval_fulltext_query(
+                    table_name,
+                    index_name,
+                    index_engine,
+                    left,
+                    min_pk,
+                    max_pk,
+                )?;
+                let right_pks = self.eval_fulltext_query(
+                    table_name,
+                    index_name,
+                    index_engine,
+                    right,
+                    min_pk,
+                    max_pk,
+                )?;
                 Ok(left_pks.union(&right_pks).cloned().collect())
             }
             crate::fts_parser::FullTextQuery::Phrase(phrase_tokens) => {
@@ -635,6 +690,15 @@ impl Transaction {
                         DbKey::String(phrase_tokens[0].clone()),
                         max_pk.clone(),
                     ]);
+
+                    if self.isolation_level == IsolationLevel::SnapshotIsolation {
+                        let mut scan_ranges = self.scan_ranges.lock().unwrap();
+                        scan_ranges
+                            .entry(format!("{}.index.{}", table_name, index_name))
+                            .or_default()
+                            .push((start_bound.clone(), end_bound.clone()));
+                    }
+
                     let index_entries =
                         index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
                     let mut pks = HashSet::new();
@@ -654,6 +718,15 @@ impl Transaction {
                         DbKey::Composite(vec![DbKey::String(tok.clone()), min_pk.clone()]);
                     let end_bound =
                         DbKey::Composite(vec![DbKey::String(tok.clone()), max_pk.clone()]);
+
+                    if self.isolation_level == IsolationLevel::SnapshotIsolation {
+                        let mut scan_ranges = self.scan_ranges.lock().unwrap();
+                        scan_ranges
+                            .entry(format!("{}.index.{}", table_name, index_name))
+                            .or_default()
+                            .push((start_bound.clone(), end_bound.clone()));
+                    }
+
                     let index_entries =
                         index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
                     let mut pos_map = HashMap::new();
@@ -817,7 +890,7 @@ impl Transaction {
         let mut resolved_batches = Vec::new();
         for (table_name, entries) in table_write_entries {
             let table = self.get_table(&table_name)?;
-            
+
             // For F05: fetch old rows for index maintenance
             let mut keys = Vec::new();
             for wrapper in &entries {
@@ -838,6 +911,48 @@ impl Transaction {
             }
             if !table_old_rows.is_empty() {
                 old_rows.insert(table_name.clone(), table_old_rows.clone());
+            }
+
+            // Extract index keys for OCC validation under the synthetic index names
+            for idx in &table.schema.indexes {
+                let synthetic_name = format!("{}.index.{}", table_name, idx.name);
+                let mut idx_keys = HashSet::new();
+                for wrapper in &entries {
+                    match &wrapper.entry {
+                        WalEntry::Put { key, .. } => {
+                            if let Some(new_row) = &wrapper.row
+                                && let Ok(keys) = table.get_index_keys(&idx.name, new_row, key)
+                            {
+                                for k in keys {
+                                    idx_keys.insert(k);
+                                }
+                            }
+                            if let Some(old_row) = table_old_rows.get(key)
+                                && let Ok(keys) = table.get_index_keys(&idx.name, old_row, key)
+                            {
+                                for k in keys {
+                                    idx_keys.insert(k);
+                                }
+                            }
+                        }
+                        WalEntry::Delete { key } => {
+                            if let Some(old_row) = table_old_rows.get(key)
+                                && let Ok(keys) = table.get_index_keys(&idx.name, old_row, key)
+                            {
+                                for k in keys {
+                                    idx_keys.insert(k);
+                                }
+                            }
+                        }
+                        WalEntry::Batch(_) => {}
+                    }
+                }
+                if !idx_keys.is_empty() {
+                    write_keys
+                        .entry(synthetic_name)
+                        .or_default()
+                        .extend(idx_keys);
+                }
             }
 
             resolved_batches.push((table, entries, table_old_rows));
@@ -871,7 +986,7 @@ impl Transaction {
                         // 4. Mark Committed & Truncate if clean
                         self.database.commit_transaction(self.tx_id)?;
                         Ok(())
-                    }
+                    },
                 )?;
             } else {
                 self.database.validate_read_only(
