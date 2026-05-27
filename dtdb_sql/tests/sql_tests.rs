@@ -4464,3 +4464,63 @@ fn test_sql_select_distinct() {
         panic!("Expected SELECT");
     }
 }
+
+#[test]
+fn test_sql_binary_short_circuit() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    engine
+        .execute("INSERT INTO t (id, val) VALUES (1, 10)", &tx_insert)
+        .unwrap();
+    tx_insert.commit().unwrap();
+
+    let tx_query = Transaction::new(3, db.clone());
+
+    // 1. OR short-circuits: true OR error => true (no error)
+    let res = engine
+        .execute("SELECT id FROM t WHERE id = 1 OR val / 0 = 5", &tx_query)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Int(1)]);
+    } else {
+        panic!("Expected SELECT");
+    }
+
+    // 2. OR does not short-circuit when left is false: false OR error => error
+    let res_err = engine.execute("SELECT id FROM t WHERE id = 2 OR val / 0 = 5", &tx_query);
+    assert!(res_err.is_err());
+    assert!(res_err.unwrap_err().contains("Division by zero"));
+
+    // 3. AND short-circuits: false AND error => false (no error)
+    let res = engine
+        .execute("SELECT id FROM t WHERE id = 2 AND val / 0 = 5", &tx_query)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 0);
+    } else {
+        panic!("Expected SELECT");
+    }
+
+    // 4. AND does not short-circuit when left is true: true AND error => error
+    let res_err2 = engine.execute("SELECT id FROM t WHERE id = 1 AND val / 0 = 5", &tx_query);
+    assert!(res_err2.is_err());
+    assert!(res_err2.unwrap_err().contains("Division by zero"));
+
+    // 5. AND short-circuits: false AND NULL => false
+    let res = engine
+        .execute("SELECT id FROM t WHERE id = 2 AND NULL = 5", &tx_query)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 0);
+    } else {
+        panic!("Expected SELECT");
+    }
+}

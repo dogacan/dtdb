@@ -250,43 +250,74 @@ impl Expr {
                 }
             }
             Expr::BinaryOp { left, op, right } => {
-                let l_val = left.eval(row, schema)?;
-                let r_val = right.eval(row, schema)?;
-
-                // Handle logical AND/OR with three-valued logic
+                // Handle logical AND/OR with short-circuiting and three-valued logic
                 if matches!(op, Operator::And | Operator::Or) {
+                    let l_val = left.eval(row, schema)?;
                     return match op {
                         Operator::And => {
-                            let l_null = matches!(l_val, DbValue::Null);
-                            let r_null = matches!(r_val, DbValue::Null);
-                            if l_null && r_null {
-                                return Ok(DbValue::Null);
-                            }
-                            let l_bool = if l_null { None } else { Some(to_bool(&l_val)?) };
-                            let r_bool = if r_null { None } else { Some(to_bool(&r_val)?) };
-                            match (l_bool, r_bool) {
-                                (Some(false), _) | (_, Some(false)) => Ok(DbValue::Bool(false)),
-                                (Some(true), Some(true)) => Ok(DbValue::Bool(true)),
-                                _ => Ok(DbValue::Null),
+                            if matches!(l_val, DbValue::Null) {
+                                let r_val = right.eval(row, schema)?;
+                                if matches!(r_val, DbValue::Null) {
+                                    Ok(DbValue::Null)
+                                } else {
+                                    let r_bool = to_bool(&r_val)?;
+                                    if !r_bool {
+                                        Ok(DbValue::Bool(false))
+                                    } else {
+                                        Ok(DbValue::Null)
+                                    }
+                                }
+                            } else {
+                                let l_bool = to_bool(&l_val)?;
+                                if !l_bool {
+                                    Ok(DbValue::Bool(false))
+                                } else {
+                                    let r_val = right.eval(row, schema)?;
+                                    if matches!(r_val, DbValue::Null) {
+                                        Ok(DbValue::Null)
+                                    } else {
+                                        let r_bool = to_bool(&r_val)?;
+                                        Ok(DbValue::Bool(r_bool))
+                                    }
+                                }
                             }
                         }
                         Operator::Or => {
-                            let l_null = matches!(l_val, DbValue::Null);
-                            let r_null = matches!(r_val, DbValue::Null);
-                            if l_null && r_null {
-                                return Ok(DbValue::Null);
-                            }
-                            let l_bool = if l_null { None } else { Some(to_bool(&l_val)?) };
-                            let r_bool = if r_null { None } else { Some(to_bool(&r_val)?) };
-                            match (l_bool, r_bool) {
-                                (Some(true), _) | (_, Some(true)) => Ok(DbValue::Bool(true)),
-                                (Some(false), Some(false)) => Ok(DbValue::Bool(false)),
-                                _ => Ok(DbValue::Null),
+                            if matches!(l_val, DbValue::Null) {
+                                let r_val = right.eval(row, schema)?;
+                                if matches!(r_val, DbValue::Null) {
+                                    Ok(DbValue::Null)
+                                } else {
+                                    let r_bool = to_bool(&r_val)?;
+                                    if r_bool {
+                                        Ok(DbValue::Bool(true))
+                                    } else {
+                                        Ok(DbValue::Null)
+                                    }
+                                }
+                            } else {
+                                let l_bool = to_bool(&l_val)?;
+                                if l_bool {
+                                    Ok(DbValue::Bool(true))
+                                } else {
+                                    let r_val = right.eval(row, schema)?;
+                                    if matches!(r_val, DbValue::Null) {
+                                        Ok(DbValue::Null)
+                                    } else {
+                                        let r_bool = to_bool(&r_val)?;
+                                        Ok(DbValue::Bool(r_bool))
+                                    }
+                                }
                             }
                         }
                         _ => unreachable!(),
                     };
-                } else if matches!(l_val, DbValue::Null) || matches!(r_val, DbValue::Null) {
+                }
+
+                let l_val = left.eval(row, schema)?;
+                let r_val = right.eval(row, schema)?;
+
+                if matches!(l_val, DbValue::Null) || matches!(r_val, DbValue::Null) {
                     // Propagate NULL for arithmetic, comparison, and LIKE operations
                     return Ok(DbValue::Null);
                 }
