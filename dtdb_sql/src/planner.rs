@@ -409,7 +409,7 @@ impl LogicalPlanner {
                     .get_table(&table_str)
                     .map_err(|e| e.to_string())?;
 
-                let col_names = if columns.is_empty() {
+                let col_names: Vec<String> = if columns.is_empty() {
                     // Default to all columns in schema order
                     table
                         .schema
@@ -425,6 +425,13 @@ impl LogicalPlanner {
                     sqlparser::ast::SetExpr::Values(values) => {
                         let mut rows = Vec::new();
                         for row_exprs in &values.rows {
+                            if row_exprs.len() != col_names.len() {
+                                return Err(format!(
+                                    "Column count mismatch: table has {} columns but {} values were provided",
+                                    col_names.len(),
+                                    row_exprs.len()
+                                ));
+                            }
                             let mut row_vals = Vec::new();
                             for expr in row_exprs {
                                 match plan_expr(expr)? {

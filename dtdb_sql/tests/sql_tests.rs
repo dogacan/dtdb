@@ -4104,3 +4104,26 @@ fn test_sql_sorted_aggregate() {
 
     drop(tx5);
 }
+
+#[test]
+fn test_sql_insert_arity_mismatch() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name STRING, age INT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    // Arity mismatch: 3 columns but only 2 values provided
+    let tx2 = Transaction::new(2, db.clone());
+    let err_res = engine.execute(
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice')",
+        &tx2,
+    );
+    assert!(err_res.is_err());
+    assert!(err_res.unwrap_err().contains("Column count mismatch"));
+}

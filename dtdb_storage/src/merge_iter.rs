@@ -20,7 +20,10 @@ impl SstableBlockIterator {
 
         if !reader.index.is_empty() {
             if let Some(start_key) = start {
-                current_block_idx = match reader.index.binary_search_by(|entry| entry.first_key.cmp(start_key)) {
+                current_block_idx = match reader
+                    .index
+                    .binary_search_by(|entry| entry.first_key.cmp(start_key))
+                {
                     Ok(idx) => idx,
                     Err(idx) => {
                         if idx == 0 {

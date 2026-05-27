@@ -578,5 +578,3 @@ fn test_scan_iter_lower_bound() {
     }
     assert_eq!(results, vec![(k_int(30), v_int(30))]);
 }
-
-

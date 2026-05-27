@@ -282,11 +282,13 @@ fn test_crash_recovery_secondary_index_maintenance() {
     {
         let db = Database::open(&db_path).unwrap();
         let table = db.get_table("users").unwrap();
-        
+
         // Write the update directly to the main engine (bypassing index engine)
         let main_engine = table.engines.get("").unwrap();
         let new_row_bytes = r_user(1, "Adams").to_bytes().unwrap();
-        main_engine.put(k_int(1), DbValue::Bytes(new_row_bytes.clone())).unwrap();
+        main_engine
+            .put(k_int(1), DbValue::Bytes(new_row_bytes.clone()))
+            .unwrap();
 
         // Write the Prepared record to transactions.log
         let tx_id = 999u64;
@@ -328,16 +330,27 @@ fn test_crash_recovery_secondary_index_maintenance() {
 
         // Verify index works: searching for "Douglas" should yield 0 results
         let douglas_rows = tx
-            .index_scan("users", "idx_name", &DbKey::String("Douglas".to_string()), &DbKey::String("Douglas".to_string()), None)
+            .index_scan(
+                "users",
+                "idx_name",
+                &DbKey::String("Douglas".to_string()),
+                &DbKey::String("Douglas".to_string()),
+                None,
+            )
             .unwrap();
         assert_eq!(douglas_rows.len(), 0);
 
         // Searching for "Adams" should yield 1 result
         let adams_rows = tx
-            .index_scan("users", "idx_name", &DbKey::String("Adams".to_string()), &DbKey::String("Adams".to_string()), None)
+            .index_scan(
+                "users",
+                "idx_name",
+                &DbKey::String("Adams".to_string()),
+                &DbKey::String("Adams".to_string()),
+                None,
+            )
             .unwrap();
         assert_eq!(adams_rows.len(), 1);
         assert_eq!(adams_rows[0], r_user(1, "Adams"));
     }
 }
-
