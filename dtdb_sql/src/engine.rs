@@ -40,8 +40,9 @@ impl SqlEngine {
 
     /// Checks if the SQL string contains a DDL statement (CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX).
     pub fn is_ddl(&self, sql: &str) -> bool {
+        let preprocessed = preprocess_sql(sql);
         let dialect = GenericDialect {};
-        if let Ok(statements) = Parser::parse_sql(&dialect, sql)
+        if let Ok(statements) = Parser::parse_sql(&dialect, &preprocessed)
             && !statements.is_empty()
         {
             return matches!(
@@ -74,8 +75,9 @@ impl SqlEngine {
     /// This restriction ensures that every `execute()` call has clear, predictable
     /// atomicity semantics: exactly one statement, exactly one transaction.
     pub fn execute(&self, sql: &str, tx: &Transaction) -> Result<ExecutionResult, String> {
+        let preprocessed = preprocess_sql(sql);
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
+        let statements = Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
         if statements.is_empty() {
             return Err("No SQL statements found".to_string());
         }
@@ -110,9 +112,11 @@ impl SqlEngine {
                 table_name,
                 index_name,
                 columns,
+                index_type,
+                tokenizer,
             } => {
                 self.database
-                    .create_index(&table_name, &index_name, columns)
+                    .create_index(&table_name, &index_name, columns, index_type, tokenizer)
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::CreateIndex)
             }
@@ -792,4 +796,36 @@ fn parent_cols_union(
         }
         set.into_iter().collect()
     })
+}
+
+fn preprocess_sql(sql: &str) -> String {
+    let sql_trimmed = sql.trim();
+    let sql_upper = sql_trimmed.to_ascii_uppercase();
+    if sql_upper.starts_with("CREATE FULLTEXT INDEX") {
+        let rest = sql_trimmed["CREATE FULLTEXT INDEX".len()..].trim();
+        let rest_upper = rest.to_ascii_uppercase();
+        if let Some(on_idx) = rest_upper.find(" ON ") {
+            let idx_name = rest[..on_idx].trim();
+            let after_on = rest[on_idx + " ON ".len()..].trim();
+            if let Some(paren_idx) = after_on.find('(') {
+                let tbl_name = after_on[..paren_idx].trim();
+                let after_paren = &after_on[paren_idx..];
+                if let Some(rparen_idx) = after_paren.find(')') {
+                    let col_name = after_paren[1..rparen_idx].trim();
+                    let after_cols = after_paren[rparen_idx + 1..].trim();
+                    let after_cols_upper = after_cols.to_ascii_uppercase();
+                    let tokenizer = if after_cols_upper.starts_with("USING ") {
+                        after_cols["USING ".len()..].trim()
+                    } else {
+                        "simple"
+                    };
+                    return format!(
+                        "CREATE INDEX {} ON {} USING {} ({})",
+                        idx_name, tbl_name, tokenizer, col_name
+                    );
+                }
+            }
+        }
+    }
+    sql.to_string()
 }

@@ -2808,3 +2808,228 @@ fn test_sql_cross_join_lazy_and_correctness() {
         panic!("Expected Select result");
     }
 }
+
+#[test]
+fn test_fulltext_search() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Setup table and insert rows
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE posts (id INT PRIMARY KEY, content STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO posts (id, content) VALUES \
+             (1, 'Database engines are complex systems'), \
+             (2, 'LSM-tree is a data structure for write-heavy workloads'), \
+             (3, 'B-trees are widely used in databases'), \
+             (4, 'Simple tokenization splits by whitespace')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    // 2. Query WITHOUT FULLTEXT index (Sequential scan fallback)
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('databases') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Check case insensitivity / tokenizer splits
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('complex') ORDER BY id ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx3);
+
+    // 3. Create FULLTEXT index (default simple tokenizer)
+    let tx4 = Transaction::new(4, db.clone());
+    engine
+        .execute("CREATE FULLTEXT INDEX idx_content ON posts (content)", &tx4)
+        .unwrap();
+    tx4.commit().unwrap();
+    drop(tx4);
+
+    // 4. Query WITH FULLTEXT index (Index scan)
+    let tx5 = Transaction::new(5, db.clone());
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('complex') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('databases') ORDER BY id ASC",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Query non-existent token
+    let res = engine
+        .execute(
+            "SELECT id FROM posts WHERE MATCH(content) AGAINST('nonexistent')",
+            &tx5,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 0);
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx5);
+
+    // 5. Custom tokenizer registration and USING syntax
+    // Define a custom tokenizer that splits by comma
+    struct CommaTokenizer;
+    impl dtdb_relational::Tokenizer for CommaTokenizer {
+        fn tokenize(&self, text: &str) -> Vec<String> {
+            text.split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+    }
+
+    dtdb_relational::register_global_tokenizer("comma", std::sync::Arc::new(CommaTokenizer));
+
+    let tx6 = Transaction::new(6, db.clone());
+    engine
+        .execute("CREATE TABLE tags (id INT PRIMARY KEY, list STRING)", &tx6)
+        .unwrap();
+    tx6.commit().unwrap();
+    drop(tx6);
+
+    let tx7 = Transaction::new(7, db.clone());
+    engine
+        .execute(
+            "INSERT INTO tags (id, list) VALUES \
+             (1, 'rust,database,lsm'), \
+             (2, 'c++,btree,relational'), \
+             (3, 'rust,compiler,ast')",
+            &tx7,
+        )
+        .unwrap();
+    tx7.commit().unwrap();
+    drop(tx7);
+
+    // Create fulltext index with USING clause
+    let tx8 = Transaction::new(8, db.clone());
+    engine
+        .execute(
+            "CREATE FULLTEXT INDEX idx_tags ON tags (list) USING comma",
+            &tx8,
+        )
+        .unwrap();
+    tx8.commit().unwrap();
+    drop(tx8);
+
+    // Query tags with comma tokenizer
+    let tx9 = Transaction::new(9, db.clone());
+    let res = engine
+        .execute(
+            "SELECT id FROM tags WHERE MATCH(list) AGAINST('rust') ORDER BY id ASC",
+            &tx9,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+
+    let res = engine
+        .execute(
+            "SELECT id FROM tags WHERE MATCH(list) AGAINST('compiler') ORDER BY id ASC",
+            &tx9,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(3));
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx9);
+
+    // 6. OCC / Transaction write updates and deletes
+    let tx10 = Transaction::new(10, db.clone());
+    // Insert new row
+    engine
+        .execute("INSERT INTO tags (id, list) VALUES (4, 'rust,web')", &tx10)
+        .unwrap();
+    // Querying within same transaction should see the uncommitted write via write buffer scan
+    let res = engine
+        .execute(
+            "SELECT id FROM tags WHERE MATCH(list) AGAINST('rust') ORDER BY id ASC",
+            &tx10,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], DbValue::Int(1));
+        assert_eq!(rows[1].values[0], DbValue::Int(3));
+        assert_eq!(rows[2].values[0], DbValue::Int(4));
+    } else {
+        panic!("Expected Select result");
+    }
+    tx10.commit().unwrap();
+    drop(tx10);
+
+    // Query committed write
+    let tx11 = Transaction::new(11, db.clone());
+    let res = engine
+        .execute(
+            "SELECT id FROM tags WHERE MATCH(list) AGAINST('web') ORDER BY id ASC",
+            &tx11,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Int(4));
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx11);
+}

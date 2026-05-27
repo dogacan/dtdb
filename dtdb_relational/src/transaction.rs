@@ -418,19 +418,38 @@ impl Transaction {
                         .find(|idx| idx.name == index_name)
                     && let Some(col_name) = idx_def.columns.first()
                     && let Some(col_idx) = table.schema.column_index(col_name)
+                    && let Some(val) = row.get_by_index(col_idx)
                 {
-                    let val = &row.values[col_idx];
-                    let k = match val {
-                        DbValue::Int(v) => Some(DbKey::Int(*v)),
-                        DbValue::String(s) => Some(DbKey::String(s.clone())),
-                        DbValue::Bool(b) => Some(DbKey::Bool(*b)),
-                        _ => None,
-                    };
-                    if let Some(k) = k
-                        && &k >= start_val
-                        && &k <= end_val
-                    {
-                        rows.push(row.clone());
+                    if idx_def.index_type == crate::schema::IndexType::FullText {
+                        if let DbValue::String(s) = val {
+                            let tokenizer_name = idx_def.tokenizer.as_deref().unwrap_or("simple");
+                            if let Some(tokenizer) = crate::tokenizer::get_tokenizer(tokenizer_name)
+                            {
+                                let tokens = tokenizer.tokenize(s.as_str());
+                                let mut match_found = false;
+                                if let DbKey::String(query_token) = start_val
+                                    && tokens.contains(query_token)
+                                {
+                                    match_found = true;
+                                }
+                                if match_found {
+                                    rows.push(row.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        let k = match val {
+                            DbValue::Int(v) => Some(DbKey::Int(*v)),
+                            DbValue::String(s) => Some(DbKey::String(s.clone())),
+                            DbValue::Bool(b) => Some(DbKey::Bool(*b)),
+                            _ => None,
+                        };
+                        if let Some(k) = k
+                            && &k >= start_val
+                            && &k <= end_val
+                        {
+                            rows.push(row.clone());
+                        }
                     }
                 }
             }

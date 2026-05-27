@@ -86,11 +86,25 @@ impl LocalityGroupOptions {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    BTree,
+    FullText,
+}
+
+fn default_index_type() -> IndexType {
+    IndexType::BTree
+}
+
 /// IndexDefinition represents a secondary index configuration.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IndexDefinition {
     pub name: String,
     pub columns: Vec<String>,
+    #[serde(default = "default_index_type")]
+    pub index_type: IndexType,
+    #[serde(default)]
+    pub tokenizer: Option<String>,
 }
 
 /// Schema defines the set of columns and types of a relational table.

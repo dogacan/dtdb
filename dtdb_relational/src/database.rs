@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use crate::schema::{IndexDefinition, Schema};
+use crate::schema::{IndexDefinition, IndexType, Schema};
 use crate::transaction::Transaction;
 use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, ThreadSpawner, WalEntry,
@@ -126,10 +126,93 @@ impl Table {
                         let old_row_opt = old_rows.get(&key);
                         if let Some(old_row) = old_row_opt {
                             for idx in &self.schema.indexes {
-                                let mut old_keys = Vec::new();
-                                for col_name in &idx.columns {
+                                if idx.index_type == IndexType::FullText {
+                                    let col_name = &idx.columns[0];
                                     let col_idx = self.schema.column_index(col_name).unwrap();
                                     let col_val = &old_row.values[col_idx];
+                                    if let DbValue::String(old_text) = col_val {
+                                        let tokenizer_name =
+                                            idx.tokenizer.as_deref().unwrap_or("simple");
+                                        if let Some(tokenizer) =
+                                            crate::tokenizer::get_tokenizer(tokenizer_name)
+                                        {
+                                            let mut tokens = tokenizer.tokenize(old_text);
+                                            tokens.sort();
+                                            tokens.dedup();
+                                            for token in tokens {
+                                                let idx_key = DbKey::Composite(vec![
+                                                    DbKey::String(token),
+                                                    key.clone(),
+                                                ]);
+                                                index_batches
+                                                    .get_mut(&idx.name)
+                                                    .unwrap()
+                                                    .push(WalEntry::Delete { key: idx_key });
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let mut old_keys = Vec::new();
+                                    for col_name in &idx.columns {
+                                        let col_idx = self.schema.column_index(col_name).unwrap();
+                                        let col_val = &old_row.values[col_idx];
+                                        if matches!(col_val, DbValue::Null) {
+                                            continue;
+                                        }
+                                        let k = match col_val {
+                                            DbValue::Int(v) => DbKey::Int(*v),
+                                            DbValue::String(s) => DbKey::String(s.clone()),
+                                            DbValue::Bool(b) => DbKey::Bool(*b),
+                                            _ => continue,
+                                        };
+                                        old_keys.push(k);
+                                    }
+                                    if old_keys.len() == idx.columns.len() {
+                                        old_keys.push(key.clone());
+                                        index_batches.get_mut(&idx.name).unwrap().push(
+                                            WalEntry::Delete {
+                                                key: DbKey::Composite(old_keys),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Add new index entry
+                        for idx in &self.schema.indexes {
+                            if idx.index_type == IndexType::FullText {
+                                let col_name = &idx.columns[0];
+                                let col_idx = self.schema.column_index(col_name).unwrap();
+                                let col_val = &full_row.values[col_idx];
+                                if let DbValue::String(new_text) = col_val {
+                                    let tokenizer_name =
+                                        idx.tokenizer.as_deref().unwrap_or("simple");
+                                    if let Some(tokenizer) =
+                                        crate::tokenizer::get_tokenizer(tokenizer_name)
+                                    {
+                                        let mut tokens = tokenizer.tokenize(new_text);
+                                        tokens.sort();
+                                        tokens.dedup();
+                                        for token in tokens {
+                                            let idx_key = DbKey::Composite(vec![
+                                                DbKey::String(token),
+                                                key.clone(),
+                                            ]);
+                                            index_batches.get_mut(&idx.name).unwrap().push(
+                                                WalEntry::Put {
+                                                    key: idx_key,
+                                                    value: DbValue::Null,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let mut new_keys = Vec::new();
+                                for col_name in &idx.columns {
+                                    let col_idx = self.schema.column_index(col_name).unwrap();
+                                    let col_val = &full_row.values[col_idx];
                                     if matches!(col_val, DbValue::Null) {
                                         continue;
                                     }
@@ -139,45 +222,18 @@ impl Table {
                                         DbValue::Bool(b) => DbKey::Bool(*b),
                                         _ => continue,
                                     };
-                                    old_keys.push(k);
+                                    new_keys.push(k);
                                 }
-                                if old_keys.len() == idx.columns.len() {
-                                    old_keys.push(key.clone());
-                                    index_batches.get_mut(&idx.name).unwrap().push(
-                                        WalEntry::Delete {
-                                            key: DbKey::Composite(old_keys),
-                                        },
-                                    );
+                                if new_keys.len() == idx.columns.len() {
+                                    new_keys.push(key.clone());
+                                    index_batches
+                                        .get_mut(&idx.name)
+                                        .unwrap()
+                                        .push(WalEntry::Put {
+                                            key: DbKey::Composite(new_keys),
+                                            value: DbValue::Null,
+                                        });
                                 }
-                            }
-                        }
-
-                        // Add new index entry
-                        for idx in &self.schema.indexes {
-                            let mut new_keys = Vec::new();
-                            for col_name in &idx.columns {
-                                let col_idx = self.schema.column_index(col_name).unwrap();
-                                let col_val = &full_row.values[col_idx];
-                                if matches!(col_val, DbValue::Null) {
-                                    continue;
-                                }
-                                let k = match col_val {
-                                    DbValue::Int(v) => DbKey::Int(*v),
-                                    DbValue::String(s) => DbKey::String(s.clone()),
-                                    DbValue::Bool(b) => DbKey::Bool(*b),
-                                    _ => continue,
-                                };
-                                new_keys.push(k);
-                            }
-                            if new_keys.len() == idx.columns.len() {
-                                new_keys.push(key.clone());
-                                index_batches
-                                    .get_mut(&idx.name)
-                                    .unwrap()
-                                    .push(WalEntry::Put {
-                                        key: DbKey::Composite(new_keys),
-                                        value: DbValue::Null,
-                                    });
                             }
                         }
                     }
@@ -210,28 +266,55 @@ impl Table {
                         let old_row_opt = old_rows.get(&key);
                         if let Some(old_row) = old_row_opt {
                             for idx in &self.schema.indexes {
-                                let mut old_keys = Vec::new();
-                                for col_name in &idx.columns {
+                                if idx.index_type == IndexType::FullText {
+                                    let col_name = &idx.columns[0];
                                     let col_idx = self.schema.column_index(col_name).unwrap();
                                     let col_val = &old_row.values[col_idx];
-                                    if matches!(col_val, DbValue::Null) {
-                                        continue;
+                                    if let DbValue::String(old_text) = col_val {
+                                        let tokenizer_name =
+                                            idx.tokenizer.as_deref().unwrap_or("simple");
+                                        if let Some(tokenizer) =
+                                            crate::tokenizer::get_tokenizer(tokenizer_name)
+                                        {
+                                            let mut tokens = tokenizer.tokenize(old_text);
+                                            tokens.sort();
+                                            tokens.dedup();
+                                            for token in tokens {
+                                                let idx_key = DbKey::Composite(vec![
+                                                    DbKey::String(token),
+                                                    key.clone(),
+                                                ]);
+                                                index_batches
+                                                    .get_mut(&idx.name)
+                                                    .unwrap()
+                                                    .push(WalEntry::Delete { key: idx_key });
+                                            }
+                                        }
                                     }
-                                    let k = match col_val {
-                                        DbValue::Int(v) => DbKey::Int(*v),
-                                        DbValue::String(s) => DbKey::String(s.clone()),
-                                        DbValue::Bool(b) => DbKey::Bool(*b),
-                                        _ => continue,
-                                    };
-                                    old_keys.push(k);
-                                }
-                                if old_keys.len() == idx.columns.len() {
-                                    old_keys.push(key.clone());
-                                    index_batches.get_mut(&idx.name).unwrap().push(
-                                        WalEntry::Delete {
-                                            key: DbKey::Composite(old_keys),
-                                        },
-                                    );
+                                } else {
+                                    let mut old_keys = Vec::new();
+                                    for col_name in &idx.columns {
+                                        let col_idx = self.schema.column_index(col_name).unwrap();
+                                        let col_val = &old_row.values[col_idx];
+                                        if matches!(col_val, DbValue::Null) {
+                                            continue;
+                                        }
+                                        let k = match col_val {
+                                            DbValue::Int(v) => DbKey::Int(*v),
+                                            DbValue::String(s) => DbKey::String(s.clone()),
+                                            DbValue::Bool(b) => DbKey::Bool(*b),
+                                            _ => continue,
+                                        };
+                                        old_keys.push(k);
+                                    }
+                                    if old_keys.len() == idx.columns.len() {
+                                        old_keys.push(key.clone());
+                                        index_batches.get_mut(&idx.name).unwrap().push(
+                                            WalEntry::Delete {
+                                                key: DbKey::Composite(old_keys),
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -652,6 +735,10 @@ impl Database {
     /// It scans the base directory for table subdirectories containing `schema.bin`.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_spawner(dir_path, Arc::new(dtdb_storage::DefaultSpawner))
+    }
+
+    pub fn register_tokenizer(&self, name: &str, tokenizer: Arc<dyn crate::tokenizer::Tokenizer>) {
+        crate::tokenizer::register_global_tokenizer(name, tokenizer);
     }
 
     pub fn open_with_spawner(
@@ -1461,6 +1548,8 @@ impl Database {
         table_name: &str,
         index_name: &str,
         columns: Vec<String>,
+        index_type: IndexType,
+        tokenizer: Option<String>,
     ) -> Result<()> {
         let mut tables_guard = self.tables.write().unwrap();
 
@@ -1492,12 +1581,37 @@ impl Database {
             }
         }
 
+        // If it's FULLTEXT index, perform type and column count checks
+        if index_type == IndexType::FullText {
+            if columns.len() != 1 {
+                return Err(RelationalError::SchemaMismatch(
+                    "FULLTEXT index must be on exactly one column".to_string(),
+                ));
+            }
+            let col_idx = table.schema.column_index(&columns[0]).unwrap();
+            let col = &table.schema.columns[col_idx];
+            if col.data_type != crate::schema::DataType::String {
+                return Err(RelationalError::SchemaMismatch(
+                    "FULLTEXT index can only be created on a STRING column".to_string(),
+                ));
+            }
+            let tokenizer_name = tokenizer.as_deref().unwrap_or("simple");
+            if crate::tokenizer::get_tokenizer(tokenizer_name).is_none() {
+                return Err(RelationalError::SchemaMismatch(format!(
+                    "Tokenizer '{}' not found",
+                    tokenizer_name
+                )));
+            }
+        }
+
         // 4. Save updated schema configuration
         let table_path = self.dir_path.join(table_name);
         let schema_path = table_path.join("schema.bin");
         table.schema.indexes.push(IndexDefinition {
             name: index_name.to_string(),
             columns: columns.clone(),
+            index_type,
+            tokenizer: tokenizer.clone(),
         });
         table.schema.save_to_file(&schema_path)?;
 
@@ -1552,35 +1666,55 @@ impl Database {
         let rows = table.filtered_scan(&start, &end, None)?;
         let mut index_entries = Vec::new();
         for (pk_key, row) in rows {
-            // Support composite index keys or single key.
-            // For columns, we construct a vector of DbKeys.
-            let mut keys = Vec::new();
-            for col_name in &columns {
+            if index_type == IndexType::FullText {
+                let col_name = &columns[0];
                 let col_idx = table.schema.column_index(col_name).unwrap();
                 let col_val = &row.values[col_idx];
-                if matches!(col_val, DbValue::Null) {
-                    // Skip indexing rows with Null values for simplification
-                    continue;
-                }
-                let k = match col_val {
-                    DbValue::Int(v) => DbKey::Int(*v),
-                    DbValue::String(s) => DbKey::String(s.clone()),
-                    DbValue::Bool(b) => DbKey::Bool(*b),
-                    other => {
-                        return Err(RelationalError::SchemaMismatch(format!(
-                            "Cannot index non-indexable value type {:?}",
-                            other
-                        )));
+                if let DbValue::String(text) = col_val {
+                    let tokenizer_name = tokenizer.as_deref().unwrap_or("simple");
+                    let tok = crate::tokenizer::get_tokenizer(tokenizer_name).unwrap();
+                    let mut tokens = tok.tokenize(text);
+                    tokens.sort();
+                    tokens.dedup();
+                    for token in tokens {
+                        let idx_key = DbKey::Composite(vec![DbKey::String(token), pk_key.clone()]);
+                        index_entries.push(WalEntry::Put {
+                            key: idx_key,
+                            value: DbValue::Null,
+                        });
                     }
-                };
-                keys.push(k);
-            }
-            if keys.len() == columns.len() {
-                keys.push(pk_key);
-                index_entries.push(WalEntry::Put {
-                    key: DbKey::Composite(keys),
-                    value: DbValue::Null,
-                });
+                }
+            } else {
+                // Support composite index keys or single key.
+                // For columns, we construct a vector of DbKeys.
+                let mut keys = Vec::new();
+                for col_name in &columns {
+                    let col_idx = table.schema.column_index(col_name).unwrap();
+                    let col_val = &row.values[col_idx];
+                    if matches!(col_val, DbValue::Null) {
+                        // Skip indexing rows with Null values for simplification
+                        continue;
+                    }
+                    let k = match col_val {
+                        DbValue::Int(v) => DbKey::Int(*v),
+                        DbValue::String(s) => DbKey::String(s.clone()),
+                        DbValue::Bool(b) => DbKey::Bool(*b),
+                        other => {
+                            return Err(RelationalError::SchemaMismatch(format!(
+                                "Cannot index non-indexable value type {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    keys.push(k);
+                }
+                if keys.len() == columns.len() {
+                    keys.push(pk_key);
+                    index_entries.push(WalEntry::Put {
+                        key: DbKey::Composite(keys),
+                        value: DbValue::Null,
+                    });
+                }
             }
         }
 

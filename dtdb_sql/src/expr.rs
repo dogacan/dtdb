@@ -47,6 +47,12 @@ pub enum Expr {
         expr: Box<Expr>,
         list: Vec<Expr>,
     },
+    Match {
+        column: String,
+        #[serde(default)]
+        index: Option<usize>,
+        token: String,
+    },
 }
 
 impl Expr {
@@ -96,6 +102,9 @@ impl Expr {
                 for item in list {
                     item.collect_columns(columns);
                 }
+            }
+            Expr::Match { column, .. } => {
+                columns.insert(column.clone());
             }
         }
     }
@@ -157,6 +166,22 @@ impl Expr {
                 expr.bind_columns(schema);
                 for item in list {
                     item.bind_columns(schema);
+                }
+            }
+            Expr::Match { column, index, .. } => {
+                if index.is_none() {
+                    let idx = schema.columns.iter().position(|col| {
+                        if col.name == *column {
+                            true
+                        } else if let Some(pos) = column.rfind('.') {
+                            col.name == column[pos + 1..]
+                        } else if let Some(col_pos) = col.name.rfind('.') {
+                            col.name[col_pos + 1..] == *column
+                        } else {
+                            false
+                        }
+                    });
+                    *index = idx;
                 }
             }
         }
@@ -519,6 +544,48 @@ impl Expr {
                         }
                     }
                     other => Err(format!("Unsupported scalar function: {}", other)),
+                }
+            }
+            Expr::Match {
+                column,
+                index,
+                token,
+            } => {
+                let idx = if let Some(idx) = index {
+                    *idx
+                } else {
+                    schema
+                        .columns
+                        .iter()
+                        .position(|col| col.name == *column)
+                        .ok_or_else(|| format!("Column not found in schema: '{}'", column))?
+                };
+                let val = row
+                    .get_by_index(idx)
+                    .cloned()
+                    .ok_or_else(|| format!("Index {} out of bounds for row values", idx))?;
+
+                if let DbValue::String(s) = val {
+                    let tokenizer_name = schema
+                        .indexes
+                        .iter()
+                        .find(|idx| {
+                            idx.index_type == dtdb_relational::schema::IndexType::FullText
+                                && idx.columns.contains(column)
+                        })
+                        .and_then(|idx| idx.tokenizer.as_deref())
+                        .unwrap_or("simple");
+
+                    if let Some(tokenizer) =
+                        dtdb_relational::tokenizer::get_tokenizer(tokenizer_name)
+                    {
+                        let tokens = tokenizer.tokenize(&s);
+                        Ok(DbValue::Bool(tokens.contains(token)))
+                    } else {
+                        Err(format!("Tokenizer '{}' not found", tokenizer_name))
+                    }
+                } else {
+                    Ok(DbValue::Bool(false))
                 }
             }
         }

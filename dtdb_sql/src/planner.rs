@@ -42,6 +42,8 @@ pub enum SqlStatement {
         table_name: String,
         index_name: String,
         columns: Vec<String>,
+        index_type: dtdb_relational::schema::IndexType,
+        tokenizer: Option<String>,
     },
     DropIndex {
         table_name: String,
@@ -365,6 +367,7 @@ impl LogicalPlanner {
                 name,
                 table_name,
                 columns,
+                using,
                 ..
             } => {
                 let index_name = name.to_string();
@@ -380,10 +383,18 @@ impl LogicalPlanner {
                         );
                     }
                 }
+                let index_type = if using.is_some() {
+                    dtdb_relational::schema::IndexType::FullText
+                } else {
+                    dtdb_relational::schema::IndexType::BTree
+                };
+                let tokenizer = using.as_ref().map(|ident| ident.value.clone());
                 Ok(SqlStatement::CreateIndex {
                     table_name: table_str,
                     index_name,
                     columns: col_names,
+                    index_type,
+                    tokenizer,
                 })
             }
             Statement::Insert {
@@ -1118,6 +1129,32 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             } else {
                 Err(format!("Unsupported or unrecognized function: {}", name))
             }
+        }
+        SqlExpr::MatchAgainst {
+            columns,
+            match_value,
+            ..
+        } => {
+            if columns.len() != 1 {
+                return Err(
+                    "MATCH against multiple columns is not supported in Phase 1".to_string()
+                );
+            }
+            let col_name = columns[0].value.clone();
+            let token_str = match match_value {
+                sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                other => {
+                    return Err(format!(
+                        "MATCH expects a string literal token, got {:?}",
+                        other
+                    ));
+                }
+            };
+            Ok(Expr::Match {
+                column: col_name,
+                index: None,
+                token: token_str,
+            })
         }
         other => Err(format!("Unsupported expression: {:?}", other)),
     }

@@ -88,6 +88,24 @@ Creates a secondary index on one or more columns of a table.
     CREATE INDEX idx_score ON students (score);
     ```
 
+#### `CREATE FULLTEXT INDEX`
+Creates a generalized inverted index (full-text index) on a single column of a table to support text search.
+*   **Syntax**:
+    ```sql
+    CREATE FULLTEXT INDEX <index_name> ON <table_name> (<column_name>) [USING <tokenizer_name>];
+    ```
+*   **Notes**:
+    *   Creates a full-text secondary index. The indexed column must have a string-compatible data type (e.g. `TEXT`, `VARCHAR`, `STRING`). Full-text indexes on multiple columns are not supported.
+    *   The optional `USING <tokenizer_name>` clause specifies which registered tokenizer to use. If omitted, the default `simple` tokenizer is used.
+    *   During population, the index splits column string values into tokens using the specified tokenizer, and maps each unique token to the primary key(s) of matching rows.
+*   **Transaction Restriction**:
+    *   `CREATE FULLTEXT INDEX` is a DDL statement and is **not allowed** inside explicit transactions. It must be run as a single auto-committed statement.
+*   **Example**:
+    ```sql
+    CREATE FULLTEXT INDEX idx_content ON articles (content);
+    CREATE FULLTEXT INDEX idx_tags ON items (tags) USING comma;
+    ```
+
 #### `DROP INDEX`
 Removes a secondary index from a table.
 *   **Syntax**:
@@ -277,6 +295,11 @@ Used to combine boolean expressions:
 *   `LIKE` / `NOT LIKE`: Performs wildcard string matching using `%`.
     *   `%`: Matches zero or more characters.
     *   *Example*: `WHERE name LIKE 'A%'` (starts with 'A'), `WHERE name NOT LIKE '%b%'` (does not contain 'b').
+
+### Full-Text Search
+*   `MATCH(<column_name>) AGAINST('<token_literal>')`: Evaluates to `TRUE` if the tokenizer matching `<column_name>` contains the exact lowercase word `<token_literal>`.
+    *   *Note*: If a `FULLTEXT` index exists on `<column_name>`, the query optimizer automatically chooses an `IndexScan` path to accelerate execution. If no index is present, it falls back to a sequential table scan evaluating the tokenizer dynamically.
+    *   *Example*: `WHERE MATCH(content) AGAINST('database')`
 
 ### Arithmetic Operators
 Used for mathematical computations in select projections or predicates:

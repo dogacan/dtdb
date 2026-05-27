@@ -424,32 +424,57 @@ impl Optimizer {
                     c.name == *col_name
                         || dtdb_relational::schema::ends_with_dot_suffix(&c.name, col_name)
                 })
-                && let Some((start, end)) =
-                    extract_bounds_for_column(predicate, &col.name, &col.data_type)
             {
-                let idx_plan = LogicalPlan::IndexScan {
-                    table_name: table_name.to_string(),
-                    index_name: index.name.clone(),
-                    schema: schema.clone(),
-                    range: Some((start.clone(), end.clone())),
-                };
-                let cost = self.estimate_index_scan_cost(
-                    table_name,
-                    &index.name,
-                    schema,
-                    stats_opt.as_ref(),
-                    &start,
-                    &end,
-                    query_columns,
-                );
-                if cost < min_cost {
-                    min_cost = cost;
-                    best_plan = idx_plan;
+                // Verify index type match
+                let is_fulltext = index.index_type == dtdb_relational::schema::IndexType::FullText;
+                let has_match = Self::has_match_predicate_for_col(predicate, &col.name);
+                if is_fulltext != has_match {
+                    continue;
+                }
+
+                if let Some((start, end)) =
+                    extract_bounds_for_column(predicate, &col.name, &col.data_type)
+                {
+                    let idx_plan = LogicalPlan::IndexScan {
+                        table_name: table_name.to_string(),
+                        index_name: index.name.clone(),
+                        schema: schema.clone(),
+                        range: Some((start.clone(), end.clone())),
+                    };
+                    let cost = self.estimate_index_scan_cost(
+                        table_name,
+                        &index.name,
+                        schema,
+                        stats_opt.as_ref(),
+                        &start,
+                        &end,
+                        query_columns,
+                    );
+                    if cost < min_cost {
+                        min_cost = cost;
+                        best_plan = idx_plan;
+                    }
                 }
             }
         }
 
         best_plan
+    }
+
+    fn has_match_predicate_for_col(predicate: &Expr, col_name: &str) -> bool {
+        match predicate {
+            Expr::Match { column, .. } => column == col_name,
+            Expr::BinaryOp {
+                left,
+                op: Operator::And,
+                right,
+            } => {
+                Self::has_match_predicate_for_col(left, col_name)
+                    || Self::has_match_predicate_for_col(right, col_name)
+            }
+            Expr::Not(inner) => Self::has_match_predicate_for_col(inner, col_name),
+            _ => false,
+        }
     }
 
     fn get_needed_locality_groups(
@@ -708,6 +733,14 @@ fn extract_bounds_for_column(
                     }
                     _ => None,
                 }
+            } else {
+                None
+            }
+        }
+        Expr::Match { column, token, .. } => {
+            if column == col_name {
+                let key = DbKey::String(token.clone());
+                Some((key.clone(), key))
             } else {
                 None
             }
