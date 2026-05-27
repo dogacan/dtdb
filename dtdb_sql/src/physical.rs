@@ -928,6 +928,21 @@ impl PhysicalOperator for PhysicalHashAggregate {
                 }
             }
 
+            if self.group_by.is_empty() && groups.is_empty() {
+                let initial_accumulators = self
+                    .aggrs
+                    .iter()
+                    .map(|aggr| match aggr {
+                        AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
+                        AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                        AggregateExpr::Min(_) => Accumulator::Min { min: None },
+                        AggregateExpr::Max(_) => Accumulator::Max { max: None },
+                        AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
+                    })
+                    .collect();
+                groups.insert(Vec::new(), initial_accumulators);
+            }
+
             // 4. Construct final output rows
             let mut output_rows = Vec::new();
             for (group_vals, accumulators) in groups {
@@ -1001,6 +1016,20 @@ impl PhysicalOperator for PhysicalSortedAggregate {
             self.next_row = self.source.next()?;
             if self.next_row.is_none() {
                 self.source_exhausted = true;
+                if self.group_by.is_empty() && self.active_group_keys.is_none() {
+                    self.active_group_keys = Some(Vec::new());
+                    self.active_accumulators = self
+                        .aggrs
+                        .iter()
+                        .map(|aggr| match aggr {
+                            AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
+                            AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                            AggregateExpr::Min(_) => Accumulator::Min { min: None },
+                            AggregateExpr::Max(_) => Accumulator::Max { max: None },
+                            AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
+                        })
+                        .collect();
+                }
             }
         }
 

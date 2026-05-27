@@ -4255,3 +4255,39 @@ fn test_sql_join_order_orientation() {
         panic!("Expected SELECT result");
     }
 }
+
+#[test]
+fn test_sql_aggregate_empty_table() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, val INT)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_query = Transaction::new(2, db.clone());
+
+    let res = engine
+        .execute(
+            "SELECT COUNT(*), SUM(val), MIN(val), MAX(val), AVG(val) FROM items",
+            &tx_query,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::Int(0),
+                DbValue::Null,
+                DbValue::Null,
+                DbValue::Null,
+                DbValue::Null
+            ]
+        );
+    } else {
+        panic!("Expected SELECT result");
+    }
+}
