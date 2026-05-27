@@ -1019,7 +1019,7 @@ fn extract_bounds_for_column(
                     Operator::GtEq | Operator::Gt => {
                         let start = if matches!(op, Operator::Gt) {
                             match key {
-                                DbKey::Int(v) => DbKey::Int(v + 1),
+                                DbKey::Int(v) => DbKey::Int(v.saturating_add(1)),
                                 DbKey::String(s) => DbKey::String(s + "\0"),
                                 _ => key,
                             }
@@ -1039,7 +1039,7 @@ fn extract_bounds_for_column(
                         };
                         let end = if matches!(op, Operator::Lt) {
                             match key {
-                                DbKey::Int(v) => DbKey::Int(v - 1),
+                                DbKey::Int(v) => DbKey::Int(v.saturating_sub(1)),
                                 DbKey::String(s) => DbKey::String(s),
                                 _ => key,
                             }

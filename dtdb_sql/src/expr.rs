@@ -300,13 +300,45 @@ impl Expr {
                         let matched = like_match(&text, &pattern);
                         Ok(DbValue::Bool(matched))
                     }
-                    Operator::Add => eval_arithmetic(&l_val, &r_val, |a, b| a + b, |a, b| a + b),
-                    Operator::Sub => eval_arithmetic(&l_val, &r_val, |a, b| a - b, |a, b| a - b),
-                    Operator::Mul => eval_arithmetic(&l_val, &r_val, |a, b| a * b, |a, b| a * b),
+                    Operator::Add => eval_arithmetic(
+                        &l_val,
+                        &r_val,
+                        |a, b| {
+                            a.checked_add(b)
+                                .ok_or_else(|| "Integer overflow".to_string())
+                        },
+                        |a, b| Ok(a + b),
+                    ),
+                    Operator::Sub => eval_arithmetic(
+                        &l_val,
+                        &r_val,
+                        |a, b| {
+                            a.checked_sub(b)
+                                .ok_or_else(|| "Integer overflow".to_string())
+                        },
+                        |a, b| Ok(a - b),
+                    ),
+                    Operator::Mul => eval_arithmetic(
+                        &l_val,
+                        &r_val,
+                        |a, b| {
+                            a.checked_mul(b)
+                                .ok_or_else(|| "Integer overflow".to_string())
+                        },
+                        |a, b| Ok(a * b),
+                    ),
                     Operator::Div => match r_val {
                         DbValue::Int(0) => Err("Division by zero".to_string()),
                         DbValue::Float(0.0) => Err("Division by zero".to_string()),
-                        _ => eval_arithmetic(&l_val, &r_val, |a, b| a / b, |a, b| a / b),
+                        _ => eval_arithmetic(
+                            &l_val,
+                            &r_val,
+                            |a, b| {
+                                a.checked_div(b)
+                                    .ok_or_else(|| "Integer overflow".to_string())
+                            },
+                            |a, b| Ok(a / b),
+                        ),
                     },
                     other_op => {
                         let ordering = compare_values(&l_val, &r_val)?;
@@ -727,14 +759,14 @@ fn eval_arithmetic<FI, FF>(
     float_op: FF,
 ) -> Result<DbValue, String>
 where
-    FI: FnOnce(i64, i64) -> i64,
-    FF: FnOnce(f64, f64) -> f64,
+    FI: FnOnce(i64, i64) -> Result<i64, String>,
+    FF: FnOnce(f64, f64) -> Result<f64, String>,
 {
     match (l, r) {
-        (DbValue::Int(lv), DbValue::Int(rv)) => Ok(DbValue::Int(int_op(*lv, *rv))),
-        (DbValue::Float(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv, *rv))),
-        (DbValue::Int(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv as f64, *rv))),
-        (DbValue::Float(lv), DbValue::Int(rv)) => Ok(DbValue::Float(float_op(*lv, *rv as f64))),
+        (DbValue::Int(lv), DbValue::Int(rv)) => Ok(DbValue::Int(int_op(*lv, *rv)?)),
+        (DbValue::Float(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv, *rv)?)),
+        (DbValue::Int(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv as f64, *rv)?)),
+        (DbValue::Float(lv), DbValue::Int(rv)) => Ok(DbValue::Float(float_op(*lv, *rv as f64)?)),
         (expected, actual) => Err(format!(
             "Cannot perform arithmetic on non-numeric types: {:?} and {:?}",
             expected, actual

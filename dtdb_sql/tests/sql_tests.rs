@@ -4127,3 +4127,52 @@ fn test_sql_insert_arity_mismatch() {
     assert!(err_res.is_err());
     assert!(err_res.unwrap_err().contains("Column count mismatch"));
 }
+
+#[test]
+fn test_sql_integer_overflow_prevention() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, val INT)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO items (id, val) VALUES (1, 9223372036854775807), (2, -9223372036854775807)",
+            &tx_insert,
+        )
+        .unwrap();
+    engine
+        .execute("UPDATE items SET val = val - 1 WHERE id = 2", &tx_insert)
+        .unwrap();
+    tx_insert.commit().unwrap();
+
+    let tx_query = Transaction::new(3, db.clone());
+    // 1. SELECT overflow check
+    let res_add = engine.execute("SELECT val + 1 FROM items WHERE id = 1", &tx_query);
+    assert!(res_add.is_err());
+    assert!(res_add.unwrap_err().contains("Integer overflow"));
+
+    let res_div_overflow = engine.execute("SELECT val / -1 FROM items WHERE id = 2", &tx_query);
+    assert!(res_div_overflow.is_err());
+    assert!(res_div_overflow.unwrap_err().contains("Integer overflow"));
+
+    // 2. Optimizer bound nudging check
+    // Lower bound nudging: Lt with i64::MIN should not overflow/panic
+    let _ = engine
+        .execute(
+            "EXPLAIN SELECT id FROM items WHERE val < -9223372036854775808",
+            &tx_query,
+        )
+        .unwrap();
+    // Upper bound nudging: Gt with i64::MAX should not overflow/panic
+    let _ = engine
+        .execute(
+            "EXPLAIN SELECT id FROM items WHERE val > 9223372036854775807",
+            &tx_query,
+        )
+        .unwrap();
+}
