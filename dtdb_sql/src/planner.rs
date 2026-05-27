@@ -846,6 +846,12 @@ impl LogicalPlanner {
     ) -> Result<LogicalPlan, String> {
         let mut plan = self.plan_select_internal(select, &query.order_by)?;
 
+        if select.distinct.is_some() {
+            plan = LogicalPlan::Distinct {
+                source: Box::new(plan),
+            };
+        }
+
         // 7. Plan LIMIT and OFFSET
         let limit = if let Some(limit_expr) = &query.limit {
             let l = match limit_expr {

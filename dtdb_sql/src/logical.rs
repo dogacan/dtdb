@@ -81,6 +81,9 @@ pub enum LogicalPlan {
         op: SetOpType,
         all: bool,
     },
+    Distinct {
+        source: Box<LogicalPlan>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,9 +226,9 @@ impl LogicalPlan {
     pub fn schema(&self) -> Schema {
         match self {
             LogicalPlan::Scan { schema, .. } => schema.clone(),
-            LogicalPlan::Filter { source, .. } | LogicalPlan::Limit { source, .. } => {
-                source.schema()
-            }
+            LogicalPlan::Filter { source, .. }
+            | LogicalPlan::Limit { source, .. }
+            | LogicalPlan::Distinct { source } => source.schema(),
             LogicalPlan::Projection { schema, .. } => schema.clone(),
             LogicalPlan::Join { schema, .. } => schema.clone(),
             LogicalPlan::Aggregate { schema, .. } => schema.clone(),
@@ -298,6 +301,9 @@ impl LogicalPlan {
             LogicalPlan::SetOp { left, right, .. } => {
                 left.collect_columns(columns);
                 right.collect_columns(columns);
+            }
+            LogicalPlan::Distinct { source } => {
+                source.collect_columns(columns);
             }
         }
     }
@@ -434,6 +440,10 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             format_logical_node(left, indent + 2, out);
             out.push_str(&format!("{}  right:\n", indent_str));
             format_logical_node(right, indent + 2, out);
+        }
+        LogicalPlan::Distinct { source } => {
+            out.push_str(&format!("{}- Distinct\n", indent_str));
+            format_logical_node(source, indent + 1, out);
         }
     }
 }

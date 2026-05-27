@@ -4,6 +4,7 @@ use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -1378,5 +1379,42 @@ impl PhysicalOperator for PhysicalSetOp {
         self.left.explain(indent + 2, out);
         out.push_str(&format!("{}  right:\n", "  ".repeat(indent)));
         self.right.explain(indent + 2, out);
+    }
+}
+
+// ==========================================
+// 9. Distinct Physical Operator (Streaming)
+// ==========================================
+pub struct PhysicalDistinct {
+    source: Box<dyn PhysicalOperator>,
+    seen: HashSet<Row>,
+}
+
+impl PhysicalDistinct {
+    pub fn new(source: Box<dyn PhysicalOperator>) -> Self {
+        Self {
+            source,
+            seen: HashSet::new(),
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalDistinct {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        while let Some(row) = self.source.next()? {
+            if self.seen.insert(row.clone()) {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    fn schema(&self) -> &Schema {
+        self.source.schema()
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        out.push_str(&format!("{}- PhysicalDistinct\n", "  ".repeat(indent)));
+        self.source.explain(indent + 1, out);
     }
 }

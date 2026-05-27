@@ -120,6 +120,12 @@ impl Optimizer {
                     keys,
                 }
             }
+            LogicalPlan::Distinct { source } => {
+                let opt_source = self.push_down_predicate(*source, conjuncts, query_columns);
+                LogicalPlan::Distinct {
+                    source: Box::new(opt_source),
+                }
+            }
             LogicalPlan::Limit {
                 source,
                 limit,
@@ -317,6 +323,9 @@ impl Optimizer {
                 limit,
                 offset,
             },
+            LogicalPlan::Distinct { source } => LogicalPlan::Distinct {
+                source: Box::new(self.optimize_join_order(*source)),
+            },
             LogicalPlan::SetOp {
                 left,
                 right,
@@ -388,6 +397,9 @@ impl Optimizer {
             }
             LogicalPlan::Sort { source, .. } | LogicalPlan::Limit { source, .. } => {
                 self.estimate_plan_rows(source)
+            }
+            LogicalPlan::Distinct { source } => {
+                (self.estimate_plan_rows(source) as f64 * 0.8) as usize
             }
             LogicalPlan::SetOp {
                 left, right, op, ..
@@ -788,6 +800,9 @@ impl Optimizer {
                 limit,
                 offset,
             },
+            LogicalPlan::Distinct { source } => LogicalPlan::Distinct {
+                source: Box::new(self.eliminate_sorts(*source)),
+            },
             LogicalPlan::SetOp {
                 left,
                 right,
@@ -821,8 +836,9 @@ impl Optimizer {
                     None
                 }
             }
-            LogicalPlan::Filter { source, .. } => Self::get_plan_sort_key(source),
-            LogicalPlan::Limit { source, .. } => Self::get_plan_sort_key(source),
+            LogicalPlan::Filter { source, .. }
+            | LogicalPlan::Limit { source, .. }
+            | LogicalPlan::Distinct { source } => Self::get_plan_sort_key(source),
             LogicalPlan::Projection {
                 source,
                 expressions,
@@ -891,6 +907,12 @@ impl Optimizer {
                     source: Box::new(promoted_source),
                     limit,
                     offset,
+                })
+            }
+            LogicalPlan::Distinct { source } => {
+                let promoted_source = self.try_promote_to_index_scan(*source, sort_col)?;
+                Some(LogicalPlan::Distinct {
+                    source: Box::new(promoted_source),
                 })
             }
             LogicalPlan::Projection {

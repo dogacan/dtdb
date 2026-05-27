@@ -2,9 +2,9 @@ use crate::expr::{Expr, Operator};
 use crate::logical::{JoinType, LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
-    PhysicalCrossJoin, PhysicalFilter, PhysicalFullTextScan, PhysicalHashAggregate,
-    PhysicalHashJoin, PhysicalIndexScan, PhysicalLimit, PhysicalOperator, PhysicalProjection,
-    PhysicalSeqScan, PhysicalSetOp, PhysicalSort, PhysicalSortedAggregate,
+    PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
+    PhysicalHashAggregate, PhysicalHashJoin, PhysicalIndexScan, PhysicalLimit, PhysicalOperator,
+    PhysicalProjection, PhysicalSeqScan, PhysicalSetOp, PhysicalSort, PhysicalSortedAggregate,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -864,6 +864,10 @@ impl SqlEngine {
                 Ok(Box::new(PhysicalSetOp::new(
                     left_op, right_op, op, all, schema,
                 )))
+            }
+            LogicalPlan::Distinct { source } => {
+                let src_op = self.compile_physical(*source, tx, columns)?;
+                Ok(Box::new(PhysicalDistinct::new(src_op)))
             }
         }
     }

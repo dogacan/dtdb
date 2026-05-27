@@ -4331,8 +4331,7 @@ fn test_sql_nan_group_by_distinct_join() {
 
     let tx_query = Transaction::new(3, db.clone());
 
-    // 1. SELECT DISTINCT val (Temporarily commented out until F12 SELECT DISTINCT is fixed/implemented)
-    /*
+    // 1. SELECT DISTINCT val
     let res_distinct = engine
         .execute("SELECT DISTINCT val FROM items", &tx_query)
         .unwrap();
@@ -4352,7 +4351,6 @@ fn test_sql_nan_group_by_distinct_join() {
     } else {
         panic!("Expected SELECT result");
     }
-    */
 
     // 2. SELECT val, COUNT(*) FROM items GROUP BY val
     let res_group = engine
@@ -4403,5 +4401,66 @@ fn test_sql_nan_group_by_distinct_join() {
         assert!(matches.contains(&(3, 3)));
     } else {
         panic!("Expected SELECT result");
+    }
+}
+
+#[test]
+fn test_sql_select_distinct() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT)",
+            &tx_ddl,
+        )
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    engine.execute(
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 30), (3, 'Alice', 25), (4, 'Charlie', 30)",
+        &tx_insert,
+    ).unwrap();
+    tx_insert.commit().unwrap();
+
+    let tx_query = Transaction::new(3, db.clone());
+
+    // SELECT DISTINCT age
+    let res = engine
+        .execute("SELECT DISTINCT age FROM users ORDER BY age", &tx_query)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values, vec![DbValue::Int(25)]);
+        assert_eq!(rows[1].values, vec![DbValue::Int(30)]);
+    } else {
+        panic!("Expected SELECT");
+    }
+
+    // SELECT DISTINCT name
+    let res = engine
+        .execute("SELECT DISTINCT name FROM users ORDER BY name", &tx_query)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values, vec![DbValue::String("Alice".to_string())]);
+        assert_eq!(rows[1].values, vec![DbValue::String("Bob".to_string())]);
+        assert_eq!(rows[2].values, vec![DbValue::String("Charlie".to_string())]);
+    } else {
+        panic!("Expected SELECT");
+    }
+
+    // SELECT DISTINCT name, age
+    let res = engine
+        .execute(
+            "SELECT DISTINCT name, age FROM users ORDER BY name, age",
+            &tx_query,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 4);
+    } else {
+        panic!("Expected SELECT");
     }
 }
