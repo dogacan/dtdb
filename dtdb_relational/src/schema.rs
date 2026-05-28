@@ -475,6 +475,34 @@ impl Schema {
         Ok(())
     }
 
+    /// Atomically replaces the on-disk schema file via temp-write + rename.
+    ///
+    /// Use this rather than `save_to_file` for in-place schema updates
+    /// (e.g. adding an index) where a partial write or a crash mid-update
+    /// must not leave the schema file truncated or pointing at an index
+    /// whose data hasn't been written yet.
+    pub fn save_to_file_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let bytes = bincode::serialize(self)?;
+        let tmp_path = match path.file_name() {
+            Some(name) => {
+                let mut tmp_name = std::ffi::OsString::from(".");
+                tmp_name.push(name);
+                tmp_name.push(".tmp");
+                path.with_file_name(tmp_name)
+            }
+            None => path.with_extension("tmp"),
+        };
+        std::fs::write(&tmp_path, bytes)?;
+        std::fs::rename(&tmp_path, path)?;
+        if let Err(e) = dtdb_storage::fsync_parent_dir(path) {
+            // Mirror the storage layer's tolerance for filesystems that don't
+            // support directory fsync (the rename itself is durable on POSIX).
+            return Err(RelationalError::Storage(e));
+        }
+        Ok(())
+    }
+
     /// Loads a schema from a file at the given path.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path)?;

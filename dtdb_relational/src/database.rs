@@ -1734,16 +1734,20 @@ impl Database {
             }
         }
 
-        // 4. Save updated schema configuration
+        // 4. Stage the new index definition. We do NOT publish it to the
+        //    on-disk schema yet: if we crash before the index has been fully
+        //    populated below, the recovered schema would declare an index whose
+        //    backing engine is missing or partial, silently corrupting any
+        //    queries that consult it. Persist the schema only after the index
+        //    data is durable.
         let table_path = self.dir_path.join(table_name);
         let schema_path = table_path.join("schema.bin");
-        table.schema.indexes.push(IndexDefinition {
+        let new_index_def = IndexDefinition {
             name: index_name.to_string(),
             columns: columns.clone(),
             index_type,
             tokenizer: tokenizer.clone(),
-        });
-        table.schema.save_to_file(&schema_path)?;
+        };
 
         // 5. Construct EngineOptions
         let engine_opts = EngineOptions {
@@ -1855,8 +1859,19 @@ impl Database {
         if !index_entries.is_empty() {
             engine.write_batch(index_entries)?;
         }
+        // Force the index data through any pending memtable so a crash right
+        // after the schema swap below cannot leave the on-disk index empty.
+        engine.flush_memtable()?;
 
-        // 10. Store the engine reference
+        // 10. Persist the schema with the new index AFTER the index data is
+        //     durable. Use atomic temp+rename so a crash mid-write cannot
+        //     truncate the schema file.
+        let mut new_schema = table.schema.clone();
+        new_schema.indexes.push(new_index_def.clone());
+        new_schema.save_to_file_atomic(&schema_path)?;
+
+        // 11. Publish the new index in-memory.
+        table.schema.indexes.push(new_index_def);
         table.index_engines.insert(index_name.to_string(), engine);
 
         Ok(())

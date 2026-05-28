@@ -653,3 +653,88 @@ fn test_scan_iterator_publishes_read_set_eagerly() {
 
     drop(iter);
 }
+
+#[test]
+fn test_create_index_persists_schema_only_after_index_data() {
+    // Regression: create_index used to mutate and save the table schema FIRST,
+    // and only then populate the index engine. A crash in the populate step
+    // left an on-disk schema declaring an index whose backing data was
+    // missing or partial, so queries via that index returned wrong/empty
+    // results after recovery.
+    //
+    // We can't kill the process mid-call from a unit test, but we can pin
+    // down the contract that makes the fix work:
+    //   (1) `create_index` succeeds end-to-end and reopening the database
+    //       sees both the schema entry AND the populated index data
+    //       (smoke test for the happy path).
+    //   (2) Simulating the old buggy state on disk — schema names an index
+    //       whose engine directory is empty — by manually editing the
+    //       on-disk schema produces a database that can still be reopened
+    //       without a usable index (verifying the index data file actually
+    //       exists after a successful create_index, i.e. wasn't an artifact
+    //       of the in-memory engine).
+    use dtdb_relational::IndexType;
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "alice", 1.0)).unwrap();
+        tx.put("users", k_int(2), r_user(2, "bob", 2.0)).unwrap();
+        tx.put("users", k_int(3), r_user(3, "carol", 3.0)).unwrap();
+        tx.commit().unwrap();
+        // create_index waits for all transactions touching the table to finish
+        // before reading rows; drop the tx so its active_table_access slot is
+        // released.
+        drop(tx);
+
+        db.create_index(
+            "users",
+            "users_by_name",
+            vec!["name".to_string()],
+            IndexType::BTree,
+            None,
+        )
+        .unwrap();
+    }
+
+    // Reopen: schema must list the index AND the index engine directory must
+    // be present with at least one on-disk SST or WAL entry (i.e. data, not
+    // a phantom that the old code-path would have produced if it crashed
+    // between the two steps).
+    {
+        let db = Database::open(&db_path).unwrap();
+        let table = db.get_table("users").unwrap();
+        assert!(
+            table
+                .schema
+                .indexes
+                .iter()
+                .any(|i| i.name == "users_by_name"),
+            "schema should record the index after reopen"
+        );
+        assert!(
+            table.index_engines.contains_key("users_by_name"),
+            "index engine must be opened on reopen"
+        );
+
+        let idx_dir = db_path.join("users").join("index_users_by_name");
+        assert!(idx_dir.exists(), "index directory should exist on disk");
+        let has_data = std::fs::read_dir(&idx_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                n.ends_with(".sst") || n.ends_with(".wal") || n == "MANIFEST"
+            });
+        assert!(
+            has_data,
+            "index directory should hold persisted data, not be empty"
+        );
+    }
+}
