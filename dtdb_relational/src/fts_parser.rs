@@ -144,6 +144,15 @@ impl<'a> Parser<'a> {
             Some(LexToken::Word(w)) => Ok(FullTextQuery::Token(w)),
             Some(LexToken::PhraseString(s)) => {
                 let tokens = self.tokenizer.tokenize(&s);
+                if tokens.is_empty() {
+                    // An empty quoted phrase (e.g. `""` or `"   "`) cannot meaningfully
+                    // match anything. Allowing it through leads to inconsistent behavior
+                    // across the two evaluation paths: the storage-index path returns
+                    // no matches while the row-by-row evaluator treats it as "always
+                    // true", so the same query returns different answers for rows in
+                    // the write buffer vs. rows on disk.
+                    return Err("Empty FTS phrase is not allowed".to_string());
+                }
                 Ok(FullTextQuery::Phrase(tokens))
             }
             Some(LexToken::LParen) => {
@@ -155,6 +164,38 @@ impl<'a> Parser<'a> {
             }
             Some(other) => Err(format!("Expected term or '(' but found {:?}", other)),
             None => Err("Unexpected end of query".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::SimpleTokenizer;
+
+    #[test]
+    fn empty_phrase_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        // The bare empty quoted phrase produces zero tokens — must error rather
+        // than silently parse to `Phrase([])`, whose semantics differ between
+        // the index-driven and row-driven evaluators.
+        let err = FullTextQuery::parse("\"\"", &tokenizer).unwrap_err();
+        assert!(err.contains("Empty FTS phrase"));
+
+        // Whitespace-only or punctuation-only phrases also tokenize to nothing.
+        let err = FullTextQuery::parse("\"   \"", &tokenizer).unwrap_err();
+        assert!(err.contains("Empty FTS phrase"));
+    }
+
+    #[test]
+    fn non_empty_phrase_still_parses() {
+        let tokenizer = SimpleTokenizer;
+        let q = FullTextQuery::parse("\"hello world\"", &tokenizer).unwrap();
+        match q {
+            FullTextQuery::Phrase(tokens) => {
+                assert_eq!(tokens, vec!["hello".to_string(), "world".to_string()]);
+            }
+            other => panic!("expected Phrase, got {other:?}"),
         }
     }
 }
