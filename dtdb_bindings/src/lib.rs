@@ -122,7 +122,10 @@ pub struct CxxTransaction {
 
 pub fn new_in_process_client(data_dir: &str) -> Result<Box<CxxClient>, String> {
     let rt = Runtime::new().map_err(|e| e.to_string())?;
-    let client = DuctTapeDbClient::in_process(data_dir).map_err(|e| e.to_string())?;
+    let client = {
+        let _guard = rt.enter();
+        DuctTapeDbClient::in_process(data_dir).map_err(|e| e.to_string())?
+    };
     Ok(Box::new(CxxClient {
         runtime: Arc::new(rt),
         client,

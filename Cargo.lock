@@ -423,6 +423,7 @@ dependencies = [
  "dtdb_sql",
  "dtdb_storage",
  "futures-util",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

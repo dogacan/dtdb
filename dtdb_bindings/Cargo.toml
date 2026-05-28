@@ -19,3 +19,6 @@ tonic = { version = "0.12", features = ["codegen", "transport"] }
 
 [build-dependencies]
 cxx-build = "1.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
