@@ -26,11 +26,26 @@ jobs:
       with:
         toolchain: stable
 
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check formatting
+      run: cargo fmt --check
+
+    - name: Clippy
+      env:
+        RUSTFLAGS: "-D warnings"
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
     - name: Build
       run: cargo build --verbose
 
     - name: Run tests
+      env:
+        RUSTFLAGS: "-D warnings"
       run: cargo test --verbose
+
+    - name: Bench smoke
+      run: cargo bench --no-run
 
   tsan:
     runs-on: ubuntu-latest
@@ -44,8 +59,7 @@ jobs:
         toolchain: nightly
         components: rust-src
 
+    - uses: Swatinem/rust-cache@v2
+
     - name: Run tests with ThreadSanitizer
-      env:
-        RUSTFLAGS: "-Z sanitizer=thread"
-        RUSTDOCFLAGS: "-Z sanitizer=thread"
-      run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --verbose
+      run: ./scripts/run_tsan.sh
