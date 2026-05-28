@@ -17,7 +17,7 @@ public:
     
     template <size_t N>
     SqlQuery& bind(const char (&name)[N], const std::string& value) {
-        params_.push_back({name, value});
+        params_.push_back({name, value, ParamKind::Text});
         return *this;
     }
 
@@ -25,43 +25,51 @@ public:
     typename std::enable_if_t<std::is_arithmetic_v<T>, SqlQuery&>
     bind(const char (&name)[N], T value) {
         if constexpr (std::is_same_v<T, bool>) {
-            params_.push_back({name, value ? "1" : "0"});
+            params_.push_back({name, value ? "1" : "0", ParamKind::Bool});
+        } else if constexpr (std::is_floating_point_v<T>) {
+            params_.push_back({name, std::to_string(value), ParamKind::Float});
         } else {
-            params_.push_back({name, std::to_string(value)});
+            params_.push_back({name, std::to_string(value), ParamKind::Int});
         }
         return *this;
     }
 
     template <size_t N>
     SqlQuery& bind(const char (&name)[N], const std::vector<uint8_t>& value) {
-        std::string hex_str = "x'";
+        // Lowercase hex with no delimiters; the Rust side decodes it directly.
+        std::string hex_str;
+        hex_str.reserve(value.size() * 2);
         for (uint8_t byte : value) {
             static const char hex[] = "0123456789abcdef";
             hex_str.push_back(hex[byte >> 4]);
             hex_str.push_back(hex[byte & 0xf]);
         }
-        hex_str.push_back('\'');
-        params_.push_back({name, hex_str});
+        params_.push_back({name, hex_str, ParamKind::Bytes});
         return *this;
     }
 
     template <size_t N>
     SqlQuery& bind(const char (&name)[N], std::nullptr_t) {
-        params_.push_back({name, "NULL"});
+        params_.push_back({name, std::string(), ParamKind::Null});
         return *this;
     }
-    
+
     // Conversion helper to bridge type
     CxxSqlQuery to_bridge() const {
         rust::Vec<QueryParam> bridge_params;
         for (const auto& p : params_) {
-            bridge_params.push_back(QueryParam{p.first, p.second});
+            bridge_params.push_back(QueryParam{p.name, p.value, p.kind});
         }
         return CxxSqlQuery{text_, bridge_params};
     }
 private:
+    struct Param {
+        std::string name;
+        std::string value;
+        ParamKind kind;
+    };
     std::string text_;
-    std::vector<std::pair<std::string, std::string>> params_;
+    std::vector<Param> params_;
 };
 
 class Client {

@@ -24,9 +24,28 @@ fn global_runtime() -> Result<Arc<Runtime>, String> {
 
 #[cxx::bridge]
 pub mod ffi {
+    /// Explicit type tag for a bound parameter.
+    ///
+    /// The C++ side sets this from the static type at the `bind` call site so
+    /// the Rust side never has to guess a value's type from its textual form
+    /// (which loses the distinction between e.g. the string "42" and the
+    /// integer 42, and made `Bool` unreachable).
+    #[repr(u8)]
+    enum ParamKind {
+        Int,
+        Float,
+        Bool,
+        Text,
+        Bytes,
+        Null,
+    }
+
     struct QueryParam {
         name: String,
+        // Textual carrier for the value. For `Bytes` this is lowercase hex
+        // with no delimiters; for `Null` it is ignored.
         value: String,
+        kind: ParamKind,
     }
 
     struct CxxSqlQuery {
@@ -86,29 +105,34 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn parse_cxx_value(val: &str) -> dtdb_storage::DbValue {
-    if val.eq_ignore_ascii_case("null") {
-        return dtdb_storage::DbValue::Null;
-    }
-    if let Ok(i) = val.parse::<i64>() {
-        return dtdb_storage::DbValue::Int(i);
-    }
-    if let Ok(f) = val.parse::<f64>() {
-        return dtdb_storage::DbValue::Float(f);
-    }
-    if (val.starts_with("x'") || val.starts_with("X'")) && val.ends_with('\'') && val.len() >= 3 {
-        let hex_str = &val[2..val.len() - 1];
-        if let Some(bytes) = decode_hex(hex_str) {
-            return dtdb_storage::DbValue::Bytes(bytes);
+fn convert_cxx_param(p: &ffi::QueryParam) -> dtdb_storage::DbValue {
+    use dtdb_storage::DbValue;
+    match p.kind {
+        ffi::ParamKind::Null => DbValue::Null,
+        ffi::ParamKind::Int => match p.value.parse::<i64>() {
+            Ok(i) => DbValue::Int(i),
+            Err(_) => DbValue::String(p.value.clone()),
+        },
+        ffi::ParamKind::Float => match p.value.parse::<f64>() {
+            Ok(f) => DbValue::Float(f),
+            Err(_) => DbValue::String(p.value.clone()),
+        },
+        ffi::ParamKind::Bool => {
+            DbValue::Bool(matches!(p.value.as_str(), "1" | "true" | "TRUE"))
         }
+        ffi::ParamKind::Bytes => match decode_hex(&p.value) {
+            Some(bytes) => DbValue::Bytes(bytes),
+            None => DbValue::String(p.value.clone()),
+        },
+        ffi::ParamKind::Text => DbValue::String(p.value.clone()),
+        _ => DbValue::String(p.value.clone()),
     }
-    dtdb_storage::DbValue::String(val.to_string())
 }
 
 fn convert_cxx_query(cxx_query: ffi::CxxSqlQuery) -> dtdb_api::SqlQuery {
     let mut query = dtdb_api::SqlQuery::new(cxx_query.text);
     for p in cxx_query.params {
-        let val = parse_cxx_value(&p.value);
+        let val = convert_cxx_param(&p);
         query = query.bind(p.name, val);
     }
     query
