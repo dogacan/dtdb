@@ -578,3 +578,53 @@ fn test_scan_iter_lower_bound() {
     }
     assert_eq!(results, vec![(k_int(30), v_int(30))]);
 }
+
+#[test]
+fn test_scan_iter_stops_loading_blocks_past_end() {
+    // Regression: scanning a tiny window of a large SSTable used to drain every
+    // remaining block of every above-range source. The iterator must drop the
+    // source once it observes a key past `end`, and SstableBlockIterator must
+    // refuse to load further blocks whose first_key exceeds `end`.
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 10 * 1024 * 1024,
+        // Tiny blocks force many small blocks per SSTable so the bug, if present,
+        // shows up as many physical block reads.
+        block_size_limit: 64,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 16,
+        sstable_target_size: 8 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+    };
+    let engine = StorageEngine::open(&db_path, options).unwrap();
+
+    let n: i64 = 2000;
+    for i in 0..n {
+        engine.put(k_int(i), v_int(i)).unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    dtdb_storage::reset_physical_blocks_read();
+
+    // Scan a window of only 5 keys near the start of the (2000-key) file.
+    let mut iter = engine.scan_iter(&k_int(0), &k_int(4)).unwrap();
+    let mut results = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        results.push(entry);
+    }
+    assert_eq!(results.len(), 5);
+
+    let blocks_read = dtdb_storage::PHYSICAL_BLOCKS_READ.load(std::sync::atomic::Ordering::SeqCst);
+    // With ~64-byte blocks the file has hundreds of blocks; a correctly bounded
+    // iterator only needs a handful of them.
+    assert!(
+        blocks_read < 20,
+        "scan_iter read {blocks_read} blocks for a 5-key window; expected early termination"
+    );
+}

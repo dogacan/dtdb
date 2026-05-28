@@ -593,9 +593,10 @@ impl EngineInner {
                 if let Some(fk) = sstable.first_key() {
                     let lk = sstable.last_key();
                     if fk <= end && lk >= start {
-                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new(
+                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new_with_end(
                             sstable.clone(),
                             Some(start),
+                            Some(end),
                             next_priority,
                         )?);
                     }
@@ -612,9 +613,10 @@ impl EngineInner {
                 if let Some(fk) = sstable.first_key() {
                     let lk = sstable.last_key();
                     if fk <= end && lk >= start {
-                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new(
+                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new_with_end(
                             sstable.clone(),
                             Some(start),
+                            Some(end),
                             next_priority,
                         )?);
                         next_priority += 1;

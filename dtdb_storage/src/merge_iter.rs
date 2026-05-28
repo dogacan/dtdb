@@ -9,11 +9,25 @@ pub struct SstableBlockIterator {
     current_block_idx: usize,
     current_entries: Arc<Vec<(DbKey, Option<DbValue>)>>,
     entry_idx: usize,
+    end: Option<DbKey>,
+    exhausted: bool,
     pub priority: usize, // lower = higher priority (newest = 0)
 }
 
 impl SstableBlockIterator {
     pub fn new(reader: Arc<SstableReader>, start: Option<&DbKey>, priority: usize) -> Result<Self> {
+        Self::new_with_end(reader, start, None, priority)
+    }
+
+    /// Creates a new block iterator restricted to the inclusive range `[start, end]`.
+    /// When `end` is provided, the iterator avoids loading any block whose first key
+    /// is beyond `end`, and stops yielding entries once a key past `end` is reached.
+    pub fn new_with_end(
+        reader: Arc<SstableReader>,
+        start: Option<&DbKey>,
+        end: Option<&DbKey>,
+        priority: usize,
+    ) -> Result<Self> {
         let mut current_block_idx = 0;
         let mut entry_idx = 0;
         let mut current_entries = Arc::new(Vec::new());
@@ -48,33 +62,62 @@ impl SstableBlockIterator {
             current_block_idx,
             current_entries,
             entry_idx,
+            end: end.cloned(),
+            exhausted: false,
             priority,
         };
 
         if !it.reader.index.is_empty() && it.entry_idx >= it.current_entries.len() {
             it.advance()?;
         }
+        it.check_end_bound();
 
         Ok(it)
     }
 
+    fn check_end_bound(&mut self) {
+        if self.exhausted {
+            return;
+        }
+        if let (Some(end), Some((k, _))) = (&self.end, self.current_entries.get(self.entry_idx))
+            && k > end
+        {
+            self.exhausted = true;
+        }
+    }
+
     /// Returns the current (key, value) without advancing, or None if exhausted.
     pub fn peek(&self) -> Option<&(DbKey, Option<DbValue>)> {
-        self.current_entries.get(self.entry_idx)
+        if self.exhausted {
+            None
+        } else {
+            self.current_entries.get(self.entry_idx)
+        }
     }
 
     /// Advances to the next entry, loading the next block if needed.
     pub fn advance(&mut self) -> Result<()> {
+        if self.exhausted {
+            return Ok(());
+        }
         self.entry_idx += 1;
         while self.entry_idx >= self.current_entries.len() {
             self.current_block_idx += 1;
             if self.current_block_idx < self.reader.index.len() {
+                // Skip loading blocks beyond the requested end bound entirely.
+                if let Some(end) = &self.end
+                    && &self.reader.index[self.current_block_idx].first_key > end
+                {
+                    self.exhausted = true;
+                    return Ok(());
+                }
                 self.current_entries = self.reader.read_block(self.current_block_idx)?;
                 self.entry_idx = 0;
             } else {
                 break;
             }
         }
+        self.check_end_bound();
         Ok(())
     }
 }

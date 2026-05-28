@@ -110,6 +110,13 @@ impl ScanIterator {
                 }
             } else {
                 let entry = self.heap.pop().unwrap();
+
+                // If we've passed `end` for this source, drop it entirely
+                // instead of draining the rest of the SSTable.
+                if entry.key > self.end {
+                    continue;
+                }
+
                 let source = &mut self.sst_iters[entry.source_idx];
                 source.advance()?;
                 if let Some((next_k, next_v)) = source.peek() {
@@ -119,10 +126,6 @@ impl ScanIterator {
                         source_idx: entry.source_idx,
                         priority: source.priority,
                     });
-                }
-
-                if entry.key > self.end {
-                    continue;
                 }
 
                 if self.seen.insert(entry.key.clone())
