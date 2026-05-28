@@ -3,8 +3,24 @@
 use dtdb_api::client::DuctTapeDbClient;
 use dtdb_api::proto::execute_query_response::Payload;
 use futures_util::StreamExt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
+
+/// Returns the process-wide Tokio runtime shared by every `CxxClient`.
+///
+/// Spawning one multi-threaded runtime per client wastes a full scheduler
+/// (worker threads + IO driver) per handle, so all clients share one.
+fn global_runtime() -> Result<Arc<Runtime>, String> {
+    static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt.clone());
+    }
+    let rt = Arc::new(Runtime::new().map_err(|e| e.to_string())?);
+    // If another thread initialized it first, our freshly built runtime is
+    // dropped here and we return the winner.
+    let _ = RUNTIME.set(rt);
+    Ok(RUNTIME.get().expect("runtime initialized above").clone())
+}
 
 #[cxx::bridge]
 pub mod ffi {
@@ -123,25 +139,25 @@ pub struct CxxTransaction {
 // --- Factory implementations ---
 
 pub fn new_in_process_client(data_dir: &str) -> Result<Box<CxxClient>, String> {
-    let rt = Runtime::new().map_err(|e| e.to_string())?;
+    let rt = global_runtime()?;
     let client = {
         let _guard = rt.enter();
         DuctTapeDbClient::in_process(data_dir).map_err(|e| e.to_string())?
     };
     Ok(Box::new(CxxClient {
-        runtime: Arc::new(rt),
+        runtime: rt,
         client,
     }))
 }
 
 pub fn new_remote_client(server_address: &str) -> Result<Box<CxxClient>, String> {
-    let rt = Runtime::new().map_err(|e| e.to_string())?;
+    let rt = global_runtime()?;
     let client = rt
         .block_on(async { DuctTapeDbClient::connect(server_address.to_string()).await })
         .map_err(|e| e.to_string())?;
 
     Ok(Box::new(CxxClient {
-        runtime: Arc::new(rt),
+        runtime: rt,
         client,
     }))
 }
