@@ -396,16 +396,22 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             }
         };
 
-        let tables = database.list_tables();
-        let mut flushed_tables = Vec::new();
-        for table_name in tables {
-            if let Ok(table) = database.get_table(&table_name) {
-                table.flush_memtable().map_err(|e| {
-                    Status::internal(format!("Failed to flush table {}: {}", table_name, e))
-                })?;
-                flushed_tables.push(table_name);
+        let flushed_tables = tokio::task::spawn_blocking(move || {
+            let tables = database.list_tables();
+            let mut flushed_tables = Vec::new();
+            for table_name in tables {
+                if let Ok(table) = database.get_table(&table_name) {
+                    if let Err(e) = table.flush_memtable() {
+                        return Err(format!("Failed to flush table {}: {}", table_name, e));
+                    }
+                    flushed_tables.push(table_name);
+                }
             }
-        }
+            Ok(flushed_tables)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Worker panicked: {}", e)))?
+        .map_err(Status::internal)?;
 
         Ok(Response::new(FlushDbResponse {
             success: true,
@@ -446,14 +452,29 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         // Create channel for streaming
         let (tx_chan, rx_chan) = mpsc::channel(128);
 
-        // Execute query
-        match sql_engine.execute_with_params(sql_query, &tx, &params) {
-            Ok(result) => {
-                if let Err(e) = tx.commit() {
-                    return Err(Status::aborted(format!("Transaction commit failed: {}", e)));
+        // Execute query off the async worker pool — the storage engine is
+        // synchronous and may block on cache-miss SSTable reads, fsyncs, and
+        // compactions; running it inline would head-of-line block every
+        // other in-flight RPC sharing this Tokio worker thread.
+        let sql_query_owned = sql_query.to_string();
+        let exec_result = tokio::task::spawn_blocking(move || {
+            let exec = sql_engine.execute_with_params(&sql_query_owned, &tx, &params);
+            match exec {
+                Ok(result) => match tx.commit() {
+                    Ok(()) => Ok(result),
+                    Err(e) => Err((true, e.to_string())),
+                },
+                Err(e) => {
+                    let _ = tx.rollback();
+                    Err((false, e))
                 }
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Worker panicked: {}", e)))?;
 
-                // Convert result into response messages and send them via the channel
+        match exec_result {
+            Ok(result) => {
                 let responses = execution_result_to_responses(result);
                 tokio::spawn(async move {
                     for resp in responses {
@@ -463,9 +484,12 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                     }
                 });
             }
-            Err(e) => {
-                let _ = tx.rollback();
-                return Err(Status::invalid_argument(format!("SQL Error: {}", e)));
+            Err((commit_failure, e)) => {
+                if commit_failure {
+                    return Err(Status::aborted(format!("Transaction commit failed: {}", e)));
+                } else {
+                    return Err(Status::invalid_argument(format!("SQL Error: {}", e)));
+                }
             }
         }
 
@@ -508,7 +532,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                     Err(e) => {
                         // Client stream error — roll back if active.
                         if let Some((tx, _)) = tx_state.take() {
-                            let _ = tx.rollback();
+                            let _ = tokio::task::spawn_blocking(move || tx.rollback()).await;
                         }
                         let _ = tx_chan
                             .send(Ok(TransactionResponse {
@@ -632,20 +656,18 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                     // --- ExecuteTxQuery ---
                     crate::proto::transaction_request::Command::Execute(exec) => {
                         // Guard: reject Execute before StartTransaction.
-                        let (tx, sql_engine) = match tx_state {
-                            Some(ref s) => s,
-                            None => {
-                                let _ = tx_chan.send(Ok(TransactionResponse {
-                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
-                                        "Protocol error: must send StartTransaction before executing queries.".to_string(),
-                                    )),
-                                })).await;
-                                continue;
-                            }
-                        };
+                        if tx_state.is_none() {
+                            let _ = tx_chan.send(Ok(TransactionResponse {
+                                payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                    "Protocol error: must send StartTransaction before executing queries.".to_string(),
+                                )),
+                            })).await;
+                            continue;
+                        }
+                        let sql_engine_ref = &tx_state.as_ref().expect("checked").1;
 
                         let sql_query = exec.sql_query.trim();
-                        if sql_engine.is_ddl(sql_query) {
+                        if sql_engine_ref.is_ddl(sql_query) {
                             let _ = tx_chan.send(Ok(TransactionResponse {
                                 payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
                                     "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions.".to_string(),
@@ -676,7 +698,28 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                 continue;
                             }
                         };
-                        match sql_engine.execute_with_params(sql_query, tx, &params) {
+                        // Take ownership of tx and engine so we can move them
+                        // into spawn_blocking; restore tx_state after.
+                        let (tx, sql_engine) = tx_state.take().expect("checked");
+                        let sql_query_owned = sql_query.to_string();
+                        let blocking_result = tokio::task::spawn_blocking(move || {
+                            let r = sql_engine.execute_with_params(&sql_query_owned, &tx, &params);
+                            (tx, sql_engine, r)
+                        })
+                        .await;
+                        let (tx, sql_engine, exec_result) = match blocking_result {
+                            Ok(triple) => triple,
+                            Err(join_err) => {
+                                let _ = tx_chan.send(Ok(TransactionResponse {
+                                    payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
+                                        format!("Worker panicked: {}", join_err),
+                                    )),
+                                })).await;
+                                return;
+                            }
+                        };
+                        tx_state = Some((tx, sql_engine));
+                        match exec_result {
                             Ok(result) => {
                                 let responses = execution_result_to_responses(result);
                                 for resp in responses {
@@ -724,7 +767,11 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             }
                         };
 
-                        let commit_result = match tx.commit() {
+                        let commit_outcome =
+                            tokio::task::spawn_blocking(move || tx.commit().map_err(|e| e.to_string()))
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Worker panicked: {}", e)));
+                        let commit_result = match commit_outcome {
                             Ok(()) => CommitResult {
                                 success: true,
                                 message: "Transaction committed successfully.".to_string(),
@@ -762,7 +809,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             }
                         };
 
-                        let _ = tx.rollback();
+                        let _ = tokio::task::spawn_blocking(move || tx.rollback()).await;
                         let _ = tx_chan
                             .send(Ok(TransactionResponse {
                                 payload: Some(
