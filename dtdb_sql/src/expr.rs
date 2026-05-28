@@ -183,16 +183,7 @@ impl Expr {
 fn resolve_column(schema: &Schema, name: &str) -> Result<usize, String> {
     let mut matches = Vec::new();
     for (i, col) in schema.columns.iter().enumerate() {
-        let is_match = if col.name == name {
-            true
-        } else if let Some(pos) = name.rfind('.') {
-            col.name == name[pos + 1..]
-        } else if let Some(col_pos) = col.name.rfind('.') {
-            col.name[col_pos + 1..] == *name
-        } else {
-            false
-        };
-        if is_match {
+        if col.matches_name(name) {
             matches.push(i);
         }
     }

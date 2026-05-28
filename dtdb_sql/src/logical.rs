@@ -153,10 +153,10 @@ impl LogicalPlan {
         for (idx, expr) in group_by.iter().enumerate() {
             let dt = match expr {
                 Expr::Column(col_name, _) => {
-                    let pos = source_schema.columns.iter().position(|col| {
-                        col.name == *col_name
-                            || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
-                    });
+                    let pos = source_schema
+                        .columns
+                        .iter()
+                        .position(|col| col.matches_name(col_name));
                     if let Some(i) = pos {
                         source_schema.columns[i].data_type
                     } else {
@@ -187,12 +187,10 @@ impl LogicalPlan {
                 AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
                     match expr {
                         Expr::Column(col_name, _) => {
-                            let pos = source_schema.columns.iter().position(|col| {
-                                col.name == *col_name
-                                    || dtdb_relational::schema::ends_with_dot_suffix(
-                                        col_name, &col.name,
-                                    )
-                            });
+                            let pos = source_schema
+                                .columns
+                                .iter()
+                                .position(|col| col.matches_name(col_name));
                             if let Some(i) = pos {
                                 source_schema.columns[i].data_type
                             } else {
@@ -461,11 +459,10 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
             dtdb_storage::DbValue::Null => DataType::Null,
         },
         Expr::Column(col_name, _) => {
-            let idx = source_schema.columns.iter().position(|col| {
-                col.name == *col_name
-                    || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
-                    || dtdb_relational::schema::ends_with_dot_suffix(&col.name, col_name)
-            });
+            let idx = source_schema
+                .columns
+                .iter()
+                .position(|col| col.matches_name(col_name));
             if let Some(i) = idx {
                 source_schema.columns[i].data_type
             } else {

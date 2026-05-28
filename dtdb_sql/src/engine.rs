@@ -555,12 +555,7 @@ impl SqlEngine {
                         let col = schema
                             .columns
                             .iter()
-                            .find(|c| {
-                                &c.name == col_name
-                                    || dtdb_relational::schema::ends_with_dot_suffix(
-                                        &c.name, col_name,
-                                    )
-                            })
+                            .find(|c| c.matches_name(col_name))
                             .ok_or_else(|| {
                                 format!("Indexed column '{}' not found in schema", col_name)
                             })?;
@@ -910,11 +905,7 @@ impl SqlEngine {
 }
 
 fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
-    schema.columns.iter().any(|col| {
-        col.name == col_name
-            || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
-            || dtdb_relational::schema::ends_with_dot_suffix(&col.name, col_name)
-    })
+    schema.matches_column(col_name)
 }
 
 fn parent_cols_union(

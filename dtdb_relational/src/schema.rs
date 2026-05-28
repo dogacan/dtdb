@@ -119,7 +119,42 @@ pub struct Schema {
     pub relative_indices: std::sync::OnceLock<Vec<(String, usize)>>,
 }
 
+impl Column {
+    /// Returns true if this column matches `query_name` under SQL-style
+    /// table-qualified lookup rules:
+    ///   - exact match on `col.name`
+    ///   - if `query_name` is qualified (e.g. `users.id`), match its trailing
+    ///     portion against an unqualified `col.name`
+    ///   - if `col.name` is qualified, match its trailing portion against an
+    ///     unqualified `query_name`
+    ///
+    /// This is the canonical comparison the SQL layer uses for binding
+    /// column references; centralizing it here keeps every call site
+    /// consistent and makes it the single place to extend later (e.g. for
+    /// schema-qualified `schema.table.col` names).
+    pub fn matches_name(&self, query_name: &str) -> bool {
+        if self.name == query_name {
+            return true;
+        }
+        if ends_with_dot_suffix(query_name, &self.name) {
+            return true;
+        }
+        if ends_with_dot_suffix(&self.name, query_name) {
+            return true;
+        }
+        false
+    }
+}
+
 impl Schema {
+    /// Returns true if any column in this schema matches `query_name` under
+    /// the same qualified-lookup rules as `Column::matches_name`. Useful as
+    /// a presence check; for actual binding the caller should iterate
+    /// `columns` and collect indices so it can detect ambiguity.
+    pub fn matches_column(&self, query_name: &str) -> bool {
+        self.columns.iter().any(|c| c.matches_name(query_name))
+    }
+
     /// Creates a new Schema.
     pub fn new(columns: Vec<Column>) -> Self {
         Self {

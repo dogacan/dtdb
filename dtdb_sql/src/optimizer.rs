@@ -462,10 +462,7 @@ impl Optimizer {
         // 3. Calculate Secondary Index Scan Costs
         for index in &schema.indexes {
             if let Some(col_name) = index.columns.first()
-                && let Some(col) = schema.columns.iter().find(|c| {
-                    c.name == *col_name
-                        || dtdb_relational::schema::ends_with_dot_suffix(&c.name, col_name)
-                })
+                && let Some(col) = schema.columns.iter().find(|c| c.matches_name(col_name))
             {
                 // Verify index type match
                 let is_fulltext = index.index_type == dtdb_relational::schema::IndexType::FullText;
@@ -574,11 +571,7 @@ impl Optimizer {
     ) -> HashSet<String> {
         let mut needed_groups = HashSet::new();
         for col in &schema.columns {
-            let matches_query = query_columns.iter().any(|q_col| {
-                q_col == &col.name
-                    || dtdb_relational::schema::ends_with_dot_suffix(q_col, &col.name)
-                    || dtdb_relational::schema::ends_with_dot_suffix(&col.name, q_col)
-            });
+            let matches_query = query_columns.iter().any(|q_col| col.matches_name(q_col));
             if matches_query {
                 needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
             }
