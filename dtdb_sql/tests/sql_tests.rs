@@ -4648,3 +4648,41 @@ fn test_sum_preserves_int_type_and_handles_overflow() {
         panic!("expected Select");
     }
 }
+
+#[test]
+fn test_substr_handles_extreme_length() {
+    // Regression for F32: SUBSTR(s, start, i64::MAX) used to overflow on
+    // `start_idx + length`, panicking in debug and wrapping to a negative
+    // value in release. Saturating-add fixes it.
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, s STRING)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_ins = Transaction::new(2, db.clone());
+    engine
+        .execute("INSERT INTO t (id, s) VALUES (1, 'hello')", &tx_ins)
+        .unwrap();
+    tx_ins.commit().unwrap();
+
+    let tx_q = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT SUBSTR(s, 1, 9223372036854775807) FROM t WHERE id = 1",
+            &tx_q,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows[0].values, vec![DbValue::String("hello".to_string())]);
+    } else {
+        panic!("expected Select");
+    }
+
+    // Negative length is now rejected explicitly.
+    let res = engine.execute("SELECT SUBSTR(s, 1, -1) FROM t WHERE id = 1", &tx_q);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("non-negative"));
+}

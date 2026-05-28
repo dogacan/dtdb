@@ -502,10 +502,21 @@ impl Expr {
                                     ));
                                 }
                             };
-                            if length <= 0 {
+                            if length < 0 {
+                                return Err(format!(
+                                    "SUBSTR length must be non-negative, got {length}"
+                                ));
+                            }
+                            if length == 0 {
                                 Ok(DbValue::String("".to_string()))
                             } else {
-                                let end_idx = start_idx + length;
+                                // Saturating add: SUBSTR(s, 1, i64::MAX) used to panic
+                                // (debug) or wrap to a negative value (release). We
+                                // intentionally clamp the candidate end index to i64::MAX
+                                // and then to the actual character count below, so the
+                                // request degrades to "give me everything from start" no
+                                // matter how absurd the requested length is.
+                                let end_idx = start_idx.saturating_add(length);
                                 let active_start = start_idx.max(0) as usize;
                                 let active_end = end_idx.clamp(0, n) as usize;
                                 if active_start < active_end && active_start < chars.len() {
