@@ -908,7 +908,10 @@ impl PhysicalOperator for PhysicalHashAggregate {
                         .iter()
                         .map(|aggr| match aggr {
                             AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                            AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                            AggregateExpr::Sum(_) => Accumulator::Sum {
+                                int_sum: None,
+                                float_sum: None,
+                            },
                             AggregateExpr::Min(_) => Accumulator::Min { min: None },
                             AggregateExpr::Max(_) => Accumulator::Max { max: None },
                             AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -935,7 +938,10 @@ impl PhysicalOperator for PhysicalHashAggregate {
                     .iter()
                     .map(|aggr| match aggr {
                         AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                        AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                        AggregateExpr::Sum(_) => Accumulator::Sum {
+                            int_sum: None,
+                            float_sum: None,
+                        },
                         AggregateExpr::Min(_) => Accumulator::Min { min: None },
                         AggregateExpr::Max(_) => Accumulator::Max { max: None },
                         AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -1024,7 +1030,10 @@ impl PhysicalOperator for PhysicalSortedAggregate {
                         .iter()
                         .map(|aggr| match aggr {
                             AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                            AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                            AggregateExpr::Sum(_) => Accumulator::Sum {
+                                int_sum: None,
+                                float_sum: None,
+                            },
                             AggregateExpr::Min(_) => Accumulator::Min { min: None },
                             AggregateExpr::Max(_) => Accumulator::Max { max: None },
                             AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -1089,7 +1098,10 @@ impl PhysicalOperator for PhysicalSortedAggregate {
                     .iter()
                     .map(|aggr| match aggr {
                         AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                        AggregateExpr::Sum(_) => Accumulator::Sum { sum: None },
+                        AggregateExpr::Sum(_) => Accumulator::Sum {
+                            int_sum: None,
+                            float_sum: None,
+                        },
                         AggregateExpr::Min(_) => Accumulator::Min { min: None },
                         AggregateExpr::Max(_) => Accumulator::Max { max: None },
                         AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -1134,11 +1146,27 @@ impl PhysicalOperator for PhysicalSortedAggregate {
 // Aggregation State Accumulators
 // ==========================================
 enum Accumulator {
-    Count { count: i64 },
-    Sum { sum: Option<f64> },
-    Min { min: Option<DbValue> },
-    Max { max: Option<DbValue> },
-    Avg { sum: f64, count: i64 },
+    Count {
+        count: i64,
+    },
+    // Track integer and floating-point running totals separately so SUM(int_col)
+    // can finalize as Int when no Float input is ever observed, matching the
+    // schema declared by the logical planner. We only fall back to Float if a
+    // Float input appears or if the integer accumulator would overflow.
+    Sum {
+        int_sum: Option<i64>,
+        float_sum: Option<f64>,
+    },
+    Min {
+        min: Option<DbValue>,
+    },
+    Max {
+        max: Option<DbValue>,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
 }
 
 impl Accumulator {
@@ -1150,19 +1178,36 @@ impl Accumulator {
             Accumulator::Count { count } => {
                 *count += 1;
             }
-            Accumulator::Sum { sum } => {
-                let s = sum.get_or_insert(0.0);
-                match val {
-                    DbValue::Int(v) => *s += *v as f64,
-                    DbValue::Float(v) => *s += *v,
-                    other => {
-                        return Err(format!(
-                            "Cannot compute SUM on non-numeric value {:?}",
-                            other
-                        ));
+            Accumulator::Sum { int_sum, float_sum } => match val {
+                DbValue::Int(v) => {
+                    if float_sum.is_some() {
+                        // Already promoted to float; just keep accumulating in float.
+                        *float_sum.as_mut().unwrap() += *v as f64;
+                    } else {
+                        let current = int_sum.unwrap_or(0);
+                        match current.checked_add(*v) {
+                            Some(new_sum) => *int_sum = Some(new_sum),
+                            None => {
+                                // Overflow: promote to float and continue there.
+                                let promoted = current as f64 + *v as f64;
+                                *int_sum = None;
+                                *float_sum = Some(promoted);
+                            }
+                        }
                     }
                 }
-            }
+                DbValue::Float(v) => {
+                    // First float input promotes any accumulated integers into floats.
+                    let promoted = float_sum.unwrap_or(0.0) + int_sum.take().unwrap_or(0) as f64;
+                    *float_sum = Some(promoted + *v);
+                }
+                other => {
+                    return Err(format!(
+                        "Cannot compute SUM on non-numeric value {:?}",
+                        other
+                    ));
+                }
+            },
             Accumulator::Min { min } => match min {
                 Some(m) => {
                     let ord = compare_values(val, m)?;
@@ -1201,7 +1246,11 @@ impl Accumulator {
     fn finalize(&self) -> DbValue {
         match self {
             Accumulator::Count { count } => DbValue::Int(*count),
-            Accumulator::Sum { sum } => sum.map(DbValue::Float).unwrap_or(DbValue::Null),
+            Accumulator::Sum { int_sum, float_sum } => match (float_sum, int_sum) {
+                (Some(f), _) => DbValue::Float(*f),
+                (None, Some(i)) => DbValue::Int(*i),
+                (None, None) => DbValue::Null,
+            },
             Accumulator::Min { min } => min.clone().unwrap_or(DbValue::Null),
             Accumulator::Max { max } => max.clone().unwrap_or(DbValue::Null),
             Accumulator::Avg { sum, count } => {

@@ -1709,9 +1709,12 @@ fn test_sql_pass2_table_and_join_features() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
+        // SUM over an INT column now finalizes as Int (matching the schema
+        // declared by the logical planner). It previously returned Float
+        // unconditionally.
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("A".to_string()), DbValue::Float(30.0)]
+            vec![DbValue::String("A".to_string()), DbValue::Int(30)]
         );
     } else {
         panic!("Expected Select");
@@ -4573,5 +4576,75 @@ fn test_sql_server_side_parameters() {
         assert_eq!(rows[0].values, vec![DbValue::Int(1), DbValue::Int(30)]);
     } else {
         panic!("Expected SELECT result");
+    }
+}
+
+#[test]
+fn test_sum_preserves_int_type_and_handles_overflow() {
+    // Regression for F31: SUM(int_col) used to finalize as DbValue::Float
+    // unconditionally. f64 loses precision past 2^53, so summing many int64
+    // values produced wrong totals; worse, the runtime type disagreed with
+    // the schema declared by the logical planner (which used the input
+    // column's type for SUM).
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE nums (id INT PRIMARY KEY, n INT, f FLOAT)",
+            &tx_ddl,
+        )
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO nums (id, n, f) VALUES (1, 10, 1.5), (2, 20, 2.5), (3, 30, 3.0)",
+            &tx_insert,
+        )
+        .unwrap();
+    tx_insert.commit().unwrap();
+
+    // SUM over an INT column must stay Int.
+    let tx_q = Transaction::new(3, db.clone());
+    let res = engine.execute("SELECT SUM(n) FROM nums", &tx_q).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows[0].values, vec![DbValue::Int(60)]);
+    } else {
+        panic!("expected Select");
+    }
+
+    // SUM over a FLOAT column stays Float.
+    let res = engine.execute("SELECT SUM(f) FROM nums", &tx_q).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows[0].values, vec![DbValue::Float(7.0)]);
+    } else {
+        panic!("expected Select");
+    }
+
+    // SUM that would overflow i64 promotes to Float instead of panicking
+    // (no precision loss for these small magnitudes, but the result type
+    // signals that the integer path bailed out).
+    let tx_ins2 = Transaction::new(4, db.clone());
+    engine
+        .execute(
+            "INSERT INTO nums (id, n, f) VALUES (4, 9223372036854775807, 0.0), (5, 1, 0.0)",
+            &tx_ins2,
+        )
+        .unwrap();
+    tx_ins2.commit().unwrap();
+
+    let tx_q2 = Transaction::new(5, db.clone());
+    let res = engine
+        .execute("SELECT SUM(n) FROM nums WHERE id IN (4, 5)", &tx_q2)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        match rows[0].values[0] {
+            DbValue::Float(_) => {} // promoted on overflow
+            ref other => panic!("expected Float (overflow promotion), got {other:?}"),
+        }
+    } else {
+        panic!("expected Select");
     }
 }

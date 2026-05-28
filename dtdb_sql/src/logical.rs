@@ -181,25 +181,27 @@ impl LogicalPlan {
         for (idx, aggr) in aggrs.iter().enumerate() {
             let dt = match aggr {
                 AggregateExpr::Count(_) => DataType::Int,
-                AggregateExpr::Sum(expr)
-                | AggregateExpr::Min(expr)
-                | AggregateExpr::Max(expr)
-                | AggregateExpr::Avg(expr) => match expr {
-                    Expr::Column(col_name, _) => {
-                        let pos = source_schema.columns.iter().position(|col| {
-                            col.name == *col_name
-                                || dtdb_relational::schema::ends_with_dot_suffix(
-                                    col_name, &col.name,
-                                )
-                        });
-                        if let Some(i) = pos {
-                            source_schema.columns[i].data_type
-                        } else {
-                            DataType::Float
+                // AVG always produces a fractional value; runtime emits Float
+                // regardless of input type, so the schema must match.
+                AggregateExpr::Avg(_) => DataType::Float,
+                AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
+                    match expr {
+                        Expr::Column(col_name, _) => {
+                            let pos = source_schema.columns.iter().position(|col| {
+                                col.name == *col_name
+                                    || dtdb_relational::schema::ends_with_dot_suffix(
+                                        col_name, &col.name,
+                                    )
+                            });
+                            if let Some(i) = pos {
+                                source_schema.columns[i].data_type
+                            } else {
+                                DataType::Float
+                            }
                         }
+                        _ => DataType::Float,
                     }
-                    _ => DataType::Float,
-                },
+                }
             };
             cols.push(Column {
                 name: field_names[start_idx + idx].clone(),
