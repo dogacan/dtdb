@@ -93,24 +93,39 @@ public:
         return inner_->execute_tx_query(tx, query.to_bridge());
     }
 
-    // Exception-safe counterpart to run_in_transaction
+    // Exception-safe counterpart to run_in_transaction.
+    //
+    // The rollback handler must only run while `tx` is still valid (i.e. only
+    // for exceptions thrown by the user callable). If `commit_tx` itself
+    // throws after consuming `tx` via std::move, jumping back to a single
+    // outer catch would re-move from a moved-from rust::Box — undefined
+    // behavior. Scope the rollback try/catch tightly around the user code so
+    // commit_tx exceptions propagate naturally without touching `tx` again.
     template <typename Func>
-    auto run_in_transaction(const std::string& db_name, Func func) 
-        -> decltype(func(std::declval<const CxxTransaction&>())) 
+    auto run_in_transaction(const std::string& db_name, Func func)
+        -> decltype(func(std::declval<const CxxTransaction&>()))
     {
         rust::Box<CxxTransaction> tx = inner_->start_transaction(db_name);
-        try {
-            if constexpr (std::is_void_v<decltype(func(*tx))>) {
+        if constexpr (std::is_void_v<decltype(func(*tx))>) {
+            try {
                 func(*tx);
-                inner_->commit_tx(std::move(tx));
-            } else {
-                auto val = func(*tx);
-                inner_->commit_tx(std::move(tx));
-                return val;
+            } catch (...) {
+                inner_->rollback_tx(std::move(tx));
+                throw;
             }
-        } catch (...) {
-            inner_->rollback_tx(std::move(tx));
-            throw; // Rethrow FFI or user exceptions
+            inner_->commit_tx(std::move(tx));
+        } else {
+            auto run = [&]() {
+                try {
+                    return func(*tx);
+                } catch (...) {
+                    inner_->rollback_tx(std::move(tx));
+                    throw;
+                }
+            };
+            auto val = run();
+            inner_->commit_tx(std::move(tx));
+            return val;
         }
     }
 
