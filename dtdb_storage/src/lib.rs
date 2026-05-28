@@ -210,6 +210,43 @@ impl<'a> From<&'a [u8]> for DbValue {
     }
 }
 
+/// fsync the parent directory of `path` so that a preceding rename of a child
+/// is durable across crashes on filesystems (ext4 data=ordered, XFS, ZFS, many
+/// network FSes) that don't otherwise guarantee directory-entry persistence.
+///
+/// Best-effort: on Windows there is no equivalent and we treat the call as a
+/// no-op; everywhere else we silently ignore EINVAL from filesystems whose
+/// directory fds can't be fsynced.
+pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    // An empty parent ("") means the current directory; map to ".".
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    #[cfg(not(windows))]
+    {
+        match std::fs::File::open(parent) {
+            Ok(dir) => match dir.sync_all() {
+                Ok(()) => Ok(()),
+                // EINVAL (22) — some filesystems (e.g. certain FUSE backends)
+                // don't allow fsync on a directory fd. Treat as best-effort.
+                Err(e) if e.raw_os_error() == Some(22) => Ok(()),
+                Err(e) => Err(StorageError::Io(e)),
+            },
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
+
 pub static PHYSICAL_BLOCKS_READ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -224,6 +261,19 @@ pub fn get_physical_blocks_read() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fsync_parent_dir_succeeds_on_existing_file() {
+        // The contract isn't about an observable side-effect (a crash is the
+        // only way to see the difference), only that the helper succeeds when
+        // pointed at a real renamed file and tolerates parentless paths.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.bin");
+        std::fs::write(&path, b"data").unwrap();
+        fsync_parent_dir(&path).expect("fsync of parent dir should succeed");
+        // No parent — should be a no-op rather than an error.
+        fsync_parent_dir(std::path::Path::new("")).expect("empty path should be a no-op");
+    }
 
     #[test]
     fn test_composite_key_ordering() {

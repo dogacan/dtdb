@@ -235,6 +235,7 @@ impl SstableWriter {
 
         // Rename the temporary file atomically to final path
         std::fs::rename(&self.temp_path, &self.final_path)?;
+        crate::fsync_parent_dir(&self.final_path)?;
 
         Ok(())
     }

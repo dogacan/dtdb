@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Result, fsync_parent_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -28,6 +28,9 @@ impl Manifest {
             file.sync_all()?;
         }
         fs::rename(&temp_path, path)?;
+        // Persist the directory entry change so a crash can't lose the new
+        // manifest and collapse the DB to "empty" on restart.
+        fsync_parent_dir(path)?;
         Ok(())
     }
 }

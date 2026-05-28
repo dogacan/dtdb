@@ -1225,6 +1225,9 @@ impl Database {
 
             // Atomically rename the table directory to a unique temporary "tombstone" directory.
             fs::rename(&table_path, &temp_table_path)?;
+            // Persist the directory entry change so a crash mid-drop doesn't
+            // resurrect the table name on the next mount.
+            dtdb_storage::fsync_parent_dir(&temp_table_path)?;
 
             // Remove the temporary directory non-atomically (crash safe).
             fs::remove_dir_all(temp_table_path)?;
