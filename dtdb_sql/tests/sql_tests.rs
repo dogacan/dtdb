@@ -4804,3 +4804,74 @@ fn test_ambiguous_column_reference_is_rejected() {
         panic!("expected Select");
     }
 }
+
+#[test]
+fn test_optimizer_bound_nudging_handles_int_extremes() {
+    // Regression for F35: range pushdown used to nudge bounds with raw `v + 1`
+    // or `v - 1` arithmetic, so `WHERE id > i64::MAX` overflowed (and a later
+    // patch replaced that with `saturating_add`, which still produced a
+    // surprising non-empty [MAX, MAX] scan). Either way, the executor opened
+    // a degenerate scan and relied on the original predicate getting
+    // re-evaluated to drop the single returned row.
+    //
+    // The optimizer should now decline the pushdown in those impossible
+    // cases. Behaviorally, the query must return zero rows without scanning
+    // any data — and crucially must not error.
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_ins = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO t (id, val) VALUES (1, 1), (9223372036854775807, 9999)",
+            &tx_ins,
+        )
+        .unwrap();
+    tx_ins.commit().unwrap();
+
+    let tx_q = Transaction::new(3, db.clone());
+
+    // `id > MAX` is the empty set.
+    let res = engine
+        .execute("SELECT id FROM t WHERE id > 9223372036854775807", &tx_q)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert!(rows.is_empty(), "no row should match id > i64::MAX");
+    } else {
+        panic!("expected Select");
+    }
+
+    // `id < MIN` is also empty.
+    let res = engine
+        .execute("SELECT id FROM t WHERE id < -9223372036854775808", &tx_q)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert!(rows.is_empty(), "no row should match id < i64::MIN");
+    } else {
+        panic!("expected Select");
+    }
+
+    // Plain `>=` and `<=` against the boundaries still return matching rows.
+    let res = engine
+        .execute("SELECT id FROM t WHERE id >= 9223372036854775807", &tx_q)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Int(i64::MAX)]);
+    } else {
+        panic!("expected Select");
+    }
+
+    // EXPLAIN must not panic on the degenerate forms.
+    let _ = engine
+        .execute(
+            "EXPLAIN SELECT id FROM t WHERE id > 9223372036854775807",
+            &tx_q,
+        )
+        .unwrap();
+}

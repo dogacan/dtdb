@@ -1041,7 +1041,17 @@ fn extract_bounds_for_column(
                     Operator::GtEq | Operator::Gt => {
                         let start = if matches!(op, Operator::Gt) {
                             match key {
-                                DbKey::Int(v) => DbKey::Int(v.saturating_add(1)),
+                                // `WHERE id > i64::MAX` has no solutions. Bail out of
+                                // the range-pushdown entirely so the executor doesn't
+                                // open a scan over [MAX, MAX] and rely on the predicate
+                                // re-evaluation to filter the one returned row.
+                                DbKey::Int(i64::MAX) => return None,
+                                DbKey::Int(v) => DbKey::Int(v.checked_add(1)?),
+                                // s + "\0" is the immediate successor of s in code-point
+                                // lex order ('\0' is the smallest scalar; no string can
+                                // sort strictly between s and s + "\0"). Rust string
+                                // invariants forbid unpaired surrogates, so this holds
+                                // for every valid &str input.
                                 DbKey::String(s) => DbKey::String(s + "\0"),
                                 _ => key,
                             }
@@ -1061,7 +1071,15 @@ fn extract_bounds_for_column(
                         };
                         let end = if matches!(op, Operator::Lt) {
                             match key {
-                                DbKey::Int(v) => DbKey::Int(v.saturating_sub(1)),
+                                // Symmetric: `WHERE id < i64::MIN` is empty.
+                                DbKey::Int(i64::MIN) => return None,
+                                DbKey::Int(v) => DbKey::Int(v.checked_sub(1)?),
+                                // For `name < "foo"` we want the largest string strictly
+                                // less than "foo". There's no clean immediate predecessor
+                                // in Unicode lex order, so we leave the bound at the
+                                // literal value and rely on the executor to skip the
+                                // matching row (range bounds are inclusive on the engine
+                                // side but the SQL predicate gets re-checked).
                                 DbKey::String(s) => DbKey::String(s),
                                 _ => key,
                             }
