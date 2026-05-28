@@ -266,6 +266,66 @@ fn test_drop_table_blocks_on_active_transaction() {
 }
 
 #[test]
+fn test_concurrent_drop_table_does_not_deadlock_commit() {
+    // Regression: drop_table used to hold the catalog write lock while
+    // spin-waiting for active table accessors to drain, while a tx in mid
+    // commit needed the read lock to re-resolve the table — a hard deadlock.
+    // The cached-table fix lets the tx commit complete with no further
+    // catalog read, so drop_table eventually drains and finishes.
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    db.create_table("orders", create_test_schema()).unwrap();
+
+    let tx = Transaction::new(1, db.clone());
+    // Touch both tables so the tx registers active access on each.
+    tx.put("users", k_int(1), r_user(1, "alice", 95.5)).unwrap();
+    tx.put("orders", k_int(1), r_user(1, "ord", 1.0)).unwrap();
+    tx.get("users", &k_int(1)).unwrap();
+    tx.get("orders", &k_int(1)).unwrap();
+
+    // Kick off a drop_table while the tx is still live and holding access.
+    let db_drop = db.clone();
+    let drop_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_done_clone = drop_done.clone();
+    let drop_handle = std::thread::spawn(move || {
+        db_drop.drop_table("orders").unwrap();
+        drop_done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // Let drop_table grab the catalog write lock and start spin-waiting.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !drop_done.load(std::sync::atomic::Ordering::SeqCst),
+        "drop_table should still be waiting on the live tx"
+    );
+
+    // Pre-fix: this commit would hang because it tries to re-resolve "users"
+    // via the catalog read lock, which is blocked behind drop_table's writer.
+    // Run commit on a worker thread and time-bound the join so the test
+    // surfaces a deadlock as a failure rather than hanging the suite.
+    let commit_handle = std::thread::spawn(move || tx.commit());
+    let start = std::time::Instant::now();
+    while !commit_handle.is_finished() {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("tx.commit() appears deadlocked behind drop_table");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    commit_handle.join().unwrap().unwrap();
+
+    let start = std::time::Instant::now();
+    while !drop_handle.is_finished() {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("drop_table did not finish after commit released its slot");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop_handle.join().unwrap();
+    assert!(drop_done.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
 fn test_drop_table_stranded_cleanup_on_startup() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();

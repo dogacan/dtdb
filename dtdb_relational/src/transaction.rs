@@ -47,6 +47,12 @@ pub struct Transaction {
     scan_ranges: Arc<Mutex<HashMap<String, Vec<(DbKey, DbKey)>>>>,
     pub isolation_level: IsolationLevel,
     accessed_tables: Mutex<HashSet<String>>,
+    // Cache of Table handles for tables this transaction has already accessed.
+    // Once a table is in the cache, get_table avoids touching the catalog
+    // read lock — so a commit that runs concurrently with a DDL write-locking
+    // the catalog can still complete and release its active_table_access slot,
+    // breaking the deadlock between DDL spin-wait and commit re-resolution.
+    cached_tables: Mutex<HashMap<String, Table>>,
 }
 
 impl Drop for Transaction {
@@ -78,15 +84,28 @@ impl Transaction {
             scan_ranges: Arc::new(Mutex::new(HashMap::new())),
             isolation_level,
             accessed_tables: Mutex::new(HashSet::new()),
+            cached_tables: Mutex::new(HashMap::new()),
         }
     }
 
     fn get_table(&self, table_name: &str) -> Result<Table> {
-        let table = self.database.get_table(table_name)?;
-        let mut accessed = self.accessed_tables.lock().unwrap();
-        if accessed.insert(table_name.to_string()) {
-            self.database.register_table_access(table_name, self.tx_id);
+        {
+            let cache = self.cached_tables.lock().unwrap();
+            if let Some(t) = cache.get(table_name) {
+                return Ok(t.clone());
+            }
         }
+        let table = self.database.get_table(table_name)?;
+        {
+            let mut accessed = self.accessed_tables.lock().unwrap();
+            if accessed.insert(table_name.to_string()) {
+                self.database.register_table_access(table_name, self.tx_id);
+            }
+        }
+        let mut cache = self.cached_tables.lock().unwrap();
+        cache
+            .entry(table_name.to_string())
+            .or_insert_with(|| table.clone());
         Ok(table)
     }
 
