@@ -226,9 +226,9 @@ impl CxxClient {
         // Rollback) was sent. The spawned task fills this in before exiting
         // the inner closure so it can signal the caller after
         // run_in_transaction completes.
-        let terminal_sender: Arc<
-            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>,
-        > = Arc::new(std::sync::Mutex::new(None));
+        type TerminalSender =
+            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>;
+        let terminal_sender: Arc<TerminalSender> = Arc::new(std::sync::Mutex::new(None));
         let terminal_sender_clone = terminal_sender.clone();
 
         // Spawn a transaction execution loop inside DuctTapeDbClient's closure-based transaction runner

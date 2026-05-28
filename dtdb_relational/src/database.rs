@@ -1393,13 +1393,17 @@ impl Database {
             return Ok(());
         }
 
-        println!("Recovering {} pending transactions...", prepared.len());
+        tracing::info!(
+            count = prepared.len(),
+            "recovering pending transactions"
+        );
         for (tx_id, (mutations, old_rows_opt)) in prepared {
             for (table_name, entries) in mutations {
                 if let Ok(table) = self.get_table(&table_name) {
-                    println!(
-                        "Rolling forward transaction {} for table {}",
-                        tx_id, table_name
+                    tracing::info!(
+                        tx_id,
+                        table = %table_name,
+                        "rolling forward transaction"
                     );
                     let write_entries = entries
                         .into_iter()
@@ -1933,7 +1937,7 @@ impl Database {
                             crate::transaction::IsolationLevel::ReadUncommitted,
                         );
                         if let Err(e) = db.analyze_all(&tx) {
-                            eprintln!("Background analyze error: {:?}", e);
+                            tracing::error!(error = ?e, "background analyze failed");
                         }
                     } else {
                         break;

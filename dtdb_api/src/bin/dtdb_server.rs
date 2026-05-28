@@ -8,6 +8,7 @@ use tonic::transport::Server;
 #[tokio::main]
 #[allow(clippy::result_large_err)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let mut data_dir = PathBuf::from("./data");
     let mut bind_addr_str = env::var("DTDB_BIND").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
     let mut auth_token = env::var("DTDB_AUTH_TOKEN").ok();
@@ -62,15 +63,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Starting DuctTapeDB gRPC Server...");
-    println!("Data directory: {:?}", data_dir);
+    tracing::info!(data_dir = ?data_dir, "starting DuctTapeDB gRPC server");
 
     let has_auth = auth_token.is_some();
     let has_tls = tls_cert.is_some() && tls_key.is_some();
     if let Err(err_msg) = dtdb_api::validate_bind_security(&bind_addr_str, has_auth, has_tls) {
-        eprintln!("{}", err_msg);
-        eprintln!(
-            "Please configure them using --auth-token, --tls-cert, and --tls-key (or corresponding env variables: DTDB_AUTH_TOKEN, DTDB_TLS_CERT, DTDB_TLS_KEY)."
+        tracing::error!(
+            "{} — configure --auth-token, --tls-cert, --tls-key (or env DTDB_AUTH_TOKEN, DTDB_TLS_CERT, DTDB_TLS_KEY)",
+            err_msg
         );
         std::process::exit(1);
     }
@@ -78,15 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = bind_addr_str.parse()?;
 
     let service = DuctTapeDbServiceImpl::new(&data_dir)?;
-    println!("Listening on: {}", addr);
+    tracing::info!(%addr, "listening");
 
     let mut server = Server::builder();
 
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
-        println!(
-            "Configuring TLS with cert: {}, key: {}",
-            cert_path, key_path
-        );
+        tracing::info!(cert = %cert_path, key = %key_path, "configuring TLS");
         let cert = tokio::fs::read_to_string(cert_path).await?;
         let key = tokio::fs::read_to_string(key_path).await?;
         let identity = tonic::transport::Identity::from_pem(cert, key);
@@ -118,4 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server.add_service(service_server).serve(addr).await?;
 
     Ok(())
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("DTDB_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
 }

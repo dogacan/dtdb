@@ -124,7 +124,7 @@ impl Wal {
                 Ok(_) => {}
                 // Truncated checksum: trailing corruption, stop recovery
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    eprintln!("Warning: WAL ended with truncated checksum. Stopping recovery.");
+                    tracing::warn!("WAL ended with truncated checksum; stopping recovery");
                     break;
                 }
                 Err(e) => return Err(StorageError::Io(e)),
@@ -137,7 +137,7 @@ impl Wal {
                 Ok(_) => {}
                 // Truncated payload: trailing corruption, stop recovery
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    eprintln!("Warning: WAL ended with truncated payload. Stopping recovery.");
+                    tracing::warn!("WAL ended with truncated payload; stopping recovery");
                     break;
                 }
                 Err(e) => return Err(StorageError::Io(e)),
@@ -146,7 +146,11 @@ impl Wal {
             // 4. Verify checksum.
             let actual_checksum = compute_checksum(&bytes);
             if actual_checksum != expected_checksum {
-                eprintln!("Warning: WAL checksum mismatch. Stopping recovery.");
+                tracing::warn!(
+                    expected = expected_checksum,
+                    actual = actual_checksum,
+                    "WAL checksum mismatch; stopping recovery"
+                );
                 break;
             }
 
@@ -154,10 +158,7 @@ impl Wal {
             let entry: WalEntry = match bincode::deserialize(&bytes) {
                 Ok(ent) => ent,
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Deserialization failed for WAL entry: {}. Stopping recovery.",
-                        e
-                    );
+                    tracing::warn!(error = %e, "WAL entry deserialization failed; stopping recovery");
                     break;
                 }
             };

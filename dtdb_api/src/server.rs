@@ -70,7 +70,7 @@ impl DuctTapeDbServiceImpl {
             {
                 // Check if db_options.bin exists
                 if path.join("db_options.bin").exists() {
-                    println!("Restoring database: {}", db_name);
+                    tracing::info!(db = %db_name, "restoring database");
                     let database = Arc::new(
                         Database::open_with_spawner(&path, self.spawner.clone())
                             .map_err(|e| e.to_string())?,
@@ -110,7 +110,11 @@ impl DuctTapeDbServiceImpl {
                         if let Ok(table) = db.get_table(&table_name)
                             && let Err(e) = table.flush_memtable()
                         {
-                            eprintln!("Periodic flush failed for table {}: {}", table_name, e);
+                            tracing::error!(
+                                table = %table_name,
+                                error = %e,
+                                "periodic flush failed"
+                            );
                         }
                     }
                 } else {

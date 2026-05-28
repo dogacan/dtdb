@@ -70,7 +70,7 @@ impl StorageEngine {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                     if let Some(engine) = inner_weak.upgrade() {
                         if let Err(e) = engine.sync_wal() {
-                            eprintln!("Background WAL sync error: {:?}", e);
+                            tracing::error!(error = ?e, "background WAL sync failed");
                         }
                     } else {
                         break;
@@ -1154,7 +1154,7 @@ impl EngineInner {
         let _compaction_lock = self.compaction_mutex.lock().unwrap();
         loop {
             if let Err(e) = self.compact_if_needed_locked() {
-                eprintln!("Background compaction error: {:?}", e);
+                tracing::error!(error = ?e, "background compaction failed");
                 break;
             }
 
