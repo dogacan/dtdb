@@ -45,6 +45,21 @@ fn k_int(val: i64) -> DbKey {
     DbKey::Int(val)
 }
 
+/// Polls `condition` until it returns true or `timeout` elapses.
+/// Returns false on timeout. Replaces ad-hoc `thread::sleep(50ms)` waits
+/// that race against the system scheduler — under load (CI, ASan, etc.)
+/// the fixed sleep was too short and the test would intermittently fail.
+fn poll_until<F: FnMut() -> bool>(timeout: std::time::Duration, mut condition: F) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    condition()
+}
+
 fn r_user(id: i64, name: &str, score: f64) -> Row {
     Row::new(vec![
         DbValue::Int(id),
@@ -574,10 +589,15 @@ fn test_background_statistics_collector() {
     tx.put("users", k_int(2), r_user(2, "bob", 80.0)).unwrap();
     tx.commit().unwrap();
 
-    // Sleep for a short while (e.g. 50ms) to allow the background thread to run and update stats
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    // Verify background thread ran and updated statistics
+    // Poll for the background analyze thread to publish updated statistics
+    // rather than relying on a fixed sleep — under CI load the previous 50ms
+    // wait sometimes lost the race and the test flaked.
+    let updated = poll_until(std::time::Duration::from_secs(5), || {
+        db.get_table_statistics("users")
+            .map(|s| s.row_count == 2)
+            .unwrap_or(false)
+    });
+    assert!(updated, "background statistics collector did not update");
     let stats2 = db.get_table_statistics("users").unwrap();
     assert_eq!(stats2.row_count, 2);
 }
