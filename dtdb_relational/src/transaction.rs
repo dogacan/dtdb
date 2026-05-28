@@ -861,20 +861,24 @@ impl Transaction {
                 match val {
                     Some(row) => {
                         let bytes = row.to_bytes()?;
-                        let entry = WalEntry::Put {
+                        let mutation = crate::database::RelationalMutation::Put {
                             key: key.clone(),
                             value: DbValue::Bytes(bytes),
                         };
-                        entries.push(entry.clone());
+                        entries.push(mutation.clone());
                         write_entries.push(crate::database::TableWriteEntry {
-                            entry,
+                            entry: WalEntry::from(mutation),
                             row: Some(row.clone()),
                         });
                     }
                     None => {
-                        let entry = WalEntry::Delete { key: key.clone() };
-                        entries.push(entry.clone());
-                        write_entries.push(crate::database::TableWriteEntry { entry, row: None });
+                        let mutation =
+                            crate::database::RelationalMutation::Delete { key: key.clone() };
+                        entries.push(mutation.clone());
+                        write_entries.push(crate::database::TableWriteEntry {
+                            entry: WalEntry::from(mutation),
+                            row: None,
+                        });
                     }
                 }
             }
@@ -890,13 +894,12 @@ impl Transaction {
             let mut keys = HashSet::new();
             for entry in entries {
                 match entry {
-                    WalEntry::Put { key, .. } => {
+                    crate::database::RelationalMutation::Put { key, .. } => {
                         keys.insert(key.clone());
                     }
-                    WalEntry::Delete { key } => {
+                    crate::database::RelationalMutation::Delete { key } => {
                         keys.insert(key.clone());
                     }
-                    WalEntry::Batch(_) => {}
                 }
             }
             if !keys.is_empty() {

@@ -1,5 +1,7 @@
-use dtdb_relational::{Column, DataType, Database, Row, Schema, Transaction, TransactionRecord};
-use dtdb_storage::{DbKey, DbValue, WalEntry};
+use dtdb_relational::{
+    Column, DataType, Database, RelationalMutation, Row, Schema, Transaction, TransactionRecord,
+};
+use dtdb_storage::{DbKey, DbValue};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -163,7 +165,7 @@ fn test_crash_recovery_roll_forward() {
 
         // Mutations for users table
         let user_bytes = r_user(42, "Douglas Adams").to_bytes().unwrap();
-        let user_entries = vec![WalEntry::Put {
+        let user_entries = vec![RelationalMutation::Put {
             key: k_int(42),
             value: DbValue::Bytes(user_bytes),
         }];
@@ -171,7 +173,7 @@ fn test_crash_recovery_roll_forward() {
 
         // Mutations for products table
         let prod_bytes = r_product("TOWEL", 42.0).to_bytes().unwrap();
-        let prod_entries = vec![WalEntry::Put {
+        let prod_entries = vec![RelationalMutation::Put {
             key: k_str("TOWEL"),
             value: DbValue::Bytes(prod_bytes),
         }];
@@ -295,7 +297,7 @@ fn test_crash_recovery_secondary_index_maintenance() {
         let mut mutations = HashMap::new();
         mutations.insert(
             "users".to_string(),
-            vec![WalEntry::Put {
+            vec![RelationalMutation::Put {
                 key: k_int(1),
                 value: DbValue::Bytes(new_row_bytes),
             }],

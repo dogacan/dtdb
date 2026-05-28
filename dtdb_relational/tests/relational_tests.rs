@@ -1,7 +1,8 @@
 use dtdb_relational::{
-    Column, DataType, Database, RelationalError, Row, Schema, Transaction, TransactionRecord,
+    Column, DataType, Database, RelationalError, RelationalMutation, Row, Schema, Transaction,
+    TransactionRecord,
 };
-use dtdb_storage::{DbKey, DbValue, WalEntry};
+use dtdb_storage::{DbKey, DbValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -406,9 +407,9 @@ fn test_auto_increment_sequence_reflects_recovered_rows() {
         // row bytes directly because the table has a single locality group.
         let row100 = Row::new(vec![DbValue::Int(100), DbValue::Int(1000)]);
         let row100_bytes = row100.to_bytes().unwrap();
-        let mutations: HashMap<String, Vec<WalEntry>> = HashMap::from([(
+        let mutations: HashMap<String, Vec<RelationalMutation>> = HashMap::from([(
             "t".to_string(),
-            vec![WalEntry::Put {
+            vec![RelationalMutation::Put {
                 key: DbKey::Int(100),
                 value: DbValue::Bytes(row100_bytes),
             }],

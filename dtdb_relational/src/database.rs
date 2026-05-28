@@ -13,11 +13,36 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+/// A single relational-layer mutation: an insert/update (`Put`) or a delete.
+///
+/// This is the public mutation primitive used by `TransactionRecord` and any
+/// future relational APIs that need to describe pending writes. It is
+/// intentionally narrower than `dtdb_storage::WalEntry` — no nested
+/// `Batch` variant — because nesting is only meaningful inside the storage
+/// engine's WAL, never at the relational/transaction layer.
+///
+/// The bincode tag layout matches `WalEntry`'s first two variants
+/// (0=Put, 1=Delete) so existing on-disk transaction logs decode unchanged.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum RelationalMutation {
+    Put { key: DbKey, value: DbValue },
+    Delete { key: DbKey },
+}
+
+impl From<RelationalMutation> for WalEntry {
+    fn from(m: RelationalMutation) -> WalEntry {
+        match m {
+            RelationalMutation::Put { key, value } => WalEntry::Put { key, value },
+            RelationalMutation::Delete { key } => WalEntry::Delete { key },
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum TransactionRecord {
     Prepared {
         tx_id: u64,
-        mutations: HashMap<String, Vec<WalEntry>>,
+        mutations: HashMap<String, Vec<RelationalMutation>>,
         #[serde(default)]
         old_rows: Option<HashMap<String, HashMap<DbKey, Row>>>,
     },
@@ -1412,7 +1437,10 @@ impl Database {
                     );
                     let write_entries = entries
                         .into_iter()
-                        .map(|entry| TableWriteEntry { entry, row: None })
+                        .map(|m| TableWriteEntry {
+                            entry: WalEntry::from(m),
+                            row: None,
+                        })
                         .collect();
                     let table_old_rows = old_rows_opt
                         .as_ref()
