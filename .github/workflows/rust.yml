@@ -64,5 +64,8 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    - name: Install Protocol Buffers Compiler
+      uses: arduino/setup-protoc@v3
+
     - name: Run tests with ThreadSanitizer
       run: ./scripts/run_tsan.sh
