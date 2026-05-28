@@ -32,6 +32,34 @@ Always run the following commands and verify they pass cleanly before proposing 
 
 ---
 
+## 🧪 Fuzz / Property Testing
+
+The `dtdb_fuzz` crate (`dtdb_fuzz/`) hosts four `#[ignore]`d targets that
+exercise the durability and concurrency surfaces with random inputs:
+
+| Target | What it shakes out |
+| --- | --- |
+| `wal_recovery` (bolero) | `Wal::recover` panics, non-determinism, truncation safety |
+| `sstable_reader` (bolero) | SSTable parsing under bit-flip / truncation / footer corruption |
+| `concurrent_txns` (proptest + real threads) | OCC panics, deadlocks, read-your-writes |
+| `sql_op_sequence` (proptest) | End-to-end durability across `flush_db` + reopen |
+
+Targets are `#[ignore]`d so `cargo test` skips them. Run locally with:
+
+```bash
+./scripts/run_fuzz.sh                       # default PR-time budget
+BOLERO_FUZZ_ITERATIONS=50000 PROPTEST_CASES=4096 ./scripts/run_fuzz.sh  # long run
+```
+
+CI runs this script in a dedicated `fuzz` job (see `.github/workflows/rust.yml`):
+short budget on every push / PR, large budget on the nightly cron.
+
+When adding a new target: drop a new `fuzz_targets/foo.rs` file, add a matching
+`[[test]]` block to `dtdb_fuzz/Cargo.toml`, mark the entry test `#[ignore]`,
+and append it to the `cargo test` invocation in `scripts/run_fuzz.sh`.
+
+---
+
 ## ✍️ Git Commit Etiquette & AI Attribution
 
 When formatting Git commit messages:

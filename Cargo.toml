@@ -6,5 +6,6 @@ members = [
     "dtdb_api",
     "dtdb_bindings",
     "dtdb_benchmark",
+    "dtdb_fuzz",
 ]
 resolver = "2"

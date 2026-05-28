@@ -42,14 +42,16 @@ impl BloomFilter {
 
     /// Inserts a key into the BloomFilter.
     pub fn insert<T: Hash>(&mut self, key: &T) {
-        if self.bits_count == 0 {
+        // Use the on-disk bit_vec length as the source of truth so a
+        // deserialized filter with a stale/garbage bits_count can't trigger
+        // an out-of-bounds index here.
+        let bits = (self.bit_vec.len() * 8) as u64;
+        if bits == 0 {
             return;
         }
         let (hash1, hash2) = self.get_hashes(key);
         for i in 0..self.num_hashes {
-            // double hashing formula: hash_i = (hash1 + i * hash2) % bits_count
-            let hash_i =
-                hash1.wrapping_add((i as u64).wrapping_mul(hash2)) % (self.bits_count as u64);
+            let hash_i = hash1.wrapping_add((i as u64).wrapping_mul(hash2)) % bits;
             let bit_idx = hash_i as usize;
             let byte_idx = bit_idx / 8;
             let bit_offset = bit_idx % 8;
@@ -62,13 +64,13 @@ impl BloomFilter {
     /// Returns `false` if the key is definitely not in the set, and `true`
     /// if the key is probably in the set (subject to false_positive_rate).
     pub fn contains<T: Hash>(&self, key: &T) -> bool {
-        if self.bits_count == 0 {
+        let bits = (self.bit_vec.len() * 8) as u64;
+        if bits == 0 {
             return false;
         }
         let (hash1, hash2) = self.get_hashes(key);
         for i in 0..self.num_hashes {
-            let hash_i =
-                hash1.wrapping_add((i as u64).wrapping_mul(hash2)) % (self.bits_count as u64);
+            let hash_i = hash1.wrapping_add((i as u64).wrapping_mul(hash2)) % bits;
             let bit_idx = hash_i as usize;
             let byte_idx = bit_idx / 8;
             let bit_offset = bit_idx % 8;

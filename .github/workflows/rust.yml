@@ -69,3 +69,28 @@ jobs:
 
     - name: Run tests with ThreadSanitizer
       run: ./scripts/run_tsan.sh
+
+  fuzz:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Protocol Buffers Compiler
+      uses: arduino/setup-protoc@v3
+
+    - name: Run dtdb_fuzz (short budget for PRs, long for nightly cron)
+      env:
+        # The cron job gets a generous budget; PRs/pushes use the script
+        # defaults (1024 bolero iters, 256 proptest cases) so each run lands
+        # in 1–3 minutes.
+        BOLERO_FUZZ_ITERATIONS: ${{ github.event_name == 'schedule' && '50000' || '1024' }}
+        PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '256' }}
+      run: ./scripts/run_fuzz.sh

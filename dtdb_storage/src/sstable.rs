@@ -301,6 +301,15 @@ impl SstableReader {
             ));
         }
 
+        // Bound-check the index slice against the file. A corrupted footer
+        // can otherwise drive a multi-exabyte allocation below.
+        let footer_start = file_len - FOOTER_SIZE;
+        if index_offset > footer_start || index_len > footer_start - index_offset {
+            return Err(StorageError::Corruption(format!(
+                "SSTable footer points outside file (file_len={file_len}, index_offset={index_offset}, index_len={index_len})"
+            )));
+        }
+
         // 2. Read and deserialize the Index block.
         file.seek(SeekFrom::Start(index_offset))?;
         let mut index_bytes = vec![0u8; index_len as usize];
@@ -421,6 +430,14 @@ impl SstableReader {
         crate::PHYSICAL_BLOCKS_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let entry = &self.index[idx];
+        // Defensively bound entry.size against the file. A corrupted index
+        // would otherwise drive an unbounded allocation here.
+        if entry.offset > self.file_size || entry.size > self.file_size - entry.offset {
+            return Err(StorageError::Corruption(format!(
+                "SSTable block extent outside file (sst id={}, block {}, offset {}, size {}, file_size {})",
+                self.id, idx, entry.offset, entry.size, self.file_size
+            )));
+        }
         let mut block_bytes = vec![0u8; entry.size as usize];
         use std::os::unix::fs::FileExt;
         self.file.read_exact_at(&mut block_bytes, entry.offset)?;

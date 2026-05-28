@@ -4,6 +4,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
+/// Upper bound on the size of a single WAL entry payload accepted by
+/// recovery. Real entries are small; a length prefix above this cap is
+/// treated as corruption and stops further recovery.
+const MAX_WAL_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Represents an operation entry in the Write-Ahead Log (WAL).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WalEntry {
@@ -102,7 +107,12 @@ impl Wal {
         }
 
         let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
+        Self::recover_from_reader(BufReader::new(file))
+    }
+
+    /// Reader-based recovery used by `recover()` and by in-memory tests /
+    /// fuzz harnesses that don't want to round-trip through the filesystem.
+    pub fn recover_from_reader<R: std::io::Read>(mut reader: R) -> Result<Vec<WalEntry>> {
         let mut entries = Vec::new();
 
         loop {
@@ -117,6 +127,19 @@ impl Wal {
                 Err(e) => return Err(StorageError::Io(e)),
             }
             let len = u32::from_le_bytes(len_bytes) as usize;
+
+            // Sanity-bound the per-entry size before allocating. A corrupted
+            // length prefix can otherwise drive a multi-gigabyte allocation
+            // that fails (or OOMs) far downstream from the actual corruption.
+            // 64 MiB is well above any plausible single WAL entry.
+            if len > MAX_WAL_ENTRY_BYTES {
+                tracing::warn!(
+                    len,
+                    cap = MAX_WAL_ENTRY_BYTES,
+                    "WAL entry length exceeds cap; stopping recovery"
+                );
+                break;
+            }
 
             // 2. Read the 4-byte checksum.
             let mut checksum_bytes = [0u8; 4];
