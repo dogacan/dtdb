@@ -606,3 +606,50 @@ fn test_database_multi_get() {
     assert_eq!(rows[1], Some(r_user(2, "bob_new", 85.0))); // From transaction write buffer
     assert_eq!(rows[2], None); // Non-existent key
 }
+
+#[test]
+fn test_scan_iterator_publishes_read_set_eagerly() {
+    use dtdb_relational::IsolationLevel;
+
+    // Regression: TransactionScanIterator used to merge its per-row read keys
+    // into the shared read_set only in Drop. If commit() ran while the iterator
+    // was still alive, OCC validation saw an empty read_set and missed
+    // conflicts with concurrent writers.
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    // Seed a row at id=1.
+    let tx0 = Transaction::new(1, db.clone());
+    tx0.put("users", k_int(1), r_user(1, "alice", 1.0)).unwrap();
+    tx0.commit().unwrap();
+
+    // tx1 uses RepeatableRead so scan_ranges aren't tracked — only the read_set
+    // can flag the upcoming conflict. Open a scan, read id=1, and KEEP the
+    // iterator alive across the conflicting commit.
+    let tx1 = Transaction::new_with_isolation(10, db.clone(), IsolationLevel::RepeatableRead);
+    let mut iter = tx1
+        .scan_iter("users", &k_int(0), &k_int(100), None)
+        .unwrap();
+    let first = iter.next().unwrap();
+    assert!(first.is_some());
+
+    // tx2 modifies id=1 and commits while tx1's iterator is still alive.
+    let tx2 = Transaction::new_with_isolation(11, db.clone(), IsolationLevel::RepeatableRead);
+    tx2.put("users", k_int(1), r_user(1, "alice_v2", 2.0))
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // tx1 writes an unrelated row so commit goes through the validating path,
+    // then commits. With the bug, read_set is empty and the conflict on id=1
+    // is missed. With the fix, validation sees id=1 in read_set and aborts.
+    tx1.put("users", k_int(50), r_user(50, "fifty", 50.0))
+        .unwrap();
+    let result = tx1.commit();
+    assert!(
+        matches!(result, Err(RelationalError::TransactionConflict(_))),
+        "expected TransactionConflict, got {result:?}"
+    );
+
+    drop(iter);
+}

@@ -1037,7 +1037,6 @@ pub struct TransactionScanIterator {
     read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
     table_name: String,
     isolation_level: IsolationLevel,
-    local_read_keys: HashSet<DbKey>,
 }
 
 impl TransactionScanIterator {
@@ -1056,7 +1055,6 @@ impl TransactionScanIterator {
             read_set,
             table_name,
             isolation_level,
-            local_read_keys: HashSet::new(),
         }
     }
 
@@ -1079,19 +1077,23 @@ impl TransactionScanIterator {
             };
 
             if choose_write {
-                let (k, v) = &self.write_buffer_entries[self.write_buffer_idx];
+                let (k, v) = self.write_buffer_entries[self.write_buffer_idx].clone();
                 self.write_buffer_idx += 1;
 
                 if self.seen.insert(k.clone()) {
-                    // Q2 Decision (A): Record read-set for isolation level repeatable read / snapshot isolation
+                    // Record read-set for isolation level repeatable read / snapshot isolation.
+                    // Publish to the shared read_set immediately rather than deferring to Drop:
+                    // commit() may run while this iterator is still alive (e.g. inside a
+                    // for-loop that calls commit at the end), and OCC validation must see
+                    // every iterated key to detect concurrent modifications.
                     if self.isolation_level == IsolationLevel::SnapshotIsolation
                         || self.isolation_level == IsolationLevel::RepeatableRead
                     {
-                        self.local_read_keys.insert(k.clone());
+                        self.publish_read_key(k);
                     }
 
                     if let Some(row) = v {
-                        return Ok(Some(row.clone()));
+                        return Ok(Some(row));
                     }
                 }
             } else {
@@ -1099,11 +1101,10 @@ impl TransactionScanIterator {
                 self.table_iter.advance()?;
 
                 if self.seen.insert(k.clone()) {
-                    // Q2 Decision (A): Record read-set
                     if self.isolation_level == IsolationLevel::SnapshotIsolation
                         || self.isolation_level == IsolationLevel::RepeatableRead
                     {
-                        self.local_read_keys.insert(k.clone());
+                        self.publish_read_key(k.clone());
                     }
 
                     return Ok(Some(row));
@@ -1113,14 +1114,12 @@ impl TransactionScanIterator {
     }
 }
 
-impl Drop for TransactionScanIterator {
-    fn drop(&mut self) {
-        if !self.local_read_keys.is_empty() {
-            let mut read_set = self.read_set.lock().unwrap();
-            let entry = read_set.entry(self.table_name.clone()).or_default();
-            for key in self.local_read_keys.drain() {
-                entry.insert(key);
-            }
-        }
+impl TransactionScanIterator {
+    fn publish_read_key(&self, key: DbKey) {
+        let mut read_set = self.read_set.lock().unwrap();
+        read_set
+            .entry(self.table_name.clone())
+            .or_default()
+            .insert(key);
     }
 }
