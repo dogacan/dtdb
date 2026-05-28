@@ -74,8 +74,9 @@ Exposes database resources over a client API supporting both embedded (in-proces
 ├── dtdb_sql/           # Layer 3: SQL Query Planner, Optimizer, and Volcano execution
 │   └── src/bin/        # dtdb_sql_cli: Interactive multi-line SQL shell
 ├── dtdb_bindings/      # C++ and Swift FFI bindings (cxx bridge, dtdb::Client wrapper)
-└── dtdb_api/           # Layer 4: Client API (In-Process/Remote), gRPC Server, and SQL CLI
-    └── src/bin/        # dtdb_server (gRPC daemon) and dtdb_client_cli (SQL prompt)
+├── dtdb_api/           # Layer 4: Client API (In-Process/Remote), gRPC Server, and SQL CLI
+│   └── src/bin/        # dtdb_server (gRPC daemon) and dtdb_client_cli (SQL prompt)
+└── dtdb_fuzz/          # Property & fuzz targets for WAL/SSTable corruption and concurrent txns
 ```
 
 ---
@@ -93,6 +94,21 @@ Execute the entire test suite across all workspace crates:
 ```bash
 cargo test
 ```
+
+### Running the Fuzz Suite
+
+The `dtdb_fuzz` crate exercises durability and concurrency surfaces with
+random inputs — WAL recovery, SSTable parsing, concurrent transactions, and
+end-to-end SQL operation sequences across `flush_db` + reopen. Targets are
+`#[ignore]`d so `cargo test` skips them. Run them via:
+
+```bash
+./scripts/run_fuzz.sh                       # default PR-time budget (~50s)
+BOLERO_FUZZ_ITERATIONS=50000 PROPTEST_CASES=4096 ./scripts/run_fuzz.sh  # long run
+```
+
+CI runs the script on every push/PR with the short budget and on the daily
+cron with the long budget.
 
 ### Running the Remote gRPC Server & Client
 
@@ -236,6 +252,7 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 * **Flexible Deployment Modes**: Supports both in-process embedded execution and client-server execution over gRPC using a unified client library.
 * **Native Cross-Language Bindings**: Provides FFI bindings in the `dtdb_bindings` crate, allowing the database to be embedded directly into non‑Rust ecosystems.
 * **Full-Text Search**: Supports `MATCH ... AGAINST` syntax with token, boolean, and phrase queries via a secondary index, enabling efficient text search.
+* **Fuzz & Property Testing**: A dedicated `dtdb_fuzz` crate runs random-input targets against WAL recovery, SSTable parsing, concurrent transactions, and end-to-end SQL durability (flush + reopen). Wired into CI with a small budget per PR and a larger budget on the nightly cron.
 
 ---
 
