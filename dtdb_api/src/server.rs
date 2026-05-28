@@ -767,10 +767,11 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             }
                         };
 
-                        let commit_outcome =
-                            tokio::task::spawn_blocking(move || tx.commit().map_err(|e| e.to_string()))
-                                .await
-                                .unwrap_or_else(|e| Err(format!("Worker panicked: {}", e)));
+                        let commit_outcome = tokio::task::spawn_blocking(move || {
+                            tx.commit().map_err(|e| e.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Worker panicked: {}", e)));
                         let commit_result = match commit_outcome {
                             Ok(()) => CommitResult {
                                 success: true,

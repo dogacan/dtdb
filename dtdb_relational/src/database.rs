@@ -1396,10 +1396,7 @@ impl Database {
             return Ok(());
         }
 
-        tracing::info!(
-            count = prepared.len(),
-            "recovering pending transactions"
-        );
+        tracing::info!(count = prepared.len(), "recovering pending transactions");
         for (tx_id, (mutations, old_rows_opt)) in prepared {
             for (table_name, entries) in mutations {
                 if let Ok(table) = self.get_table(&table_name) {

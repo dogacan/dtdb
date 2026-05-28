@@ -618,8 +618,8 @@ fn test_sstable_block_checksum_detects_bitrot() {
     // The checksum must catch it — either at open-time (last_key read of the
     // last block) or on the lookup. Both are acceptable signals of corruption;
     // what's not acceptable is silently returning wrong data.
-    let result = SstableReader::open(&sst_path, 1, 0, None)
-        .and_then(|r| r.get(&k_int(0)).map(|_| ()));
+    let result =
+        SstableReader::open(&sst_path, 1, 0, None).and_then(|r| r.get(&k_int(0)).map(|_| ()));
     let err = result.expect_err("corrupted block must be detected");
     let msg = format!("{err}");
     assert!(
