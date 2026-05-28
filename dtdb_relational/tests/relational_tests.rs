@@ -1,5 +1,8 @@
-use dtdb_relational::{Column, DataType, Database, RelationalError, Row, Schema, Transaction};
-use dtdb_storage::{DbKey, DbValue};
+use dtdb_relational::{
+    Column, DataType, Database, RelationalError, Row, Schema, Transaction, TransactionRecord,
+};
+use dtdb_storage::{DbKey, DbValue, WalEntry};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -350,6 +353,86 @@ fn test_drop_table_stranded_cleanup_on_startup() {
 
     // 4. Verify the stranded directory was deleted.
     assert!(!stranded_path.exists());
+}
+
+fn auto_inc_schema() -> Schema {
+    Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: true,
+        },
+        Column {
+            name: "val".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ])
+}
+
+#[test]
+fn test_auto_increment_sequence_reflects_recovered_rows() {
+    // Regression: auto-increment sequences were seeded from on-disk rows BEFORE
+    // recover_transactions(), so a prepared-but-not-committed transaction that
+    // gets rolled forward during recovery would leave the in-memory sequence
+    // pointing below the recovered row's PK — guaranteeing a collision on the
+    // next allocation.
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    // Phase 1: insert a small row normally, then inject a Prepared (but never
+    // Committed) record describing a future row with id=100. The matching
+    // `Committed` marker is intentionally omitted to simulate a crash between
+    // prepare and commit.
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        db.create_table("t", auto_inc_schema()).unwrap();
+
+        // Commit a regular row at id=1 so on-disk max == 1.
+        let tx = Transaction::new(1, db.clone());
+        let row1 = Row::new(vec![DbValue::Int(1), DbValue::Int(10)]);
+        tx.put("t", DbKey::Int(1), row1).unwrap();
+        tx.commit().unwrap();
+
+        // Build a Prepared record for tx 999 that inserts id=100. We write the
+        // row bytes directly because the table has a single locality group.
+        let row100 = Row::new(vec![DbValue::Int(100), DbValue::Int(1000)]);
+        let row100_bytes = row100.to_bytes().unwrap();
+        let mutations: HashMap<String, Vec<WalEntry>> = HashMap::from([(
+            "t".to_string(),
+            vec![WalEntry::Put {
+                key: DbKey::Int(100),
+                value: DbValue::Bytes(row100_bytes),
+            }],
+        )]);
+        let prepared = TransactionRecord::Prepared {
+            tx_id: 999,
+            mutations,
+            old_rows: None,
+        };
+        db.write_transaction_record(&prepared).unwrap();
+        // Drop without ever calling commit_transaction(999) — the log retains
+        // the Prepared record across the close.
+    }
+
+    // Phase 2: reopen. Recovery rolls forward id=100. The sequence must now be
+    // initialized from the post-recovery state, i.e. >= 101.
+    {
+        let db = Database::open(&db_path).unwrap();
+        let next = db.next_sequence_value("t").unwrap();
+        assert!(
+            next > 100,
+            "auto-increment sequence collided with recovered row: got {next}, expected > 100"
+        );
+    }
 }
 
 #[test]

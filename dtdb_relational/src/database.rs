@@ -1029,7 +1029,14 @@ impl Database {
             is_background_analyze_started: std::sync::atomic::AtomicBool::new(false),
         };
 
-        // Initialize auto-increment sequences for loaded tables
+        db.recover_transactions()?;
+
+        // Initialize auto-increment sequences for loaded tables.
+        // This must run AFTER recover_transactions: recovery may roll forward a
+        // prepared transaction whose rows contain an auto-increment value larger
+        // than anything previously visible on disk. Seeding the sequence before
+        // recovery would leave it pointing below the recovered max, causing the
+        // very next allocation to collide with an existing row.
         {
             let mut seqs = db.auto_increment_sequences.lock().unwrap();
             let tables_guard = db.tables.read().unwrap();
@@ -1056,8 +1063,6 @@ impl Database {
                 }
             }
         }
-
-        db.recover_transactions()?;
 
         // Open the persistent log file handle
         let log_file = OpenOptions::new()
