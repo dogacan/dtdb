@@ -111,7 +111,9 @@ enum TxRequest {
     Commit {
         resp_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    Rollback,
+    Rollback {
+        resp_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 pub struct CxxTransaction {
@@ -217,11 +219,17 @@ impl CxxClient {
 
     pub fn start_transaction(&self, db_name: &str) -> Result<Box<CxxTransaction>, String> {
         let mut client = self.client.clone();
-        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<TxRequest>(1);
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<TxRequest>(32);
         let db_name = db_name.to_string();
 
-        let commit_sender = Arc::new(std::sync::Mutex::new(None));
-        let commit_sender_clone = commit_sender.clone();
+        // Holds the responder for whichever terminal request (Commit or
+        // Rollback) was sent. The spawned task fills this in before exiting
+        // the inner closure so it can signal the caller after
+        // run_in_transaction completes.
+        let terminal_sender: Arc<
+            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let terminal_sender_clone = terminal_sender.clone();
 
         // Spawn a transaction execution loop inside DuctTapeDbClient's closure-based transaction runner
         self.runtime.spawn(async move {
@@ -264,10 +272,11 @@ impl CxxClient {
                                 let _ = resp_tx.send(mapped);
                             }
                             TxRequest::Commit { resp_tx } => {
-                                *commit_sender_clone.lock().unwrap() = Some(resp_tx);
+                                *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
                                 return Ok(()); // Returns Ok to commit
                             }
-                            TxRequest::Rollback => {
+                            TxRequest::Rollback { resp_tx } => {
+                                *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
                                 return Err(tonic::Status::aborted("Rollback requested"));
                             }
                         }
@@ -276,17 +285,15 @@ impl CxxClient {
                 })
                 .await;
 
-            // Wait for the commit to complete and return the final commit result
-            let mut guard = commit_sender.lock().unwrap();
+            // Notify whichever caller (commit_tx or rollback_tx) is waiting
+            // for the terminal outcome of the transaction.
+            let mut guard = terminal_sender.lock().unwrap();
             if let Some(resp_tx) = guard.take() {
-                match res {
-                    Ok(_) => {
-                        let _ = resp_tx.send(Ok(()));
-                    }
-                    Err(status) => {
-                        let _ = resp_tx.send(Err(status.message().to_string()));
-                    }
-                }
+                let mapped = match res {
+                    Ok(_) => Ok(()),
+                    Err(status) => Err(status.message().to_string()),
+                };
+                let _ = resp_tx.send(mapped);
             }
         });
 
@@ -300,14 +307,17 @@ impl CxxClient {
     ) -> Result<ffi::QueryResult, String> {
         let rust_query = convert_cxx_query(query);
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        tx.req_tx
-            .try_send(TxRequest::Execute {
-                query: rust_query,
-                resp_tx,
-            })
-            .map_err(|e| e.to_string())?;
-
         self.runtime.block_on(async {
+            tx.req_tx
+                .send(TxRequest::Execute {
+                    query: rust_query,
+                    resp_tx,
+                })
+                .await
+                .map_err(|_| {
+                    "transaction worker is no longer running (likely panicked or aborted)"
+                        .to_string()
+                })?;
             resp_rx
                 .await
                 .map_err(|e| e.to_string())?
@@ -317,8 +327,13 @@ impl CxxClient {
 
     pub fn commit_tx(&self, tx: Box<CxxTransaction>) -> Result<(), String> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.req_tx.try_send(TxRequest::Commit { resp_tx });
         self.runtime.block_on(async {
+            tx.req_tx
+                .send(TxRequest::Commit { resp_tx })
+                .await
+                .map_err(|_| {
+                    "transaction worker is no longer running; commit not applied".to_string()
+                })?;
             resp_rx
                 .await
                 .map_err(|e| e.to_string())?
@@ -327,7 +342,22 @@ impl CxxClient {
     }
 
     pub fn rollback_tx(&self, tx: Box<CxxTransaction>) -> Result<(), String> {
-        let _ = tx.req_tx.try_send(TxRequest::Rollback);
-        Ok(())
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.runtime.block_on(async {
+            tx.req_tx
+                .send(TxRequest::Rollback { resp_tx })
+                .await
+                .map_err(|_| {
+                    "transaction worker is no longer running; rollback not applied".to_string()
+                })?;
+            // The worker returns Err(Aborted) from run_in_transaction on
+            // rollback, then forwards it to us. Treat an Aborted reply as
+            // success since that is the expected outcome of a rollback.
+            match resp_rx.await.map_err(|e| e.to_string())? {
+                Ok(()) => Ok(()),
+                Err(msg) if msg.contains("Rollback requested") => Ok(()),
+                Err(msg) => Err(msg),
+            }
+        })
     }
 }
