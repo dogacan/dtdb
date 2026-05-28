@@ -50,7 +50,16 @@ Exposes database resources over a client API supporting both embedded (in-proces
 
 * **Protobuf API**: Defines database creation/deletion, streaming query execution, and bidirectional streaming transaction endpoints.
 * **gRPC Server**: Restores existing databases on boot, implements stateful multi-statement transactions using a streaming RPC, and streams query rows back.
-* **Client Library**: A unified Rust client library (`DuctTapeDbClient`) that supports both in-process and remote gRPC execution, featuring an explicit transaction closure API (`run_in_transaction`).
+* **Client Library**: A unified Rust client library (`DuctTapeDbClient`) that supports both in-process and remote gRPC execution, featuring an explicit transaction closure API (`run_in_transaction`). See the [In-Process API Guide](docs/in_process_api.md) for embedded usage.
+
+---
+
+## 📚 Documentation
+
+* [SQL Support Reference](docs/sql_support.md) — Supported statements, data types, expressions, and functions.
+* [In-Process API Guide](docs/in_process_api.md) — Using `DuctTapeDbClient::in_process` and the underlying `Database` / `Transaction` / `SqlEngine` types directly.
+* [Configuration Reference](docs/configuration.md) — `DatabaseOptions`, per-locality-group overrides, transaction isolation levels, custom tokenizers, and other knobs.
+* [C++ & Swift Bindings Guide](docs/bindings.md) — Cross-language FFI for embedding DuctTapeDB in non-Rust applications.
 
 ---
 
