@@ -23,7 +23,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [build-dependencies]
 tonic-build = "0.12"
 prost-build = "0.13"
-protobuf-src = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

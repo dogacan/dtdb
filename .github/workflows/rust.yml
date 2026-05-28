@@ -28,6 +28,9 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    - name: Install Protocol Buffers Compiler
+      uses: arduino/setup-protoc@v3
+
     - name: Check formatting
       run: cargo fmt --check
 
