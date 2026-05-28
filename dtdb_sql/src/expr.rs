@@ -109,28 +109,18 @@ impl Expr {
         }
     }
 
-    pub fn bind_columns(&mut self, schema: &Schema) {
+    pub fn bind_columns(&mut self, schema: &Schema) -> Result<(), String> {
         match self {
             Expr::Column(name, index) => {
                 if index.is_none() {
-                    let idx = schema.columns.iter().position(|col| {
-                        if col.name == *name {
-                            true
-                        } else if let Some(pos) = name.rfind('.') {
-                            col.name == name[pos + 1..]
-                        } else if let Some(col_pos) = col.name.rfind('.') {
-                            col.name[col_pos + 1..] == *name
-                        } else {
-                            false
-                        }
-                    });
-                    *index = idx;
+                    *index = Some(resolve_column(schema, name)?);
                 }
+                Ok(())
             }
-            Expr::Literal(_) => {}
+            Expr::Literal(_) => Ok(()),
             Expr::BinaryOp { left, right, .. } => {
-                left.bind_columns(schema);
-                right.bind_columns(schema);
+                left.bind_columns(schema)?;
+                right.bind_columns(schema)
             }
             Expr::Case {
                 operand,
@@ -139,54 +129,90 @@ impl Expr {
                 else_result,
             } => {
                 if let Some(op) = operand {
-                    op.bind_columns(schema);
+                    op.bind_columns(schema)?;
                 }
                 for cond in conditions {
-                    cond.bind_columns(schema);
+                    cond.bind_columns(schema)?;
                 }
                 for res in results {
-                    res.bind_columns(schema);
+                    res.bind_columns(schema)?;
                 }
                 if let Some(el) = else_result {
-                    el.bind_columns(schema);
+                    el.bind_columns(schema)?;
                 }
+                Ok(())
             }
             Expr::Function { args, .. } => {
                 for arg in args {
-                    arg.bind_columns(schema);
+                    arg.bind_columns(schema)?;
                 }
+                Ok(())
             }
-            Expr::Not(inner) => {
-                inner.bind_columns(schema);
-            }
-            Expr::IsNull(inner) => {
-                inner.bind_columns(schema);
-            }
+            Expr::Not(inner) => inner.bind_columns(schema),
+            Expr::IsNull(inner) => inner.bind_columns(schema),
             Expr::InList { expr, list } => {
-                expr.bind_columns(schema);
+                expr.bind_columns(schema)?;
                 for item in list {
-                    item.bind_columns(schema);
+                    item.bind_columns(schema)?;
                 }
+                Ok(())
             }
             Expr::Match { column, index, .. } => {
                 if index.is_none() {
-                    let idx = schema.columns.iter().position(|col| {
-                        if col.name == *column {
-                            true
-                        } else if let Some(pos) = column.rfind('.') {
-                            col.name == column[pos + 1..]
-                        } else if let Some(col_pos) = col.name.rfind('.') {
-                            col.name[col_pos + 1..] == *column
-                        } else {
-                            false
-                        }
-                    });
-                    *index = idx;
+                    *index = Some(resolve_column(schema, column)?);
                 }
+                Ok(())
             }
         }
     }
+}
 
+/// Returns the index of the column matching `name` in `schema`, or an error
+/// if the lookup is ambiguous (matches more than one column) or not found.
+///
+/// Matching rules:
+///   - exact match on `col.name`
+///   - if `name` is qualified (e.g. `users.name`), match the trailing portion
+///     against `col.name`
+///   - if `col.name` is qualified, match its trailing portion against `name`
+///
+/// An ambiguous resolution is a hard error rather than silently picking the
+/// first match: after `SELECT a.name, b.name FROM a JOIN b`, an unqualified
+/// `name` in WHERE would otherwise bind to whichever column happened to be
+/// listed first, which is both surprising and non-portable.
+fn resolve_column(schema: &Schema, name: &str) -> Result<usize, String> {
+    let mut matches = Vec::new();
+    for (i, col) in schema.columns.iter().enumerate() {
+        let is_match = if col.name == name {
+            true
+        } else if let Some(pos) = name.rfind('.') {
+            col.name == name[pos + 1..]
+        } else if let Some(col_pos) = col.name.rfind('.') {
+            col.name[col_pos + 1..] == *name
+        } else {
+            false
+        };
+        if is_match {
+            matches.push(i);
+        }
+    }
+    match matches.len() {
+        0 => Err(format!("Column not found in schema: '{}'", name)),
+        1 => Ok(matches[0]),
+        _ => {
+            let candidates: Vec<&str> = matches
+                .iter()
+                .map(|&i| schema.columns[i].name.as_str())
+                .collect();
+            Err(format!(
+                "Ambiguous column reference '{}': matches {:?}",
+                name, candidates
+            ))
+        }
+    }
+}
+
+impl Expr {
     /// Evaluates the expression against a Row and its Schema.
     pub fn eval(&self, row: &Row, schema: &Schema) -> Result<DbValue, String> {
         match self {
@@ -195,21 +221,7 @@ impl Expr {
                 let idx = if let Some(idx) = index {
                     *idx
                 } else {
-                    schema
-                        .columns
-                        .iter()
-                        .position(|col| {
-                            if col.name == *name {
-                                true
-                            } else if let Some(pos) = name.rfind('.') {
-                                col.name == name[pos + 1..]
-                            } else if let Some(col_pos) = col.name.rfind('.') {
-                                col.name[col_pos + 1..] == *name
-                            } else {
-                                false
-                            }
-                        })
-                        .ok_or_else(|| format!("Column not found in schema: '{}'", name))?
+                    resolve_column(schema, name)?
                 };
 
                 row.get_by_index(idx)

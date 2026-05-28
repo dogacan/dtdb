@@ -4752,3 +4752,55 @@ fn test_like_handles_adversarial_pattern_in_bounded_time() {
         panic!("expected Select");
     }
 }
+
+#[test]
+fn test_ambiguous_column_reference_is_rejected() {
+    // Regression for F34: after JOIN-ing two tables that each expose a column
+    // with the same trailing name, an unqualified reference (`WHERE name = ?`)
+    // used to silently bind to whichever column appeared first in the joined
+    // schema. That made queries depend on join order and column ordering —
+    // surprising, non-portable, and a frequent silent data bug.
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE a (id INT PRIMARY KEY, name STRING)", &tx_ddl)
+        .unwrap();
+    engine
+        .execute("CREATE TABLE b (id INT PRIMARY KEY, name STRING)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_ins = Transaction::new(2, db.clone());
+    engine
+        .execute("INSERT INTO a (id, name) VALUES (1, 'alice')", &tx_ins)
+        .unwrap();
+    engine
+        .execute("INSERT INTO b (id, name) VALUES (1, 'bob')", &tx_ins)
+        .unwrap();
+    tx_ins.commit().unwrap();
+
+    let tx_q = Transaction::new(3, db.clone());
+
+    // Unqualified `name` in the SELECT projection is ambiguous after the
+    // join (both `a` and `b` expose a `name` column). The projection binds
+    // against the joined schema, so predicate-pushdown can't hide the
+    // duplicate and the planner must surface the conflict.
+    let res = engine.execute("SELECT a.id, name FROM a JOIN b ON a.id = b.id", &tx_q);
+    assert!(res.is_err(), "ambiguous column should error, got {res:?}");
+    let err = res.unwrap_err();
+    assert!(
+        err.to_lowercase().contains("ambiguous"),
+        "expected an ambiguity message, got: {err}"
+    );
+
+    // Qualifying the column makes the query well-formed.
+    let res = engine
+        .execute("SELECT a.id, a.name FROM a JOIN b ON a.id = b.id", &tx_q)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+    } else {
+        panic!("expected Select");
+    }
+}

@@ -637,7 +637,9 @@ impl SqlEngine {
                 predicate.collect_columns(&mut predicate_cols);
                 let child_cols = parent_cols_union(columns, &predicate_cols);
                 let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
-                predicate.bind_columns(src_op.schema());
+                predicate
+                    .bind_columns(src_op.schema())
+                    .map_err(|e| e.to_string())?;
                 Ok(Box::new(PhysicalFilter::new(src_op, predicate)))
             }
             LogicalPlan::Projection {
@@ -653,7 +655,8 @@ impl SqlEngine {
                 let child_cols: Vec<String> = child_needed.into_iter().collect();
                 let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
                 for expr in &mut expressions {
-                    expr.bind_columns(src_op.schema());
+                    expr.bind_columns(src_op.schema())
+                        .map_err(|e| e.to_string())?;
                 }
                 let proj_schema = LogicalPlan::new_projection(
                     LogicalPlan::Scan {
@@ -688,7 +691,8 @@ impl SqlEngine {
                 let child_cols = parent_cols_union(columns, &key_cols);
                 let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
                 for (expr, _) in &mut keys {
-                    expr.bind_columns(src_op.schema());
+                    expr.bind_columns(src_op.schema())
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(Box::new(PhysicalSort::new(
                     src_op,
@@ -802,8 +806,8 @@ impl SqlEngine {
                         (l_expr, r_expr)
                     };
 
-                    left_on.bind_columns(left_schema);
-                    right_on.bind_columns(right_schema);
+                    left_on.bind_columns(left_schema)?;
+                    right_on.bind_columns(right_schema)?;
 
                     Ok(Box::new(PhysicalHashJoin::new(
                         left_op,
@@ -841,7 +845,8 @@ impl SqlEngine {
                 let child_cols: Vec<String> = child_needed.into_iter().collect();
                 let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
                 for expr in &mut group_by {
-                    expr.bind_columns(src_op.schema());
+                    expr.bind_columns(src_op.schema())
+                        .map_err(|e| e.to_string())?;
                 }
                 for aggr in &mut aggrs {
                     match aggr {
@@ -850,7 +855,8 @@ impl SqlEngine {
                         | crate::logical::AggregateExpr::Min(expr)
                         | crate::logical::AggregateExpr::Max(expr)
                         | crate::logical::AggregateExpr::Avg(expr) => {
-                            expr.bind_columns(src_op.schema());
+                            expr.bind_columns(src_op.schema())
+                                .map_err(|e| e.to_string())?;
                         }
                     }
                 }
