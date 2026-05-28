@@ -757,40 +757,71 @@ pub(crate) fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Order
     }
 }
 
-/// Implements SQL LIKE recursive matching.
+/// Implements SQL LIKE matching by translating the pattern to a regular
+/// expression and matching with the `regex` crate (RE2-style NFA/DFA,
+/// guaranteed linear time in the input — no catastrophic backtracking).
 ///
 /// - `%` matches zero or more of any characters.
 /// - `_` matches exactly one of any character.
+///
+/// Compiled patterns are cached in a process-wide map so repeated executions
+/// of the same query don't re-translate and re-compile on every row.
 fn like_match(text: &str, pattern: &str) -> bool {
-    let t_chars: Vec<char> = text.chars().collect();
-    let p_chars: Vec<char> = pattern.chars().collect();
-    like_match_recursive(&t_chars, &p_chars, 0, 0)
+    match compiled_like_regex(pattern) {
+        Some(re) => re.is_match(text),
+        None => false,
+    }
 }
 
-fn like_match_recursive(t: &[char], p: &[char], t_idx: usize, p_idx: usize) -> bool {
-    if p_idx == p.len() {
-        return t_idx == t.len();
+fn compiled_like_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
+    use std::sync::{Arc, OnceLock, RwLock};
+    static CACHE: OnceLock<RwLock<std::collections::HashMap<String, Arc<regex::Regex>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+
+    // Fast path: cached hit.
+    if let Some(re) = cache.read().ok().and_then(|g| g.get(pattern).cloned()) {
+        return Some(re);
     }
 
-    if p[p_idx] == '%' {
-        // Try skipping the '%' or matching one or more characters.
-        for i in t_idx..=t.len() {
-            if like_match_recursive(t, p, i, p_idx + 1) {
-                return true;
+    let regex_src = like_pattern_to_regex(pattern);
+    let compiled = match regex::Regex::new(&regex_src) {
+        Ok(r) => Arc::new(r),
+        Err(_) => return None,
+    };
+    if let Ok(mut g) = cache.write() {
+        // Bound cache size to avoid unbounded memory growth from adversarial
+        // workloads that issue many distinct patterns.
+        if g.len() >= 1024 {
+            g.clear();
+        }
+        g.entry(pattern.to_string())
+            .or_insert_with(|| compiled.clone());
+    }
+    Some(compiled)
+}
+
+/// Translates a SQL LIKE pattern into an anchored regex. `%` becomes `.*`,
+/// `_` becomes `.`, and every other character is escaped so regex
+/// metacharacters embedded in user input cannot alter the match.
+fn like_pattern_to_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    out.push_str("(?s)^"); // anchor + dotall so `.` matches newlines too
+    for c in pattern.chars() {
+        match c {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            other => {
+                // regex::escape on a single char would allocate; do it inline.
+                if "\\.+*?()|[]{}^$".contains(other) {
+                    out.push('\\');
+                }
+                out.push(other);
             }
         }
-        return false;
     }
-
-    if t_idx == t.len() {
-        return false;
-    }
-
-    if p[p_idx] == '_' || p[p_idx] == t[t_idx] {
-        return like_match_recursive(t, p, t_idx + 1, p_idx + 1);
-    }
-
-    false
+    out.push('$');
+    out
 }
 
 /// Helper to evaluate arithmetic operations on DbValues with promotion logic.

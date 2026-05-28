@@ -4686,3 +4686,69 @@ fn test_substr_handles_extreme_length() {
     assert!(res.is_err());
     assert!(res.unwrap_err().contains("non-negative"));
 }
+
+#[test]
+fn test_like_handles_adversarial_pattern_in_bounded_time() {
+    // Regression for F33: the old recursive-backtracking matcher took
+    // exponential time on patterns like `%a%a%a%a%a%a%a%b` against a long
+    // non-matching string and could effectively hang a query thread. The
+    // regex-backed implementation uses RE2-style NFA simulation and is
+    // guaranteed to be linear in the input.
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, s STRING)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let long_text = "a".repeat(100);
+    let tx_ins = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            &format!("INSERT INTO t (id, s) VALUES (1, '{}')", long_text),
+            &tx_ins,
+        )
+        .unwrap();
+    tx_ins.commit().unwrap();
+
+    // This pattern is the canonical worst case for naive LIKE. We don't
+    // measure wall-clock time here (CI variance), but if we ever regress to
+    // backtracking it would take many seconds to minutes on this input.
+    let tx_q = Transaction::new(3, db.clone());
+    let start = std::time::Instant::now();
+    let res = engine
+        .execute("SELECT id FROM t WHERE s LIKE '%a%a%a%a%a%a%a%b'", &tx_q)
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "LIKE took too long ({elapsed:?}) — backtracking regression?"
+    );
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert!(
+            rows.is_empty(),
+            "non-matching pattern should return no rows"
+        );
+    } else {
+        panic!("expected Select");
+    }
+
+    // Sanity: positive matches still work, including regex metacharacters
+    // that must not leak through the translator.
+    let tx_ins2 = Transaction::new(4, db.clone());
+    engine
+        .execute("INSERT INTO t (id, s) VALUES (2, 'a.b+c')", &tx_ins2)
+        .unwrap();
+    tx_ins2.commit().unwrap();
+    let tx_q2 = Transaction::new(5, db.clone());
+    let res = engine
+        .execute("SELECT id FROM t WHERE s LIKE 'a.b+c'", &tx_q2)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1, "literal '.' and '+' must match exactly");
+        assert_eq!(rows[0].values, vec![DbValue::Int(2)]);
+    } else {
+        panic!("expected Select");
+    }
+}

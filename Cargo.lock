@@ -440,6 +440,7 @@ dependencies = [
  "bincode",
  "dtdb_relational",
  "dtdb_storage",
+ "regex",
  "serde",
  "sqlparser",
  "tempfile",
