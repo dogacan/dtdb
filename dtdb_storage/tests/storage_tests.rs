@@ -580,6 +580,55 @@ fn test_scan_iter_lower_bound() {
 }
 
 #[test]
+fn test_sstable_block_checksum_detects_bitrot() {
+    use std::io::{Seek, SeekFrom, Write};
+    let temp_dir = TempDir::new().unwrap();
+    let sst_path = temp_dir.path().join("00001.sst");
+
+    {
+        let mut writer = SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4).unwrap();
+        for i in 0..16 {
+            writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    // Sanity: clean read works.
+    {
+        let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+        assert_eq!(reader.get(&k_int(0)).unwrap(), Some(Some(v_int(0))));
+    }
+
+    // Flip a byte inside the first data block (offset 0).
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(8)).unwrap();
+        let mut b = [0u8; 1];
+        std::io::Read::read_exact(&mut f, &mut b).unwrap();
+        b[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(8)).unwrap();
+        f.write_all(&b).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // The checksum must catch it — either at open-time (last_key read of the
+    // last block) or on the lookup. Both are acceptable signals of corruption;
+    // what's not acceptable is silently returning wrong data.
+    let result = SstableReader::open(&sst_path, 1, 0, None)
+        .and_then(|r| r.get(&k_int(0)).map(|_| ()));
+    let err = result.expect_err("corrupted block must be detected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("checksum") || msg.contains("Corruption") || msg.contains("decompress"),
+        "expected corruption-flavored error, got: {msg}"
+    );
+}
+
+#[test]
 fn test_scan_iter_stops_loading_blocks_past_end() {
     // Regression: scanning a tiny window of a large SSTable used to drain every
     // remaining block of every above-range source. The iterator must drop the

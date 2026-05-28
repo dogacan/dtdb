@@ -17,6 +17,11 @@ pub struct IndexEntry {
     pub offset: u64,
     /// Compressed size of the block in bytes.
     pub size: u64,
+    /// xxh32 checksum over the on-disk (compressed) block bytes. Zero means
+    /// "no checksum recorded" — used to remain readable against SSTables
+    /// produced by older builds that didn't store one.
+    #[serde(default)]
+    pub checksum: u32,
 }
 
 /// StatsBlock tracks statistics for the keys and values written to this SSTable.
@@ -139,6 +144,7 @@ impl SstableWriter {
                 first_key: key.clone(),
                 offset: self.offset,
                 size: 0,
+                checksum: 0,
             });
         }
 
@@ -171,12 +177,17 @@ impl SstableWriter {
         };
         let block_len = block_bytes.len() as u64;
 
+        // Compute checksum over the bytes that hit disk so a corrupted block
+        // is caught after decompression-time errors miss subtle bitrot.
+        let block_checksum = xxhash_rust::xxh32::xxh32(&block_bytes, 0);
+
         // Write block to file
         self.file.as_mut().unwrap().write_all(&block_bytes)?;
 
-        // Update the last index entry with the correct size
+        // Update the last index entry with the correct size and checksum
         if let Some(entry) = self.index.last_mut() {
             entry.size = block_len;
+            entry.checksum = block_checksum;
         }
 
         self.offset += block_len;
@@ -413,6 +424,19 @@ impl SstableReader {
         let mut block_bytes = vec![0u8; entry.size as usize];
         use std::os::unix::fs::FileExt;
         self.file.read_exact_at(&mut block_bytes, entry.offset)?;
+
+        // Verify the on-disk block checksum before decompression. A zero
+        // checksum means the block was written by a build that pre-dates
+        // per-block checksums; skip verification rather than reject the file.
+        if entry.checksum != 0 {
+            let actual = xxhash_rust::xxh32::xxh32(&block_bytes, 0);
+            if actual != entry.checksum {
+                return Err(StorageError::Corruption(format!(
+                    "SSTable block checksum mismatch (sst id={}, block {}, expected {:#010x}, actual {:#010x})",
+                    self.id, idx, entry.checksum, actual
+                )));
+            }
+        }
 
         let raw_bytes = match self.compression {
             CompressionType::Lz4 => lz4_flex::decompress_size_prepended(&block_bytes)
