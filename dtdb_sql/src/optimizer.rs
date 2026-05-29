@@ -1139,3 +1139,442 @@ fn swap_join_condition(condition: Expr) -> Expr {
         other => other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtdb_relational::{Column, DataType, IndexDefinition, IndexType, Schema};
+
+    #[test]
+    fn test_get_plan_sort_key_projection() {
+        let schema = Schema::new(vec![Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        }]);
+
+        let scan = LogicalPlan::Scan {
+            table_name: "t".to_string(),
+            schema: schema.clone(),
+            range: None,
+        };
+
+        let proj = LogicalPlan::Projection {
+            source: Box::new(scan),
+            expressions: vec![crate::expr::Expr::Column("id".to_string(), None)],
+            field_names: vec!["alias_id".to_string()],
+            schema: schema.clone(),
+        };
+
+        let sort_key = Optimizer::get_plan_sort_key(&proj);
+        assert_eq!(sort_key, Some("alias_id".to_string()));
+    }
+
+    #[test]
+    fn test_is_key_unbounded_min_max() {
+        assert!(is_key_unbounded_min(&DbKey::Int(i64::MIN)));
+        assert!(!is_key_unbounded_min(&DbKey::Int(0)));
+        assert!(is_key_unbounded_max(&DbKey::Int(i64::MAX)));
+        assert!(!is_key_unbounded_max(&DbKey::Int(0)));
+
+        assert!(is_key_unbounded_min(&DbKey::String("".to_string())));
+        assert!(!is_key_unbounded_min(&DbKey::String("a".to_string())));
+        assert!(is_key_unbounded_max(&DbKey::String(
+            "\u{10ffff}".to_string()
+        )));
+
+        assert!(is_key_unbounded_min(&DbKey::Bool(false)));
+        assert!(!is_key_unbounded_min(&DbKey::Bool(true)));
+        assert!(is_key_unbounded_max(&DbKey::Bool(true)));
+        assert!(!is_key_unbounded_max(&DbKey::Bool(false)));
+
+        assert!(is_key_unbounded_min(&DbKey::Composite(vec![])));
+        assert!(is_key_unbounded_min(&DbKey::Composite(vec![DbKey::Bool(
+            false
+        )])));
+        assert!(!is_key_unbounded_min(&DbKey::Composite(vec![DbKey::Bool(
+            true
+        )])));
+        assert!(is_key_unbounded_max(&DbKey::Composite(vec![])));
+        assert!(is_key_unbounded_max(&DbKey::Composite(vec![DbKey::Bool(
+            true
+        )])));
+        assert!(!is_key_unbounded_max(&DbKey::Composite(vec![DbKey::Bool(
+            false
+        )])));
+    }
+
+    #[test]
+    fn test_val_to_key_unsupported() {
+        assert_eq!(val_to_key(&DbValue::Float(1.5)), None);
+        assert_eq!(val_to_key(&DbValue::Bool(true)), None);
+        assert_eq!(val_to_key(&DbValue::Null), None);
+    }
+
+    #[test]
+    fn test_swap_join_conditions() {
+        let l = Box::new(Expr::Column("a".to_string(), None));
+        let r = Box::new(Expr::Column("b".to_string(), None));
+
+        let cond_eq = Expr::BinaryOp {
+            left: l.clone(),
+            op: Operator::Eq,
+            right: r.clone(),
+        };
+        let swapped_eq = swap_join_condition(cond_eq);
+        assert!(matches!(
+            swapped_eq,
+            Expr::BinaryOp {
+                op: Operator::Eq,
+                ..
+            }
+        ));
+        if let Expr::BinaryOp { left, right, .. } = swapped_eq {
+            assert_eq!(left, r);
+            assert_eq!(right, l);
+        }
+
+        let cond_neq = Expr::BinaryOp {
+            left: l.clone(),
+            op: Operator::NotEq,
+            right: r.clone(),
+        };
+        let swapped_neq = swap_join_condition(cond_neq);
+        assert!(matches!(
+            swapped_neq,
+            Expr::BinaryOp {
+                op: Operator::NotEq,
+                ..
+            }
+        ));
+        if let Expr::BinaryOp { left, right, .. } = swapped_neq {
+            assert_eq!(left, r);
+            assert_eq!(right, l);
+        }
+
+        let cond_lt = Expr::BinaryOp {
+            left: l.clone(),
+            op: Operator::Lt,
+            right: r.clone(),
+        };
+        let swapped_lt = swap_join_condition(cond_lt);
+        assert!(matches!(
+            swapped_lt,
+            Expr::BinaryOp {
+                op: Operator::Gt,
+                ..
+            }
+        ));
+        if let Expr::BinaryOp { left, right, .. } = swapped_lt {
+            assert_eq!(left, r);
+            assert_eq!(right, l);
+        }
+
+        let cond_lteq = Expr::BinaryOp {
+            left: l.clone(),
+            op: Operator::LtEq,
+            right: r.clone(),
+        };
+        let swapped_lteq = swap_join_condition(cond_lteq);
+        assert!(matches!(
+            swapped_lteq,
+            Expr::BinaryOp {
+                op: Operator::GtEq,
+                ..
+            }
+        ));
+        if let Expr::BinaryOp { left, right, .. } = swapped_lteq {
+            assert_eq!(left, r);
+            assert_eq!(right, l);
+        }
+
+        let cond_gteq = Expr::BinaryOp {
+            left: l.clone(),
+            op: Operator::GtEq,
+            right: r.clone(),
+        };
+        let swapped_gteq = swap_join_condition(cond_gteq);
+        assert!(matches!(
+            swapped_gteq,
+            Expr::BinaryOp {
+                op: Operator::LtEq,
+                ..
+            }
+        ));
+        if let Expr::BinaryOp { left, right, .. } = swapped_gteq {
+            assert_eq!(left, r);
+            assert_eq!(right, l);
+        }
+
+        let cond_other = Expr::BinaryOp {
+            left: l.clone(),
+            op: Operator::Add,
+            right: r.clone(),
+        };
+        let swapped_other = swap_join_condition(cond_other);
+        assert!(matches!(
+            swapped_other,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                ..
+            }
+        ));
+        if let Expr::BinaryOp { left, right, .. } = swapped_other {
+            assert_eq!(left, r);
+            assert_eq!(right, l);
+        }
+
+        let non_binary = Expr::Literal(DbValue::Int(1));
+        assert_eq!(swap_join_condition(non_binary.clone()), non_binary);
+    }
+
+    #[test]
+    fn test_extract_bounds_for_column_edge_cases() {
+        let col_type_int = DataType::Int;
+
+        // WHERE id < i64::MIN should return None (empty range)
+        let predicate_lt_min = Expr::BinaryOp {
+            left: Box::new(Expr::Column("id".to_string(), None)),
+            op: Operator::Lt,
+            right: Box::new(Expr::Literal(DbValue::Int(i64::MIN))),
+        };
+        assert_eq!(
+            extract_bounds_for_column(&predicate_lt_min, "id", &col_type_int),
+            None
+        );
+
+        // WHERE val > true for bool type (unsupported val_to_key)
+        let predicate_bool_gt = Expr::BinaryOp {
+            left: Box::new(Expr::Column("val".to_string(), None)),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(DbValue::Bool(true))),
+        };
+        assert_eq!(
+            extract_bounds_for_column(&predicate_bool_gt, "val", &DataType::Bool),
+            None
+        );
+
+        // WHERE val > 5 for boolean col_type (testing fallback arm _ => key in matches!(op, Operator::Gt))
+        let predicate_bool_gt_2 = Expr::BinaryOp {
+            left: Box::new(Expr::Column("val".to_string(), None)),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(DbValue::Int(5))),
+        };
+        let bounds = extract_bounds_for_column(&predicate_bool_gt_2, "val", &DataType::Bool);
+        assert!(bounds.is_some());
+        let (start, end) = bounds.unwrap();
+        assert_eq!(start, DbKey::Int(6));
+        assert_eq!(end, DbKey::String("\u{10ffff}".to_string()));
+
+        // WHERE val < 5 for boolean col_type (testing fallback arm _ => key in matches!(op, Operator::Lt))
+        let predicate_bool_lt = Expr::BinaryOp {
+            left: Box::new(Expr::Column("val".to_string(), None)),
+            op: Operator::Lt,
+            right: Box::new(Expr::Literal(DbValue::Int(5))),
+        };
+        let bounds = extract_bounds_for_column(&predicate_bool_lt, "val", &DataType::Bool);
+        assert!(bounds.is_some());
+        let (start, end) = bounds.unwrap();
+        assert_eq!(start, DbKey::String("".to_string()));
+        assert_eq!(end, DbKey::Int(4));
+
+        // And operators
+        let predicate_and = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("id".to_string(), None)),
+                op: Operator::GtEq,
+                right: Box::new(Expr::Literal(DbValue::Int(5))),
+            }),
+            op: Operator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("id".to_string(), None)),
+                op: Operator::LtEq,
+                right: Box::new(Expr::Literal(DbValue::Int(10))),
+            }),
+        };
+        let bounds = extract_bounds_for_column(&predicate_and, "id", &col_type_int);
+        assert_eq!(bounds, Some((DbKey::Int(5), DbKey::Int(10))));
+    }
+
+    #[test]
+    fn test_get_plan_sort_key_edge_cases() {
+        let mut schema = Schema::new(vec![Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        }]);
+        schema.indexes.push(IndexDefinition {
+            name: "idx_id".to_string(),
+            columns: vec!["id".to_string()],
+            index_type: IndexType::BTree,
+            tokenizer: None,
+        });
+
+        // IndexScan sort key check
+        let iscan_valid = LogicalPlan::IndexScan {
+            table_name: "t".to_string(),
+            index_name: "idx_id".to_string(),
+            schema: schema.clone(),
+            range: None,
+        };
+        assert_eq!(
+            Optimizer::get_plan_sort_key(&iscan_valid),
+            Some("id".to_string())
+        );
+
+        let iscan_invalid = LogicalPlan::IndexScan {
+            table_name: "t".to_string(),
+            index_name: "idx_non_existent".to_string(),
+            schema: schema.clone(),
+            range: None,
+        };
+        assert_eq!(Optimizer::get_plan_sort_key(&iscan_invalid), None);
+
+        // Filter / Limit / Distinct propagation
+        let filter = LogicalPlan::Filter {
+            source: Box::new(iscan_valid.clone()),
+            predicate: Expr::Literal(DbValue::Bool(true)),
+        };
+        assert_eq!(
+            Optimizer::get_plan_sort_key(&filter),
+            Some("id".to_string())
+        );
+
+        // Projection match and mismatch
+        let proj_match = LogicalPlan::Projection {
+            source: Box::new(iscan_valid.clone()),
+            expressions: vec![Expr::Column("id".to_string(), None)],
+            field_names: vec!["alias_id".to_string()],
+            schema: schema.clone(),
+        };
+        assert_eq!(
+            Optimizer::get_plan_sort_key(&proj_match),
+            Some("alias_id".to_string())
+        );
+
+        let proj_mismatch = LogicalPlan::Projection {
+            source: Box::new(iscan_valid.clone()),
+            expressions: vec![Expr::Literal(DbValue::Int(1))],
+            field_names: vec!["alias_id".to_string()],
+            schema: schema.clone(),
+        };
+        assert_eq!(Optimizer::get_plan_sort_key(&proj_mismatch), None);
+    }
+
+    #[test]
+    fn test_try_promote_to_index_scan_edge_cases() {
+        let mut schema = Schema::new(vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Int,
+                is_primary_key: true,
+                is_nullable: false,
+                locality_group: None,
+                default_value: None,
+                is_auto_increment: false,
+            },
+            Column {
+                name: "val".to_string(),
+                data_type: DataType::Int,
+                is_primary_key: false,
+                is_nullable: true,
+                locality_group: None,
+                default_value: None,
+                is_auto_increment: false,
+            },
+        ]);
+        schema.indexes.push(IndexDefinition {
+            name: "idx_val".to_string(),
+            columns: vec!["val".to_string()],
+            index_type: IndexType::BTree,
+            tokenizer: None,
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let opt = Optimizer::new(db);
+
+        // Scan range is not None (cannot promote)
+        let scan_with_range = LogicalPlan::Scan {
+            table_name: "t".to_string(),
+            schema: schema.clone(),
+            range: Some((DbKey::Int(1), DbKey::Int(10))),
+        };
+        assert!(
+            opt.try_promote_to_index_scan(scan_with_range, "val")
+                .is_none()
+        );
+
+        // Scan with no range (can promote)
+        let scan = LogicalPlan::Scan {
+            table_name: "t".to_string(),
+            schema: schema.clone(),
+            range: None,
+        };
+        let promoted = opt.try_promote_to_index_scan(scan.clone(), "val");
+        assert!(promoted.is_some());
+        assert!(matches!(promoted.unwrap(), LogicalPlan::IndexScan { .. }));
+
+        // Filter propagation
+        let filter = LogicalPlan::Filter {
+            source: Box::new(scan.clone()),
+            predicate: Expr::Literal(DbValue::Bool(true)),
+        };
+        let filter_promoted = opt.try_promote_to_index_scan(filter, "val");
+        assert!(filter_promoted.is_some());
+        if let Some(LogicalPlan::Filter { source, .. }) = filter_promoted {
+            assert!(matches!(*source, LogicalPlan::IndexScan { .. }));
+        } else {
+            panic!("Expected Filter containing IndexScan");
+        }
+
+        // Limit propagation
+        let limit = LogicalPlan::Limit {
+            source: Box::new(scan.clone()),
+            limit: Some(10),
+            offset: 0,
+        };
+        let limit_promoted = opt.try_promote_to_index_scan(limit, "val");
+        assert!(limit_promoted.is_some());
+        if let Some(LogicalPlan::Limit { source, .. }) = limit_promoted {
+            assert!(matches!(*source, LogicalPlan::IndexScan { .. }));
+        } else {
+            panic!("Expected Limit containing IndexScan");
+        }
+
+        // Distinct propagation
+        let distinct = LogicalPlan::Distinct {
+            source: Box::new(scan.clone()),
+        };
+        let distinct_promoted = opt.try_promote_to_index_scan(distinct, "val");
+        assert!(distinct_promoted.is_some());
+        if let Some(LogicalPlan::Distinct { source, .. }) = distinct_promoted {
+            assert!(matches!(*source, LogicalPlan::IndexScan { .. }));
+        } else {
+            panic!("Expected Distinct containing IndexScan");
+        }
+
+        // Projection propagation
+        let proj = LogicalPlan::Projection {
+            source: Box::new(scan.clone()),
+            expressions: vec![Expr::Column("val".to_string(), None)],
+            field_names: vec!["alias_val".to_string()],
+            schema: schema.clone(),
+        };
+        let proj_promoted = opt.try_promote_to_index_scan(proj, "alias_val");
+        assert!(proj_promoted.is_some());
+        if let Some(LogicalPlan::Projection { source, .. }) = proj_promoted {
+            assert!(matches!(*source, LogicalPlan::IndexScan { .. }));
+        } else {
+            panic!("Expected Projection containing IndexScan");
+        }
+    }
+}
