@@ -4891,6 +4891,71 @@ fn test_prepared_statement_insert_and_errors() {
 }
 
 #[test]
+fn test_prepared_update_and_delete_with_params() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_ins = Transaction::new(2, db.clone());
+    for i in 1..=5i64 {
+        engine
+            .execute(
+                &format!("INSERT INTO t (id, n) VALUES ({i}, {})", i * 10),
+                &tx_ins,
+            )
+            .unwrap();
+    }
+    tx_ins.commit().unwrap();
+
+    // Prepared UPDATE with parameters in both SET and WHERE, reused with two
+    // different bindings (exercises plan-cached substitution of Update exprs).
+    let upd = engine
+        .prepare("UPDATE t SET n = :n WHERE id = :id")
+        .unwrap();
+    for (id, n) in [(2i64, 999i64), (4, 888)] {
+        let tx = Transaction::new(10 + id as u64, db.clone());
+        let mut p = std::collections::HashMap::new();
+        p.insert("n".to_string(), DbValue::Int(n));
+        p.insert("id".to_string(), DbValue::Int(id));
+        engine.execute_prepared(&upd, &tx, &p).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = Transaction::new(50, db.clone());
+    let res = engine
+        .execute("SELECT id, n FROM t ORDER BY id", &tx)
+        .unwrap();
+    match res {
+        ExecutionResult::Select { rows, .. } => {
+            assert_eq!(rows[1].values, vec![DbValue::Int(2), DbValue::Int(999)]);
+            assert_eq!(rows[3].values, vec![DbValue::Int(4), DbValue::Int(888)]);
+        }
+        _ => panic!("expected Select"),
+    }
+
+    // Prepared DELETE with a parameter in WHERE.
+    let del = engine.prepare("DELETE FROM t WHERE id = :id").unwrap();
+    let tx = Transaction::new(60, db.clone());
+    let mut p = std::collections::HashMap::new();
+    p.insert("id".to_string(), DbValue::Int(1));
+    engine.execute_prepared(&del, &tx, &p).unwrap();
+    tx.commit().unwrap();
+
+    let tx = Transaction::new(70, db.clone());
+    let res = engine.execute("SELECT COUNT(*) FROM t", &tx).unwrap();
+    match res {
+        ExecutionResult::Select { rows, .. } => {
+            assert_eq!(rows[0].values, vec![DbValue::Int(4)])
+        }
+        _ => panic!("expected Select"),
+    }
+}
+
+#[test]
 fn test_sum_preserves_int_type_and_handles_overflow() {
     // Regression for F31: SUM(int_col) used to finalize as DbValue::Float
     // unconditionally. f64 loses precision past 2^53, so summing many int64

@@ -175,7 +175,7 @@ fn main() {
     );
 
     println!(
-        "  prepared (parse cached) = {:.2} us/query  ({:.0}% of full, {:.2}x faster)\n",
+        "  prepared (parse + plan cached) = {:.2} us/query  ({:.0}% of full, {:.2}x faster)\n",
         t_prepared / 1000.0,
         100.0 * t_prepared / t_full,
         t_full / t_prepared

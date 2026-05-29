@@ -99,6 +99,79 @@ pub enum SetOpType {
 }
 
 impl LogicalPlan {
+    /// Recursively replaces every [`Expr::Parameter`] in the plan with its
+    /// bound value from `params`. Called at execution time to turn a cached,
+    /// parameterized plan into a concrete one before optimization/compilation.
+    pub fn substitute_params(
+        &mut self,
+        params: &std::collections::HashMap<String, dtdb_storage::DbValue>,
+    ) -> Result<(), String> {
+        match self {
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::IndexScan { .. }
+            | LogicalPlan::FullTextScan { .. } => Ok(()),
+            LogicalPlan::Filter { source, predicate } => {
+                source.substitute_params(params)?;
+                predicate.substitute_params(params)
+            }
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                ..
+            } => {
+                source.substitute_params(params)?;
+                for e in expressions {
+                    e.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                ..
+            } => {
+                left.substitute_params(params)?;
+                right.substitute_params(params)?;
+                condition.substitute_params(params)
+            }
+            LogicalPlan::Aggregate {
+                source,
+                group_by,
+                aggrs,
+                ..
+            } => {
+                source.substitute_params(params)?;
+                for g in group_by {
+                    g.substitute_params(params)?;
+                }
+                for aggr in aggrs {
+                    let (AggregateExpr::Count { expr, .. }
+                    | AggregateExpr::Sum { expr, .. }
+                    | AggregateExpr::Min { expr, .. }
+                    | AggregateExpr::Max { expr, .. }
+                    | AggregateExpr::Avg { expr, .. }) = aggr;
+                    expr.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            LogicalPlan::Sort { source, keys } => {
+                source.substitute_params(params)?;
+                for (e, _) in keys {
+                    e.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            LogicalPlan::Limit { source, .. } | LogicalPlan::Distinct { source } => {
+                source.substitute_params(params)
+            }
+            LogicalPlan::SetOp { left, right, .. } => {
+                left.substitute_params(params)?;
+                right.substitute_params(params)
+            }
+        }
+    }
+
     pub fn new_projection(
         source: LogicalPlan,
         expressions: Vec<Expr>,

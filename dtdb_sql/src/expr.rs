@@ -1,7 +1,7 @@
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Operator represents binary operations in SQL WHERE conditions.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +169,61 @@ impl Expr {
             Expr::Match { column, index, .. } => {
                 if index.is_none() {
                     *index = Some(resolve_column(schema, column)?);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Recursively replaces each [`Expr::Parameter`] with the bound value from
+    /// `params` (as an [`Expr::Literal`]). Errors if a referenced parameter has
+    /// no binding. Used to turn a cached, parameterized plan into a concrete one
+    /// at execution time.
+    pub fn substitute_params(&mut self, params: &HashMap<String, DbValue>) -> Result<(), String> {
+        match self {
+            Expr::Parameter(name) => {
+                let val = params
+                    .get(name)
+                    .ok_or_else(|| format!("Unbound parameter: {name}"))?;
+                *self = Expr::Literal(val.clone());
+                Ok(())
+            }
+            Expr::Column(..) | Expr::Literal(_) | Expr::Match { .. } => Ok(()),
+            Expr::BinaryOp { left, right, .. } => {
+                left.substitute_params(params)?;
+                right.substitute_params(params)
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    op.substitute_params(params)?;
+                }
+                for cond in conditions {
+                    cond.substitute_params(params)?;
+                }
+                for res in results {
+                    res.substitute_params(params)?;
+                }
+                if let Some(el) = else_result {
+                    el.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    arg.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            Expr::Not(inner) | Expr::IsNull(inner) => inner.substitute_params(params),
+            Expr::InList { expr, list } => {
+                expr.substitute_params(params)?;
+                for item in list {
+                    item.substitute_params(params)?;
                 }
                 Ok(())
             }

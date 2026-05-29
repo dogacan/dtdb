@@ -41,19 +41,71 @@ fn is_plan_sorted_by(plan: &LogicalPlan, group_by: &[Expr]) -> bool {
     false
 }
 
+/// Substitutes bound parameter values into a planned statement, turning its
+/// symbolic `Expr::Parameter` nodes into concrete literals before execution.
+fn substitute_statement_params(
+    planned: &mut SqlStatement,
+    params: &std::collections::HashMap<String, DbValue>,
+) -> Result<(), String> {
+    match planned {
+        SqlStatement::Query(plan) | SqlStatement::Explain(plan) => plan.substitute_params(params),
+        SqlStatement::InsertSelect { query, .. } => query.substitute_params(params),
+        SqlStatement::Delete { filter, .. } => {
+            if let Some(f) = filter {
+                f.substitute_params(params)?;
+            }
+            Ok(())
+        }
+        SqlStatement::Update {
+            assignments,
+            filter,
+            ..
+        } => {
+            for (_, e) in assignments.iter_mut() {
+                e.substitute_params(params)?;
+            }
+            if let Some(f) = filter {
+                f.substitute_params(params)?;
+            }
+            Ok(())
+        }
+        // Insert holds concrete values (parameters can't survive planning into
+        // it); DDL and Analyze carry no expressions.
+        SqlStatement::Insert { .. }
+        | SqlStatement::CreateTable { .. }
+        | SqlStatement::DropTable { .. }
+        | SqlStatement::CreateIndex { .. }
+        | SqlStatement::DropIndex { .. }
+        | SqlStatement::Analyze { .. } => Ok(()),
+    }
+}
+
+/// How a [`PreparedStatement`]'s work is cached.
+#[derive(Debug, Clone)]
+enum PreparedPlan {
+    /// The statement was planned once with its parameters left symbolic
+    /// (`Expr::Parameter`). Each execution clones this plan, substitutes the
+    /// bound values, then optimizes and runs it — skipping both parsing and
+    /// logical planning.
+    Planned(Box<SqlStatement>),
+    /// Fallback for statements whose parameters cannot survive planning — e.g.
+    /// placeholders in `INSERT ... VALUES`, which the planner materializes to
+    /// concrete values. The parsed AST is cached and bound on each execution,
+    /// so only parsing is skipped (the original prepared-statement behavior).
+    /// Boxed because a sqlparser `Statement` is far larger than a planned one.
+    Ast(Box<Statement>),
+}
+
 /// A parsed, reusable SQL statement produced by [`SqlEngine::prepare`].
 ///
-/// Preparing parses (and preprocesses) the SQL once and stores the resulting
-/// AST here; [`SqlEngine::execute_prepared`] then runs it many times — binding
-/// fresh parameter values each call — without re-parsing. Parsing is the single
-/// largest slice of a small query's cost, so reusing a prepared statement is a
-/// substantial win for repeated queries such as point lookups in a loop.
-///
-/// Planning, optimization, and physical execution still run on every call;
-/// caching those is a separate future step.
+/// Preparing parses and preprocesses the SQL once, and — where possible — plans
+/// it too, leaving parameters symbolic. [`SqlEngine::execute_prepared`] then
+/// runs it many times with fresh bindings, skipping the parse (always) and the
+/// logical planning (when the plan could be cached). Optimization and physical
+/// execution still run on every call.
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    statement: Statement,
+    plan: PreparedPlan,
     sql: String,
 }
 
@@ -92,22 +144,43 @@ impl SqlEngine {
                 "Multiple SQL statements in a single prepare() call are not allowed.".to_string(),
             );
         }
+        let statement = statements.remove(0);
+
+        // Try to plan now, with parameters left symbolic, so execution can skip
+        // logical planning. If planning can't represent the parameters (e.g.
+        // placeholders in INSERT ... VALUES, which the planner materializes to
+        // values), fall back to caching the AST and binding on each execution.
+        let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
+            Ok(planned) => PreparedPlan::Planned(Box::new(planned)),
+            Err(_) => PreparedPlan::Ast(Box::new(statement)),
+        };
+
         Ok(PreparedStatement {
-            statement: statements.remove(0),
+            plan,
             sql: sql.to_string(),
         })
     }
 
     /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
-    /// binding `params`. Behaves exactly like [`execute_with_params`](Self::execute_with_params)
-    /// but reuses the cached parse instead of re-parsing the SQL text.
+    /// binding `params`. Reuses the cached parse, and — when the plan was
+    /// cacheable — the cached logical plan, substituting the bound values into
+    /// it before optimization and execution.
     pub fn execute_prepared(
         &self,
         prepared: &PreparedStatement,
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
-        self.execute_statement(prepared.statement.clone(), tx, params)
+        match &prepared.plan {
+            PreparedPlan::Planned(planned) => {
+                let mut planned = (**planned).clone();
+                substitute_statement_params(&mut planned, params)?;
+                self.execute_planned(planned, tx)
+            }
+            PreparedPlan::Ast(statement) => {
+                self.execute_statement((**statement).clone(), tx, params)
+            }
+        }
     }
 
     /// Returns the temp directory for spill files, creating it if needed.
@@ -226,7 +299,18 @@ impl SqlEngine {
     ) -> Result<ExecutionResult, String> {
         crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
+        self.execute_planned(planned_stmt, tx)
+    }
 
+    /// Optimizes, compiles, and executes an already-planned statement. Shared by
+    /// the parse-then-plan path (`execute_statement`) and the prepared path
+    /// (`execute_prepared`), which supplies a cached plan with parameters
+    /// already substituted.
+    fn execute_planned(
+        &self,
+        planned_stmt: SqlStatement,
+        tx: &Transaction,
+    ) -> Result<ExecutionResult, String> {
         match planned_stmt {
             SqlStatement::CreateTable { name, schema } => {
                 self.database

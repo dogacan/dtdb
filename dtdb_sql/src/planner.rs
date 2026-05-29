@@ -9,6 +9,7 @@ use sqlparser::ast::{
 use std::sync::Arc;
 
 /// Represents a parsed and planned SQL statement.
+#[derive(Debug, Clone)]
 pub enum SqlStatement {
     CreateTable {
         name: String,
