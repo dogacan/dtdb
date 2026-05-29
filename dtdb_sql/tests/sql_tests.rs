@@ -2385,6 +2385,7 @@ fn opts_with_budget(memory_budget: Option<usize>) -> dtdb_relational::DatabaseOp
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     }
 }
 
@@ -2421,6 +2422,7 @@ fn test_cbo_index_selection_by_cardinality() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -2536,6 +2538,7 @@ fn test_cbo_locality_group_pruning_performance() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -3742,6 +3745,7 @@ fn test_external_sort_basic() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: Some(200), // very small budget to force spills
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -3830,6 +3834,7 @@ fn test_external_sort_desc() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: Some(200), // force spills
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -3893,6 +3898,7 @@ fn test_external_sort_multi_key() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: Some(100), // force spills
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -3957,6 +3963,7 @@ fn test_external_sort_empty_and_single() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: Some(200),
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());

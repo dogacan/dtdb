@@ -82,6 +82,7 @@ impl LocalityGroupOptions {
             wal_sync_interval_ms: self
                 .wal_sync_interval_ms
                 .unwrap_or(defaults.wal_sync_interval_ms),
+            ..defaults
         }
     }
 }
@@ -997,6 +998,7 @@ mod tests {
             max_level: 7,
             block_cache_capacity: 1000,
             wal_sync_interval_ms: Some(50),
+            ..Default::default()
         }
     }
 

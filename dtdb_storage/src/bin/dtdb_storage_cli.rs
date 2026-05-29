@@ -26,6 +26,7 @@ fn main() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
     let engine = match StorageEngine::open(db_path, options) {
         Ok(eng) => eng,

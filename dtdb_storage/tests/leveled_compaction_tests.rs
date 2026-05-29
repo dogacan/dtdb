@@ -58,6 +58,7 @@ fn test_l0_to_l1_auto_compaction() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -105,6 +106,7 @@ fn test_sstable_splitting_by_target_size() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -161,6 +163,7 @@ fn test_tombstone_purging() {
         max_level: 2, // max level is 2
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -199,6 +202,7 @@ fn test_deep_stress_and_consistency() {
         max_level: 4,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
 
     let engine = Arc::new(StorageEngine::open(&db_path, options).unwrap());

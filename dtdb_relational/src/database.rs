@@ -3,8 +3,8 @@ use crate::row::Row;
 use crate::schema::{IndexDefinition, IndexType, Schema};
 use crate::transaction::Transaction;
 use dtdb_storage::{
-    CompressionType, DbKey, DbValue, EngineOptions, Executor, PeriodicHandle, Priority,
-    StorageEngine, WalEntry,
+    CompressionType, DbKey, DbValue, EngineOptions, Executor, FsyncMethod, PeriodicHandle,
+    Priority, StorageEngine, WalEntry,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -832,6 +832,8 @@ pub struct DatabaseOptions {
     pub wal_sync_interval_ms: Option<u64>,
     #[serde(default, alias = "sort_memory_budget")]
     pub memory_budget: Option<usize>,
+    #[serde(default)]
+    pub fsync_method: FsyncMethod,
 }
 
 /// Default background WAL-sync interval (milliseconds) for the internal
@@ -929,6 +931,7 @@ impl Database {
                 analyze_frequency_ms: None,
                 wal_sync_interval_ms: None,
                 memory_budget: None,
+                fsync_method: FsyncMethod::default(),
             }
         };
         Self::open_with_options_and_executor(dir_path, options, executor)
@@ -1011,6 +1014,7 @@ impl Database {
                         wal_sync_interval_ms: engine_wal_sync_interval(
                             options.wal_sync_interval_ms,
                         ),
+                        fsync_method: options.fsync_method,
                     };
 
                     let mut engines = HashMap::new();
@@ -1186,6 +1190,7 @@ impl Database {
             max_level: self.options.max_level.unwrap_or(7),
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
             wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
+            fsync_method: self.options.fsync_method,
         };
 
         let mut engines = HashMap::new();
@@ -1396,7 +1401,7 @@ impl Database {
             file.write_all(&len.to_le_bytes())?;
             file.write_all(&bytes)?;
             if sync {
-                file.sync_all()?;
+                dtdb_storage::sync_file(file, self.options.fsync_method)?;
             }
         }
         Ok(())
@@ -1484,7 +1489,7 @@ impl Database {
             use std::io::Seek;
             file.set_len(0)?;
             file.seek(std::io::SeekFrom::Start(0))?;
-            file.sync_all()?;
+            dtdb_storage::sync_file(file, self.options.fsync_method)?;
         }
         Ok(())
     }
@@ -1927,6 +1932,7 @@ impl Database {
             max_level: self.options.max_level.unwrap_or(7),
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
             wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
+            fsync_method: self.options.fsync_method,
         };
 
         // 6. Create index directory

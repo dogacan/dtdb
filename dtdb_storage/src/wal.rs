@@ -26,6 +26,7 @@ pub struct Wal {
     #[allow(dead_code)]
     path: PathBuf,
     sync_interval_ms: Option<u64>,
+    fsync_method: crate::FsyncMethod,
     /// Bytes written to the WAL, tracked in memory so the hot write path can
     /// consult the size for flush decisions without an `fstat` syscall per
     /// write. Seeded from the file's length on open.
@@ -41,7 +42,11 @@ enum WalEntryRef<'a> {
 
 impl Wal {
     /// Opens an existing WAL file or creates a new one in append-only mode.
-    pub fn open(path: impl AsRef<Path>, sync_interval_ms: Option<u64>) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        sync_interval_ms: Option<u64>,
+        fsync_method: crate::FsyncMethod,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let size_bytes = file.metadata()?.len();
@@ -50,6 +55,7 @@ impl Wal {
             file,
             path,
             sync_interval_ms,
+            fsync_method,
             size_bytes,
         })
     }
@@ -93,14 +99,14 @@ impl Wal {
         // directly to the physical storage media (similar to fsync in C). Without this,
         // data could remain in OS memory and be lost during a sudden power outage.
         if self.sync_interval_ms.is_none() || self.sync_interval_ms == Some(0) {
-            self.file.sync_all()?;
+            crate::sync_file(&self.file, self.fsync_method)?;
         }
         Ok(())
     }
 
     /// Explicitly flushes WAL buffers to disk. Used for periodic background syncing.
     pub fn sync_all(&self) -> Result<()> {
-        self.file.sync_all()?;
+        crate::sync_file(&self.file, self.fsync_method)?;
         Ok(())
     }
 
@@ -241,7 +247,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("batch.wal");
         {
-            let mut wal = Wal::open(&path, None).unwrap();
+            let mut wal = Wal::open(&path, None, crate::FsyncMethod::Fullfsync).unwrap();
             wal.append_batch(&[
                 WalEntry::Put {
                     key: k(1),
@@ -263,7 +269,7 @@ mod tests {
     fn test_sync_all_and_size() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("size.wal");
-        let mut wal = Wal::open(&path, Some(1000)).unwrap();
+        let mut wal = Wal::open(&path, Some(1000), crate::FsyncMethod::Fullfsync).unwrap();
         assert_eq!(wal.size().unwrap(), 0);
         wal.append_put(&k(1), &v(1)).unwrap();
         // With a non-zero sync interval, append doesn't fsync; do it explicitly.

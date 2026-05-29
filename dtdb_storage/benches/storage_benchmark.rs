@@ -24,6 +24,7 @@ fn create_options(cache_capacity: usize, compression: CompressionType) -> Engine
         max_level: 7,
         block_cache_capacity: cache_capacity,
         wal_sync_interval_ms: None,
+        ..Default::default()
     }
 }
 

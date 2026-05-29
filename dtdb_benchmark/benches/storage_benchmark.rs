@@ -60,6 +60,7 @@ fn bench_options() -> EngineOptions {
         max_level: 7,
         block_cache_capacity: 2_000,
         wal_sync_interval_ms: Some(1_000),
+        ..Default::default()
     }
 }
 

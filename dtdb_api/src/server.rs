@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 
 use dtdb_relational::{Database, DatabaseOptions, Transaction};
 use dtdb_sql::SqlEngine;
-use dtdb_storage::{CompressionType, DbValue};
+use dtdb_storage::{CompressionType, DbValue, FsyncMethod};
 
 use crate::proto::duct_tape_db_service_server::DuctTapeDbService;
 use crate::proto::{
@@ -252,6 +252,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             analyze_frequency_ms: req.analyze_frequency_ms,
             wal_sync_interval_ms: None,
             memory_budget: None,
+            fsync_method: FsyncMethod::default(),
         };
 
         let database = Arc::new(

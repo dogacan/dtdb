@@ -66,6 +66,7 @@ async fn test_wal_size_based_flush() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let create_resp = client
@@ -158,6 +159,7 @@ async fn test_periodic_time_based_flush() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let create_resp = client
@@ -265,6 +267,7 @@ async fn test_manual_rpc_flush() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let create_resp = client

@@ -319,7 +319,11 @@ impl EngineInner {
             fs::remove_file(&wal_path)?;
         }
 
-        let wal = Wal::open(&wal_path, active_options.wal_sync_interval_ms)?;
+        let wal = Wal::open(
+            &wal_path,
+            active_options.wal_sync_interval_ms,
+            active_options.fsync_method,
+        )?;
 
         Ok(Self {
             dir_path,
@@ -1128,7 +1132,11 @@ impl EngineInner {
         }
 
         let temp_wal_path = self.dir_path.join("active.wal.tmp");
-        let new_wal = Wal::open(&temp_wal_path, self.options.wal_sync_interval_ms)?;
+        let new_wal = Wal::open(
+            &temp_wal_path,
+            self.options.wal_sync_interval_ms,
+            self.options.fsync_method,
+        )?;
 
         let wal_path = self.dir_path.join("active.wal");
         {

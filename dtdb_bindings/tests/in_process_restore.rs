@@ -30,6 +30,7 @@ fn new_in_process_client_restores_db_with_flush_interval() {
             analyze_frequency_ms: None,
             wal_sync_interval_ms: None,
             memory_budget: None,
+            fsync_method: dtdb_storage::FsyncMethod::default(),
         };
         let _db = Arc::new(
             Database::open_with_options_and_executor(

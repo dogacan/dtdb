@@ -47,6 +47,7 @@ async fn test_in_process_client_integration() {
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
     let create_opt_resp = client
         .create_db_with_options("db_opt", options)

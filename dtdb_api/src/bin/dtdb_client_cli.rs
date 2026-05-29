@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     analyze_frequency_ms: None,
                     wal_sync_interval_ms: None,
                     memory_budget: None,
+                    fsync_method: dtdb_storage::FsyncMethod::default(),
                 };
 
                 match client.create_db_with_options(db_name, options).await {

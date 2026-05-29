@@ -1,7 +1,9 @@
 use dtdb_storage::memtable::MemTable;
 use dtdb_storage::sstable::{SstableReader, SstableWriter};
 use dtdb_storage::wal::Wal;
-use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, WalEntry};
+use dtdb_storage::{
+    CompressionType, DbKey, DbValue, EngineOptions, FsyncMethod, StorageEngine, WalEntry,
+};
 use std::fs;
 use tempfile::TempDir;
 
@@ -50,7 +52,7 @@ fn test_wal_recovery() {
 
     // Write entries to WAL
     {
-        let mut wal = Wal::open(&wal_path, None).unwrap();
+        let mut wal = Wal::open(&wal_path, None, FsyncMethod::default()).unwrap();
         wal.append_put(&k_int(1), &v_int(100)).unwrap();
         wal.append_put(&k_str("a"), &v_str("apple")).unwrap();
         wal.append_delete(&k_int(1)).unwrap();
@@ -134,6 +136,7 @@ fn test_engine_crud() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
 
@@ -184,6 +187,7 @@ fn test_engine_crash_recovery() {
             max_level: 7,
             block_cache_capacity: 1000,
             wal_sync_interval_ms: None,
+            ..Default::default()
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("one")).unwrap();
@@ -206,6 +210,7 @@ fn test_engine_crash_recovery() {
             max_level: 7,
             block_cache_capacity: 1000,
             wal_sync_interval_ms: None,
+            ..Default::default()
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         assert_eq!(engine.get(&k_int(1)).unwrap(), None); // Deleted
@@ -246,6 +251,7 @@ fn test_engine_compaction() {
             max_level: 7,
             block_cache_capacity: 1000,
             wal_sync_interval_ms: None,
+            ..Default::default()
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("v1_old")).unwrap(); // Flushes
@@ -305,6 +311,7 @@ fn test_engine_statistics() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -387,6 +394,7 @@ fn test_engine_multi_get() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
 
@@ -429,6 +437,7 @@ fn test_engine_compaction_round_robin() {
             max_level: 4,
             block_cache_capacity: 0,
             wal_sync_interval_ms: None,
+            ..Default::default()
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -466,6 +475,7 @@ fn test_engine_compaction_round_robin() {
             max_level: 4,
             block_cache_capacity: 0,
             wal_sync_interval_ms: None,
+            ..Default::default()
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -521,6 +531,7 @@ fn test_engine_crash_recovery_multiple_restarts() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
 
     // 1. Open engine, write some keys, and drop it (leaving WAL).
@@ -560,6 +571,7 @@ fn test_scan_iter_lower_bound() {
         max_level: 7,
         block_cache_capacity: 0,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -650,6 +662,7 @@ fn test_scan_iter_stops_loading_blocks_past_end() {
         max_level: 7,
         block_cache_capacity: 0,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -694,6 +707,7 @@ fn merge_test_options() -> EngineOptions {
         max_level: 7,
         block_cache_capacity: 0,
         wal_sync_interval_ms: None,
+        ..Default::default()
     }
 }
 
@@ -787,6 +801,7 @@ fn test_scan_and_filtered_scan_across_compacted_levels() {
         max_level: 7,
         block_cache_capacity: 0,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
@@ -908,6 +923,7 @@ fn many_l1_files_options() -> EngineOptions {
         max_level: 7,
         block_cache_capacity: 0,
         wal_sync_interval_ms: None,
+        ..Default::default()
     }
 }
 
@@ -997,6 +1013,7 @@ fn test_compaction_at_max_level_drops_tombstones() {
         max_level: 1, // L0 compacts straight into the max level (L1)
         block_cache_capacity: 0,
         wal_sync_interval_ms: None,
+        ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 

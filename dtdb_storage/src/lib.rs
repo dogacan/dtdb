@@ -144,6 +144,13 @@ pub enum CompressionType {
     Lz4,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FsyncMethod {
+    #[default]
+    Fsync,
+    Fullfsync,
+}
+
 /// EngineOptions defines the configuration limits and parameters for a StorageEngine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineOptions {
@@ -159,6 +166,27 @@ pub struct EngineOptions {
     pub block_cache_capacity: usize,
     #[serde(default)]
     pub wal_sync_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub fsync_method: FsyncMethod,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            compression: CompressionType::Lz4,
+            memtable_size_limit: 8 * 1024 * 1024,
+            block_size_limit: 4096,
+            wal_size_limit: 32 * 1024 * 1024,
+            l0_compaction_threshold: 4,
+            sstable_target_size: 2 * 1024 * 1024,
+            base_level_size_limit: 10 * 1024 * 1024,
+            level_size_multiplier: 10,
+            max_level: 7,
+            block_cache_capacity: 1000,
+            wal_sync_interval_ms: None,
+            fsync_method: FsyncMethod::default(),
+        }
+    }
 }
 
 impl From<i64> for DbValue {
@@ -237,6 +265,32 @@ pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
     {
         let _ = parent;
         Ok(())
+    }
+}
+
+/// Synchronizes file data to disk using the selected fsync method.
+pub fn sync_file(file: &std::fs::File, method: FsyncMethod) -> std::io::Result<()> {
+    match method {
+        FsyncMethod::Fsync => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = file.as_raw_fd();
+                unsafe extern "C" {
+                    fn fsync(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+                }
+                let res = unsafe { fsync(fd) };
+                if res == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                file.sync_all()
+            }
+        }
+        FsyncMethod::Fullfsync => file.sync_all(),
     }
 }
 

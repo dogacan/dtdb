@@ -574,6 +574,7 @@ fn test_background_statistics_collector() {
         analyze_frequency_ms: Some(10), // Run every 10ms
         wal_sync_interval_ms: None,
         memory_budget: None,
+        fsync_method: dtdb_storage::FsyncMethod::default(),
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
