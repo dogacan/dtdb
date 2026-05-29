@@ -3,7 +3,7 @@ use crate::logical::{AggregateExpr, JoinType, SetOpType};
 use crate::spill::{self, KWayMerge, Run};
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// PhysicalOperator defines the Volcano Iterator interface for query execution.
@@ -769,13 +769,13 @@ impl AggMerge {
                     }
                     _ => {
                         if let Some((k, a)) = self.current.replace((key, accs)) {
-                            return Ok(Some(finalize_group(k, a)));
+                            return Ok(Some(finalize_group(k, a)?));
                         }
                     }
                 },
                 None => {
                     return match self.current.take() {
-                        Some((k, a)) => Ok(Some(finalize_group(k, a))),
+                        Some((k, a)) => Ok(Some(finalize_group(k, a)?)),
                         None => Ok(None),
                     };
                 }
@@ -845,11 +845,11 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
                 for (idx, aggr) in self.aggrs.iter().enumerate() {
                     let val = match aggr {
-                        AggregateExpr::Count(expr)
-                        | AggregateExpr::Sum(expr)
-                        | AggregateExpr::Min(expr)
-                        | AggregateExpr::Max(expr)
-                        | AggregateExpr::Avg(expr) => expr.eval(&row, &source_schema)?,
+                        AggregateExpr::Count { expr, .. }
+                        | AggregateExpr::Sum { expr, .. }
+                        | AggregateExpr::Min { expr, .. }
+                        | AggregateExpr::Max { expr, .. }
+                        | AggregateExpr::Avg { expr, .. } => expr.eval(&row, &source_schema)?,
                     };
                     accumulators[idx].update(&val)?;
                 }
@@ -870,7 +870,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
                 let output_rows: Vec<Row> = groups
                     .into_iter()
                     .map(|(keys, accs)| finalize_group(keys, accs))
-                    .collect();
+                    .collect::<Result<_, String>>()?;
                 self.output = Some(AggOutput::InMemory(output_rows.into_iter()));
             } else {
                 if !groups.is_empty() {
@@ -954,20 +954,7 @@ impl PhysicalOperator for PhysicalSortedAggregate {
                 self.source_exhausted = true;
                 if self.group_by.is_empty() && self.active_group_keys.is_none() {
                     self.active_group_keys = Some(Vec::new());
-                    self.active_accumulators = self
-                        .aggrs
-                        .iter()
-                        .map(|aggr| match aggr {
-                            AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                            AggregateExpr::Sum(_) => Accumulator::Sum {
-                                int_sum: None,
-                                float_sum: None,
-                            },
-                            AggregateExpr::Min(_) => Accumulator::Min { min: None },
-                            AggregateExpr::Max(_) => Accumulator::Max { max: None },
-                            AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
-                        })
-                        .collect();
+                    self.active_accumulators = new_accumulators(&self.aggrs);
                 }
             }
         }
@@ -979,7 +966,7 @@ impl PhysicalOperator for PhysicalSortedAggregate {
                     if let Some(keys) = self.active_group_keys.take() {
                         let mut row_vals = keys;
                         for acc in self.active_accumulators.drain(..) {
-                            row_vals.push(acc.finalize());
+                            row_vals.push(acc.finalize()?);
                         }
                         return Ok(Some(Row::new(row_vals)));
                     }
@@ -997,11 +984,11 @@ impl PhysicalOperator for PhysicalSortedAggregate {
                 if group_vals == *active_keys {
                     for (idx, aggr) in self.aggrs.iter().enumerate() {
                         let val = match aggr {
-                            AggregateExpr::Count(expr)
-                            | AggregateExpr::Sum(expr)
-                            | AggregateExpr::Min(expr)
-                            | AggregateExpr::Max(expr)
-                            | AggregateExpr::Avg(expr) => expr.eval(&row, &source_schema)?,
+                            AggregateExpr::Count { expr, .. }
+                            | AggregateExpr::Sum { expr, .. }
+                            | AggregateExpr::Min { expr, .. }
+                            | AggregateExpr::Max { expr, .. }
+                            | AggregateExpr::Avg { expr, .. } => expr.eval(&row, &source_schema)?,
                         };
                         self.active_accumulators[idx].update(&val)?;
                     }
@@ -1016,34 +1003,21 @@ impl PhysicalOperator for PhysicalSortedAggregate {
                     let keys = self.active_group_keys.take().unwrap();
                     let mut row_vals = keys;
                     for acc in self.active_accumulators.drain(..) {
-                        row_vals.push(acc.finalize());
+                        row_vals.push(acc.finalize()?);
                     }
                     return Ok(Some(Row::new(row_vals)));
                 }
             } else {
                 self.active_group_keys = Some(group_vals);
-                self.active_accumulators = self
-                    .aggrs
-                    .iter()
-                    .map(|aggr| match aggr {
-                        AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                        AggregateExpr::Sum(_) => Accumulator::Sum {
-                            int_sum: None,
-                            float_sum: None,
-                        },
-                        AggregateExpr::Min(_) => Accumulator::Min { min: None },
-                        AggregateExpr::Max(_) => Accumulator::Max { max: None },
-                        AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
-                    })
-                    .collect();
+                self.active_accumulators = new_accumulators(&self.aggrs);
 
                 for (idx, aggr) in self.aggrs.iter().enumerate() {
                     let val = match aggr {
-                        AggregateExpr::Count(expr)
-                        | AggregateExpr::Sum(expr)
-                        | AggregateExpr::Min(expr)
-                        | AggregateExpr::Max(expr)
-                        | AggregateExpr::Avg(expr) => expr.eval(&row, &source_schema)?,
+                        AggregateExpr::Count { expr, .. }
+                        | AggregateExpr::Sum { expr, .. }
+                        | AggregateExpr::Min { expr, .. }
+                        | AggregateExpr::Max { expr, .. }
+                        | AggregateExpr::Avg { expr, .. } => expr.eval(&row, &source_schema)?,
                     };
                     self.active_accumulators[idx].update(&val)?;
                 }
@@ -1097,32 +1071,57 @@ enum Accumulator {
         sum: f64,
         count: i64,
     },
+    // DISTINCT aggregate (COUNT/SUM/AVG DISTINCT). Inputs are collected into
+    // `seen`, deduplicated by value, and the wrapped `inner` aggregate is applied
+    // to the distinct set only at finalize time. Deferring aggregation keeps
+    // merging of spilled partial groups a simple set union: the same value may
+    // appear in several runs of one group, so partial inner results cannot be
+    // combined directly without double counting.
+    Distinct {
+        seen: HashSet<DbValue>,
+        inner: Box<Accumulator>,
+    },
+}
+
+/// Builds a fresh zeroed accumulator for a single aggregate expression, wrapping
+/// it in a `Distinct` layer when the call used the `DISTINCT` quantifier. MIN/MAX
+/// are idempotent under duplication, so DISTINCT is a no-op there and skipped.
+fn make_accumulator(aggr: &AggregateExpr) -> Accumulator {
+    let (base, distinct) = match aggr {
+        AggregateExpr::Count { distinct, .. } => (Accumulator::Count { count: 0 }, *distinct),
+        AggregateExpr::Sum { distinct, .. } => (
+            Accumulator::Sum {
+                int_sum: None,
+                float_sum: None,
+            },
+            *distinct,
+        ),
+        AggregateExpr::Avg { distinct, .. } => (Accumulator::Avg { sum: 0.0, count: 0 }, *distinct),
+        AggregateExpr::Min { .. } => (Accumulator::Min { min: None }, false),
+        AggregateExpr::Max { .. } => (Accumulator::Max { max: None }, false),
+    };
+    if distinct {
+        Accumulator::Distinct {
+            seen: HashSet::new(),
+            inner: Box::new(base),
+        }
+    } else {
+        base
+    }
 }
 
 /// Creates a fresh set of zeroed accumulators matching the given aggregate exprs.
 fn new_accumulators(aggrs: &[AggregateExpr]) -> Vec<Accumulator> {
-    aggrs
-        .iter()
-        .map(|aggr| match aggr {
-            AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-            AggregateExpr::Sum(_) => Accumulator::Sum {
-                int_sum: None,
-                float_sum: None,
-            },
-            AggregateExpr::Min(_) => Accumulator::Min { min: None },
-            AggregateExpr::Max(_) => Accumulator::Max { max: None },
-            AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
-        })
-        .collect()
+    aggrs.iter().map(make_accumulator).collect()
 }
 
 /// Builds an output row from group keys followed by each finalized aggregate.
-fn finalize_group(keys: Vec<DbValue>, accs: Vec<Accumulator>) -> Row {
+fn finalize_group(keys: Vec<DbValue>, accs: Vec<Accumulator>) -> Result<Row, String> {
     let mut row_vals = keys;
     for acc in accs {
-        row_vals.push(acc.finalize());
+        row_vals.push(acc.finalize()?);
     }
-    Row::new(row_vals)
+    Ok(Row::new(row_vals))
 }
 
 impl Accumulator {
@@ -1131,6 +1130,11 @@ impl Accumulator {
             return Ok(()); // Ignore NULL values for all aggregates
         }
         match self {
+            // Defer the underlying aggregation to finalize; here we only record the
+            // distinct input values. The NULL guard above already excludes NULLs.
+            Accumulator::Distinct { seen, .. } => {
+                seen.insert(val.clone());
+            }
             Accumulator::Count { count } => {
                 *count += 1;
             }
@@ -1259,13 +1263,22 @@ impl Accumulator {
                 *sum += o_sum;
                 *count += o_count;
             }
+            // Partial distinct groups from different spilled runs may share values,
+            // so the inner aggregate is rebuilt from the union at finalize; merging
+            // is just the set union of observed values.
+            (
+                Accumulator::Distinct { seen, .. },
+                Accumulator::Distinct { seen: o_seen, .. },
+            ) => {
+                seen.extend(o_seen);
+            }
             _ => return Err("Cannot merge accumulators of different kinds".to_string()),
         }
         Ok(())
     }
 
-    fn finalize(&self) -> DbValue {
-        match self {
+    fn finalize(&self) -> Result<DbValue, String> {
+        let val = match self {
             Accumulator::Count { count } => DbValue::Int(*count),
             Accumulator::Sum { int_sum, float_sum } => match (float_sum, int_sum) {
                 (Some(f), _) => DbValue::Float(*f),
@@ -1281,7 +1294,18 @@ impl Accumulator {
                     DbValue::Float(*sum / (*count as f64))
                 }
             }
-        }
+            // Replay the deduplicated values through a fresh copy of the wrapped
+            // aggregate. Set iteration order is unspecified, which is fine: the
+            // wrapped aggregates here (COUNT/SUM/AVG) are order-insensitive.
+            Accumulator::Distinct { seen, inner } => {
+                let mut acc = (**inner).clone();
+                for v in seen {
+                    acc.update(v)?;
+                }
+                acc.finalize()?
+            }
+        };
+        Ok(val)
     }
 }
 

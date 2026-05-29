@@ -201,3 +201,137 @@ impl Wal {
 fn compute_checksum(data: &[u8]) -> u32 {
     xxhash_rust::xxh32::xxh32(data, 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn k(i: i64) -> DbKey {
+        DbKey::Int(i)
+    }
+    fn v(i: i64) -> DbValue {
+        DbValue::Int(i)
+    }
+
+    /// Encode a single WAL frame (len + checksum + payload) the way the writer
+    /// does, so recovery tests can hand-build streams with deliberate damage.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compute_checksum(payload).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn put_payload(key: &DbKey, value: &DbValue) -> Vec<u8> {
+        bincode::serialize(&WalEntryRef::Put { key, value }).unwrap()
+    }
+
+    #[test]
+    fn test_append_batch_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("batch.wal");
+        {
+            let mut wal = Wal::open(&path, None).unwrap();
+            wal.append_batch(&[
+                WalEntry::Put {
+                    key: k(1),
+                    value: v(10),
+                },
+                WalEntry::Delete { key: k(2) },
+            ])
+            .unwrap();
+        }
+        let entries = Wal::recover(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Batch(sub) => assert_eq!(sub.len(), 2),
+            other => panic!("expected a batch entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sync_all_and_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("size.wal");
+        let mut wal = Wal::open(&path, Some(1000)).unwrap();
+        assert_eq!(wal.size().unwrap(), 0);
+        wal.append_put(&k(1), &v(1)).unwrap();
+        // With a non-zero sync interval, append doesn't fsync; do it explicitly.
+        wal.sync_all().unwrap();
+        assert!(wal.size().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_recover_missing_file_is_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let entries = Wal::recover(dir.path().join("does_not_exist.wal")).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_recover_stops_at_truncated_length_prefix() {
+        // One good entry, then a stray byte that can't form a 4-byte length.
+        let mut stream = frame(&put_payload(&k(1), &v(1)));
+        stream.push(0x07);
+        let entries = Wal::recover_from_reader(&stream[..]).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_recover_stops_at_truncated_checksum() {
+        // Good entry, then a length prefix with no checksum following it.
+        let mut stream = frame(&put_payload(&k(1), &v(1)));
+        stream.extend_from_slice(&8u32.to_le_bytes());
+        let entries = Wal::recover_from_reader(&stream[..]).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_recover_stops_at_truncated_payload() {
+        // Good entry, then len + checksum claiming 16 bytes but only 4 present.
+        let mut stream = frame(&put_payload(&k(1), &v(1)));
+        stream.extend_from_slice(&16u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&[1, 2, 3, 4]);
+        let entries = Wal::recover_from_reader(&stream[..]).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_recover_stops_at_oversized_length() {
+        // A length prefix above the per-entry cap is treated as corruption.
+        let mut stream = frame(&put_payload(&k(1), &v(1)));
+        stream.extend_from_slice(&((MAX_WAL_ENTRY_BYTES as u32) + 1).to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        let entries = Wal::recover_from_reader(&stream[..]).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_recover_stops_at_checksum_mismatch() {
+        let payload = put_payload(&k(1), &v(1));
+        let good = frame(&payload);
+
+        // A second frame whose stored checksum doesn't match the payload.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bad.extend_from_slice(&compute_checksum(&payload).wrapping_add(1).to_le_bytes());
+        bad.extend_from_slice(&payload);
+
+        let stream = [good, bad].concat();
+        let entries = Wal::recover_from_reader(&stream[..]).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_recover_stops_at_undeserializable_payload() {
+        let good = frame(&put_payload(&k(1), &v(1)));
+        // Bytes with a valid checksum that bincode can't decode into a WalEntry
+        // (a bogus enum discriminant well past the defined variants).
+        let garbage = vec![0xFFu8; 8];
+        let stream = [good, frame(&garbage)].concat();
+        let entries = Wal::recover_from_reader(&stream[..]).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+}

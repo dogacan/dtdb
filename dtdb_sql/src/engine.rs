@@ -828,11 +828,11 @@ impl SqlEngine {
                 }
                 for aggr in &aggrs {
                     match aggr {
-                        crate::logical::AggregateExpr::Count(expr)
-                        | crate::logical::AggregateExpr::Sum(expr)
-                        | crate::logical::AggregateExpr::Min(expr)
-                        | crate::logical::AggregateExpr::Max(expr)
-                        | crate::logical::AggregateExpr::Avg(expr) => {
+                        crate::logical::AggregateExpr::Count { expr, .. }
+                        | crate::logical::AggregateExpr::Sum { expr, .. }
+                        | crate::logical::AggregateExpr::Min { expr, .. }
+                        | crate::logical::AggregateExpr::Max { expr, .. }
+                        | crate::logical::AggregateExpr::Avg { expr, .. } => {
                             expr.collect_columns(&mut child_needed)
                         }
                     }
@@ -845,11 +845,11 @@ impl SqlEngine {
                 }
                 for aggr in &mut aggrs {
                     match aggr {
-                        crate::logical::AggregateExpr::Count(expr)
-                        | crate::logical::AggregateExpr::Sum(expr)
-                        | crate::logical::AggregateExpr::Min(expr)
-                        | crate::logical::AggregateExpr::Max(expr)
-                        | crate::logical::AggregateExpr::Avg(expr) => {
+                        crate::logical::AggregateExpr::Count { expr, .. }
+                        | crate::logical::AggregateExpr::Sum { expr, .. }
+                        | crate::logical::AggregateExpr::Min { expr, .. }
+                        | crate::logical::AggregateExpr::Max { expr, .. }
+                        | crate::logical::AggregateExpr::Avg { expr, .. } => {
                             expr.bind_columns(src_op.schema())
                                 .map_err(|e| e.to_string())?;
                         }

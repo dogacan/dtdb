@@ -1479,13 +1479,28 @@ fn rewrite_having_expr(
             if matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
                 let alias = func.to_string();
 
-                let args_vec = match &func.args {
-                    sqlparser::ast::FunctionArguments::List(arg_list) => arg_list.args.as_slice(),
-                    sqlparser::ast::FunctionArguments::None => &[],
+                // The DISTINCT quantifier lives on the argument list, not the
+                // function name (e.g. `COUNT(DISTINCT col)`); pull it out so the
+                // executor can deduplicate inputs before aggregating.
+                let (args_vec, distinct) = match &func.args {
+                    sqlparser::ast::FunctionArguments::List(arg_list) => (
+                        arg_list.args.as_slice(),
+                        matches!(
+                            arg_list.duplicate_treatment,
+                            Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                        ),
+                    ),
+                    sqlparser::ast::FunctionArguments::None => (&[][..], false),
                     other => return Err(format!("Unsupported aggregate arguments: {:?}", other)),
                 };
 
                 let arg_expr = if args_vec.is_empty() {
+                    if distinct {
+                        return Err(format!(
+                            "{} with DISTINCT requires a column argument",
+                            name
+                        ));
+                    }
                     Expr::Literal(DbValue::Int(1))
                 } else {
                     match &args_vec[0] {
@@ -1493,6 +1508,9 @@ fn rewrite_having_expr(
                             plan_expr(inner_expr)?
                         }
                         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                            if distinct {
+                                return Err("COUNT(DISTINCT *) is not supported".to_string());
+                            }
                             Expr::Literal(DbValue::Int(1))
                         }
                         other => return Err(format!("Unsupported function argument: {:?}", other)),
@@ -1500,11 +1518,26 @@ fn rewrite_having_expr(
                 };
 
                 let aggr = match name.as_str() {
-                    "COUNT" => AggregateExpr::Count(arg_expr),
-                    "SUM" => AggregateExpr::Sum(arg_expr),
-                    "MIN" => AggregateExpr::Min(arg_expr),
-                    "MAX" => AggregateExpr::Max(arg_expr),
-                    "AVG" => AggregateExpr::Avg(arg_expr),
+                    "COUNT" => AggregateExpr::Count {
+                        expr: arg_expr,
+                        distinct,
+                    },
+                    "SUM" => AggregateExpr::Sum {
+                        expr: arg_expr,
+                        distinct,
+                    },
+                    "MIN" => AggregateExpr::Min {
+                        expr: arg_expr,
+                        distinct,
+                    },
+                    "MAX" => AggregateExpr::Max {
+                        expr: arg_expr,
+                        distinct,
+                    },
+                    "AVG" => AggregateExpr::Avg {
+                        expr: arg_expr,
+                        distinct,
+                    },
                     _ => unreachable!(),
                 };
 

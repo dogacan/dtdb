@@ -294,6 +294,104 @@ mod tests {
     }
 
     #[test]
+    fn test_fsync_parent_dir_relative_path_maps_to_cwd() {
+        // A bare filename has an empty ("") parent, which the helper maps to
+        // ".". This exercises the empty-parent branch without a crash test.
+        // The current directory always exists, so the fsync should succeed.
+        fsync_parent_dir(std::path::Path::new("some_relative_file.bin"))
+            .expect("relative path should fsync the current directory");
+    }
+
+    #[test]
+    fn test_dbkey_byte_size_all_variants() {
+        assert_eq!(DbKey::Int(0).byte_size(), 8);
+        assert_eq!(DbKey::String("abcd".to_string()).byte_size(), 4);
+        assert_eq!(DbKey::Bool(true).byte_size(), 1);
+        assert_eq!(DbKey::String(String::new()).byte_size(), 0);
+    }
+
+    #[test]
+    fn test_dbvalue_partial_eq_variants() {
+        // Matching variants compare their inner data.
+        assert_eq!(DbValue::Int(7), DbValue::Int(7));
+        assert_ne!(DbValue::Int(7), DbValue::Int(8));
+        assert_eq!(DbValue::String("x".into()), DbValue::String("x".into()));
+        assert_ne!(DbValue::String("x".into()), DbValue::String("y".into()));
+        assert_eq!(DbValue::Bytes(vec![1, 2]), DbValue::Bytes(vec![1, 2]));
+        assert_ne!(DbValue::Bytes(vec![1, 2]), DbValue::Bytes(vec![1, 3]));
+        assert_eq!(DbValue::Bool(true), DbValue::Bool(true));
+        assert_ne!(DbValue::Bool(true), DbValue::Bool(false));
+        assert_eq!(DbValue::Null, DbValue::Null);
+        assert_eq!(DbValue::Float(1.5), DbValue::Float(1.5));
+        assert_ne!(DbValue::Float(1.5), DbValue::Float(2.5));
+
+        // Mismatched variants are never equal (the `_ => false` arm).
+        assert_ne!(DbValue::Int(1), DbValue::Bool(true));
+        assert_ne!(DbValue::String("1".into()), DbValue::Int(1));
+        assert_ne!(DbValue::Null, DbValue::Bool(false));
+    }
+
+    #[test]
+    fn test_dbvalue_hash_distinguishes_variants() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(v: &DbValue) -> u64 {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        }
+
+        // Equal values hash equal across every variant.
+        assert_eq!(hash_of(&DbValue::Int(42)), hash_of(&DbValue::Int(42)));
+        assert_eq!(
+            hash_of(&DbValue::String("k".into())),
+            hash_of(&DbValue::String("k".into()))
+        );
+        assert_eq!(
+            hash_of(&DbValue::Bytes(vec![9, 8])),
+            hash_of(&DbValue::Bytes(vec![9, 8]))
+        );
+        assert_eq!(hash_of(&DbValue::Bool(true)), hash_of(&DbValue::Bool(true)));
+        assert_eq!(hash_of(&DbValue::Null), hash_of(&DbValue::Null));
+
+        // The variant tag is mixed in, so identical inner bytes in different
+        // variants don't collide trivially.
+        assert_ne!(hash_of(&DbValue::Bool(false)), hash_of(&DbValue::Null));
+
+        // A non-zero, non-NaN float hashes by its bit pattern.
+        assert_eq!(hash_of(&DbValue::Float(3.5)), hash_of(&DbValue::Float(3.5)));
+    }
+
+    #[test]
+    fn test_dbvalue_from_conversions() {
+        assert_eq!(DbValue::from(5i64), DbValue::Int(5));
+        assert_eq!(DbValue::from(2.5f64), DbValue::Float(2.5));
+        assert_eq!(
+            DbValue::from("hi".to_string()),
+            DbValue::String("hi".into())
+        );
+        assert_eq!(DbValue::from(true), DbValue::Bool(true));
+        assert_eq!(DbValue::from("slice"), DbValue::String("slice".into()));
+        assert_eq!(
+            DbValue::from(vec![1u8, 2, 3]),
+            DbValue::Bytes(vec![1, 2, 3])
+        );
+        let bytes: &[u8] = &[7, 8];
+        assert_eq!(DbValue::from(bytes), DbValue::Bytes(vec![7, 8]));
+    }
+
+    #[test]
+    fn test_physical_blocks_read_counter() {
+        reset_physical_blocks_read();
+        assert_eq!(get_physical_blocks_read(), 0);
+        PHYSICAL_BLOCKS_READ.fetch_add(3, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get_physical_blocks_read(), 3);
+        reset_physical_blocks_read();
+        assert_eq!(get_physical_blocks_read(), 0);
+    }
+
+    #[test]
     fn test_dbvalue_nan_eq_hash_consistency() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

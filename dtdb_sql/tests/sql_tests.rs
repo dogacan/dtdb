@@ -4503,6 +4503,188 @@ fn test_sql_select_distinct() {
     }
 }
 
+/// Seeds a table `t(id, k, v)` with duplicate and NULL `v` values for exercising
+/// DISTINCT aggregates, returning a committed engine ready to query.
+fn setup_distinct_agg_table() -> (TempDir, Arc<Database>, SqlEngine) {
+    let (temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE t (id INT PRIMARY KEY, k VARCHAR, v INT)",
+            &tx_ddl,
+        )
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_insert = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO t (id, k, v) VALUES \
+             (1, 'a', 10), (2, 'a', 10), (3, 'a', 20), \
+             (4, 'b', 30), (5, 'b', 30), (6, 'b', 30), \
+             (7, 'c', NULL), (8, 'c', 5)",
+            &tx_insert,
+        )
+        .unwrap();
+    tx_insert.commit().unwrap();
+
+    (temp, db, engine)
+}
+
+#[test]
+fn test_sql_count_distinct_global() {
+    let (_temp, db, engine) = setup_distinct_agg_table();
+    let tx = Transaction::new(3, db.clone());
+
+    // Distinct non-null values are {10, 20, 30, 5}; plain COUNT(v) counts all 7
+    // non-null rows. SUM/AVG operate over the deduplicated set (65, 65/4).
+    let res = engine
+        .execute(
+            "SELECT COUNT(v), COUNT(DISTINCT v), SUM(DISTINCT v), AVG(DISTINCT v) FROM t",
+            &tx,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::Int(7),     // COUNT(v)
+                DbValue::Int(4),     // COUNT(DISTINCT v)
+                DbValue::Int(65),    // SUM(DISTINCT v) = 10+20+30+5
+                DbValue::Float(16.25) // AVG(DISTINCT v) = 65/4
+            ]
+        );
+    } else {
+        panic!("Expected SELECT");
+    }
+}
+
+#[test]
+fn test_sql_count_distinct_grouped() {
+    let (_temp, db, engine) = setup_distinct_agg_table();
+    let tx = Transaction::new(3, db.clone());
+
+    let res = engine
+        .execute(
+            "SELECT k, COUNT(v), COUNT(DISTINCT v), SUM(DISTINCT v) \
+             FROM t GROUP BY k ORDER BY k",
+            &tx,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 3);
+        // a: v = {10,10,20} -> count=3, distinct=2, sum_distinct=30
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::String("a".to_string()),
+                DbValue::Int(3),
+                DbValue::Int(2),
+                DbValue::Int(30),
+            ]
+        );
+        // b: v = {30,30,30} -> count=3, distinct=1, sum_distinct=30
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::String("b".to_string()),
+                DbValue::Int(3),
+                DbValue::Int(1),
+                DbValue::Int(30),
+            ]
+        );
+        // c: v = {NULL,5} -> count=1, distinct=1, sum_distinct=5 (NULL ignored)
+        assert_eq!(
+            rows[2].values,
+            vec![
+                DbValue::String("c".to_string()),
+                DbValue::Int(1),
+                DbValue::Int(1),
+                DbValue::Int(5),
+            ]
+        );
+    } else {
+        panic!("Expected SELECT");
+    }
+}
+
+#[test]
+fn test_sql_count_distinct_star_rejected() {
+    let (_temp, db, engine) = setup_distinct_agg_table();
+    let tx = Transaction::new(3, db.clone());
+
+    let err = engine
+        .execute("SELECT COUNT(DISTINCT *) FROM t", &tx)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("COUNT(DISTINCT *)"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_sql_count_distinct_spilling() {
+    // Tiny budget forces the grouped hash aggregate to spill partial groups to
+    // disk. Each group's `v` values are inserted across two passes, so a single
+    // group's distinct set is split across multiple runs; the merge must union
+    // the sets (COUNT(DISTINCT)=1 per group) rather than add partial counts.
+    let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(Some(150)));
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE s (id INT PRIMARY KEY, g INT, v INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    // 20 groups, two rows each with the identical value 100, inserted in two
+    // interleaved passes (ids 0..20 then 20..40) so spills land between passes.
+    let mut values = Vec::new();
+    for id in 0..20 {
+        values.push(format!("({}, {}, 100)", id, id));
+    }
+    for id in 0..20 {
+        values.push(format!("({}, {}, 100)", id + 20, id));
+    }
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            &format!("INSERT INTO s (id, g, v) VALUES {}", values.join(", ")),
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT g, COUNT(DISTINCT v), SUM(DISTINCT v) FROM s GROUP BY g ORDER BY g",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 20);
+        for (g, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.values,
+                vec![
+                    DbValue::Int(g as i64),
+                    DbValue::Int(1),   // distinct value count, not 2
+                    DbValue::Int(100), // distinct sum, not 200
+                ]
+            );
+        }
+    } else {
+        panic!("Expected SELECT");
+    }
+    drop(tx3);
+
+    assert_tmp_empty(&db);
+}
+
 #[test]
 fn test_sql_binary_short_circuit() {
     let (_temp, db, engine) = setup_engine();

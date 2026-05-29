@@ -11,13 +11,18 @@ pub enum JoinType {
 }
 
 /// AggregateExpr represents aggregate functions (COUNT, SUM, MIN, MAX, AVG).
+///
+/// `distinct` records whether the call used the `DISTINCT` quantifier
+/// (e.g. `COUNT(DISTINCT col)`), which deduplicates input values before
+/// aggregating. It is meaningful for COUNT/SUM/AVG; for MIN/MAX it has no
+/// effect on the result and the executor ignores it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum AggregateExpr {
-    Count(Expr),
-    Sum(Expr),
-    Min(Expr),
-    Max(Expr),
-    Avg(Expr),
+    Count { expr: Expr, distinct: bool },
+    Sum { expr: Expr, distinct: bool },
+    Min { expr: Expr, distinct: bool },
+    Max { expr: Expr, distinct: bool },
+    Avg { expr: Expr, distinct: bool },
 }
 
 /// LogicalPlan represents relational algebra logical operations.
@@ -180,11 +185,13 @@ impl LogicalPlan {
         let start_idx = group_by.len();
         for (idx, aggr) in aggrs.iter().enumerate() {
             let dt = match aggr {
-                AggregateExpr::Count(_) => DataType::Int,
+                AggregateExpr::Count { .. } => DataType::Int,
                 // AVG always produces a fractional value; runtime emits Float
                 // regardless of input type, so the schema must match.
-                AggregateExpr::Avg(_) => DataType::Float,
-                AggregateExpr::Sum(expr) | AggregateExpr::Min(expr) | AggregateExpr::Max(expr) => {
+                AggregateExpr::Avg { .. } => DataType::Float,
+                AggregateExpr::Sum { expr, .. }
+                | AggregateExpr::Min { expr, .. }
+                | AggregateExpr::Max { expr, .. } => {
                     match expr {
                         Expr::Column(col_name, _) => {
                             let pos = source_schema
@@ -278,11 +285,11 @@ impl LogicalPlan {
                 }
                 for aggr in aggrs {
                     match aggr {
-                        AggregateExpr::Count(expr)
-                        | AggregateExpr::Sum(expr)
-                        | AggregateExpr::Min(expr)
-                        | AggregateExpr::Max(expr)
-                        | AggregateExpr::Avg(expr) => expr.collect_columns(columns),
+                        AggregateExpr::Count { expr, .. }
+                        | AggregateExpr::Sum { expr, .. }
+                        | AggregateExpr::Min { expr, .. }
+                        | AggregateExpr::Max { expr, .. }
+                        | AggregateExpr::Avg { expr, .. } => expr.collect_columns(columns),
                     }
                 }
                 source.collect_columns(columns);

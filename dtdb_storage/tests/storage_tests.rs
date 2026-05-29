@@ -677,3 +677,195 @@ fn test_scan_iter_stops_loading_blocks_past_end() {
         "scan_iter read {blocks_read} blocks for a 5-key window; expected early termination"
     );
 }
+
+/// Options with a large memtable so manually-flushed SSTables and live
+/// memtable entries coexist for merge tests, and no block cache so reads are
+/// deterministic.
+fn merge_test_options() -> EngineOptions {
+    EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 8 * 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 100,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+    }
+}
+
+#[test]
+fn test_scan_iter_merges_memtable_over_sstable_with_tombstones() {
+    let temp_dir = TempDir::new().unwrap();
+    let engine = StorageEngine::open(temp_dir.path(), merge_test_options()).unwrap();
+
+    // Persist a baseline into an L0 SSTable.
+    for i in [10, 20, 30, 40, 50] {
+        engine.put(k_int(i), v_int(i)).unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    // Live memtable mutations layered on top of the SSTable:
+    //   - 20 is overwritten (memtable must win),
+    //   - 40 is deleted (tombstone must hide the SSTable value),
+    //   - 25 is brand new and interleaves between SSTable keys.
+    engine.put(k_int(20), v_int(200)).unwrap();
+    engine.delete(k_int(40)).unwrap();
+    engine.put(k_int(25), v_int(25)).unwrap();
+
+    let mut iter = engine.scan_iter(&k_int(0), &k_int(100)).unwrap();
+    let mut results = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        results.push(entry);
+    }
+
+    assert_eq!(
+        results,
+        vec![
+            (k_int(10), v_int(10)),
+            (k_int(20), v_int(200)), // memtable shadows SSTable
+            (k_int(25), v_int(25)),  // memtable-only key
+            (k_int(30), v_int(30)),
+            // 40 deleted — absent
+            (k_int(50), v_int(50)),
+        ]
+    );
+}
+
+#[test]
+fn test_filtered_scan_applies_filter_and_honors_tombstones() {
+    let temp_dir = TempDir::new().unwrap();
+    let engine = StorageEngine::open(temp_dir.path(), merge_test_options()).unwrap();
+
+    for i in 1..=5 {
+        engine.put(k_int(i), v_int(i)).unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    engine.put(k_int(3), v_int(30)).unwrap(); // shadow with an even value
+    engine.delete(k_int(5)).unwrap(); // tombstone
+    engine.put(k_int(6), v_int(60)).unwrap(); // memtable-only
+
+    // Keep only even values. Exercises the filter's true and false arms across
+    // both the memtable and the SSTable, plus tombstone shadowing.
+    let results = engine
+        .filtered_scan(&k_int(0), &k_int(10), |_, v| match v {
+            DbValue::Int(n) => n % 2 == 0,
+            _ => false,
+        })
+        .unwrap();
+
+    assert_eq!(
+        results,
+        vec![
+            (k_int(2), v_int(2)),
+            (k_int(3), v_int(30)), // memtable shadow, passes even filter
+            (k_int(4), v_int(4)),
+            (k_int(6), v_int(60)),
+        ]
+    );
+}
+
+#[test]
+fn test_scan_and_filtered_scan_across_compacted_levels() {
+    // After compaction the data lives in level >= 1, exercising the level-1+
+    // branches of both scan_iter and filtered_scan.
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let options = EngineOptions {
+        compression: CompressionType::Lz4,
+        memtable_size_limit: 5, // tiny: every put flushes
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 10,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+    };
+    let engine = StorageEngine::open(&db_path, options).unwrap();
+
+    for i in 0..20 {
+        engine.put(k_int(i), v_int(i * 10)).unwrap();
+    }
+    // Push the L0 files down into level 1.
+    engine.compact().unwrap();
+
+    // No L0 *.sst should remain; everything is in L1+.
+    let l0_remaining = fs::read_dir(&db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("L0_") && n.ends_with(".sst"))
+        })
+        .count();
+    assert_eq!(l0_remaining, 0, "compaction should have drained L0");
+
+    // scan_iter over the compacted levels.
+    let mut iter = engine.scan_iter(&k_int(5), &k_int(9)).unwrap();
+    let mut scanned = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        scanned.push(entry);
+    }
+    assert_eq!(
+        scanned,
+        vec![
+            (k_int(5), v_int(50)),
+            (k_int(6), v_int(60)),
+            (k_int(7), v_int(70)),
+            (k_int(8), v_int(80)),
+            (k_int(9), v_int(90)),
+        ]
+    );
+
+    // filtered_scan over the same compacted levels.
+    let filtered = engine
+        .filtered_scan(&k_int(0), &k_int(19), |_, v| match v {
+            DbValue::Int(n) => *n >= 150,
+            _ => false,
+        })
+        .unwrap();
+    let expected: Vec<_> = (15..20).map(|i| (k_int(i), v_int(i * 10))).collect();
+    assert_eq!(filtered, expected);
+}
+
+#[test]
+fn test_open_reconstructs_missing_manifest_and_cleans_tmp_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    {
+        let engine = StorageEngine::open(&db_path, merge_test_options()).unwrap();
+        for i in 0..5 {
+            engine.put(k_int(i), v_int(i)).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+    }
+
+    // Simulate an older/lost manifest plus a leftover temp file from a crash
+    // mid-write. Reopen must rebuild the manifest from the on-disk L*.sst files
+    // and sweep away the orphaned .tmp.
+    fs::remove_file(db_path.join("manifest.bin")).unwrap();
+    let stray_tmp = db_path.join("L9_99999.sst.tmp");
+    fs::write(&stray_tmp, b"garbage").unwrap();
+
+    let engine = StorageEngine::open(&db_path, merge_test_options()).unwrap();
+    for i in 0..5 {
+        assert_eq!(engine.get(&k_int(i)).unwrap(), Some(v_int(i)));
+    }
+    assert!(
+        !stray_tmp.exists(),
+        "leftover .tmp file should be cleaned up"
+    );
+    assert!(
+        db_path.join("manifest.bin").exists(),
+        "manifest should have been rebuilt"
+    );
+}
