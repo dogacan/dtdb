@@ -8,6 +8,15 @@ dtdb_storage = { workspace = true }
 dtdb_relational = { workspace = true }
 dtdb_sql = { workspace = true }
 
+# Optional: only pulled in for the dtdb-vs-SQLite comparison bench. The
+# `bundled` feature compiles SQLite from source (needs a C compiler), so it is
+# gated behind the `compare-sqlite` feature to keep the default build — and the
+# CI `cargo bench --no-run` smoke test — free of any C toolchain dependency.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+compare-sqlite = ["dep:rusqlite"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
@@ -18,4 +27,8 @@ harness = false
 
 [[bench]]
 name = "storage_benchmark"
+harness = false
+
+[[bench]]
+name = "dtdb_vs_sqlite"
 harness = false
