@@ -9,7 +9,7 @@ dtdb_relational = { workspace = true }
 dtdb_sql = { workspace = true }
 tonic = { workspace = true, features = ["codegen", "transport", "tls", "prost"] }
 prost = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 serde = { workspace = true }
 bincode = { workspace = true }
