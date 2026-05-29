@@ -2,3 +2,4 @@ coverage:
   ignore:
     - "dtdb_api/src/bin/dtdb_server.rs"
     - "dtdb_api/src/bin/dtdb_client_cli.rs"
+    - "dtdb_fuzz/*"
