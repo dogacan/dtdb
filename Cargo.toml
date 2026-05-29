@@ -10,6 +10,13 @@ members = [
 ]
 resolver = "2"
 
+# Optimize release builds (and benches, which inherit this profile).
+# Cross-crate inlining matters for the SQL -> relational -> storage hot path,
+# and codegen-units = 1 reduces run-to-run benchmark variance.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 # Workspace member paths
 dtdb_storage = { path = "dtdb_storage" }
