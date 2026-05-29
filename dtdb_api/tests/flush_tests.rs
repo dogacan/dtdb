@@ -65,7 +65,7 @@ async fn test_wal_size_based_flush() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
 
     let create_resp = client
@@ -154,7 +154,7 @@ async fn test_periodic_time_based_flush() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
 
     let create_resp = client
@@ -249,7 +249,7 @@ async fn test_manual_rpc_flush() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
 
     let create_resp = client

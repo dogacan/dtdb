@@ -815,8 +815,8 @@ pub struct DatabaseOptions {
     pub analyze_frequency_ms: Option<u64>,
     #[serde(default)]
     pub wal_sync_interval_ms: Option<u64>,
-    #[serde(default)]
-    pub sort_memory_budget: Option<usize>,
+    #[serde(default, alias = "sort_memory_budget")]
+    pub memory_budget: Option<usize>,
 }
 
 /// Database represents a catalog of Tables stored in a base directory.
@@ -879,7 +879,7 @@ impl Database {
                 block_cache_capacity: Some(1000),
                 analyze_frequency_ms: None,
                 wal_sync_interval_ms: None,
-                sort_memory_budget: None,
+                memory_budget: None,
             }
         };
         Self::open_with_options_and_spawner(dir_path, options, spawner)

@@ -2367,6 +2367,41 @@ fn setup_engine_with_options(
     (temp_dir, db, engine)
 }
 
+/// Default database options with a configurable per-operator memory budget. A tiny
+/// budget (a few hundred bytes) forces the spilling operators down their disk path.
+fn opts_with_budget(memory_budget: Option<usize>) -> dtdb_relational::DatabaseOptions {
+    dtdb_relational::DatabaseOptions {
+        compression: dtdb_storage::CompressionType::Lz4,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        flush_interval_ms: None,
+        l0_compaction_threshold: None,
+        sstable_target_size: None,
+        base_level_size_limit: None,
+        level_size_multiplier: None,
+        max_level: None,
+        block_cache_capacity: Some(1000),
+        analyze_frequency_ms: None,
+        wal_sync_interval_ms: None,
+        memory_budget,
+    }
+}
+
+/// Asserts the `_tmp/` spill directory is empty (all `Run` temp files were cleaned up
+/// on Drop after the query finished).
+fn assert_tmp_empty(db: &Arc<Database>) {
+    let tmp_path = db.dir_path().join("_tmp");
+    if tmp_path.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&tmp_path).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "Temp directory should be empty but has entries: {:?}",
+            entries
+        );
+    }
+}
+
 #[test]
 fn test_cbo_index_selection_by_cardinality() {
     // Construct database options with block_cache_capacity = Some(0) to disable caching
@@ -2385,7 +2420,7 @@ fn test_cbo_index_selection_by_cardinality() {
         block_cache_capacity: Some(0),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -2500,7 +2535,7 @@ fn test_cbo_locality_group_pruning_performance() {
         block_cache_capacity: Some(0),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -2715,7 +2750,7 @@ fn test_sql_optimizer_join_order_reordering() {
         };
         println!("PLAN TEXT IS:\n{}", plan_text);
         // Verify that the Physical Plan swaps the children so that t2 is left and t1 is right.
-        // The plan text output for PhysicalHashJoin has left: then right:
+        // The plan text output for PhysicalSortMergeJoin has left: then right:
         let optimized_part = plan_text.split("--- Physical Plan ---").nth(1).unwrap();
         let left_idx = optimized_part.find("left:").unwrap();
         let right_idx = optimized_part.find("right:").unwrap();
@@ -3706,7 +3741,7 @@ fn test_external_sort_basic() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: Some(200), // very small budget to force spills
+        memory_budget: Some(200), // very small budget to force spills
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -3794,7 +3829,7 @@ fn test_external_sort_desc() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: Some(200), // force spills
+        memory_budget: Some(200), // force spills
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -3857,7 +3892,7 @@ fn test_external_sort_multi_key() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: Some(100), // force spills
+        memory_budget: Some(100), // force spills
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -3921,7 +3956,7 @@ fn test_external_sort_empty_and_single() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: Some(200),
+        memory_budget: Some(200),
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -4874,4 +4909,381 @@ fn test_optimizer_bound_nudging_handles_int_extremes() {
             &tx_q,
         )
         .unwrap();
+}
+
+// ==========================================
+// Disk-spilling parity tests (tiny memory budget forces the external path)
+// ==========================================
+
+#[test]
+fn test_spilling_hash_aggregate() {
+    // Tiny budget forces PhysicalHashAggregate to spill partial groups to disk and
+    // merge+combine them at finalize time. Results must match the in-memory path.
+    let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(Some(200)));
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO sales (id, region, amount) VALUES \
+             (1, 'east', 10), (2, 'west', 20), (3, 'east', 30), (4, 'north', 40), \
+             (5, 'west', 50), (6, 'south', 60), (7, 'east', 70), (8, 'north', 80), \
+             (9, 'south', 90), (10, 'west', 100), (11, 'east', 5), (12, 'north', 15)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT region, COUNT(*), SUM(amount), MIN(amount), MAX(amount), AVG(amount) \
+             FROM sales GROUP BY region ORDER BY region",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        // east: 10,30,70,5 -> cnt 4, sum 115, min 5, max 70, avg 28.75
+        // north: 40,80,15 -> cnt 3, sum 135, min 15, max 80, avg 45
+        // south: 60,90 -> cnt 2, sum 150, min 60, max 90, avg 75
+        // west: 20,50,100 -> cnt 3, sum 170, min 20, max 100, avg ~56.666...
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::String("east".into()),
+                DbValue::Int(4),
+                DbValue::Int(115),
+                DbValue::Int(5),
+                DbValue::Int(70),
+                DbValue::Float(28.75),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::String("north".into()),
+                DbValue::Int(3),
+                DbValue::Int(135),
+                DbValue::Int(15),
+                DbValue::Int(80),
+                DbValue::Float(45.0),
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                DbValue::String("south".into()),
+                DbValue::Int(2),
+                DbValue::Int(150),
+                DbValue::Int(60),
+                DbValue::Int(90),
+                DbValue::Float(75.0),
+            ]
+        );
+        assert_eq!(rows[3].values[0], DbValue::String("west".into()));
+        assert_eq!(rows[3].values[1], DbValue::Int(3));
+        assert_eq!(rows[3].values[2], DbValue::Int(170));
+        assert_eq!(rows[3].values[3], DbValue::Int(20));
+        assert_eq!(rows[3].values[4], DbValue::Int(100));
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx3);
+
+    assert_tmp_empty(&db);
+}
+
+#[test]
+fn test_spilling_distinct() {
+    let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(Some(150)));
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO t (id, val) VALUES \
+             (1, 3), (2, 1), (3, 2), (4, 3), (5, 1), (6, 2), (7, 3), (8, 4), (9, 1), (10, 5)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute("SELECT DISTINCT val FROM t ORDER BY val", &tx3)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        let vals: Vec<i64> = rows
+            .into_iter()
+            .map(|r| match r.values[0] {
+                DbValue::Int(v) => v,
+                _ => panic!("Expected Int"),
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5]);
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx3);
+
+    assert_tmp_empty(&db);
+}
+
+#[test]
+fn test_spilling_set_ops() {
+    let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(Some(150)));
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)", &tx1)
+        .unwrap();
+    engine
+        .execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO a (id, val) VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)",
+            &tx2,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO b (id, val) VALUES (1, 4), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9)",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let collect_vals = |res: ExecutionResult| -> Vec<i64> {
+        if let ExecutionResult::Select { rows, .. } = res {
+            rows.into_iter()
+                .map(|r| match r.values[0] {
+                    DbValue::Int(v) => v,
+                    _ => panic!("Expected Int"),
+                })
+                .collect()
+        } else {
+            panic!("Expected Select result");
+        }
+    };
+
+    let tx3 = Transaction::new(3, db.clone());
+    let inter = engine
+        .execute(
+            "SELECT val FROM a INTERSECT SELECT val FROM b ORDER BY val",
+            &tx3,
+        )
+        .unwrap();
+    assert_eq!(collect_vals(inter), vec![4, 5, 6]);
+
+    let except = engine
+        .execute(
+            "SELECT val FROM a EXCEPT SELECT val FROM b ORDER BY val",
+            &tx3,
+        )
+        .unwrap();
+    assert_eq!(collect_vals(except), vec![1, 2, 3]);
+
+    let union = engine
+        .execute(
+            "SELECT val FROM a UNION SELECT val FROM b ORDER BY val",
+            &tx3,
+        )
+        .unwrap();
+    assert_eq!(collect_vals(union), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    drop(tx3);
+
+    assert_tmp_empty(&db);
+}
+
+#[test]
+fn test_spilling_sort_merge_join() {
+    let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(Some(150)));
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE l (id INT PRIMARY KEY, k INT, name TEXT)",
+            &tx1,
+        )
+        .unwrap();
+    engine
+        .execute("CREATE TABLE r (id INT PRIMARY KEY, k INT, tag TEXT)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    drop(tx1);
+
+    let tx2 = Transaction::new(2, db.clone());
+    // Left rows: k=1 (two rows), k=2, k=3 (no right match), k=NULL (never matches).
+    engine
+        .execute(
+            "INSERT INTO l (id, k, name) VALUES \
+             (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c'), (4, 3, 'd'), (5, NULL, 'e')",
+            &tx2,
+        )
+        .unwrap();
+    // Right rows: k=1 (two rows -> many-to-many), k=2, k=4 (no left match).
+    engine
+        .execute(
+            "INSERT INTO r (id, k, tag) VALUES \
+             (1, 1, 'x'), (2, 1, 'y'), (3, 2, 'z'), (4, 4, 'w')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+    drop(tx2);
+
+    let tx3 = Transaction::new(3, db.clone());
+    // Inner join: k=1 -> 2 left * 2 right = 4 rows; k=2 -> 1 row. Total 5.
+    let inner = engine
+        .execute(
+            "SELECT l.name, r.tag FROM l JOIN r ON l.k = r.k ORDER BY l.name, r.tag",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = inner {
+        let pairs: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| match (&row.values[0], &row.values[1]) {
+                (DbValue::String(a), DbValue::String(b)) => (a.clone(), b.clone()),
+                _ => panic!("Expected strings"),
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".into(), "x".into()),
+                ("a".into(), "y".into()),
+                ("b".into(), "x".into()),
+                ("b".into(), "y".into()),
+                ("c".into(), "z".into()),
+            ]
+        );
+    } else {
+        panic!("Expected Select result");
+    }
+
+    // Left outer join: all 5 left rows appear; k=3 and k=NULL get NULL tags.
+    let left = engine
+        .execute(
+            "SELECT l.name, r.tag FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.name, r.tag",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = left {
+        assert_eq!(rows.len(), 7); // 5 inner matches + d(NULL) + e(NULL)
+        let unmatched: Vec<String> = rows
+            .iter()
+            .filter(|row| row.values[1] == DbValue::Null)
+            .map(|row| match &row.values[0] {
+                DbValue::String(s) => s.clone(),
+                _ => panic!("Expected string"),
+            })
+            .collect();
+        assert_eq!(unmatched, vec!["d".to_string(), "e".to_string()]);
+    } else {
+        panic!("Expected Select result");
+    }
+    drop(tx3);
+
+    assert_tmp_empty(&db);
+}
+
+/// Runs a fixed battery of spilling queries over an identical, larger-than-budget
+/// dataset under two memory budgets and asserts the results are identical. This is the
+/// strongest spill check: the tiny budget forces many runs through the external merge
+/// paths, the large budget stays fully in memory, and any divergence (lost rows,
+/// mis-merged accumulators, dedup gaps) shows up as a mismatch.
+#[test]
+fn test_spilling_parity_against_in_memory() {
+    fn run_battery(memory_budget: Option<usize>) -> Vec<Vec<dtdb_relational::Row>> {
+        let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(memory_budget));
+
+        let tx1 = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE l (id INT PRIMARY KEY, k INT, g TEXT)", &tx1)
+            .unwrap();
+        engine
+            .execute("CREATE TABLE r (id INT PRIMARY KEY, k INT)", &tx1)
+            .unwrap();
+        tx1.commit().unwrap();
+        drop(tx1);
+
+        // 300 left rows; k cycles 0..30 (10 each), g cycles a..j. Right: 150 rows, k 0..15.
+        let tx2 = Transaction::new(2, db.clone());
+        let mut lvals = Vec::new();
+        for i in 0..300 {
+            let k = i % 30;
+            let g = (b'a' + (i % 10) as u8) as char;
+            lvals.push(format!("({i}, {k}, '{g}')"));
+        }
+        engine
+            .execute(
+                &format!("INSERT INTO l (id, k, g) VALUES {}", lvals.join(", ")),
+                &tx2,
+            )
+            .unwrap();
+        let rvals: Vec<String> = (0..150).map(|i| format!("({i}, {})", i % 15)).collect();
+        engine
+            .execute(
+                &format!("INSERT INTO r (id, k) VALUES {}", rvals.join(", ")),
+                &tx2,
+            )
+            .unwrap();
+        tx2.commit().unwrap();
+        drop(tx2);
+
+        let queries = [
+            "SELECT g, COUNT(*), SUM(k), MIN(k), MAX(k), AVG(k) FROM l GROUP BY g ORDER BY g",
+            "SELECT DISTINCT k FROM l ORDER BY k",
+            "SELECT k FROM l INTERSECT SELECT k FROM r ORDER BY k",
+            "SELECT k FROM l EXCEPT SELECT k FROM r ORDER BY k",
+            "SELECT l.g, r.id FROM l JOIN r ON l.k = r.k ORDER BY l.g, l.id, r.id",
+            "SELECT l.id, r.id FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.id, r.id",
+        ];
+
+        let tx3 = Transaction::new(3, db.clone());
+        let mut results = Vec::new();
+        for q in queries {
+            match engine.execute(q, &tx3).unwrap() {
+                ExecutionResult::Select { rows, .. } => results.push(rows),
+                _ => panic!("Expected Select for query: {q}"),
+            }
+        }
+        drop(tx3);
+
+        // Spill temp files must be cleaned up regardless of budget.
+        assert_tmp_empty(&db);
+        results
+    }
+
+    let spilled = run_battery(Some(256)); // tiny budget -> heavy spilling
+    let in_memory = run_battery(None); // 8 MiB default -> fully in memory
+    assert_eq!(
+        spilled, in_memory,
+        "spilling output diverged from the in-memory path"
+    );
 }

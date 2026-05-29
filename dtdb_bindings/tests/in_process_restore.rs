@@ -29,7 +29,7 @@ fn new_in_process_client_restores_db_with_flush_interval() {
             block_cache_capacity: Some(1000),
             analyze_frequency_ms: None,
             wal_sync_interval_ms: None,
-            sort_memory_budget: None,
+            memory_budget: None,
         };
         let _db = Arc::new(
             Database::open_with_options_and_spawner(

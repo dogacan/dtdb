@@ -1,14 +1,10 @@
 use crate::expr::{Expr, compare_values};
 use crate::logical::{AggregateExpr, JoinType, SetOpType};
+use crate::spill::{self, KWayMerge, Run};
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 /// PhysicalOperator defines the Volcano Iterator interface for query execution.
 pub trait PhysicalOperator {
@@ -301,191 +297,9 @@ impl PhysicalOperator for PhysicalLimit {
 // ==========================================
 // 5. Sort Physical Operator (Pipeline-Blocking)
 // ==========================================
-/// A sorted run stored as a temporary file on disk.
-struct SortedRun {
-    path: PathBuf,
-    reader: Option<BufReader<File>>,
-    peeked: Option<(Vec<DbValue>, Row)>,
-    remaining: usize,
-}
-
-impl SortedRun {
-    fn new(path: PathBuf, count: usize) -> Self {
-        Self {
-            path,
-            reader: None,
-            peeked: None,
-            remaining: count,
-        }
-    }
-
-    fn open(&mut self) -> Result<(), String> {
-        let file = File::open(&self.path)
-            .map_err(|e| format!("Failed to open temp file {:?}: {}", self.path, e))?;
-        let mut reader = BufReader::new(file);
-        let count: u64 = bincode::deserialize_from(&mut reader)
-            .map_err(|e| format!("Failed to read count from run file: {}", e))?;
-        self.remaining = count as usize;
-        self.reader = Some(reader);
-        self.advance()?;
-        Ok(())
-    }
-
-    fn advance(&mut self) -> Result<(), String> {
-        if self.remaining == 0 {
-            self.peeked = None;
-            self.reader = None; // Close file handle early
-            return Ok(());
-        }
-
-        let reader = self.reader.as_mut().ok_or("Advance called on closed run")?;
-        let keys: Vec<DbValue> = bincode::deserialize_from(&mut *reader)
-            .map_err(|e| format!("Failed to deserialize keys: {}", e))?;
-        let row: Row = bincode::deserialize_from(&mut *reader)
-            .map_err(|e| format!("Failed to deserialize row: {}", e))?;
-
-        self.peeked = Some((keys, row));
-        self.remaining -= 1;
-        Ok(())
-    }
-}
-
-impl Drop for SortedRun {
-    fn drop(&mut self) {
-        self.reader = None; // Explicitly drop the reader to release the file lock
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-struct HeapEntry {
-    sort_keys: Vec<DbValue>,
-    row: Row,
-    run_index: usize,
-    directions: Arc<Vec<bool>>,
-    error_slot: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        for (idx, &asc) in self.directions.iter().enumerate() {
-            let a_val = &self.sort_keys[idx];
-            let b_val = &other.sort_keys[idx];
-            match compare_values(a_val, b_val) {
-                Ok(ord) => {
-                    if ord != std::cmp::Ordering::Equal {
-                        return if asc { ord.reverse() } else { ord };
-                    }
-                }
-                Err(e) => {
-                    if let Ok(mut guard) = self.error_slot.lock() {
-                        let _ = guard.get_or_insert(e);
-                    }
-                    return std::cmp::Ordering::Equal;
-                }
-            }
-        }
-        std::cmp::Ordering::Equal
-    }
-}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-
-impl Eq for HeapEntry {}
-
-struct KWayMerge {
-    heap: BinaryHeap<HeapEntry>,
-    runs: Vec<SortedRun>,
-    directions: Arc<Vec<bool>>,
-    error_slot: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-impl KWayMerge {
-    fn new(mut runs: Vec<SortedRun>, keys: &[(Expr, bool)]) -> Result<Self, String> {
-        let directions = Arc::new(keys.iter().map(|(_, asc)| *asc).collect::<Vec<_>>());
-        let error_slot = Arc::new(std::sync::Mutex::new(None));
-        let mut heap = BinaryHeap::new();
-
-        for (idx, run) in runs.iter_mut().enumerate() {
-            run.open()?;
-            if let Some((sort_keys, row)) = run.peeked.take() {
-                heap.push(HeapEntry {
-                    sort_keys,
-                    row,
-                    run_index: idx,
-                    directions: Arc::clone(&directions),
-                    error_slot: Arc::clone(&error_slot),
-                });
-            }
-        }
-
-        Ok(Self {
-            heap,
-            runs,
-            directions,
-            error_slot,
-        })
-    }
-
-    fn next(&mut self) -> Result<Option<Row>, String> {
-        if let Some(err) = self.error_slot.lock().ok().and_then(|g| g.clone()) {
-            return Err(err);
-        }
-
-        let entry = match self.heap.pop() {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        let run_idx = entry.run_index;
-        self.runs[run_idx].advance()?;
-
-        if let Some((sort_keys, row)) = self.runs[run_idx].peeked.take() {
-            self.heap.push(HeapEntry {
-                sort_keys,
-                row,
-                run_index: run_idx,
-                directions: Arc::clone(&self.directions),
-                error_slot: Arc::clone(&self.error_slot),
-            });
-        }
-
-        Ok(Some(entry.row))
-    }
-}
-
 enum MergeState {
     InMemory(std::vec::IntoIter<Row>),
-    External(KWayMerge),
-}
-
-fn estimate_row_size(keys: &[DbValue], row: &Row) -> usize {
-    let mut size = std::mem::size_of::<Row>() + row.values.len() * std::mem::size_of::<DbValue>();
-    for val in &row.values {
-        size += match val {
-            DbValue::String(s) => s.len(),
-            DbValue::Bytes(b) => b.len(),
-            _ => 0,
-        };
-    }
-    size += std::mem::size_of::<Vec<DbValue>>() + std::mem::size_of_val(keys);
-    for val in keys {
-        size += match val {
-            DbValue::String(s) => s.len(),
-            DbValue::Bytes(b) => b.len(),
-            _ => 0,
-        };
-    }
-    size
+    External(KWayMerge<Row>),
 }
 
 pub struct PhysicalSort {
@@ -512,59 +326,8 @@ impl PhysicalSort {
         }
     }
 
-    fn sort_buffer(&self, buffer: &mut [(Vec<DbValue>, Row)]) -> Result<(), String> {
-        let mut err = None;
-        buffer.sort_by(|a, b| {
-            for (idx, (_, asc)) in self.keys.iter().enumerate() {
-                let a_val = &a.0[idx];
-                let b_val = &b.0[idx];
-                match compare_values(a_val, b_val) {
-                    Ok(ord) => {
-                        if ord != std::cmp::Ordering::Equal {
-                            return if *asc { ord } else { ord.reverse() };
-                        }
-                    }
-                    Err(e) => {
-                        err = Some(e);
-                        return std::cmp::Ordering::Equal;
-                    }
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-
-        if let Some(e) = err {
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    fn flush_to_disk(&self, buffer: &[(Vec<DbValue>, Row)]) -> Result<SortedRun, String> {
-        static RUN_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let run_id = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = self
-            .temp_dir
-            .join(format!("sort_run_{}_{}.bin", std::process::id(), run_id));
-
-        let file = File::create(&path)
-            .map_err(|e| format!("Failed to create temp file {:?}: {}", path, e))?;
-        let mut writer = BufWriter::new(file);
-
-        bincode::serialize_into(&mut writer, &(buffer.len() as u64))
-            .map_err(|e| format!("Serialization error: {}", e))?;
-
-        for (keys, row) in buffer {
-            bincode::serialize_into(&mut writer, keys)
-                .map_err(|e| format!("Serialization error: {}", e))?;
-            bincode::serialize_into(&mut writer, row)
-                .map_err(|e| format!("Serialization error: {}", e))?;
-        }
-
-        writer
-            .flush()
-            .map_err(|e| format!("Failed to flush temp file: {}", e))?;
-
-        Ok(SortedRun::new(path, buffer.len()))
+    fn directions(&self) -> Vec<bool> {
+        self.keys.iter().map(|(_, asc)| *asc).collect()
     }
 }
 
@@ -572,9 +335,10 @@ impl PhysicalOperator for PhysicalSort {
     fn next(&mut self) -> Result<Option<Row>, String> {
         if self.merge_state.is_none() {
             let source_schema = self.source.schema().clone();
+            let directions = self.directions();
             let mut buffer: Vec<(Vec<DbValue>, Row)> = Vec::new();
             let mut buffer_bytes: usize = 0;
-            let mut runs: Vec<SortedRun> = Vec::new();
+            let mut runs: Vec<Run<Row>> = Vec::new();
 
             while let Some(row) = self.source.next()? {
                 let mut row_keys = Vec::with_capacity(self.keys.len());
@@ -583,21 +347,19 @@ impl PhysicalOperator for PhysicalSort {
                     row_keys.push(val);
                 }
 
-                let size = estimate_row_size(&row_keys, &row);
-                buffer_bytes += size;
+                buffer_bytes += spill::estimate_row_size(&row_keys, &row.values);
                 buffer.push((row_keys, row));
 
                 if buffer_bytes >= self.memory_budget {
-                    self.sort_buffer(&mut buffer)?;
-                    let run = self.flush_to_disk(&buffer)?;
-                    runs.push(run);
+                    spill::sort_entries(&mut buffer, &directions);
+                    runs.push(spill::write_run(&self.temp_dir, "sort_run", &buffer)?);
                     buffer.clear();
                     buffer_bytes = 0;
                 }
             }
 
             if runs.is_empty() {
-                self.sort_buffer(&mut buffer)?;
+                spill::sort_entries(&mut buffer, &directions);
                 self.merge_state = Some(MergeState::InMemory(
                     buffer
                         .into_iter()
@@ -607,18 +369,17 @@ impl PhysicalOperator for PhysicalSort {
                 ));
             } else {
                 if !buffer.is_empty() {
-                    self.sort_buffer(&mut buffer)?;
-                    let run = self.flush_to_disk(&buffer)?;
-                    runs.push(run);
+                    spill::sort_entries(&mut buffer, &directions);
+                    runs.push(spill::write_run(&self.temp_dir, "sort_run", &buffer)?);
                 }
-                let merger = KWayMerge::new(runs, &self.keys)?;
+                let merger = KWayMerge::new(runs, directions)?;
                 self.merge_state = Some(MergeState::External(merger));
             }
         }
 
         match self.merge_state.as_mut().unwrap() {
             MergeState::InMemory(iter) => Ok(iter.next()),
-            MergeState::External(merger) => merger.next(),
+            MergeState::External(merger) => Ok(merger.next()?.map(|(_, row)| row)),
         }
     }
 
@@ -642,25 +403,120 @@ impl PhysicalOperator for PhysicalSort {
 }
 
 // ==========================================
-// 6. HashJoin Physical Operator (Semi-Blocking)
+// 6. SortMergeJoin Physical Operator (Bounded-memory)
 // ==========================================
-pub struct PhysicalHashJoin {
+/// A sorted stream of `(key, row)` pairs keyed on a single join expression, used as
+/// one side of the sort-merge join. Memory is bounded by spilling sorted runs of the
+/// input to disk and k-way merging them, exactly like `PhysicalSort`.
+struct JoinSortedStream {
+    inner: JoinStreamInner,
+    head: Option<(Vec<DbValue>, Row)>,
+}
+
+enum JoinStreamInner {
+    InMemory(std::vec::IntoIter<(Vec<DbValue>, Row)>),
+    External(KWayMerge<Row>),
+}
+
+impl JoinSortedStream {
+    /// Drains `source`, evaluating `key_expr` per row, and returns a stream that yields
+    /// `(key, row)` pairs in ascending key order.
+    fn build(
+        source: &mut Box<dyn PhysicalOperator>,
+        key_expr: &Expr,
+        temp_dir: &Path,
+        memory_budget: usize,
+    ) -> Result<Self, String> {
+        let directions = vec![true];
+        let source_schema = source.schema().clone();
+        let mut buffer: Vec<(Vec<DbValue>, Row)> = Vec::new();
+        let mut buffer_bytes: usize = 0;
+        let mut runs: Vec<Run<Row>> = Vec::new();
+
+        while let Some(row) = source.next()? {
+            let key = vec![key_expr.eval(&row, &source_schema)?];
+            buffer_bytes += spill::estimate_row_size(&key, &row.values);
+            buffer.push((key, row));
+            if buffer_bytes >= memory_budget {
+                spill::sort_entries(&mut buffer, &directions);
+                runs.push(spill::write_run(temp_dir, "join_run", &buffer)?);
+                buffer.clear();
+                buffer_bytes = 0;
+            }
+        }
+
+        let inner = if runs.is_empty() {
+            spill::sort_entries(&mut buffer, &directions);
+            JoinStreamInner::InMemory(buffer.into_iter())
+        } else {
+            if !buffer.is_empty() {
+                spill::sort_entries(&mut buffer, &directions);
+                runs.push(spill::write_run(temp_dir, "join_run", &buffer)?);
+            }
+            JoinStreamInner::External(KWayMerge::new(runs, directions)?)
+        };
+
+        let mut stream = Self { inner, head: None };
+        stream.advance()?;
+        Ok(stream)
+    }
+
+    fn advance(&mut self) -> Result<(), String> {
+        self.head = match &mut self.inner {
+            JoinStreamInner::InMemory(iter) => iter.next(),
+            JoinStreamInner::External(merger) => merger.next()?,
+        };
+        Ok(())
+    }
+
+    fn peek_key(&self) -> Option<&Vec<DbValue>> {
+        self.head.as_ref().map(|(k, _)| k)
+    }
+
+    /// Consumes and returns every row at the head whose key equals `key`, advancing
+    /// past them. Equal keys are adjacent after the sort, so this collects a full group.
+    fn take_group(&mut self, key: &[DbValue]) -> Result<Vec<Row>, String> {
+        let mut group = Vec::new();
+        while let Some((k, _)) = self.head.as_ref() {
+            if compare_rows(k, key) == std::cmp::Ordering::Equal {
+                let (_, row) = self.head.take().unwrap();
+                group.push(row);
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        Ok(group)
+    }
+}
+
+/// Pads a left row with NULLs for every right column (left-outer non-match).
+fn pad_left_row(left_row: &Row, right_cols: usize) -> Row {
+    let mut merged = left_row.values.clone();
+    merged.extend(std::iter::repeat_n(DbValue::Null, right_cols));
+    Row::new(merged)
+}
+
+/// Equi-join via sort-merge: both inputs are externally sorted on their join key, then
+/// merged by walking the two sorted streams in lockstep. Memory is bounded — only a
+/// single matching key-group is buffered at a time (vs. the entire right side before).
+/// Supports Inner and Left-outer joins. NULL keys never match (matching SQL semantics).
+pub struct PhysicalSortMergeJoin {
     left: Box<dyn PhysicalOperator>,
     right: Box<dyn PhysicalOperator>,
     left_on: Expr,
     right_on: Expr,
     join_type: JoinType,
     schema: Schema,
-    left_schema: Schema,
-    right_schema: Schema,
-    // Build phase hash map: DbValue representation of join key -> Right Rows
-    hash_table: Option<HashMap<DbValue, Vec<Row>>>,
-    // Buffer to hold joined rows from the current probe row
-    join_buffer: Vec<Row>,
-    join_buffer_index: usize,
+    right_cols: usize,
+    temp_dir: PathBuf,
+    memory_budget: usize,
+    streams: Option<(JoinSortedStream, JoinSortedStream)>,
+    pending: std::collections::VecDeque<Row>,
 }
 
-impl PhysicalHashJoin {
+impl PhysicalSortMergeJoin {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         left: Box<dyn PhysicalOperator>,
         right: Box<dyn PhysicalOperator>,
@@ -668,9 +524,10 @@ impl PhysicalHashJoin {
         right_on: Expr,
         join_type: JoinType,
         schema: Schema,
+        temp_dir: PathBuf,
+        memory_budget: usize,
     ) -> Self {
-        let left_schema = left.schema().clone();
-        let right_schema = right.schema().clone();
+        let right_cols = right.schema().columns.len();
         Self {
             left,
             right,
@@ -678,83 +535,98 @@ impl PhysicalHashJoin {
             right_on,
             join_type,
             schema,
-            left_schema,
-            right_schema,
-            hash_table: None,
-            join_buffer: Vec::new(),
-            join_buffer_index: 0,
+            right_cols,
+            temp_dir,
+            memory_budget,
+            streams: None,
+            pending: std::collections::VecDeque::new(),
         }
     }
 }
 
-impl PhysicalOperator for PhysicalHashJoin {
+impl PhysicalOperator for PhysicalSortMergeJoin {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        // If there are rows buffered from the previous probe match, yield them
-        if self.join_buffer_index < self.join_buffer.len() {
-            let row = self.join_buffer[self.join_buffer_index].clone();
-            self.join_buffer_index += 1;
-            if self.join_buffer_index >= self.join_buffer.len() {
-                self.join_buffer.clear();
-                self.join_buffer_index = 0;
-            }
-            return Ok(Some(row));
+        if self.streams.is_none() {
+            let left = JoinSortedStream::build(
+                &mut self.left,
+                &self.left_on,
+                &self.temp_dir,
+                self.memory_budget,
+            )?;
+            let right = JoinSortedStream::build(
+                &mut self.right,
+                &self.right_on,
+                &self.temp_dir,
+                self.memory_budget,
+            )?;
+            self.streams = Some((left, right));
         }
 
-        // Build phase: read all right rows into the hash table
-        if self.hash_table.is_none() {
-            let mut table = HashMap::new();
-            while let Some(row) = self.right.next()? {
-                let key_val = self.right_on.eval(&row, &self.right_schema)?;
-                if key_val != DbValue::Null {
-                    table.entry(key_val).or_insert_with(Vec::new).push(row);
-                }
-            }
-            self.hash_table = Some(table);
-        }
+        let is_left = self.join_type == JoinType::Left;
+        let right_cols = self.right_cols;
 
-        let hash_table = self.hash_table.as_ref().unwrap();
-
-        // Probe phase: stream left rows one by one
-        while let Some(left_row) = self.left.next()? {
-            let key_val = self.left_on.eval(&left_row, &self.left_schema)?;
-
-            if key_val != DbValue::Null {
-                if let Some(right_rows) = hash_table.get(&key_val) {
-                    // Generate joined rows: combine left row fields + right row fields
-                    for right_row in right_rows {
-                        let mut merged_values = left_row.values.clone();
-                        merged_values.extend(right_row.values.clone());
-                        self.join_buffer.push(Row::new(merged_values));
-                    }
-                } else if self.join_type == JoinType::Left {
-                    // Left outer join mismatch: pad right columns with NULL values
-                    let mut merged_values = left_row.values.clone();
-                    for _ in &self.right_schema.columns {
-                        merged_values.push(DbValue::Null);
-                    }
-                    self.join_buffer.push(Row::new(merged_values));
-                }
-            } else if self.join_type == JoinType::Left {
-                // Left outer join mismatch: pad right columns with NULL values
-                let mut merged_values = left_row.values.clone();
-                for _ in &self.right_schema.columns {
-                    merged_values.push(DbValue::Null);
-                }
-                self.join_buffer.push(Row::new(merged_values));
-            }
-
-            if self.join_buffer_index < self.join_buffer.len() {
-                let row = self.join_buffer[self.join_buffer_index].clone();
-                self.join_buffer_index += 1;
-                if self.join_buffer_index >= self.join_buffer.len() {
-                    self.join_buffer.clear();
-                    self.join_buffer_index = 0;
-                }
+        loop {
+            if let Some(row) = self.pending.pop_front() {
                 return Ok(Some(row));
             }
-        }
 
-        Ok(None)
+            let mut emits: Vec<Row> = Vec::new();
+            {
+                let (left, right) = self.streams.as_mut().unwrap();
+                let lkey = match left.peek_key() {
+                    Some(k) => k.clone(),
+                    None => return Ok(None),
+                };
+
+                // NULL keys never join; left-outer still emits the padded left row.
+                if lkey[0] == DbValue::Null {
+                    let left_group = left.take_group(&lkey)?;
+                    if is_left {
+                        emits.extend(left_group.iter().map(|r| pad_left_row(r, right_cols)));
+                    }
+                } else {
+                    match right.peek_key().cloned() {
+                        None => {
+                            // Right exhausted: remaining left rows are unmatched.
+                            let left_group = left.take_group(&lkey)?;
+                            if is_left {
+                                emits
+                                    .extend(left_group.iter().map(|r| pad_left_row(r, right_cols)));
+                            }
+                        }
+                        Some(rkey) => match compare_rows(&lkey, &rkey) {
+                            std::cmp::Ordering::Less => {
+                                // Left key has no match on the right.
+                                let left_group = left.take_group(&lkey)?;
+                                if is_left {
+                                    emits.extend(
+                                        left_group.iter().map(|r| pad_left_row(r, right_cols)),
+                                    );
+                                }
+                            }
+                            std::cmp::Ordering::Greater => {
+                                // Right key has no match on the left; discard the group.
+                                right.take_group(&rkey)?;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                // Matched key: emit the cross product of the two groups.
+                                let right_group = right.take_group(&rkey)?;
+                                let left_group = left.take_group(&lkey)?;
+                                for left_row in &left_group {
+                                    for right_row in &right_group {
+                                        let mut merged = left_row.values.clone();
+                                        merged.extend(right_row.values.clone());
+                                        emits.push(Row::new(merged));
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+
+            self.pending.extend(emits);
+        }
     }
 
     fn schema(&self) -> &Schema {
@@ -763,7 +635,7 @@ impl PhysicalOperator for PhysicalHashJoin {
 
     fn explain(&self, indent: usize, out: &mut String) {
         out.push_str(&format!(
-            "{}- PhysicalHashJoin: type={:?}, left_on={:?}, right_on={:?}\n",
+            "{}- PhysicalSortMergeJoin: type={:?}, left_on={:?}, right_on={:?}\n",
             "  ".repeat(indent),
             self.join_type,
             self.left_on,
@@ -866,7 +738,50 @@ pub struct PhysicalHashAggregate {
     group_by: Vec<Expr>,
     aggrs: Vec<AggregateExpr>,
     schema: Schema,
-    aggregated_rows: Option<std::vec::IntoIter<Row>>,
+    temp_dir: PathBuf,
+    memory_budget: usize,
+    output: Option<AggOutput>,
+}
+
+/// Output state of a hash aggregate once its build phase has run: either all groups
+/// fit in memory, or partial groups were spilled and are streamed back via merge.
+enum AggOutput {
+    InMemory(std::vec::IntoIter<Row>),
+    Merge(AggMerge),
+}
+
+/// Streams finalized rows out of spilled partial-aggregate runs, combining the
+/// partial accumulators of equal group keys (which are adjacent after merge).
+struct AggMerge {
+    merger: KWayMerge<Vec<Accumulator>>,
+    current: Option<(Vec<DbValue>, Vec<Accumulator>)>,
+}
+
+impl AggMerge {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        loop {
+            match self.merger.next()? {
+                Some((key, accs)) => match &mut self.current {
+                    Some((cur_key, cur_accs)) if *cur_key == key => {
+                        for (acc, partial) in cur_accs.iter_mut().zip(accs) {
+                            acc.merge(partial)?;
+                        }
+                    }
+                    _ => {
+                        if let Some((k, a)) = self.current.replace((key, accs)) {
+                            return Ok(Some(finalize_group(k, a)));
+                        }
+                    }
+                },
+                None => {
+                    return match self.current.take() {
+                        Some((k, a)) => Ok(Some(finalize_group(k, a))),
+                        None => Ok(None),
+                    };
+                }
+            }
+        }
+    }
 }
 
 impl PhysicalHashAggregate {
@@ -875,51 +790,59 @@ impl PhysicalHashAggregate {
         group_by: Vec<Expr>,
         aggrs: Vec<AggregateExpr>,
         schema: Schema,
+        temp_dir: PathBuf,
+        memory_budget: usize,
     ) -> Self {
         Self {
             source,
             group_by,
             aggrs,
             schema,
-            aggregated_rows: None,
+            temp_dir,
+            memory_budget,
+            output: None,
         }
+    }
+
+    fn spill_groups(
+        &self,
+        groups: &mut HashMap<Vec<DbValue>, Vec<Accumulator>>,
+        runs: &mut Vec<Run<Vec<Accumulator>>>,
+    ) -> Result<(), String> {
+        let directions = vec![true; self.group_by.len()];
+        let mut entries: Vec<(Vec<DbValue>, Vec<Accumulator>)> = groups.drain().collect();
+        spill::sort_entries(&mut entries, &directions);
+        runs.push(spill::write_run(&self.temp_dir, "agg_run", &entries)?);
+        Ok(())
     }
 }
 
 impl PhysicalOperator for PhysicalHashAggregate {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        if self.aggregated_rows.is_none() {
-            // Blocking phase: group and accumulate aggregates for all source rows
-            let mut groups: HashMap<Vec<DbValue>, Vec<Accumulator>> = HashMap::new();
-
+        if self.output.is_none() {
+            // Build phase: accumulate groups in memory, spilling sorted partial-group
+            // runs whenever the byte budget is exceeded so memory stays bounded.
             let source_schema = self.source.schema().clone();
+            let mut groups: HashMap<Vec<DbValue>, Vec<Accumulator>> = HashMap::new();
+            let mut buffer_bytes: usize = 0;
+            let mut runs: Vec<Run<Vec<Accumulator>>> = Vec::new();
+            let acc_overhead = self.aggrs.len() * std::mem::size_of::<Accumulator>();
 
             while let Some(row) = self.source.next()? {
-                // 1. Compute group-by values
-                let mut group_vals = Vec::new();
+                let mut group_vals = Vec::with_capacity(self.group_by.len());
                 for expr in &self.group_by {
-                    let val = expr.eval(&row, &source_schema)?;
-                    group_vals.push(val);
+                    group_vals.push(expr.eval(&row, &source_schema)?);
                 }
 
-                // 2. Initialize accumulators if group is seen for the first time
-                let accumulators = groups.entry(group_vals).or_insert_with(|| {
-                    self.aggrs
-                        .iter()
-                        .map(|aggr| match aggr {
-                            AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                            AggregateExpr::Sum(_) => Accumulator::Sum {
-                                int_sum: None,
-                                float_sum: None,
-                            },
-                            AggregateExpr::Min(_) => Accumulator::Min { min: None },
-                            AggregateExpr::Max(_) => Accumulator::Max { max: None },
-                            AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
-                        })
-                        .collect()
-                });
+                let added = if groups.contains_key(&group_vals) {
+                    0
+                } else {
+                    spill::estimate_row_size(&group_vals, &[]) + acc_overhead
+                };
+                let accumulators = groups
+                    .entry(group_vals)
+                    .or_insert_with(|| new_accumulators(&self.aggrs));
 
-                // 3. Update accumulators with column values
                 for (idx, aggr) in self.aggrs.iter().enumerate() {
                     let val = match aggr {
                         AggregateExpr::Count(expr)
@@ -930,40 +853,41 @@ impl PhysicalOperator for PhysicalHashAggregate {
                     };
                     accumulators[idx].update(&val)?;
                 }
-            }
 
-            if self.group_by.is_empty() && groups.is_empty() {
-                let initial_accumulators = self
-                    .aggrs
-                    .iter()
-                    .map(|aggr| match aggr {
-                        AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
-                        AggregateExpr::Sum(_) => Accumulator::Sum {
-                            int_sum: None,
-                            float_sum: None,
-                        },
-                        AggregateExpr::Min(_) => Accumulator::Min { min: None },
-                        AggregateExpr::Max(_) => Accumulator::Max { max: None },
-                        AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
-                    })
-                    .collect();
-                groups.insert(Vec::new(), initial_accumulators);
-            }
-
-            // 4. Construct final output rows
-            let mut output_rows = Vec::new();
-            for (group_vals, accumulators) in groups {
-                let mut row_vals = group_vals; // starts with group-by keys
-                for acc in accumulators {
-                    row_vals.push(acc.finalize());
+                buffer_bytes += added;
+                // Spilling only helps when there are group keys; an ungrouped query
+                // (or one with a single group) never exceeds one map entry to spill.
+                if buffer_bytes >= self.memory_budget && !self.group_by.is_empty() {
+                    self.spill_groups(&mut groups, &mut runs)?;
+                    buffer_bytes = 0;
                 }
-                output_rows.push(Row::new(row_vals));
             }
 
-            self.aggregated_rows = Some(output_rows.into_iter());
+            if runs.is_empty() {
+                if self.group_by.is_empty() && groups.is_empty() {
+                    groups.insert(Vec::new(), new_accumulators(&self.aggrs));
+                }
+                let output_rows: Vec<Row> = groups
+                    .into_iter()
+                    .map(|(keys, accs)| finalize_group(keys, accs))
+                    .collect();
+                self.output = Some(AggOutput::InMemory(output_rows.into_iter()));
+            } else {
+                if !groups.is_empty() {
+                    self.spill_groups(&mut groups, &mut runs)?;
+                }
+                let merger = KWayMerge::new(runs, vec![true; self.group_by.len()])?;
+                self.output = Some(AggOutput::Merge(AggMerge {
+                    merger,
+                    current: None,
+                }));
+            }
         }
 
-        Ok(self.aggregated_rows.as_mut().unwrap().next())
+        match self.output.as_mut().unwrap() {
+            AggOutput::InMemory(iter) => Ok(iter.next()),
+            AggOutput::Merge(merge) => merge.next(),
+        }
     }
 
     fn schema(&self) -> &Schema {
@@ -1145,6 +1069,7 @@ impl PhysicalOperator for PhysicalSortedAggregate {
 // ==========================================
 // Aggregation State Accumulators
 // ==========================================
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum Accumulator {
     Count {
         count: i64,
@@ -1167,6 +1092,32 @@ enum Accumulator {
         sum: f64,
         count: i64,
     },
+}
+
+/// Creates a fresh set of zeroed accumulators matching the given aggregate exprs.
+fn new_accumulators(aggrs: &[AggregateExpr]) -> Vec<Accumulator> {
+    aggrs
+        .iter()
+        .map(|aggr| match aggr {
+            AggregateExpr::Count(_) => Accumulator::Count { count: 0 },
+            AggregateExpr::Sum(_) => Accumulator::Sum {
+                int_sum: None,
+                float_sum: None,
+            },
+            AggregateExpr::Min(_) => Accumulator::Min { min: None },
+            AggregateExpr::Max(_) => Accumulator::Max { max: None },
+            AggregateExpr::Avg(_) => Accumulator::Avg { sum: 0.0, count: 0 },
+        })
+        .collect()
+}
+
+/// Builds an output row from group keys followed by each finalized aggregate.
+fn finalize_group(keys: Vec<DbValue>, accs: Vec<Accumulator>) -> Row {
+    let mut row_vals = keys;
+    for acc in accs {
+        row_vals.push(acc.finalize());
+    }
+    Row::new(row_vals)
 }
 
 impl Accumulator {
@@ -1243,6 +1194,71 @@ impl Accumulator {
         Ok(())
     }
 
+    /// Combines a partial accumulator (from a spilled run) into this one. Both
+    /// must be the same variant, which holds because they aggregate the same
+    /// group across runs.
+    fn merge(&mut self, other: Accumulator) -> Result<(), String> {
+        match (self, other) {
+            (Accumulator::Count { count }, Accumulator::Count { count: o }) => {
+                *count += o;
+            }
+            (
+                Accumulator::Sum { int_sum, float_sum },
+                Accumulator::Sum {
+                    int_sum: o_int,
+                    float_sum: o_float,
+                },
+            ) => {
+                if float_sum.is_some() || o_float.is_some() {
+                    let a = float_sum.unwrap_or(0.0) + int_sum.take().unwrap_or(0) as f64;
+                    let b = o_float.unwrap_or(0.0) + o_int.unwrap_or(0) as f64;
+                    *float_sum = Some(a + b);
+                } else {
+                    match (*int_sum, o_int) {
+                        (None, None) => {}
+                        (Some(a), None) => *int_sum = Some(a),
+                        (None, Some(b)) => *int_sum = Some(b),
+                        (Some(a), Some(b)) => match a.checked_add(b) {
+                            Some(s) => *int_sum = Some(s),
+                            None => {
+                                *int_sum = None;
+                                *float_sum = Some(a as f64 + b as f64);
+                            }
+                        },
+                    }
+                }
+            }
+            (Accumulator::Min { min }, Accumulator::Min { min: o }) => {
+                if let Some(v) = o {
+                    match min {
+                        Some(cur) if compare_values(&v, cur)? != std::cmp::Ordering::Less => {}
+                        _ => *min = Some(v),
+                    }
+                }
+            }
+            (Accumulator::Max { max }, Accumulator::Max { max: o }) => {
+                if let Some(v) = o {
+                    match max {
+                        Some(cur) if compare_values(&v, cur)? != std::cmp::Ordering::Greater => {}
+                        _ => *max = Some(v),
+                    }
+                }
+            }
+            (
+                Accumulator::Avg { sum, count },
+                Accumulator::Avg {
+                    sum: o_sum,
+                    count: o_count,
+                },
+            ) => {
+                *sum += o_sum;
+                *count += o_count;
+            }
+            _ => return Err("Cannot merge accumulators of different kinds".to_string()),
+        }
+        Ok(())
+    }
+
     fn finalize(&self) -> DbValue {
         match self {
             Accumulator::Count { count } => DbValue::Int(*count),
@@ -1272,23 +1288,99 @@ impl Accumulator {
 // ==========================================
 // Set Operation Physical Operator (UNION, INTERSECT, EXCEPT)
 // ==========================================
-pub enum SetOpState {
-    Init,
-    UnionDistinct {
-        seen: std::collections::HashSet<Row>,
-        reading_left: bool,
-    },
-    UnionAll {
-        reading_left: bool,
-    },
-    Intersect {
-        right_counts: std::collections::HashMap<Row, usize>,
-        seen: std::collections::HashSet<Row>,
-    },
-    Except {
-        right_counts: std::collections::HashMap<Row, usize>,
-        seen: std::collections::HashSet<Row>,
-    },
+/// A peekable stream of rows in total-order, produced by externally sorting a child
+/// operator. Memory is bounded by spilling sorted runs; `head` holds the current row.
+struct SortedRowStream {
+    inner: SortedStreamInner,
+    head: Option<Vec<DbValue>>,
+}
+
+enum SortedStreamInner {
+    InMemory(std::vec::IntoIter<Vec<DbValue>>),
+    External(KWayMerge<()>),
+}
+
+impl SortedRowStream {
+    fn build(
+        source: &mut Box<dyn PhysicalOperator>,
+        temp_dir: &std::path::Path,
+        memory_budget: usize,
+    ) -> Result<Self, String> {
+        let directions = vec![true; source.schema().columns.len()];
+        let mut buffer: Vec<(Vec<DbValue>, ())> = Vec::new();
+        let mut buffer_bytes: usize = 0;
+        let mut runs: Vec<Run<()>> = Vec::new();
+
+        while let Some(row) = source.next()? {
+            let key = row.values;
+            buffer_bytes += spill::estimate_row_size(&key, &[]);
+            buffer.push((key, ()));
+            if buffer_bytes >= memory_budget {
+                spill::sort_entries(&mut buffer, &directions);
+                runs.push(spill::write_run(temp_dir, "setop_run", &buffer)?);
+                buffer.clear();
+                buffer_bytes = 0;
+            }
+        }
+
+        let inner = if runs.is_empty() {
+            spill::sort_entries(&mut buffer, &directions);
+            SortedStreamInner::InMemory(
+                buffer
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        } else {
+            if !buffer.is_empty() {
+                spill::sort_entries(&mut buffer, &directions);
+                runs.push(spill::write_run(temp_dir, "setop_run", &buffer)?);
+            }
+            SortedStreamInner::External(KWayMerge::new(runs, directions)?)
+        };
+
+        let mut stream = Self { inner, head: None };
+        stream.advance()?;
+        Ok(stream)
+    }
+
+    fn advance(&mut self) -> Result<(), String> {
+        self.head = match &mut self.inner {
+            SortedStreamInner::InMemory(iter) => iter.next(),
+            SortedStreamInner::External(merger) => merger.next()?.map(|(k, _)| k),
+        };
+        Ok(())
+    }
+
+    fn peek(&self) -> Option<&Vec<DbValue>> {
+        self.head.as_ref()
+    }
+
+    /// Consumes and counts the rows at the head equal to `key`, advancing past them.
+    fn consume_equal(&mut self, key: &[DbValue]) -> Result<usize, String> {
+        let mut count = 0;
+        while let Some(head) = self.head.as_deref() {
+            if compare_rows(head, key) == std::cmp::Ordering::Equal {
+                count += 1;
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        Ok(count)
+    }
+}
+
+/// Total-order comparison of two whole rows (all columns ascending).
+fn compare_rows(a: &[DbValue], b: &[DbValue]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = spill::total_compare(x, y);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 pub struct PhysicalSetOp {
@@ -1297,7 +1389,10 @@ pub struct PhysicalSetOp {
     op: SetOpType,
     all: bool,
     schema: Schema,
-    state: SetOpState,
+    temp_dir: PathBuf,
+    memory_budget: usize,
+    streams: Option<(SortedRowStream, SortedRowStream)>,
+    pending: std::collections::VecDeque<Vec<DbValue>>,
 }
 
 impl PhysicalSetOp {
@@ -1307,6 +1402,8 @@ impl PhysicalSetOp {
         op: SetOpType,
         all: bool,
         schema: Schema,
+        temp_dir: PathBuf,
+        memory_budget: usize,
     ) -> Self {
         Self {
             left,
@@ -1314,102 +1411,81 @@ impl PhysicalSetOp {
             op,
             all,
             schema,
-            state: SetOpState::Init,
+            temp_dir,
+            memory_budget,
+            streams: None,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// Number of times the row for the current key should be emitted, given the
+/// occurrence counts on each side and the operation's multiset semantics.
+fn set_op_emit_count(op: &SetOpType, all: bool, left_count: usize, right_count: usize) -> usize {
+    match op {
+        SetOpType::Union => {
+            if all {
+                left_count + right_count
+            } else {
+                usize::from(left_count + right_count > 0)
+            }
+        }
+        SetOpType::Intersect => {
+            if all {
+                left_count.min(right_count)
+            } else {
+                usize::from(left_count > 0 && right_count > 0)
+            }
+        }
+        SetOpType::Except => {
+            if all {
+                left_count.saturating_sub(right_count)
+            } else {
+                usize::from(left_count > 0 && right_count == 0)
+            }
         }
     }
 }
 
 impl PhysicalOperator for PhysicalSetOp {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        if matches!(self.state, SetOpState::Init) {
-            match self.op {
-                SetOpType::Union => {
-                    if self.all {
-                        self.state = SetOpState::UnionAll { reading_left: true };
-                    } else {
-                        self.state = SetOpState::UnionDistinct {
-                            seen: std::collections::HashSet::new(),
-                            reading_left: true,
-                        };
-                    }
-                }
-                SetOpType::Intersect => {
-                    let mut right_counts = std::collections::HashMap::new();
-                    while let Some(row) = self.right.next()? {
-                        *right_counts.entry(row).or_insert(0) += 1;
-                    }
-                    self.state = SetOpState::Intersect {
-                        right_counts,
-                        seen: std::collections::HashSet::new(),
-                    };
-                }
-                SetOpType::Except => {
-                    let mut right_counts = std::collections::HashMap::new();
-                    while let Some(row) = self.right.next()? {
-                        *right_counts.entry(row).or_insert(0) += 1;
-                    }
-                    self.state = SetOpState::Except {
-                        right_counts,
-                        seen: std::collections::HashSet::new(),
-                    };
-                }
-            }
+        if self.streams.is_none() {
+            let left = SortedRowStream::build(&mut self.left, &self.temp_dir, self.memory_budget)?;
+            let right =
+                SortedRowStream::build(&mut self.right, &self.temp_dir, self.memory_budget)?;
+            self.streams = Some((left, right));
         }
 
-        match &mut self.state {
-            SetOpState::UnionAll { reading_left } => {
-                if *reading_left {
-                    if let Some(row) = self.left.next()? {
-                        return Ok(Some(row));
-                    }
-                    *reading_left = false;
-                }
-                self.right.next()
+        let op = self.op;
+        let all = self.all;
+        let (left, right) = self.streams.as_mut().unwrap();
+
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(Some(Row::new(row)));
             }
-            SetOpState::UnionDistinct { seen, reading_left } => {
-                if *reading_left {
-                    while let Some(row) = self.left.next()? {
-                        if seen.insert(row.clone()) {
-                            return Ok(Some(row));
-                        }
+
+            // Pick the smaller of the two current heads as the next group key.
+            let key = match (left.peek(), right.peek()) {
+                (None, None) => return Ok(None),
+                (Some(l), None) => l.clone(),
+                (None, Some(r)) => r.clone(),
+                (Some(l), Some(r)) => {
+                    if compare_rows(l, r) == std::cmp::Ordering::Greater {
+                        r.clone()
+                    } else {
+                        l.clone()
                     }
-                    *reading_left = false;
                 }
-                while let Some(row) = self.right.next()? {
-                    if seen.insert(row.clone()) {
-                        return Ok(Some(row));
-                    }
-                }
-                Ok(None)
+            };
+
+            let left_count = left.consume_equal(&key)?;
+            let right_count = right.consume_equal(&key)?;
+
+            let emit = set_op_emit_count(&op, all, left_count, right_count);
+            for _ in 0..emit {
+                self.pending.push_back(key.clone());
             }
-            SetOpState::Intersect { right_counts, seen } => {
-                while let Some(row) = self.left.next()? {
-                    if self.all {
-                        if let Some(count) = right_counts.get_mut(&row).filter(|c| **c > 0) {
-                            *count -= 1;
-                            return Ok(Some(row));
-                        }
-                    } else if right_counts.contains_key(&row) && seen.insert(row.clone()) {
-                        return Ok(Some(row));
-                    }
-                }
-                Ok(None)
-            }
-            SetOpState::Except { right_counts, seen } => {
-                while let Some(row) = self.left.next()? {
-                    if self.all {
-                        if let Some(count) = right_counts.get_mut(&row).filter(|c| **c > 0) {
-                            *count -= 1;
-                            continue;
-                        }
-                        return Ok(Some(row));
-                    } else if !right_counts.contains_key(&row) && seen.insert(row.clone()) {
-                        return Ok(Some(row));
-                    }
-                }
-                Ok(None)
-            }
-            SetOpState::Init => unreachable!(),
         }
     }
 
@@ -1432,30 +1508,89 @@ impl PhysicalOperator for PhysicalSetOp {
 }
 
 // ==========================================
-// 9. Distinct Physical Operator (Streaming)
+// 9. Distinct Physical Operator (Sort-based, bounded-memory)
 // ==========================================
+/// Deduplicates by externally sorting the source on all columns, then dropping
+/// rows equal to the previously emitted one. Memory is bounded by spilling sorted
+/// runs; equal rows are adjacent after the merge so a single look-back suffices.
 pub struct PhysicalDistinct {
     source: Box<dyn PhysicalOperator>,
-    seen: HashSet<Row>,
+    temp_dir: PathBuf,
+    memory_budget: usize,
+    state: Option<DistinctState>,
+}
+
+enum DistinctState {
+    InMemory(std::vec::IntoIter<Vec<DbValue>>),
+    External {
+        merger: KWayMerge<()>,
+        last: Option<Vec<DbValue>>,
+    },
 }
 
 impl PhysicalDistinct {
-    pub fn new(source: Box<dyn PhysicalOperator>) -> Self {
+    pub fn new(source: Box<dyn PhysicalOperator>, temp_dir: PathBuf, memory_budget: usize) -> Self {
         Self {
             source,
-            seen: HashSet::new(),
+            temp_dir,
+            memory_budget,
+            state: None,
         }
     }
 }
 
 impl PhysicalOperator for PhysicalDistinct {
     fn next(&mut self) -> Result<Option<Row>, String> {
-        while let Some(row) = self.source.next()? {
-            if self.seen.insert(row.clone()) {
-                return Ok(Some(row));
+        if self.state.is_none() {
+            let width = self.source.schema().columns.len();
+            let directions = vec![true; width];
+            let mut buffer: Vec<(Vec<DbValue>, ())> = Vec::new();
+            let mut buffer_bytes: usize = 0;
+            let mut runs: Vec<Run<()>> = Vec::new();
+
+            while let Some(row) = self.source.next()? {
+                let key = row.values;
+                buffer_bytes += spill::estimate_row_size(&key, &[]);
+                buffer.push((key, ()));
+
+                if buffer_bytes >= self.memory_budget {
+                    spill::sort_entries(&mut buffer, &directions);
+                    runs.push(spill::write_run(&self.temp_dir, "distinct_run", &buffer)?);
+                    buffer.clear();
+                    buffer_bytes = 0;
+                }
+            }
+
+            if runs.is_empty() {
+                spill::sort_entries(&mut buffer, &directions);
+                let mut keys: Vec<Vec<DbValue>> = buffer.into_iter().map(|(k, _)| k).collect();
+                keys.dedup();
+                self.state = Some(DistinctState::InMemory(keys.into_iter()));
+            } else {
+                if !buffer.is_empty() {
+                    spill::sort_entries(&mut buffer, &directions);
+                    runs.push(spill::write_run(&self.temp_dir, "distinct_run", &buffer)?);
+                }
+                self.state = Some(DistinctState::External {
+                    merger: KWayMerge::new(runs, directions)?,
+                    last: None,
+                });
             }
         }
-        Ok(None)
+
+        match self.state.as_mut().unwrap() {
+            DistinctState::InMemory(iter) => Ok(iter.next().map(Row::new)),
+            DistinctState::External { merger, last } => {
+                // Skip consecutive duplicates; equal keys are adjacent post-merge.
+                while let Some((key, ())) = merger.next()? {
+                    if last.as_ref() != Some(&key) {
+                        *last = Some(key.clone());
+                        return Ok(Some(Row::new(key)));
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn schema(&self) -> &Schema {

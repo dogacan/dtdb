@@ -25,7 +25,7 @@ pub struct DatabaseOptions {
     pub block_cache_capacity: Option<usize>,
     pub analyze_frequency_ms: Option<u64>,
     pub wal_sync_interval_ms: Option<u64>,
-    pub sort_memory_budget: Option<usize>,
+    pub memory_budget: Option<usize>,
 }
 ```
 
@@ -56,7 +56,7 @@ pub struct DatabaseOptions {
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `sort_memory_budget` | `None` (in-memory, no spill) | Reserved for the future external-sort path. Currently the planner sorts in memory and may OOM on large inputs — set this once spill-to-disk lands. |
+| `memory_budget` | `None` (defaults to 8 MiB) | Per-operator working-memory budget in bytes, shared by all spilling operators: external sort (`ORDER BY`), hash aggregation (`GROUP BY`), `DISTINCT`, set operations, and the sort-merge join. When an operator's buffered working set exceeds this, it spills sorted runs to `_tmp/` and finishes via external merge. Smaller values spill sooner (lower RSS, more I/O); larger values keep more in memory. Accepts the legacy alias `sort_memory_budget` when deserializing. |
 
 ### Constructing a non-default `DatabaseOptions`
 
@@ -78,7 +78,7 @@ let options = DatabaseOptions {
     block_cache_capacity: Some(2048),
     analyze_frequency_ms: Some(60_000),     // refresh stats every 60s
     wal_sync_interval_ms: None,
-    sort_memory_budget: None,
+    memory_budget: None,
 };
 
 let db = Database::open_with_options("/tmp/dtdb-app", options)?;

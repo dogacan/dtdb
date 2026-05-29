@@ -46,7 +46,7 @@ async fn test_in_process_client_integration() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: None,
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
     let create_opt_resp = client
         .create_db_with_options("db_opt", options)

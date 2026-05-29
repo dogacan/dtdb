@@ -3,8 +3,8 @@ use crate::logical::{JoinType, LogicalPlan, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
-    PhysicalHashAggregate, PhysicalHashJoin, PhysicalIndexScan, PhysicalLimit, PhysicalOperator,
-    PhysicalProjection, PhysicalSeqScan, PhysicalSetOp, PhysicalSort, PhysicalSortedAggregate,
+    PhysicalHashAggregate, PhysicalIndexScan, PhysicalLimit, PhysicalOperator, PhysicalProjection,
+    PhysicalSeqScan, PhysicalSetOp, PhysicalSort, PhysicalSortMergeJoin, PhysicalSortedAggregate,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -57,11 +57,11 @@ impl SqlEngine {
         dir
     }
 
-    /// Returns the per-sort memory budget in bytes.
-    fn sort_memory_budget(&self) -> usize {
+    /// Returns the per-operator memory budget in bytes used to trigger disk spilling.
+    fn memory_budget(&self) -> usize {
         self.database
             .options
-            .sort_memory_budget
+            .memory_budget
             .unwrap_or(8 * 1024 * 1024)
     }
 
@@ -691,7 +691,7 @@ impl SqlEngine {
                     src_op,
                     keys,
                     self.temp_dir(),
-                    self.sort_memory_budget(),
+                    self.memory_budget(),
                 )))
             }
             LogicalPlan::Join {
@@ -802,13 +802,15 @@ impl SqlEngine {
                     left_on.bind_columns(left_schema)?;
                     right_on.bind_columns(right_schema)?;
 
-                    Ok(Box::new(PhysicalHashJoin::new(
+                    Ok(Box::new(PhysicalSortMergeJoin::new(
                         left_op,
                         right_op,
                         *left_on,
                         *right_on,
                         join_type,
                         joined_schema,
+                        self.temp_dir(),
+                        self.memory_budget(),
                     )))
                 }
             }
@@ -878,6 +880,8 @@ impl SqlEngine {
                         group_by,
                         aggrs,
                         aggr_schema,
+                        self.temp_dir(),
+                        self.memory_budget(),
                     )))
                 }
             }
@@ -891,12 +895,22 @@ impl SqlEngine {
                 let right_op = self.compile_physical(*right, tx, columns)?;
                 let schema = left_op.schema().clone();
                 Ok(Box::new(PhysicalSetOp::new(
-                    left_op, right_op, op, all, schema,
+                    left_op,
+                    right_op,
+                    op,
+                    all,
+                    schema,
+                    self.temp_dir(),
+                    self.memory_budget(),
                 )))
             }
             LogicalPlan::Distinct { source } => {
                 let src_op = self.compile_physical(*source, tx, columns)?;
-                Ok(Box::new(PhysicalDistinct::new(src_op)))
+                Ok(Box::new(PhysicalDistinct::new(
+                    src_op,
+                    self.temp_dir(),
+                    self.memory_budget(),
+                )))
             }
         }
     }

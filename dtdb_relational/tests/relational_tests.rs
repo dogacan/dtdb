@@ -573,7 +573,7 @@ fn test_background_statistics_collector() {
         block_cache_capacity: Some(1000),
         analyze_frequency_ms: Some(10), // Run every 10ms
         wal_sync_interval_ms: None,
-        sort_memory_budget: None,
+        memory_budget: None,
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());

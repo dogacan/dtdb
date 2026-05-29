@@ -5,6 +5,7 @@ pub mod optimizer;
 pub mod parameters;
 pub mod physical;
 pub mod planner;
+pub mod spill;
 
 pub use engine::{ExecutionResult, SqlEngine};
 pub use expr::{Expr, Operator};
