@@ -608,7 +608,11 @@ impl Optimizer {
         if let Some((start, end)) = range {
             let mut s = 0.05; // default closed range
             if start == end {
-                s = 1.0 / (row_count.max(1) as f64);
+                // Exact-match point lookup: at most one row. Fall back to a
+                // large assumed cardinality when statistics are absent so this
+                // stays highly selective (and thus far cheaper than a full
+                // scan) instead of collapsing to a selectivity of 1.0.
+                s = 1.0 / (effective_row_count(row_count) as f64);
             } else {
                 let is_start_unbounded = is_key_unbounded_min(start);
                 let is_end_unbounded = is_key_unbounded_max(end);
@@ -642,9 +646,9 @@ impl Optimizer {
             if let Some(stats) = stats_opt
                 && let Some(idx_stats) = stats.index_stats.get(index_name)
             {
-                s_idx = idx_stats.avg_rows_per_value / (row_count.max(1) as f64);
+                s_idx = idx_stats.avg_rows_per_value / (effective_row_count(row_count) as f64);
             } else {
-                s_idx = 1.0 / (row_count.max(1) as f64);
+                s_idx = 1.0 / (effective_row_count(row_count) as f64);
             }
         } else {
             let is_start_unbounded = is_key_unbounded_min(start);
@@ -960,6 +964,26 @@ fn val_to_key(val: &DbValue) -> Option<DbKey> {
         DbValue::Int(v) => Some(DbKey::Int(*v)),
         DbValue::String(s) => Some(DbKey::String(s.clone())),
         _ => None,
+    }
+}
+
+/// Assumed table cardinality used for selectivity math when no statistics are
+/// available. It only needs to be large enough that an exact-match predicate is
+/// estimated as far cheaper than a full scan, so a primary-key (or secondary
+/// index) point lookup is chosen even on a table that has never been analyzed.
+///
+/// Without this, an exact-match selectivity is `1.0 / row_count`, which
+/// collapses to `1.0` when `row_count` is `0` — making a point lookup cost the
+/// same as a full scan and defeating predicate pushdown on fresh tables.
+const DEFAULT_ROW_COUNT_ESTIMATE: u64 = 1_000_000;
+
+/// Returns `row_count` when known, otherwise a large default so selectivity
+/// estimates remain meaningful in the absence of statistics.
+fn effective_row_count(row_count: u64) -> u64 {
+    if row_count > 0 {
+        row_count
+    } else {
+        DEFAULT_ROW_COUNT_ESTIMATE
     }
 }
 

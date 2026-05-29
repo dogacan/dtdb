@@ -898,3 +898,28 @@ fn test_additional_optimizer_edge_cases() {
         LogicalPlan::Filter { .. } | LogicalPlan::FullTextScan { .. }
     ));
 }
+
+#[test]
+fn test_pk_equality_pushdown_without_statistics() {
+    // `setup_db` creates t1 with no rows and never runs ANALYZE, so the table
+    // has no statistics (row_count == 0). A primary-key equality must still be
+    // lowered to a single-key point-range scan rather than a full table scan.
+    //
+    // Regression: a zero row_count made the point-lookup selectivity
+    // `1.0 / row_count.max(1)` collapse to 1.0, so the point scan was costed
+    // identically to a full scan and the strict `<` tie-break kept the full
+    // scan — turning every `WHERE pk = const` into a full table scan on
+    // un-analyzed tables.
+    let (_tmp, db) = setup_db();
+    let plan = optimize_plan(db, "SELECT val FROM t1 WHERE id = 7").unwrap();
+    let rendered = dtdb_sql::format_logical_plan(&plan);
+
+    assert!(
+        rendered.contains("range=[Int(7), Int(7)]"),
+        "PK equality on an un-analyzed table should push down a point range.\nPlan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("range=all"),
+        "PK equality must not fall back to a full scan.\nPlan:\n{rendered}"
+    );
+}
