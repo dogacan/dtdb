@@ -460,6 +460,20 @@ impl Table {
         Ok(())
     }
 
+    /// Fsyncs the WAL of every storage engine backing this table (locality
+    /// group engines and index engines), making all applied mutations durable.
+    /// Used by the database checkpoint to flush committed data before the
+    /// transaction log that redo-protects it is truncated.
+    pub fn sync_all_engines(&self) -> Result<()> {
+        for engine in self.engines.values() {
+            engine.sync_wal()?;
+        }
+        for engine in self.index_engines.values() {
+            engine.sync_wal()?;
+        }
+        Ok(())
+    }
+
     /// Fetches a row by primary key, reading only the necessary locality group engines.
     pub fn get(&self, key: &DbKey, columns: Option<&[String]>) -> Result<Option<Row>> {
         let mut needed_groups = HashSet::new();
@@ -819,6 +833,37 @@ pub struct DatabaseOptions {
     pub memory_budget: Option<usize>,
 }
 
+/// Default background WAL-sync interval (milliseconds) for the internal
+/// table/index storage engines.
+///
+/// The relational transaction log is the authoritative durability barrier: a
+/// commit fsyncs exactly one `Prepared` record that captures every mutation
+/// across every engine. The per-engine storage WALs therefore never need to
+/// fsync per write; they sync in the background and are force-flushed in bulk
+/// by [`Database::checkpoint`] before the transaction log is truncated. This
+/// is what reduces a commit's cost to a single fsync.
+const ENGINE_WAL_BACKGROUND_SYNC_MS: u64 = 1000;
+
+/// Once the transaction log grows past this many bytes and no transaction is
+/// in flight, a commit triggers a [`Database::checkpoint`]. Checkpointing
+/// fsyncs every engine's WAL and truncates the log, so this threshold bounds
+/// both the wasted work on the next recovery and the per-engine fsync rate
+/// (the fsyncs are amortized across every commit since the last checkpoint).
+const CHECKPOINT_LOG_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Resolves the WAL-sync interval used when opening an internal storage engine.
+///
+/// Because the transaction log provides commit durability, engine WALs are
+/// always opened in background-sync mode. A caller-supplied positive interval
+/// is honored as a tuning knob; `None`/`Some(0)` (which would otherwise mean
+/// "fsync every write") is mapped to the background default.
+fn engine_wal_sync_interval(db_option: Option<u64>) -> Option<u64> {
+    match db_option {
+        Some(ms) if ms > 0 => Some(ms),
+        _ => Some(ENGINE_WAL_BACKGROUND_SYNC_MS),
+    }
+}
+
 /// Database represents a catalog of Tables stored in a base directory.
 pub struct Database {
     dir_path: PathBuf,
@@ -963,7 +1008,9 @@ impl Database {
                         level_size_multiplier: options.level_size_multiplier.unwrap_or(10),
                         max_level: options.max_level.unwrap_or(7),
                         block_cache_capacity: options.block_cache_capacity.unwrap_or(1000),
-                        wal_sync_interval_ms: options.wal_sync_interval_ms,
+                        wal_sync_interval_ms: engine_wal_sync_interval(
+                            options.wal_sync_interval_ms,
+                        ),
                     };
 
                     let mut engines = HashMap::new();
@@ -1138,7 +1185,7 @@ impl Database {
             level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
             max_level: self.options.max_level.unwrap_or(7),
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
-            wal_sync_interval_ms: self.options.wal_sync_interval_ms,
+            wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
         };
 
         let mut engines = HashMap::new();
@@ -1366,22 +1413,78 @@ impl Database {
     }
 
     pub fn commit_transaction(&self, tx_id: u64) -> Result<()> {
-        let truncate = {
+        let no_active = {
             let mut active = self.active_transactions.lock().unwrap();
             active.remove(&tx_id);
             active.is_empty()
         };
 
-        if truncate {
-            let mut file_guard = self.transaction_log_file.lock().unwrap();
-            if let Some(ref mut file) = *file_guard {
-                file.set_len(0)?;
-                use std::io::Seek;
-                file.seek(std::io::SeekFrom::Start(0))?;
-            }
-        } else {
-            let record = TransactionRecord::Committed { tx_id };
-            self.append_record(&record, false)?;
+        // The transaction is already durable: its `Prepared` record (which
+        // carries every mutation) was fsynced before the engines were updated.
+        // We no longer truncate eagerly here, nor fsync per engine — that is
+        // deferred to a checkpoint so that the steady-state cost of a commit is
+        // a single fsync. Once the log has grown past the threshold and no
+        // transaction is in flight (so every logged record is fully applied to
+        // the engines), fold the redo records into durable engine state.
+        if no_active && self.transaction_log_len()? >= CHECKPOINT_LOG_THRESHOLD_BYTES {
+            // Safe to checkpoint without re-acquiring the commit lock: this runs
+            // inside the commit closure, which already holds it, and the empty
+            // in-flight set means every logged record is fully applied.
+            self.checkpoint_locked()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the current size of the transaction log in bytes.
+    fn transaction_log_len(&self) -> Result<u64> {
+        let file_guard = self.transaction_log_file.lock().unwrap();
+        match *file_guard {
+            Some(ref file) => Ok(file.metadata()?.len()),
+            None => Ok(0),
+        }
+    }
+
+    /// Fsyncs every table/index storage engine's WAL, making all applied
+    /// mutations durable in the engines themselves.
+    fn sync_all_table_engines(&self) -> Result<()> {
+        let tables = self.tables.read().unwrap();
+        for table in tables.values() {
+            table.sync_all_engines()?;
+        }
+        Ok(())
+    }
+
+    /// Checkpoints the database: durably flushes all storage-engine WALs and
+    /// then truncates the transaction log.
+    ///
+    /// After this returns, every transaction previously recorded in the log is
+    /// durably persisted in the storage engines, so the log's redo records are
+    /// no longer needed for crash recovery and the log can start fresh. This is
+    /// what amortizes the per-engine fsyncs across many commits.
+    ///
+    /// Takes the commit lock for its duration so it cannot interleave with a
+    /// commit that has fsynced its `Prepared` record but not yet applied it to
+    /// the engines — which would otherwise let the truncation drop a durable
+    /// transaction. Use this for an explicit flush (e.g. clean shutdown).
+    pub fn checkpoint(&self) -> Result<()> {
+        let _commit_guard = self.commit_history.write().unwrap();
+        self.checkpoint_locked()
+    }
+
+    /// Checkpoint body. The caller must hold the commit lock (`commit_history`
+    /// write lock) so that no transaction is mid-apply; the commit path
+    /// satisfies this directly, and [`Database::checkpoint`] acquires it.
+    fn checkpoint_locked(&self) -> Result<()> {
+        // 1. Make all applied mutations durable in the engines.
+        self.sync_all_table_engines()?;
+
+        // 2. The log's redo records are now redundant — discard them.
+        let mut file_guard = self.transaction_log_file.lock().unwrap();
+        if let Some(ref mut file) = *file_guard {
+            use std::io::Seek;
+            file.set_len(0)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.sync_all()?;
         }
         Ok(())
     }
@@ -1393,7 +1496,24 @@ impl Database {
 
         let file = File::open(&self.transaction_log_path)?;
         let mut reader = std::io::BufReader::new(file);
-        let mut prepared = std::collections::BTreeMap::new();
+
+        // Collect every `Prepared` record in *log order*, which is commit
+        // order (records are appended sequentially under the commit lock).
+        // Replay must preserve this order so later writes to a key win.
+        //
+        // A `Prepared` record is the durable commit point, so every one found
+        // here is a committed transaction whose mutations must be present in
+        // the engines. The `Committed` marker is informational and ignored:
+        // re-applying a transaction is idempotent (LSM is last-writer-wins and
+        // each record carries its own pre-image `old_rows` for deterministic
+        // index maintenance), so replaying records that a background WAL sync
+        // had already persisted before the crash is harmless.
+        #[allow(clippy::type_complexity)]
+        let mut prepared: Vec<(
+            u64,
+            HashMap<String, Vec<RelationalMutation>>,
+            Option<HashMap<String, HashMap<DbKey, Row>>>,
+        )> = Vec::new();
 
         loop {
             let mut len_bytes = [0u8; 4];
@@ -1419,11 +1539,10 @@ impl Database {
                     mutations,
                     old_rows,
                 } => {
-                    prepared.insert(tx_id, (mutations, old_rows));
+                    prepared.push((tx_id, mutations, old_rows));
                 }
-                TransactionRecord::Committed { tx_id } => {
-                    prepared.remove(&tx_id);
-                }
+                // Informational only; durability is anchored by `Prepared`.
+                TransactionRecord::Committed { .. } => {}
             }
         }
 
@@ -1432,14 +1551,14 @@ impl Database {
             return Ok(());
         }
 
-        tracing::info!(count = prepared.len(), "recovering pending transactions");
-        for (tx_id, (mutations, old_rows_opt)) in prepared {
+        tracing::info!(count = prepared.len(), "replaying committed transactions");
+        for (tx_id, mutations, old_rows_opt) in prepared {
             for (table_name, entries) in mutations {
                 if let Ok(table) = self.get_table(&table_name) {
                     tracing::info!(
                         tx_id,
                         table = %table_name,
-                        "rolling forward transaction"
+                        "replaying transaction"
                     );
                     let write_entries = entries
                         .into_iter()
@@ -1457,7 +1576,11 @@ impl Database {
             }
         }
 
-        // Clean up the log since recovery has completed.
+        // The replayed mutations now live in the engine memtables/WALs. Make
+        // them durable, then discard the log so the next epoch starts clean.
+        // (The persistent log handle is not open yet during recovery, so we
+        // truncate by recreating the file rather than via `checkpoint`.)
+        self.sync_all_table_engines()?;
         let _ = File::create(&self.transaction_log_path)?;
         Ok(())
     }
@@ -1803,7 +1926,7 @@ impl Database {
             level_size_multiplier: self.options.level_size_multiplier.unwrap_or(10),
             max_level: self.options.max_level.unwrap_or(7),
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
-            wal_sync_interval_ms: self.options.wal_sync_interval_ms,
+            wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
         };
 
         // 6. Create index directory

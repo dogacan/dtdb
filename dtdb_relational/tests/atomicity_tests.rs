@@ -356,3 +356,90 @@ fn test_crash_recovery_secondary_index_maintenance() {
         assert_eq!(adams_rows[0], r_user(1, "Adams"));
     }
 }
+
+// Durability model: a commit fsyncs exactly one transaction-log record and the
+// underlying storage engines sync their WALs only in the background. These
+// tests assert that committed data survives an *unclean* shutdown (a drop with
+// no explicit checkpoint, simulating a crash) purely via transaction-log
+// replay, and that an explicit checkpoint folds that data durably into the
+// engines and reclaims the log.
+
+#[test]
+fn test_committed_data_survives_crash_without_checkpoint() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    const N: i64 = 50;
+
+    // Phase 1: commit N single-row transactions, then drop the Database WITHOUT
+    // checkpointing — i.e. simulate a crash. Each commit's only durability
+    // barrier is its fsynced `Prepared` record in the transaction log; the
+    // engine WALs are in background-sync mode and need not have reached disk.
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        db.create_table("users", create_user_schema()).unwrap();
+
+        for i in 1..=N {
+            let tx = Transaction::new(i as u64, db.clone());
+            tx.put("users", k_int(i), r_user(i, &format!("user-{i}")))
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        // Dropped here: no checkpoint / clean shutdown.
+    }
+
+    // Phase 2: reopen. Recovery must replay the retained transaction log and
+    // reconstruct every committed row.
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        let tx = Transaction::new(10_000, db);
+        for i in 1..=N {
+            assert_eq!(
+                tx.get("users", &k_int(i)).unwrap(),
+                Some(r_user(i, &format!("user-{i}"))),
+                "row {i} should survive a crash with no checkpoint"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_checkpoint_truncates_log_and_persists_data() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let log_path = db_path.join("transactions.log");
+
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        db.create_table("users", create_user_schema()).unwrap();
+
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(7), r_user(7, "Grace")).unwrap();
+        tx.commit().unwrap();
+
+        // Before checkpoint, the commit's redo record is retained in the log.
+        assert!(
+            std::fs::metadata(&log_path).unwrap().len() > 0,
+            "transaction log should retain the commit until a checkpoint"
+        );
+
+        // Checkpoint fsyncs the engines and truncates the log.
+        db.checkpoint().unwrap();
+        assert_eq!(
+            std::fs::metadata(&log_path).unwrap().len(),
+            0,
+            "checkpoint should truncate the transaction log"
+        );
+    }
+
+    // After a checkpoint the data lives durably in the engines, so it must
+    // survive reopen even though the transaction log is now empty.
+    {
+        let db = Arc::new(Database::open(&db_path).unwrap());
+        let tx = Transaction::new(2, db);
+        assert_eq!(
+            tx.get("users", &k_int(7)).unwrap(),
+            Some(r_user(7, "Grace"))
+        );
+    }
+}

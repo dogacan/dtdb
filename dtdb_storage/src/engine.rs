@@ -122,6 +122,14 @@ impl StorageEngine {
         self.inner.flush_memtable()
     }
 
+    /// Forces the engine's WAL to be fsynced to disk. Used by callers that
+    /// batch their own durability barrier (e.g. the relational layer's
+    /// transaction-log checkpoint) and therefore open the engine with
+    /// background WAL syncing rather than fsync-per-write.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.inner.sync_wal()
+    }
+
     pub fn compact(&self) -> Result<()> {
         self.inner.compact()
     }
