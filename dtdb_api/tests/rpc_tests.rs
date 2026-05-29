@@ -542,3 +542,218 @@ async fn test_drop_db_active_transactions() {
     // Cleanup server
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_database_restore_on_startup() {
+    use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbService;
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    // 1. Create a service and a database
+    {
+        let service = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+        let req = tonic::Request::new(dtdb_api::proto::CreateDbRequest {
+            db_name: "restore_me".to_string(),
+            compression: dtdb_api::proto::CompressionOption::CompressionUncompressed as i32,
+            memtable_size_limit: None,
+            block_size_limit: None,
+            wal_size_limit: None,
+            flush_interval_ms: None,
+            analyze_frequency_ms: None,
+        });
+        let resp = service.create_db(req).await.unwrap().into_inner();
+        assert!(resp.success);
+    } // service is dropped here
+
+    // Create a folder that doesn't have db_options.bin to test skipping
+    let dummy_db_path = data_path.join("dummy_no_options");
+    fs::create_dir_all(&dummy_db_path).unwrap();
+
+    // 2. Re-create the service on the same path
+    let service2 = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+
+    // 3. Verify restore_me was restored, but dummy_no_options was skipped
+    let lookup_restored = service2.get_db_and_engine("restore_me");
+    assert!(lookup_restored.is_some());
+    let (db, _engine) = lookup_restored.unwrap();
+    assert_eq!(db.list_tables().len(), 0);
+
+    let lookup_dummy = service2.get_db_and_engine("dummy_no_options");
+    assert!(lookup_dummy.is_none());
+}
+
+#[tokio::test]
+async fn test_invalid_arguments_and_missing_databases() {
+    use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbService;
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+    let service = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+
+    // Test create_db with empty name
+    let create_empty_req = tonic::Request::new(dtdb_api::proto::CreateDbRequest {
+        db_name: "   ".to_string(),
+        compression: dtdb_api::proto::CompressionOption::CompressionUncompressed as i32,
+        memtable_size_limit: None,
+        block_size_limit: None,
+        wal_size_limit: None,
+        flush_interval_ms: None,
+        analyze_frequency_ms: None,
+    });
+    let err = service.create_db(create_empty_req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("Database name cannot be empty"));
+
+    // Test create_db for already existing db
+    let create_req1 = tonic::Request::new(dtdb_api::proto::CreateDbRequest {
+        db_name: "exists_db".to_string(),
+        compression: dtdb_api::proto::CompressionOption::CompressionUncompressed as i32,
+        memtable_size_limit: None,
+        block_size_limit: None,
+        wal_size_limit: None,
+        flush_interval_ms: None,
+        analyze_frequency_ms: None,
+    });
+    let resp1 = service.create_db(create_req1).await.unwrap().into_inner();
+    assert!(resp1.success);
+
+    let create_req2 = tonic::Request::new(dtdb_api::proto::CreateDbRequest {
+        db_name: "exists_db".to_string(),
+        compression: dtdb_api::proto::CompressionOption::CompressionUncompressed as i32,
+        memtable_size_limit: None,
+        block_size_limit: None,
+        wal_size_limit: None,
+        flush_interval_ms: None,
+        analyze_frequency_ms: None,
+    });
+    let resp2 = service.create_db(create_req2).await.unwrap().into_inner();
+    assert!(!resp2.success);
+    assert!(resp2.message.contains("already exists"));
+
+    // Test drop_db with empty name
+    let drop_empty_req = tonic::Request::new(dtdb_api::proto::DropDbRequest {
+        db_name: "  ".to_string(),
+    });
+    let err = service.drop_db(drop_empty_req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // Test drop_db for non-existent database
+    let drop_missing_req = tonic::Request::new(dtdb_api::proto::DropDbRequest {
+        db_name: "no_such_db".to_string(),
+    });
+    let resp = service
+        .drop_db(drop_missing_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resp.success);
+    assert!(resp.message.contains("not found"));
+
+    // Test flush_db with empty name
+    let flush_empty_req = tonic::Request::new(dtdb_api::proto::FlushDbRequest {
+        db_name: "".to_string(),
+    });
+    let err = service.flush_db(flush_empty_req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // Test flush_db for non-existent database
+    let flush_missing_req = tonic::Request::new(dtdb_api::proto::FlushDbRequest {
+        db_name: "no_such_db".to_string(),
+    });
+    let err = service.flush_db(flush_missing_req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Test execute_query for non-existent database
+    let exec_missing_req = tonic::Request::new(dtdb_api::proto::ExecuteQueryRequest {
+        db_name: "no_such_db".to_string(),
+        sql_query: "SELECT 1;".to_string(),
+        parameters: Vec::new(),
+    });
+    let err = service.execute_query(exec_missing_req).await.err().unwrap();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn test_parameter_types_coverage() {
+    use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbService;
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+    let service = DuctTapeDbServiceImpl::new(&data_path).unwrap();
+
+    // 1. Create a database and a table
+    let create_req = tonic::Request::new(dtdb_api::proto::CreateDbRequest {
+        db_name: "param_db".to_string(),
+        compression: dtdb_api::proto::CompressionOption::CompressionUncompressed as i32,
+        memtable_size_limit: None,
+        block_size_limit: None,
+        wal_size_limit: None,
+        flush_interval_ms: None,
+        analyze_frequency_ms: None,
+    });
+    service.create_db(create_req).await.unwrap();
+
+    let create_table_req = tonic::Request::new(dtdb_api::proto::ExecuteQueryRequest {
+        db_name: "param_db".to_string(),
+        sql_query: "CREATE TABLE ValuesTable (id int PRIMARY KEY, f_val float, b_val bool, s_val varchar(255), bytes_val blob);".to_string(),
+        parameters: Vec::new(),
+    });
+    let mut create_table_stream = service
+        .execute_query(create_table_req)
+        .await
+        .unwrap()
+        .into_inner();
+    while let Some(res) = create_table_stream.next().await {
+        res.unwrap();
+    }
+
+    // 2. Insert with float, bool, string, bytes, null, and int parameters
+    use dtdb_api::proto::{QueryParam, param_value};
+
+    let p_id = QueryParam {
+        name: "id".to_string(),
+        value: Some(dtdb_api::proto::ParamValue {
+            val: Some(param_value::Val::IntVal(100)),
+        }),
+    };
+    let p_float = QueryParam {
+        name: "f".to_string(),
+        value: Some(dtdb_api::proto::ParamValue {
+            val: Some(param_value::Val::FloatVal(1.23)),
+        }),
+    };
+    let p_bool = QueryParam {
+        name: "b".to_string(),
+        value: Some(dtdb_api::proto::ParamValue {
+            val: Some(param_value::Val::BoolVal(true)),
+        }),
+    };
+    let p_str = QueryParam {
+        name: "s".to_string(),
+        value: Some(dtdb_api::proto::ParamValue {
+            val: Some(param_value::Val::StringVal("hello".to_string())),
+        }),
+    };
+    let p_bytes = QueryParam {
+        name: "bytes".to_string(),
+        value: Some(dtdb_api::proto::ParamValue {
+            val: Some(param_value::Val::BytesVal(vec![1, 2, 3])),
+        }),
+    };
+    let p_null = QueryParam {
+        name: "n".to_string(),
+        value: Some(dtdb_api::proto::ParamValue {
+            val: Some(param_value::Val::NullVal(true)),
+        }),
+    };
+
+    let insert_req = tonic::Request::new(dtdb_api::proto::ExecuteQueryRequest {
+        db_name: "param_db".to_string(),
+        sql_query: "INSERT INTO ValuesTable (id, f_val, b_val, s_val, bytes_val) VALUES (:id, :f, :b, :s, :bytes);".to_string(),
+        parameters: vec![p_id, p_float, p_bool, p_str, p_bytes, p_null],
+    });
+    let err = service.execute_query(insert_req).await.err().unwrap();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("Unsupported SQL value type")
+            || err.message().contains("HexStringLiteral")
+    );
+}

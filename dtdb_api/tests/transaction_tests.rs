@@ -501,6 +501,234 @@ async fn test_grpc_protocol_misuse() {
         }
     }
 
+    // Scenario F: Send commands after Rollback
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        // 1. Start
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp.payload, Some(TxPayload::QueryFinished(true))));
+
+        // 2. Rollback
+        tx.send(TransactionRequest {
+            command: Some(Command::Rollback(RollbackTransaction {})),
+        })
+        .await
+        .unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp.payload, Some(TxPayload::CommitResult(_))));
+
+        // 3. Execute query (misuse)
+        tx.send(TransactionRequest {
+            command: Some(Command::Execute(ExecuteTxQuery {
+                sql_query: "SELECT * FROM Users;".to_string(),
+                parameters: Vec::new(),
+            })),
+        })
+        .await
+        .unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("Transaction already completed"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    // Scenario G: Send transaction request with no command specified
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        tx.send(TransactionRequest { command: None }).await.unwrap();
+
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("Empty transaction request"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    // Scenario I: SQL syntax error inside transaction
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        // 1. Start
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp.payload, Some(TxPayload::QueryFinished(true))));
+
+        // 2. Execute invalid syntax query
+        tx.send(TransactionRequest {
+            command: Some(Command::Execute(ExecuteTxQuery {
+                sql_query: "SELECT INVALID SYNTAX;".to_string(),
+                parameters: Vec::new(),
+            })),
+        })
+        .await
+        .unwrap();
+
+        let resp_err = response.next().await.unwrap().unwrap();
+        match resp_err.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("SQL Error") || msg.contains("Expected"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+
+        let resp_fin = response.next().await.unwrap().unwrap();
+        assert!(matches!(
+            resp_fin.payload,
+            Some(TxPayload::QueryFinished(true))
+        ));
+    }
+
+    // Scenario J: Database not found when starting transaction
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "non_existent_db_tx".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+
+        let resp = response.next().await.unwrap().unwrap();
+        match resp.payload {
+            Some(TxPayload::ErrorMessage(msg)) => {
+                assert!(msg.contains("Database") && msg.contains("not found"));
+            }
+            other => panic!("Expected ErrorMessage, got {:?}", other),
+        }
+    }
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_grpc_transaction_disconnect_rollback() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    let (port, server_handle) = start_test_server(&data_path).await;
+
+    let client_addr = format!("http://127.0.0.1:{}", port);
+    let mut client = DuctTapeDbClient::connect(client_addr.clone())
+        .await
+        .unwrap();
+
+    client
+        .create_db("test_disconnect_db", CompressionType::Uncompressed)
+        .await
+        .unwrap();
+
+    // Create table
+    {
+        let mut stream = client
+            .execute_query(
+                "test_disconnect_db",
+                dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
+            )
+            .await
+            .unwrap();
+        while let Some(res) = stream.next().await {
+            res.unwrap();
+        }
+    }
+
+    let mut raw_client = DuctTapeDbServiceClient::connect(client_addr).await.unwrap();
+
+    // Start transaction and execute insert, then drop the channel
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response = raw_client.transaction(stream).await.unwrap().into_inner();
+
+        tx.send(TransactionRequest {
+            command: Some(Command::Start(StartTransaction {
+                db_name: "test_disconnect_db".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+        let resp = response.next().await.unwrap().unwrap();
+        assert!(matches!(resp.payload, Some(TxPayload::QueryFinished(true))));
+
+        tx.send(TransactionRequest {
+            command: Some(Command::Execute(ExecuteTxQuery {
+                sql_query: "INSERT INTO Users (id, name) VALUES (999, 'Abandoned');".to_string(),
+                parameters: Vec::new(),
+            })),
+        })
+        .await
+        .unwrap();
+
+        let resp_query = response.next().await.unwrap().unwrap();
+        assert!(matches!(
+            resp_query.payload,
+            Some(TxPayload::QueryResult(_))
+        ));
+        let resp_fin = response.next().await.unwrap().unwrap();
+        assert!(matches!(
+            resp_fin.payload,
+            Some(TxPayload::QueryFinished(true))
+        ));
+
+        // Drop tx sender here to simulate connection termination / client disconnect
+        drop(tx);
+
+        // Wait a short moment for server task to receive disconnect and rollback
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Now query the table to confirm that (999, 'Abandoned') was NOT committed
+    {
+        let mut stream = client
+            .execute_query(
+                "test_disconnect_db",
+                dtdb_api::sql_query!("SELECT id, name FROM Users WHERE id = 999;"),
+            )
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(res) = stream.next().await {
+            let resp = res.unwrap();
+            if let Some(EqPayload::Row(row)) = resp.payload {
+                rows.push(row.values);
+            }
+        }
+        assert_eq!(rows.len(), 0);
+    }
+
     server_handle.abort();
 }
 
