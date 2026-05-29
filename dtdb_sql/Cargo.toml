@@ -10,7 +10,7 @@ sqlparser = "0.62.0"
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
-regex = "1"
+regex = "1.12"
 
 [dev-dependencies]
 tempfile = { workspace = true }
