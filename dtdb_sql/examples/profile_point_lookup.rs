@@ -12,6 +12,7 @@
 
 use dtdb_relational::{Database, Transaction};
 use dtdb_sql::{LogicalPlanner, Optimizer, SqlEngine, SqlStatement};
+use dtdb_storage::DbValue;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::hint::black_box;
@@ -123,6 +124,22 @@ fn main() {
         black_box(res);
     });
 
+    // --- Prepared statement: parse once, then bind + execute + commit ---
+    // Skips re-parsing on every call; everything else is unchanged.
+    let prepared = engine
+        .prepare("SELECT k, v FROM bench WHERE id = :id")
+        .unwrap();
+    let mut txid3 = 2_000_000u64;
+    let t_prepared = bench(|i| {
+        let tx = Transaction::new(txid3, db.clone());
+        txid3 += 1;
+        let mut params = std::collections::HashMap::new();
+        params.insert("id".to_string(), DbValue::Int(((i * 97) % ROWS) as i64));
+        let res = engine.execute_prepared(&prepared, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        black_box(res);
+    });
+
     // Derived per-stage costs.
     let plan = t_parse_plan - t_parse;
     let optimize = t_parse_plan_opt - t_parse_plan;
@@ -155,6 +172,13 @@ fn main() {
         "\n  full cycle = {:.2} us/query  (~{:.0} k queries/s single-threaded)\n",
         t_full / 1000.0,
         1_000_000.0 / t_full
+    );
+
+    println!(
+        "  prepared (parse cached) = {:.2} us/query  ({:.0}% of full, {:.2}x faster)\n",
+        t_prepared / 1000.0,
+        100.0 * t_prepared / t_full,
+        t_full / t_prepared
     );
 
     let _ = std::fs::remove_dir_all(&dir);

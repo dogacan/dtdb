@@ -4797,6 +4797,100 @@ fn test_sql_server_side_parameters() {
 }
 
 #[test]
+fn test_prepared_statement_reuse() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE kv (id INT PRIMARY KEY, v VARCHAR)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    let tx_ins = Transaction::new(2, db.clone());
+    for i in 1..=5i64 {
+        engine
+            .execute(
+                &format!("INSERT INTO kv (id, v) VALUES ({i}, 'v{i}')"),
+                &tx_ins,
+            )
+            .unwrap();
+    }
+    tx_ins.commit().unwrap();
+
+    // Prepare a parameterized point lookup once, run it many times with
+    // different bound keys. Each execution must return the correct row.
+    let stmt = engine.prepare("SELECT v FROM kv WHERE id = :id").unwrap();
+    assert_eq!(stmt.sql(), "SELECT v FROM kv WHERE id = :id");
+
+    for i in 1..=5i64 {
+        let tx = Transaction::new((10 + i) as u64, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("id".to_string(), DbValue::Int(i));
+        let res = engine.execute_prepared(&stmt, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1, "id={i}");
+                assert_eq!(rows[0].values, vec![DbValue::String(format!("v{i}"))]);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // A miss returns no rows (same prepared statement, different binding).
+    let tx = Transaction::new(100, db.clone());
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), DbValue::Int(999));
+    let res = engine.execute_prepared(&stmt, &tx, &params).unwrap();
+    match res {
+        ExecutionResult::Select { rows, .. } => assert!(rows.is_empty()),
+        _ => panic!("expected Select"),
+    }
+}
+
+#[test]
+fn test_prepared_statement_insert_and_errors() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    // A prepared INSERT reused with different bound rows.
+    let ins = engine
+        .prepare("INSERT INTO t (id, n) VALUES (:id, :n)")
+        .unwrap();
+    for i in 1..=3i64 {
+        let tx = Transaction::new((1 + i) as u64, db.clone());
+        let mut p = std::collections::HashMap::new();
+        p.insert("id".to_string(), DbValue::Int(i));
+        p.insert("n".to_string(), DbValue::Int(i * 10));
+        engine.execute_prepared(&ins, &tx, &p).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = Transaction::new(100, db.clone());
+    let res = engine.execute("SELECT COUNT(*) FROM t", &tx).unwrap();
+    match res {
+        ExecutionResult::Select { rows, .. } => {
+            assert_eq!(rows[0].values, vec![DbValue::Int(3)])
+        }
+        _ => panic!("expected Select"),
+    }
+
+    // prepare() rejects multi-statement input, like execute().
+    assert!(engine.prepare("SELECT 1; SELECT 2").is_err());
+
+    // Executing with a missing parameter binding is an error.
+    let sel = engine.prepare("SELECT n FROM t WHERE id = :id").unwrap();
+    let tx = Transaction::new(200, db.clone());
+    let empty = std::collections::HashMap::new();
+    assert!(engine.execute_prepared(&sel, &tx, &empty).is_err());
+}
+
+#[test]
 fn test_sum_preserves_int_type_and_handles_overflow() {
     // Regression for F31: SUM(int_col) used to finalize as DbValue::Float
     // unconditionally. f64 loses precision past 2^53, so summing many int64

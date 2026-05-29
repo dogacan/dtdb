@@ -9,6 +9,7 @@ use crate::physical::{
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
 use dtdb_storage::{DbKey, DbValue};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashSet;
@@ -40,6 +41,29 @@ fn is_plan_sorted_by(plan: &LogicalPlan, group_by: &[Expr]) -> bool {
     false
 }
 
+/// A parsed, reusable SQL statement produced by [`SqlEngine::prepare`].
+///
+/// Preparing parses (and preprocesses) the SQL once and stores the resulting
+/// AST here; [`SqlEngine::execute_prepared`] then runs it many times — binding
+/// fresh parameter values each call — without re-parsing. Parsing is the single
+/// largest slice of a small query's cost, so reusing a prepared statement is a
+/// substantial win for repeated queries such as point lookups in a loop.
+///
+/// Planning, optimization, and physical execution still run on every call;
+/// caching those is a separate future step.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    statement: Statement,
+    sql: String,
+}
+
+impl PreparedStatement {
+    /// The original SQL text this statement was prepared from.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
 /// SqlEngine orchestrates the parser, logical planner, optimizer, and physical execution pipeline.
 pub struct SqlEngine {
     database: Arc<Database>,
@@ -48,6 +72,42 @@ pub struct SqlEngine {
 impl SqlEngine {
     pub fn new(database: Arc<Database>) -> Self {
         Self { database }
+    }
+
+    /// Parses and preprocesses `sql` once into a reusable [`PreparedStatement`].
+    ///
+    /// Like [`execute`](Self::execute), this accepts exactly one statement. Use
+    /// parameter placeholders (e.g. `WHERE id = :id`) for the values that vary
+    /// between executions, then supply them to [`execute_prepared`](Self::execute_prepared).
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, String> {
+        let preprocessed = preprocess_sql(sql);
+        let dialect = GenericDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
+        if statements.is_empty() {
+            return Err("No SQL statements found".to_string());
+        }
+        if statements.len() > 1 {
+            return Err(
+                "Multiple SQL statements in a single prepare() call are not allowed.".to_string(),
+            );
+        }
+        Ok(PreparedStatement {
+            statement: statements.remove(0),
+            sql: sql.to_string(),
+        })
+    }
+
+    /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
+    /// binding `params`. Behaves exactly like [`execute_with_params`](Self::execute_with_params)
+    /// but reuses the cached parse instead of re-parsing the SQL text.
+    pub fn execute_prepared(
+        &self,
+        prepared: &PreparedStatement,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<ExecutionResult, String> {
+        self.execute_statement(prepared.statement.clone(), tx, params)
     }
 
     /// Returns the temp directory for spill files, creating it if needed.
@@ -150,7 +210,20 @@ impl SqlEngine {
             );
         }
 
-        let mut statement = statements.remove(0);
+        let statement = statements.remove(0);
+        self.execute_statement(statement, tx, params)
+    }
+
+    /// Binds parameters into an already-parsed statement, then plans,
+    /// optimizes, and executes it. Shared by `execute_with_params` (which
+    /// parses fresh each call) and `execute_prepared` (which reuses a cached
+    /// parse), so the parameter/plan/execute behavior is identical either way.
+    fn execute_statement(
+        &self,
+        mut statement: Statement,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<ExecutionResult, String> {
         crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
 
