@@ -19,7 +19,7 @@ fi
 
 # 3. Run cargo test with ASan enabled
 echo "Compiling and running tests with AddressSanitizer..."
-RUSTFLAGS="-Z sanitizer=address" \
-RUSTDOCFLAGS="-Z sanitizer=address" \
+RUSTFLAGS="-Z sanitizer=address -Cunsafe-allow-abi-mismatch=sanitizer" \
+RUSTDOCFLAGS="-Z sanitizer=address -Cunsafe-allow-abi-mismatch=sanitizer" \
 ASAN_OPTIONS=detect_leaks=1 \
 cargo +nightly test -Zbuild-std --target "$TARGET" "$@"

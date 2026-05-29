@@ -28,6 +28,6 @@ fi
 
 # 3. Run cargo test with MSan enabled
 echo "Compiling and running tests with MemorySanitizer..."
-RUSTFLAGS="-Z sanitizer=memory" \
-RUSTDOCFLAGS="-Z sanitizer=memory" \
+RUSTFLAGS="-Z sanitizer=memory -Cunsafe-allow-abi-mismatch=sanitizer" \
+RUSTDOCFLAGS="-Z sanitizer=memory -Cunsafe-allow-abi-mismatch=sanitizer" \
 cargo +nightly test -Zbuild-std --target "$TARGET" "$@"

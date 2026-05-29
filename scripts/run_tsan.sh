@@ -19,6 +19,6 @@ fi
 
 # 3. Run cargo test with TSan enabled
 echo "Compiling and running tests with ThreadSanitizer..."
-RUSTFLAGS="-Z sanitizer=thread" \
-RUSTDOCFLAGS="-Z sanitizer=thread" \
+RUSTFLAGS="-Z sanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer" \
+RUSTDOCFLAGS="-Z sanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer" \
 cargo +nightly test -Zbuild-std --target "$TARGET" "$@"
