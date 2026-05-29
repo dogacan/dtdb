@@ -7,18 +7,18 @@ edition = "2024"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-dtdb_storage = { path = "../dtdb_storage" }
-dtdb_relational = { path = "../dtdb_relational" }
-dtdb_sql = { path = "../dtdb_sql" }
-dtdb_api = { path = "../dtdb_api" }
+dtdb_storage = { workspace = true }
+dtdb_relational = { workspace = true }
+dtdb_sql = { workspace = true }
+dtdb_api = { workspace = true }
 cxx = "1.0"
-tokio = { version = "1.35", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-futures-util = { version = "0.3" }
-tonic = { version = "0.12", features = ["codegen", "transport"] }
+futures-util = { workspace = true }
+tonic = { workspace = true, features = ["codegen", "transport", "prost"] }
 
 [build-dependencies]
 cxx-build = "1.0"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile = { workspace = true }

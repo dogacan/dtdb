@@ -8,19 +8,19 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-dtdb_storage = { path = "../dtdb_storage" }
-dtdb_relational = { path = "../dtdb_relational" }
-dtdb_sql = { path = "../dtdb_sql" }
-dtdb_api = { path = "../dtdb_api" }
+dtdb_storage = { workspace = true }
+dtdb_relational = { workspace = true }
+dtdb_sql = { workspace = true }
+dtdb_api = { workspace = true }
 
 [dev-dependencies]
 bolero = "0.13"
 proptest = "1.6"
-tempfile = "3.8"
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
-bincode = "1.3"
-tonic = { version = "0.12", default-features = false }
-futures-util = "0.3"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bincode = { workspace = true }
+tonic = { workspace = true }
+futures-util = { workspace = true }
 
 [[test]]
 name = "wal_recovery"

@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Stable type-rank used to give cross-type comparisons a deterministic order.
@@ -148,6 +148,15 @@ impl<P> Drop for Run<P> {
     }
 }
 
+/// Process-wide counter giving every spilled run file a unique name.
+static RUN_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Builds a unique temp-file path for a new run under `temp_dir`.
+fn next_run_path(temp_dir: &Path, prefix: &str) -> PathBuf {
+    let run_id = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    temp_dir.join(format!("{}_{}_{}.bin", prefix, std::process::id(), run_id))
+}
+
 /// Serializes a buffer of `(key, payload)` entries to a fresh temp file and returns
 /// a `Run` handle over it. The caller is responsible for having sorted the buffer.
 pub fn write_run<P: Serialize>(
@@ -155,9 +164,7 @@ pub fn write_run<P: Serialize>(
     prefix: &str,
     buffer: &[(Vec<DbValue>, P)],
 ) -> Result<Run<P>, String> {
-    static RUN_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let run_id = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let path = temp_dir.join(format!("{}_{}_{}.bin", prefix, std::process::id(), run_id));
+    let path = next_run_path(temp_dir, prefix);
 
     let file =
         File::create(&path).map_err(|e| format!("Failed to create temp file {:?}: {}", path, e))?;
@@ -214,6 +221,11 @@ impl<P> PartialEq for HeapEntry<P> {
 
 impl<P> Eq for HeapEntry<P> {}
 
+/// Maximum number of runs merged in a single pass. Bounding the fan-in caps the
+/// number of run files (and thus file descriptors) held open at once; when more
+/// runs than this exist they are merged in cascading passes into intermediate runs.
+const MAX_FANIN: usize = 64;
+
 /// Streaming k-way merge over sorted runs, yielding `(key, payload)` pairs in the
 /// order defined by `directions`.
 pub struct KWayMerge<P> {
@@ -222,11 +234,42 @@ pub struct KWayMerge<P> {
     directions: std::rc::Rc<Vec<bool>>,
 }
 
-impl<P: DeserializeOwned> KWayMerge<P> {
-    /// Opens every run and primes the merge heap. `directions` gives the sort
-    /// direction for each key column (`true` = ascending).
-    pub fn new(mut runs: Vec<Run<P>>, directions: Vec<bool>) -> Result<Self, String> {
+impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
+    /// Prepares a streaming merge over `runs`. `directions` gives the sort direction
+    /// for each key column (`true` = ascending).
+    ///
+    /// If there are more than `MAX_FANIN` runs, they are first reduced via cascading
+    /// merge passes — groups of runs are merged into intermediate runs on disk
+    /// (`temp_dir`/`prefix`) until few enough remain — so the final streaming merge
+    /// never opens more than `MAX_FANIN` files at once.
+    pub fn new(
+        mut runs: Vec<Run<P>>,
+        directions: Vec<bool>,
+        temp_dir: &Path,
+        prefix: &str,
+    ) -> Result<Self, String> {
         let directions = std::rc::Rc::new(directions);
+
+        while runs.len() > MAX_FANIN {
+            let mut next_runs = Vec::with_capacity(runs.len() / MAX_FANIN + 1);
+            let mut iter = runs.into_iter();
+            loop {
+                let chunk: Vec<Run<P>> = iter.by_ref().take(MAX_FANIN).collect();
+                match chunk.len() {
+                    0 => break,
+                    // A lone run needs no merging; carry it into the next pass as-is.
+                    1 => next_runs.push(chunk.into_iter().next().unwrap()),
+                    _ => next_runs.push(merge_chunk(chunk, &directions, temp_dir, prefix)?),
+                }
+            }
+            runs = next_runs;
+        }
+
+        Self::prime(runs, directions)
+    }
+
+    /// Opens every run and primes the merge heap. Assumes `runs.len() <= MAX_FANIN`.
+    fn prime(mut runs: Vec<Run<P>>, directions: std::rc::Rc<Vec<bool>>) -> Result<Self, String> {
         let mut heap = BinaryHeap::new();
 
         for (idx, run) in runs.iter_mut().enumerate() {
@@ -273,4 +316,50 @@ impl<P: DeserializeOwned> KWayMerge<P> {
 
         Ok(Some((entry.sort_keys, entry.payload)))
     }
+}
+
+/// Merges a group of sorted runs into a single new sorted run on disk, returning a
+/// handle over it. The input runs are consumed and their backing files deleted once
+/// the merge finishes. Used by `KWayMerge::new` to cascade-reduce a large fan-in.
+fn merge_chunk<P: Serialize + DeserializeOwned>(
+    chunk: Vec<Run<P>>,
+    directions: &std::rc::Rc<Vec<bool>>,
+    temp_dir: &Path,
+    prefix: &str,
+) -> Result<Run<P>, String> {
+    let mut merger = KWayMerge::prime(chunk, std::rc::Rc::clone(directions))?;
+
+    let path = next_run_path(temp_dir, prefix);
+    let file =
+        File::create(&path).map_err(|e| format!("Failed to create temp file {:?}: {}", path, e))?;
+    let mut writer = BufWriter::new(file);
+
+    // Reserve a fixed-width count prefix; patched in once the total is known.
+    bincode::serialize_into(&mut writer, &0u64)
+        .map_err(|e| format!("Serialization error: {}", e))?;
+
+    let mut count: u64 = 0;
+    while let Some((keys, payload)) = merger.next()? {
+        bincode::serialize_into(&mut writer, &keys)
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        bincode::serialize_into(&mut writer, &payload)
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        count += 1;
+    }
+
+    let mut file = writer
+        .into_inner()
+        .map_err(|e| format!("Failed to flush temp file: {}", e))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Failed to seek temp file {:?}: {}", path, e))?;
+    bincode::serialize_into(&mut file, &count)
+        .map_err(|e| format!("Serialization error: {}", e))?;
+
+    // Dropping `merger` here releases and deletes the chunk's input run files.
+    Ok(Run {
+        path,
+        reader: None,
+        peeked: None,
+        remaining: count as usize,
+    })
 }

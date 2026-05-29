@@ -372,7 +372,7 @@ impl PhysicalOperator for PhysicalSort {
                     spill::sort_entries(&mut buffer, &directions);
                     runs.push(spill::write_run(&self.temp_dir, "sort_run", &buffer)?);
                 }
-                let merger = KWayMerge::new(runs, directions)?;
+                let merger = KWayMerge::new(runs, directions, &self.temp_dir, "sort_run")?;
                 self.merge_state = Some(MergeState::External(merger));
             }
         }
@@ -453,7 +453,7 @@ impl JoinSortedStream {
                 spill::sort_entries(&mut buffer, &directions);
                 runs.push(spill::write_run(temp_dir, "join_run", &buffer)?);
             }
-            JoinStreamInner::External(KWayMerge::new(runs, directions)?)
+            JoinStreamInner::External(KWayMerge::new(runs, directions, temp_dir, "join_run")?)
         };
 
         let mut stream = Self { inner, head: None };
@@ -876,7 +876,12 @@ impl PhysicalOperator for PhysicalHashAggregate {
                 if !groups.is_empty() {
                     self.spill_groups(&mut groups, &mut runs)?;
                 }
-                let merger = KWayMerge::new(runs, vec![true; self.group_by.len()])?;
+                let merger = KWayMerge::new(
+                    runs,
+                    vec![true; self.group_by.len()],
+                    &self.temp_dir,
+                    "agg_run",
+                )?;
                 self.output = Some(AggOutput::Merge(AggMerge {
                     merger,
                     current: None,
@@ -1337,7 +1342,7 @@ impl SortedRowStream {
                 spill::sort_entries(&mut buffer, &directions);
                 runs.push(spill::write_run(temp_dir, "setop_run", &buffer)?);
             }
-            SortedStreamInner::External(KWayMerge::new(runs, directions)?)
+            SortedStreamInner::External(KWayMerge::new(runs, directions, temp_dir, "setop_run")?)
         };
 
         let mut stream = Self { inner, head: None };
@@ -1572,7 +1577,7 @@ impl PhysicalOperator for PhysicalDistinct {
                     runs.push(spill::write_run(&self.temp_dir, "distinct_run", &buffer)?);
                 }
                 self.state = Some(DistinctState::External {
-                    merger: KWayMerge::new(runs, directions)?,
+                    merger: KWayMerge::new(runs, directions, &self.temp_dir, "distinct_run")?,
                     last: None,
                 });
             }
