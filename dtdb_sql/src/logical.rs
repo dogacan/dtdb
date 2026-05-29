@@ -512,5 +512,7 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
         }
         Expr::Not(_) | Expr::IsNull(_) | Expr::InList { .. } => DataType::Int,
         Expr::Match { .. } => DataType::Bool,
+        // A parameter's type is unknown until it is bound to a value.
+        Expr::Parameter(_) => DataType::Null,
     }
 }

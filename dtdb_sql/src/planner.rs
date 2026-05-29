@@ -1142,6 +1142,9 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
         SqlExpr::Identifier(ident) => {
             if ident.quote_style == Some('"') {
                 Ok(Expr::Literal(DbValue::String(ident.value.clone())))
+            } else if let Some(name) = ident.value.strip_prefix('@') {
+                // `@name` is a bind-parameter placeholder, not a column.
+                Ok(Expr::Parameter(name.to_string()))
             } else {
                 Ok(Expr::Column(ident.value.clone(), None))
             }
@@ -1168,6 +1171,12 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                 SqlValue::SingleQuotedString(s) => DbValue::String(s.clone()),
                 SqlValue::Boolean(b) => DbValue::Bool(*b),
                 SqlValue::Null => DbValue::Null,
+                // `:name` / `?` bind-parameter placeholder: keep it symbolic in
+                // the plan (a leading ':' is stripped to match the bound name).
+                SqlValue::Placeholder(p) => {
+                    let name = p.strip_prefix(':').unwrap_or(p).to_string();
+                    return Ok(Expr::Parameter(name));
+                }
                 other => return Err(format!("Unsupported SQL value type: {:?}", other)),
             };
             Ok(Expr::Literal(db_val))

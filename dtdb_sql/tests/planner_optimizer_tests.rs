@@ -923,3 +923,34 @@ fn test_pk_equality_pushdown_without_statistics() {
         "PK equality must not fall back to a full scan.\nPlan:\n{rendered}"
     );
 }
+
+#[test]
+fn test_placeholder_survives_planning_as_parameter() {
+    // Without binding, a `:name` placeholder must reach the logical plan as
+    // Expr::Parameter — not a literal, not a column. This is the foundation for
+    // caching an optimized plan and substituting bound values at execution
+    // time (rather than binding into the AST before planning, as today).
+    let (_tmp, db) = setup_db();
+
+    let stmt = plan_sql(db.clone(), "SELECT val FROM t1 WHERE id = :id").unwrap();
+    let plan = match stmt {
+        SqlStatement::Query(p) => p,
+        _ => panic!("expected a Query plan"),
+    };
+    let rendered = format!("{plan:?}");
+    assert!(
+        rendered.contains(r#"Parameter("id")"#),
+        "':id' should plan to Expr::Parameter; got plan: {rendered}"
+    );
+
+    // `@id` is an equivalent placeholder spelling and must behave identically.
+    let stmt2 = plan_sql(db, "SELECT val FROM t1 WHERE id = @id").unwrap();
+    let plan2 = match stmt2 {
+        SqlStatement::Query(p) => p,
+        _ => panic!("expected a Query plan"),
+    };
+    assert!(
+        format!("{plan2:?}").contains(r#"Parameter("id")"#),
+        "'@id' should plan to Expr::Parameter"
+    );
+}

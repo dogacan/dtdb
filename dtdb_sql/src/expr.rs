@@ -26,6 +26,13 @@ pub enum Operator {
 pub enum Expr {
     Column(String, #[serde(default)] Option<usize>),
     Literal(DbValue),
+    /// A bind parameter placeholder (e.g. `:id`), carrying the parameter name.
+    ///
+    /// Parameters survive into the logical plan so a plan can be cached and
+    /// reused across executions with different bound values. They must be
+    /// substituted with a concrete [`Expr::Literal`] before execution;
+    /// evaluating one directly is an error.
+    Parameter(String),
     BinaryOp {
         left: Box<Expr>,
         op: Operator,
@@ -63,6 +70,7 @@ impl Expr {
                 columns.insert(name.clone());
             }
             Expr::Literal(_) => {}
+            Expr::Parameter(_) => {}
             Expr::BinaryOp { left, right, .. } => {
                 left.collect_columns(columns);
                 right.collect_columns(columns);
@@ -118,6 +126,7 @@ impl Expr {
                 Ok(())
             }
             Expr::Literal(_) => Ok(()),
+            Expr::Parameter(_) => Ok(()),
             Expr::BinaryOp { left, right, .. } => {
                 left.bind_columns(schema)?;
                 right.bind_columns(schema)
@@ -208,6 +217,9 @@ impl Expr {
     pub fn eval(&self, row: &Row, schema: &Schema) -> Result<DbValue, String> {
         match self {
             Expr::Literal(val) => Ok(val.clone()),
+            Expr::Parameter(name) => Err(format!(
+                "Unbound parameter '{name}' reached execution; parameters must be bound before the query runs"
+            )),
             Expr::Column(name, index) => {
                 let idx = if let Some(idx) = index {
                     *idx
