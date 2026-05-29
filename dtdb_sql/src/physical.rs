@@ -1266,10 +1266,7 @@ impl Accumulator {
             // Partial distinct groups from different spilled runs may share values,
             // so the inner aggregate is rebuilt from the union at finalize; merging
             // is just the set union of observed values.
-            (
-                Accumulator::Distinct { seen, .. },
-                Accumulator::Distinct { seen: o_seen, .. },
-            ) => {
+            (Accumulator::Distinct { seen, .. }, Accumulator::Distinct { seen: o_seen, .. }) => {
                 seen.extend(o_seen);
             }
             _ => return Err("Cannot merge accumulators of different kinds".to_string()),

@@ -1496,10 +1496,7 @@ fn rewrite_having_expr(
 
                 let arg_expr = if args_vec.is_empty() {
                     if distinct {
-                        return Err(format!(
-                            "{} with DISTINCT requires a column argument",
-                            name
-                        ));
+                        return Err(format!("{} with DISTINCT requires a column argument", name));
                     }
                     Expr::Literal(DbValue::Int(1))
                 } else {

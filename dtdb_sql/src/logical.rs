@@ -191,22 +191,20 @@ impl LogicalPlan {
                 AggregateExpr::Avg { .. } => DataType::Float,
                 AggregateExpr::Sum { expr, .. }
                 | AggregateExpr::Min { expr, .. }
-                | AggregateExpr::Max { expr, .. } => {
-                    match expr {
-                        Expr::Column(col_name, _) => {
-                            let pos = source_schema
-                                .columns
-                                .iter()
-                                .position(|col| col.matches_name(col_name));
-                            if let Some(i) = pos {
-                                source_schema.columns[i].data_type
-                            } else {
-                                DataType::Float
-                            }
+                | AggregateExpr::Max { expr, .. } => match expr {
+                    Expr::Column(col_name, _) => {
+                        let pos = source_schema
+                            .columns
+                            .iter()
+                            .position(|col| col.matches_name(col_name));
+                        if let Some(i) = pos {
+                            source_schema.columns[i].data_type
+                        } else {
+                            DataType::Float
                         }
-                        _ => DataType::Float,
                     }
-                }
+                    _ => DataType::Float,
+                },
             };
             cols.push(Column {
                 name: field_names[start_idx + idx].clone(),

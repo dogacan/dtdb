@@ -4550,10 +4550,10 @@ fn test_sql_count_distinct_global() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::Int(7),     // COUNT(v)
-                DbValue::Int(4),     // COUNT(DISTINCT v)
-                DbValue::Int(65),    // SUM(DISTINCT v) = 10+20+30+5
-                DbValue::Float(16.25) // AVG(DISTINCT v) = 65/4
+                DbValue::Int(7),       // COUNT(v)
+                DbValue::Int(4),       // COUNT(DISTINCT v)
+                DbValue::Int(65),      // SUM(DISTINCT v) = 10+20+30+5
+                DbValue::Float(16.25)  // AVG(DISTINCT v) = 65/4
             ]
         );
     } else {
