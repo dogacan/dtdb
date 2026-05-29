@@ -34,6 +34,8 @@ jobs:
 
     - name: Install Protocol Buffers Compiler
       uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Check formatting
       run: cargo fmt --check
@@ -70,6 +72,8 @@ jobs:
 
     - name: Install Protocol Buffers Compiler
       uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Run tests with ThreadSanitizer
       run: ./scripts/run_tsan.sh
@@ -90,6 +94,8 @@ jobs:
 
     - name: Install Protocol Buffers Compiler
       uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
@@ -125,6 +131,8 @@ jobs:
 
     - name: Install Protocol Buffers Compiler
       uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Run dtdb_fuzz (short budget for PRs, long for nightly cron)
       env:
