@@ -336,24 +336,18 @@ impl EngineInner {
     pub fn put(self: &Arc<Self>, key: DbKey, value: DbValue) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
 
-        {
+        let wal_size = {
             let mut wal = self.wal.lock().unwrap();
             wal.append_put(&key, &value)?;
-        }
+            wal.size()?
+        };
 
         let mem = self.memtable.read().unwrap();
         mem.put(key, value);
 
         let trigger_flush = {
             let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
-            let wal_full = {
-                let wal = self.wal.lock().unwrap();
-                if let Ok(size) = wal.size() {
-                    size as usize >= self.options.wal_size_limit
-                } else {
-                    false
-                }
-            };
+            let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
         };
 
@@ -367,24 +361,18 @@ impl EngineInner {
     pub fn delete(self: &Arc<Self>, key: DbKey) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
 
-        {
+        let wal_size = {
             let mut wal = self.wal.lock().unwrap();
             wal.append_delete(&key)?;
-        }
+            wal.size()?
+        };
 
         let mem = self.memtable.read().unwrap();
         mem.delete(key);
 
         let trigger_flush = {
             let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
-            let wal_full = {
-                let wal = self.wal.lock().unwrap();
-                if let Ok(size) = wal.size() {
-                    size as usize >= self.options.wal_size_limit
-                } else {
-                    false
-                }
-            };
+            let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
         };
 
@@ -402,10 +390,11 @@ impl EngineInner {
 
         let _write_lock = self.write_mutex.lock().unwrap();
 
-        {
+        let wal_size = {
             let mut wal = self.wal.lock().unwrap();
             wal.append_batch(&entries)?;
-        }
+            wal.size()?
+        };
 
         {
             let mem = self.memtable.read().unwrap();
@@ -422,14 +411,7 @@ impl EngineInner {
 
         let trigger_flush = {
             let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
-            let wal_full = {
-                let wal = self.wal.lock().unwrap();
-                if let Ok(size) = wal.size() {
-                    size as usize >= self.options.wal_size_limit
-                } else {
-                    false
-                }
-            };
+            let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
         };
 
@@ -609,19 +591,25 @@ impl EngineInner {
             if *level == 0 {
                 continue;
             }
-            for sstable in ssts.iter() {
-                if let Some(fk) = sstable.first_key() {
-                    let lk = sstable.last_key();
-                    if fk <= end && lk >= start {
-                        sst_iters.push(crate::merge_iter::SstableBlockIterator::new_with_end(
-                            sstable.clone(),
-                            Some(start),
-                            Some(end),
-                            next_priority,
-                        )?);
-                        next_priority += 1;
-                    }
+            // L1+ files are sorted by key and non-overlapping, so binary-search
+            // to the first file that can contain `start` and stop at the first
+            // file beyond `end` instead of scanning the whole level.
+            let start_idx = ssts.partition_point(|s| s.last_key() < start);
+            for sstable in ssts[start_idx..].iter() {
+                let Some(fk) = sstable.first_key() else {
+                    continue;
+                };
+                if fk > end {
+                    break;
                 }
+                // `last_key() >= start` is guaranteed by `partition_point`.
+                sst_iters.push(crate::merge_iter::SstableBlockIterator::new_with_end(
+                    sstable.clone(),
+                    Some(start),
+                    Some(end),
+                    next_priority,
+                )?);
+                next_priority += 1;
             }
         }
 
@@ -674,13 +662,15 @@ impl EngineInner {
             if *level == 0 {
                 continue;
             }
-            for sstable in ssts.iter() {
+            // L1+ files are sorted and non-overlapping: binary-search to the
+            // first file that can contain `start`, then stop once past `end`.
+            let start_idx = ssts.partition_point(|s| s.last_key() < start);
+            for sstable in ssts[start_idx..].iter() {
                 let f_key = sstable
                     .first_key()
                     .expect("Level 1+ SSTable must not be empty");
-                let l_key = sstable.last_key();
-                if f_key > end || l_key < start {
-                    continue;
+                if f_key > end {
+                    break;
                 }
 
                 let entries = sstable.scan_raw(start, end)?;
@@ -936,6 +926,28 @@ impl EngineInner {
         let mut current_id = 0;
         let mut current_writer_uncompressed_bytes = 0;
 
+        // Snapshot the key ranges of every SSTable below the target level once,
+        // up front, so the tombstone-drop check below is a lock-free scan over
+        // in-memory bounds rather than re-acquiring the `sstables` read lock and
+        // re-walking the live map for every tombstone. Levels below the target
+        // can't change during this compaction (the compaction_mutex serializes
+        // compactions, and flushes only add to L0, which is above any target),
+        // so a one-shot snapshot is consistent.
+        let lower_level_ranges: Vec<(DbKey, DbKey)> = if target_level < self.options.max_level {
+            let sstables_guard = self.sstables.read().unwrap();
+            sstables_guard
+                .iter()
+                .filter(|(level, _)| **level > target_level)
+                .flat_map(|(_, ssts)| ssts.iter())
+                .filter_map(|sst| {
+                    sst.first_key()
+                        .map(|fk| (fk.clone(), sst.last_key().clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         while let Some((k, v)) = merge_iter.next()? {
             if v.is_none() {
                 // Decision: To avoid expensive point lookups during compaction, we only
@@ -943,24 +955,9 @@ impl EngineInner {
                 // If there are no overlapping SSTables in lower levels (or if we are at max_level),
                 // the tombstone is safe to drop. This has zero I/O cost as it only uses in-memory range metadata.
                 if target_level < self.options.max_level {
-                    let mut overlaps_below = false;
-                    let sstables_guard = self.sstables.read().unwrap();
-                    for (level, ssts) in sstables_guard.iter() {
-                        if *level > target_level {
-                            for sst in ssts {
-                                if let Some(fk) = sst.first_key() {
-                                    let lk = sst.last_key();
-                                    if &k >= fk && &k <= lk {
-                                        overlaps_below = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if overlaps_below {
-                            break;
-                        }
-                    }
+                    let overlaps_below = lower_level_ranges
+                        .iter()
+                        .any(|(fk, lk)| &k >= fk && &k <= lk);
                     if !overlaps_below {
                         continue;
                     }

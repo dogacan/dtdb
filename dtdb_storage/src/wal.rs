@@ -26,6 +26,10 @@ pub struct Wal {
     #[allow(dead_code)]
     path: PathBuf,
     sync_interval_ms: Option<u64>,
+    /// Bytes written to the WAL, tracked in memory so the hot write path can
+    /// consult the size for flush decisions without an `fstat` syscall per
+    /// write. Seeded from the file's length on open.
+    size_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -40,11 +44,13 @@ impl Wal {
     pub fn open(path: impl AsRef<Path>, sync_interval_ms: Option<u64>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let size_bytes = file.metadata()?.len();
 
         Ok(Self {
             file,
             path,
             sync_interval_ms,
+            size_bytes,
         })
     }
 
@@ -81,6 +87,7 @@ impl Wal {
         buffer.extend_from_slice(&bytes);
 
         self.file.write_all(&buffer)?;
+        self.size_bytes += buffer.len() as u64;
 
         // CRITICAL FOR DURABILITY: `sync_all` forces the OS to flush its file system caches
         // directly to the physical storage media (similar to fsync in C). Without this,
@@ -192,9 +199,11 @@ impl Wal {
     }
 
     /// Returns the current size of the WAL file in bytes.
+    ///
+    /// Served from an in-memory counter, so this is cheap to call on the write
+    /// hot path (no `fstat` syscall).
     pub fn size(&self) -> Result<u64> {
-        let metadata = self.file.metadata()?;
-        Ok(metadata.len())
+        Ok(self.size_bytes)
     }
 }
 

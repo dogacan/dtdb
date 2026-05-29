@@ -349,12 +349,19 @@ impl SstableReader {
             file_size: file_len,
         };
 
-        // Cache the last key of the SSTable by reading the last block
+        // Cache the last key of the SSTable. The index stats already record the
+        // max key for any SSTable written by a current build, so use it and skip
+        // the otherwise-needless read + decompress of the final block on every
+        // open. Only the legacy index format (no stats) requires reading it.
         if !reader.index.is_empty() {
-            let last_block_idx = reader.index.len() - 1;
-            let last_block = reader.read_block(last_block_idx)?;
-            if let Some((k, _)) = last_block.last() {
-                reader.last_key = k.clone();
+            if let Some(max_key) = reader.stats.max_key.clone() {
+                reader.last_key = max_key;
+            } else {
+                let last_block_idx = reader.index.len() - 1;
+                let last_block = reader.read_block(last_block_idx)?;
+                if let Some((k, _)) = last_block.last() {
+                    reader.last_key = k.clone();
+                }
             }
         }
 
