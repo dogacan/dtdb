@@ -3,7 +3,7 @@
 use dtdb_api::client::DuctTapeDbClient;
 use dtdb_api::proto::execute_query_response::Payload;
 use futures_util::StreamExt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 /// Returns the process-wide Tokio runtime shared by every `CxxClient`.
@@ -11,15 +11,14 @@ use tokio::runtime::Runtime;
 /// Spawning one multi-threaded runtime per client wastes a full scheduler
 /// (worker threads + IO driver) per handle, so all clients share one.
 fn global_runtime() -> Result<Arc<Runtime>, String> {
-    static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
-    if let Some(rt) = RUNTIME.get() {
+    static RUNTIME: std::sync::Mutex<Option<Arc<Runtime>>> = std::sync::Mutex::new(None);
+    let mut guard = RUNTIME.lock().unwrap();
+    if let Some(rt) = &*guard {
         return Ok(rt.clone());
     }
     let rt = Arc::new(Runtime::new().map_err(|e| e.to_string())?);
-    // If another thread initialized it first, our freshly built runtime is
-    // dropped here and we return the winner.
-    let _ = RUNTIME.set(rt);
-    Ok(RUNTIME.get().expect("runtime initialized above").clone())
+    *guard = Some(rt.clone());
+    Ok(rt)
 }
 
 #[cxx::bridge]
