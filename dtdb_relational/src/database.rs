@@ -835,6 +835,7 @@ pub struct Database {
     pub auto_increment_sequences: Mutex<HashMap<String, i64>>,
     pub statistics: RwLock<HashMap<String, TableStatistics>>,
     is_background_analyze_started: std::sync::atomic::AtomicBool,
+    background_analyze_shutdown: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl Database {
@@ -1056,6 +1057,7 @@ impl Database {
             auto_increment_sequences,
             statistics: RwLock::new(statistics),
             is_background_analyze_started: std::sync::atomic::AtomicBool::new(false),
+            background_analyze_shutdown: Mutex::new(None),
         };
 
         db.recover_transactions()?;
@@ -1974,25 +1976,35 @@ impl Database {
                 .is_background_analyze_started
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Ok(mut shutdown_guard) = self.background_analyze_shutdown.lock() {
+                *shutdown_guard = Some(tx);
+            }
             let weak_db = Arc::downgrade(db_arc);
             let spawner = self.spawner.clone();
             spawner.spawn(Box::new(move || {
                 let mut i = 0;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                    if let Some(db) = weak_db.upgrade() {
-                        let tx_id = 1_000_000_000_000 + i;
-                        i += 1;
-                        let tx = Transaction::new_with_isolation(
-                            tx_id,
-                            db.clone(),
-                            crate::transaction::IsolationLevel::ReadUncommitted,
-                        );
-                        if let Err(e) = db.analyze_all(&tx) {
-                            tracing::error!(error = ?e, "background analyze failed");
+                    match rx.recv_timeout(std::time::Duration::from_millis(ms)) {
+                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
                         }
-                    } else {
-                        break;
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if let Some(db) = weak_db.upgrade() {
+                                let tx_id = 1_000_000_000_000 + i;
+                                i += 1;
+                                let tx = Transaction::new_with_isolation(
+                                    tx_id,
+                                    db.clone(),
+                                    crate::transaction::IsolationLevel::ReadUncommitted,
+                                );
+                                if let Err(e) = db.analyze_all(&tx) {
+                                    tracing::error!(error = ?e, "background analyze failed");
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
                 }
             }));
@@ -2100,17 +2112,22 @@ impl Database {
             index_stats,
         };
 
-        // 4. Update in-memory cache and persist to file
-        {
-            let mut stats_guard = self.statistics.write().unwrap();
-            stats_guard.insert(table_name.to_string(), stats.clone());
-        }
-
-        let table_path = self.dir_path.join(table_name);
-        let stats_path = table_path.join("statistics.bin");
         let bytes = bincode::serialize(&stats)
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
-        fs::write(stats_path, bytes)?;
+
+        // 4. Update in-memory cache and persist to file under catalog read lock
+        // to prevent race with drop_table rename.
+        let tables_guard = self.tables.read().unwrap();
+        if tables_guard.contains_key(table_name) {
+            {
+                let mut stats_guard = self.statistics.write().unwrap();
+                stats_guard.insert(table_name.to_string(), stats);
+            }
+
+            let table_path = self.dir_path.join(table_name);
+            let stats_path = table_path.join("statistics.bin");
+            fs::write(stats_path, bytes)?;
+        }
 
         Ok(())
     }
@@ -2130,5 +2147,15 @@ impl Database {
     pub fn get_table_statistics(&self, table_name: &str) -> Option<TableStatistics> {
         let stats_guard = self.statistics.read().unwrap();
         stats_guard.get(table_name).cloned()
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Ok(mut shutdown_guard) = self.background_analyze_shutdown.lock()
+            && let Some(tx) = shutdown_guard.take()
+        {
+            let _ = tx.send(());
+        }
     }
 }

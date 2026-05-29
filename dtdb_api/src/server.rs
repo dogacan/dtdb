@@ -75,6 +75,7 @@ impl DuctTapeDbServiceImpl {
                         Database::open_with_spawner(&path, self.spawner.clone())
                             .map_err(|e| e.to_string())?,
                     );
+                    database.start_background_analyze_if_needed(&database);
                     let sql_engine = Arc::new(SqlEngine::new(database.clone()));
 
                     // Spawn periodic flush if configured
@@ -294,6 +295,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             )
             .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?,
         );
+        database.start_background_analyze_if_needed(&database);
         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
 
         // Spawn periodic flush task if flush_interval_ms is configured
