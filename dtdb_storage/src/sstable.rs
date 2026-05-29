@@ -315,55 +315,34 @@ impl SstableReader {
         let mut index_bytes = vec![0u8; index_len as usize];
         file.read_exact(&mut index_bytes)?;
 
-        let index_block: IndexBlock = match bincode::deserialize(&index_bytes) {
-            Ok(ib) => ib,
-            Err(_) => {
-                // Fallback to old format: just Vec<IndexEntry> with Lz4 compression
-                let entries: Vec<IndexEntry> = bincode::deserialize(&index_bytes)?;
-                IndexBlock {
-                    entries,
-                    compression: CompressionType::Lz4,
-                    stats: StatsBlock {
-                        num_entries: 0,
-                        num_tombstones: 0,
-                        total_uncompressed_bytes: 0,
-                        min_key: None,
-                        max_key: None,
-                    },
-                    bloom_filter: None,
-                }
-            }
+        let index_block: IndexBlock = bincode::deserialize(&index_bytes)?;
+
+        // The index stats record the max key for every non-empty SSTable, so we
+        // take `last_key` straight from there and never touch a data block at
+        // open time. A non-empty index with no recorded max key is corruption.
+        let last_key = if index_block.entries.is_empty() {
+            DbKey::Int(0) // Placeholder; an empty SSTable has no keys to report.
+        } else {
+            index_block.stats.max_key.clone().ok_or_else(|| {
+                StorageError::Corruption(
+                    "SSTable index is non-empty but stats.max_key is missing".to_string(),
+                )
+            })?
         };
 
-        let mut reader = Self {
+        let reader = Self {
             file,
             index: index_block.entries,
             compression: index_block.compression,
             id,
             level,
             path: path_buf,
-            last_key: DbKey::Int(0), // Temp placeholder
+            last_key,
             block_cache,
             stats: index_block.stats,
             bloom_filter: index_block.bloom_filter,
             file_size: file_len,
         };
-
-        // Cache the last key of the SSTable. The index stats already record the
-        // max key for any SSTable written by a current build, so use it and skip
-        // the otherwise-needless read + decompress of the final block on every
-        // open. Only the legacy index format (no stats) requires reading it.
-        if !reader.index.is_empty() {
-            if let Some(max_key) = reader.stats.max_key.clone() {
-                reader.last_key = max_key;
-            } else {
-                let last_block_idx = reader.index.len() - 1;
-                let last_block = reader.read_block(last_block_idx)?;
-                if let Some((k, _)) = last_block.last() {
-                    reader.last_key = k.clone();
-                }
-            }
-        }
 
         Ok(reader)
     }

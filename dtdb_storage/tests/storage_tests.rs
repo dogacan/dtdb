@@ -615,9 +615,9 @@ fn test_sstable_block_checksum_detects_bitrot() {
         f.sync_all().unwrap();
     }
 
-    // The checksum must catch it — either at open-time (last_key read of the
-    // last block) or on the lookup. Both are acceptable signals of corruption;
-    // what's not acceptable is silently returning wrong data.
+    // Opening no longer reads any data block (last_key comes from the index
+    // stats), so the checksum is verified on the lookup that reads the damaged
+    // block. What's not acceptable is silently returning wrong data.
     let result =
         SstableReader::open(&sst_path, 1, 0, None).and_then(|r| r.get(&k_int(0)).map(|_| ()));
     let err = result.expect_err("corrupted block must be detected");
@@ -868,4 +868,149 @@ fn test_open_reconstructs_missing_manifest_and_cleans_tmp_files() {
         db_path.join("manifest.bin").exists(),
         "manifest should have been rebuilt"
     );
+}
+
+#[test]
+fn test_scan_iter_stops_at_memtable_key_past_end() {
+    // A purely-in-memtable scan whose `end` falls before the last key must stop
+    // as soon as it reaches a memtable key past `end`, rather than walking the
+    // rest of the memtable.
+    let temp_dir = TempDir::new().unwrap();
+    let engine = StorageEngine::open(temp_dir.path(), merge_test_options()).unwrap();
+
+    engine.put(k_int(10), v_int(10)).unwrap();
+    engine.put(k_int(20), v_int(20)).unwrap();
+    engine.put(k_int(30), v_int(30)).unwrap();
+
+    let mut iter = engine.scan_iter(&k_int(0), &k_int(15)).unwrap();
+    let mut results = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        results.push(entry);
+    }
+    assert_eq!(results, vec![(k_int(10), v_int(10))]);
+}
+
+/// Builds many single-key, non-overlapping L1 SSTables (sstable_target_size = 1
+/// makes compaction emit one file per entry), then exercises the binary-search
+/// pruning in `scan_iter` / `filtered_scan` over a sub-range: leading files
+/// below `start` must be skipped and trailing files past `end` must not be
+/// opened.
+fn many_l1_files_options() -> EngineOptions {
+    EngineOptions {
+        compression: CompressionType::Uncompressed,
+        memtable_size_limit: 8 * 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 100,
+        sstable_target_size: 1, // one entry per output SSTable
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+    }
+}
+
+#[test]
+fn test_range_scan_prunes_nonoverlapping_l1_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let engine = StorageEngine::open(&db_path, many_l1_files_options()).unwrap();
+
+    // Keys 0,10,20,...,90 → after compaction, ten one-key L1 files.
+    for i in 0..10 {
+        engine.put(k_int(i * 10), v_int(i * 10)).unwrap();
+    }
+    engine.compact().unwrap();
+
+    // Confirm we really produced multiple L1 files (so partition_point has work
+    // to do rather than trivially returning 0).
+    let l1_files = fs::read_dir(&db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("L1_") && n.ends_with(".sst"))
+        })
+        .count();
+    assert!(l1_files >= 5, "expected several L1 files, got {l1_files}");
+
+    // scan_iter over [25, 65]: skips files for 0/10/20 (below start) and must
+    // break before opening the file for 70 (past end).
+    let mut iter = engine.scan_iter(&k_int(25), &k_int(65)).unwrap();
+    let mut scanned = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        scanned.push(entry);
+    }
+    assert_eq!(
+        scanned,
+        vec![
+            (k_int(30), v_int(30)),
+            (k_int(40), v_int(40)),
+            (k_int(50), v_int(50)),
+            (k_int(60), v_int(60)),
+        ]
+    );
+
+    // filtered_scan over the same window exercises its own pruning loop.
+    let filtered = engine
+        .filtered_scan(&k_int(25), &k_int(65), |_, _| true)
+        .unwrap();
+    assert_eq!(
+        filtered,
+        vec![
+            (k_int(30), v_int(30)),
+            (k_int(40), v_int(40)),
+            (k_int(50), v_int(50)),
+            (k_int(60), v_int(60)),
+        ]
+    );
+
+    // A live memtable value for a key already in L1 must shadow the L1 copy,
+    // exercising the duplicate-skip path of the merge.
+    engine.put(k_int(40), v_int(4000)).unwrap();
+    let mut iter = engine.scan_iter(&k_int(35), &k_int(45)).unwrap();
+    let mut shadowed = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        shadowed.push(entry);
+    }
+    assert_eq!(shadowed, vec![(k_int(40), v_int(4000))]);
+}
+
+#[test]
+fn test_compaction_at_max_level_drops_tombstones() {
+    // When the compaction target IS the max level there is no level below, so a
+    // tombstone is dropped unconditionally (the `target_level == max_level`
+    // branch and its empty lower-level snapshot).
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let options = EngineOptions {
+        compression: CompressionType::Uncompressed,
+        memtable_size_limit: 8 * 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 100,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 1, // L0 compacts straight into the max level (L1)
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+    };
+    let engine = StorageEngine::open(&db_path, options).unwrap();
+
+    // One SSTable carrying a value, a second carrying its tombstone.
+    engine.put(k_int(1), v_int(100)).unwrap();
+    engine.flush_memtable().unwrap();
+    engine.delete(k_int(1)).unwrap();
+    engine.flush_memtable().unwrap();
+
+    engine.compact().unwrap();
+
+    assert_eq!(engine.get(&k_int(1)).unwrap(), None);
+    // Both the value and the tombstone are gone — nothing survives at max level.
+    let stats = engine.get_statistics().unwrap();
+    assert_eq!(stats.sstable_entries, 0);
+    assert_eq!(stats.sstable_tombstones, 0);
 }
