@@ -465,9 +465,12 @@ impl Table {
         let mut needed_groups = HashSet::new();
         if let Some(cols) = columns {
             for col_name in cols {
-                if let Some(col) = self.schema.columns.iter().find(|c| {
-                    c.matches_name(col_name)
-                }) {
+                if let Some(col) = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.matches_name(col_name))
+                {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
             }
@@ -509,9 +512,12 @@ impl Table {
         let mut needed_groups = HashSet::new();
         if let Some(cols) = columns {
             for col_name in cols {
-                if let Some(col) = self.schema.columns.iter().find(|c| {
-                    c.matches_name(col_name)
-                }) {
+                if let Some(col) = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.matches_name(col_name))
+                {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
             }
@@ -575,9 +581,12 @@ impl Table {
         let mut needed_groups = HashSet::new();
         if let Some(cols) = columns {
             for col_name in cols {
-                if let Some(col) = self.schema.columns.iter().find(|c| {
-                    c.matches_name(col_name)
-                }) {
+                if let Some(col) = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.matches_name(col_name))
+                {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
             }
@@ -657,9 +666,12 @@ impl Table {
         let mut needed_groups = HashSet::new();
         if let Some(cols) = columns {
             for col_name in cols {
-                if let Some(col) = self.schema.columns.iter().find(|c| {
-                    c.matches_name(col_name)
-                }) {
+                if let Some(col) = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.matches_name(col_name))
+                {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
             }

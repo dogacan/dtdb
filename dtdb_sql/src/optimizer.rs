@@ -521,9 +521,7 @@ impl Optimizer {
 
     fn has_match_predicate_for_col(predicate: &Expr, col_name: &str) -> bool {
         match predicate {
-            Expr::Match { column, .. } => {
-                dtdb_relational::column_names_match(column, col_name)
-            }
+            Expr::Match { column, .. } => dtdb_relational::column_names_match(column, col_name),
             Expr::BinaryOp {
                 left,
                 op: Operator::And,
@@ -1114,9 +1112,10 @@ fn cols_subset_of_schema(cols: &HashSet<String>, schema: &Schema) -> bool {
 }
 
 fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
-    schema.columns.iter().any(|col| {
-        dtdb_relational::column_names_match(&col.name, col_name)
-    })
+    schema
+        .columns
+        .iter()
+        .any(|col| dtdb_relational::column_names_match(&col.name, col_name))
 }
 
 fn swap_join_condition(condition: Expr) -> Expr {

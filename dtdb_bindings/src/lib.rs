@@ -117,9 +117,7 @@ fn convert_cxx_param(p: &ffi::QueryParam) -> dtdb_storage::DbValue {
             Ok(f) => DbValue::Float(f),
             Err(_) => DbValue::String(p.value.clone()),
         },
-        ffi::ParamKind::Bool => {
-            DbValue::Bool(matches!(p.value.as_str(), "1" | "true" | "TRUE"))
-        }
+        ffi::ParamKind::Bool => DbValue::Bool(matches!(p.value.as_str(), "1" | "true" | "TRUE")),
         ffi::ParamKind::Bytes => match decode_hex(&p.value) {
             Some(bytes) => DbValue::Bytes(bytes),
             None => DbValue::String(p.value.clone()),
