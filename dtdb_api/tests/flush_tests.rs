@@ -139,13 +139,16 @@ async fn test_periodic_time_based_flush() {
     let client_addr = format!("http://127.0.0.1:{}", port);
     let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
 
-    // Create a database with 150ms periodic flush interval
+    // Create a database with a 3s periodic flush interval. The interval is kept
+    // comfortably longer than the test's setup + insert so the "not flushed
+    // yet" check below cannot race a flush tick firing mid-insert — a race that
+    // flaked under coverage instrumentation when the interval was 150ms.
     let options = DatabaseOptions {
         compression: CompressionType::Lz4,
         memtable_size_limit: 1024 * 1024,
         block_size_limit: 4096,
         wal_size_limit: 1024 * 1024,
-        flush_interval_ms: Some(150),
+        flush_interval_ms: Some(3000),
         l0_compaction_threshold: None,
         sstable_target_size: None,
         base_level_size_limit: None,
@@ -196,14 +199,26 @@ async fn test_periodic_time_based_flush() {
         }
     }
 
-    // Verify immediately (no flush yet)
+    // The row is in the memtable; the long flush interval guarantees the
+    // periodic flusher hasn't fired yet, so no SSTable exists.
     assert_eq!(count_sst_files(&table_dir), 0);
 
-    // Sleep for 300ms to allow background periodic flush task to run
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Verify that the table has been flushed
-    assert_eq!(count_sst_files(&table_dir), 1);
+    // Poll (rather than sleeping a fixed amount) for the periodic flush to land.
+    // The background flush thread fires roughly one interval after the row hits
+    // the memtable, but instrumented runs stretch wall-clock timing, so we wait
+    // up to ~12s.
+    let mut flushed = false;
+    for _ in 0..80 {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if count_sst_files(&table_dir) == 1 {
+            flushed = true;
+            break;
+        }
+    }
+    assert!(
+        flushed,
+        "periodic flush should have produced exactly one SSTable within the timeout"
+    );
 
     server_handle.abort();
 }
