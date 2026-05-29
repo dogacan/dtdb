@@ -1466,6 +1466,11 @@ impl Database {
         !self.occ_active_transactions.lock().unwrap().is_empty()
     }
 
+    pub fn global_commit_version(&self) -> u64 {
+        self.global_commit_version
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn register_transaction(&self, tx_id: u64) -> u64 {
         let _history_lock = self.commit_history.read().unwrap();
         let version = self

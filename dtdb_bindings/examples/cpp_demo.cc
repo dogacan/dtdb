@@ -29,7 +29,7 @@ int main() {
         std::cout << "[C++] Creating table 'users'..." << std::endl;
         QueryResult create_res = client.execute_query(
             "demo_db",
-            dtdb::SqlQuery("CREATE TABLE users (id INT PRIMARY KEY, name STRING, active INT);")
+            dtdb::SqlQuery("CREATE TABLE users (id INT PRIMARY KEY, name STRING, active BOOL);")
         );
         assert(create_res.success);
         std::cout << "[C++] Create table success: " << std::string(create_res.rows[0]) << std::endl;

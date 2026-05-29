@@ -74,7 +74,13 @@ impl Transaction {
         isolation_level: IsolationLevel,
     ) -> Self {
         database.start_background_analyze_if_needed(&database);
-        let start_version = database.register_transaction(tx_id);
+        let start_version = if isolation_level == IsolationLevel::ReadUncommitted
+            || isolation_level == IsolationLevel::ReadCommitted
+        {
+            database.global_commit_version()
+        } else {
+            database.register_transaction(tx_id)
+        };
         Self {
             tx_id,
             database,
