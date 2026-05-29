@@ -1214,7 +1214,7 @@ mod tests {
     fn in_list_semantics() {
         let in_list = |val: DbValue, items: Vec<DbValue>| Expr::InList {
             expr: lit(val),
-            list: items.into_iter().map(|v| Expr::Literal(v)).collect(),
+            list: items.into_iter().map(Expr::Literal).collect(),
         };
         assert_eq!(
             eval(&in_list(
