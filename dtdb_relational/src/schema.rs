@@ -133,17 +133,18 @@ impl Column {
     /// consistent and makes it the single place to extend later (e.g. for
     /// schema-qualified `schema.table.col` names).
     pub fn matches_name(&self, query_name: &str) -> bool {
-        if self.name == query_name {
-            return true;
-        }
-        if ends_with_dot_suffix(query_name, &self.name) {
-            return true;
-        }
-        if ends_with_dot_suffix(&self.name, query_name) {
-            return true;
-        }
-        false
+        column_names_match(&self.name, query_name)
     }
+}
+
+/// Returns true if two column names refer to the same column under SQL-style
+/// table-qualified matching. The relation is symmetric: either name may be
+/// qualified (e.g. `users.id`) and matches the other's trailing portion.
+///
+/// This is the canonical name comparison shared by the relational layer and
+/// the SQL layer above it, so qualified-lookup rules live in exactly one place.
+pub fn column_names_match(a: &str, b: &str) -> bool {
+    a == b || ends_with_dot_suffix(a, b) || ends_with_dot_suffix(b, a)
 }
 
 impl Schema {
@@ -548,7 +549,10 @@ impl Schema {
 
 /// Helper to check if a string ends with a suffix preceded by a dot `.`,
 /// avoiding heap allocation from `format!(".{}", suffix)`.
-pub fn ends_with_dot_suffix(full: &str, suffix: &str) -> bool {
+///
+/// Crate-internal: callers outside `dtdb_relational` should use the symmetric
+/// [`column_names_match`] instead of reaching for this low-level primitive.
+pub(crate) fn ends_with_dot_suffix(full: &str, suffix: &str) -> bool {
     full.len() > suffix.len()
         && full.ends_with(suffix)
         && full.as_bytes()[full.len() - suffix.len() - 1] == b'.'

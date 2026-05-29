@@ -13,6 +13,8 @@ pub use database::{
 pub use error::{RelationalError, Result};
 pub use fts_parser::FullTextQuery;
 pub use row::Row;
-pub use schema::{Column, DataType, IndexDefinition, IndexType, LocalityGroupOptions, Schema};
+pub use schema::{
+    Column, DataType, IndexDefinition, IndexType, LocalityGroupOptions, Schema, column_names_match,
+};
 pub use tokenizer::{SimpleTokenizer, Tokenizer, get_tokenizer, register_global_tokenizer};
 pub use transaction::{IsolationLevel, Transaction, TransactionOptions, TransactionScanIterator};

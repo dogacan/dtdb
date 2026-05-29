@@ -647,14 +647,14 @@ impl Expr {
                         .indexes
                         .iter()
                         .find(|idx| {
-                            idx.index_type == dtdb_relational::schema::IndexType::FullText
+                            idx.index_type == dtdb_relational::IndexType::FullText
                                 && idx.columns.contains(column)
                         })
                         .and_then(|idx| idx.tokenizer.as_deref())
                         .unwrap_or("simple");
 
                     if let Some(tokenizer) =
-                        dtdb_relational::tokenizer::get_tokenizer(tokenizer_name)
+                        dtdb_relational::get_tokenizer(tokenizer_name)
                     {
                         let query =
                             dtdb_relational::FullTextQuery::parse(query_str, tokenizer.as_ref())

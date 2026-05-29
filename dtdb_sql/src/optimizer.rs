@@ -465,7 +465,7 @@ impl Optimizer {
                 && let Some(col) = schema.columns.iter().find(|c| c.matches_name(col_name))
             {
                 // Verify index type match
-                let is_fulltext = index.index_type == dtdb_relational::schema::IndexType::FullText;
+                let is_fulltext = index.index_type == dtdb_relational::IndexType::FullText;
                 let has_match = Self::has_match_predicate_for_col(predicate, &col.name);
                 if is_fulltext != has_match {
                     continue;
@@ -522,9 +522,7 @@ impl Optimizer {
     fn has_match_predicate_for_col(predicate: &Expr, col_name: &str) -> bool {
         match predicate {
             Expr::Match { column, .. } => {
-                column == col_name
-                    || dtdb_relational::schema::ends_with_dot_suffix(column, col_name)
-                    || dtdb_relational::schema::ends_with_dot_suffix(col_name, column)
+                dtdb_relational::column_names_match(column, col_name)
             }
             Expr::BinaryOp {
                 left,
@@ -544,10 +542,7 @@ impl Optimizer {
             Expr::Match {
                 column, query_str, ..
             } => {
-                if column == col_name
-                    || dtdb_relational::schema::ends_with_dot_suffix(column, col_name)
-                    || dtdb_relational::schema::ends_with_dot_suffix(col_name, column)
-                {
+                if dtdb_relational::column_names_match(column, col_name) {
                     Some(query_str.clone())
                 } else {
                     None
@@ -700,15 +695,7 @@ impl Optimizer {
                     if let Expr::Column(sort_col, _) = sort_expr {
                         // 1. Check if opt_source is already sorted by sort_col (ASC)
                         if let Some(sorted_col) = Self::get_plan_sort_key(&opt_source)
-                            && (sorted_col == *sort_col
-                                || dtdb_relational::schema::ends_with_dot_suffix(
-                                    sort_col,
-                                    &sorted_col,
-                                )
-                                || dtdb_relational::schema::ends_with_dot_suffix(
-                                    &sorted_col,
-                                    sort_col,
-                                ))
+                            && dtdb_relational::column_names_match(&sorted_col, sort_col)
                         {
                             return opt_source;
                         }
@@ -841,9 +828,7 @@ impl Optimizer {
                 let child_sort_key = Self::get_plan_sort_key(source)?;
                 for (idx, expr) in expressions.iter().enumerate() {
                     if let Expr::Column(name, _) = expr
-                        && (name == &child_sort_key
-                            || dtdb_relational::schema::ends_with_dot_suffix(name, &child_sort_key)
-                            || dtdb_relational::schema::ends_with_dot_suffix(&child_sort_key, name))
+                        && dtdb_relational::column_names_match(name, &child_sort_key)
                     {
                         return Some(field_names[idx].clone());
                     }
@@ -864,13 +849,7 @@ impl Optimizer {
                 if range.is_none() {
                     for index in &schema.indexes {
                         if let Some(first_col) = index.columns.first()
-                            && (first_col == sort_col
-                                || dtdb_relational::schema::ends_with_dot_suffix(
-                                    first_col, sort_col,
-                                )
-                                || dtdb_relational::schema::ends_with_dot_suffix(
-                                    sort_col, first_col,
-                                ))
+                            && dtdb_relational::column_names_match(first_col, sort_col)
                         {
                             return Some(LogicalPlan::IndexScan {
                                 table_name: table_name.clone(),
@@ -965,16 +944,12 @@ fn get_column_comparison<'a>(
 ) -> Option<&'a DbValue> {
     match (left, right) {
         (Expr::Column(name, _), Expr::Literal(lit))
-            if name == col_name
-                || dtdb_relational::schema::ends_with_dot_suffix(name, col_name)
-                || dtdb_relational::schema::ends_with_dot_suffix(col_name, name) =>
+            if dtdb_relational::column_names_match(name, col_name) =>
         {
             Some(lit)
         }
         (Expr::Literal(lit), Expr::Column(name, _))
-            if name == col_name
-                || dtdb_relational::schema::ends_with_dot_suffix(name, col_name)
-                || dtdb_relational::schema::ends_with_dot_suffix(col_name, name) =>
+            if dtdb_relational::column_names_match(name, col_name) =>
         {
             Some(lit)
         }
@@ -1140,9 +1115,7 @@ fn cols_subset_of_schema(cols: &HashSet<String>, schema: &Schema) -> bool {
 
 fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
     schema.columns.iter().any(|col| {
-        col.name == col_name
-            || dtdb_relational::schema::ends_with_dot_suffix(col_name, &col.name)
-            || dtdb_relational::schema::ends_with_dot_suffix(&col.name, col_name)
+        dtdb_relational::column_names_match(&col.name, col_name)
     })
 }
 

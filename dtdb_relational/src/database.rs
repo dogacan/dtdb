@@ -466,9 +466,7 @@ impl Table {
         if let Some(cols) = columns {
             for col_name in cols {
                 if let Some(col) = self.schema.columns.iter().find(|c| {
-                    &c.name == col_name
-                        || crate::schema::ends_with_dot_suffix(col_name, &c.name)
-                        || crate::schema::ends_with_dot_suffix(&c.name, col_name)
+                    c.matches_name(col_name)
                 }) {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
@@ -512,9 +510,7 @@ impl Table {
         if let Some(cols) = columns {
             for col_name in cols {
                 if let Some(col) = self.schema.columns.iter().find(|c| {
-                    &c.name == col_name
-                        || crate::schema::ends_with_dot_suffix(col_name, &c.name)
-                        || crate::schema::ends_with_dot_suffix(&c.name, col_name)
+                    c.matches_name(col_name)
                 }) {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
@@ -580,9 +576,7 @@ impl Table {
         if let Some(cols) = columns {
             for col_name in cols {
                 if let Some(col) = self.schema.columns.iter().find(|c| {
-                    &c.name == col_name
-                        || crate::schema::ends_with_dot_suffix(col_name, &c.name)
-                        || crate::schema::ends_with_dot_suffix(&c.name, col_name)
+                    c.matches_name(col_name)
                 }) {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }
@@ -664,9 +658,7 @@ impl Table {
         if let Some(cols) = columns {
             for col_name in cols {
                 if let Some(col) = self.schema.columns.iter().find(|c| {
-                    &c.name == col_name
-                        || crate::schema::ends_with_dot_suffix(col_name, &c.name)
-                        || crate::schema::ends_with_dot_suffix(&c.name, col_name)
+                    c.matches_name(col_name)
                 }) {
                     needed_groups.insert(col.locality_group.as_deref().unwrap_or("").to_string());
                 }

@@ -42,7 +42,7 @@ pub enum SqlStatement {
         table_name: String,
         index_name: String,
         columns: Vec<String>,
-        index_type: dtdb_relational::schema::IndexType,
+        index_type: dtdb_relational::IndexType,
         tokenizer: Option<String>,
     },
     DropIndex {
@@ -384,9 +384,9 @@ impl LogicalPlanner {
                     }
                 }
                 let index_type = if using.is_some() {
-                    dtdb_relational::schema::IndexType::FullText
+                    dtdb_relational::IndexType::FullText
                 } else {
-                    dtdb_relational::schema::IndexType::BTree
+                    dtdb_relational::IndexType::BTree
                 };
                 let tokenizer = using.as_ref().map(|ident| ident.value.clone());
                 Ok(SqlStatement::CreateIndex {

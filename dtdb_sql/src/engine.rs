@@ -35,9 +35,7 @@ fn is_plan_sorted_by(plan: &LogicalPlan, group_by: &[Expr]) -> bool {
     if let Expr::Column(group_col, _) = &group_by[0]
         && let Some(child_sort_col) = Optimizer::get_plan_sort_key(plan)
     {
-        return group_col == &child_sort_col
-            || dtdb_relational::schema::ends_with_dot_suffix(group_col, &child_sort_col)
-            || dtdb_relational::schema::ends_with_dot_suffix(&child_sort_col, group_col);
+        return dtdb_relational::column_names_match(group_col, &child_sort_col);
     }
     false
 }
