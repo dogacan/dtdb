@@ -1,6 +1,6 @@
 use crate::merge_iter::SstableBlockIterator;
 use crate::{DbKey, DbValue, Result};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 
 #[derive(Debug)]
 struct HeapEntry {
@@ -45,7 +45,12 @@ pub struct ScanIterator {
     mem_idx: usize,
     sst_iters: Vec<SstableBlockIterator>,
     heap: BinaryHeap<HeapEntry>,
-    seen: HashSet<DbKey>,
+    // The merge below always emits keys in non-decreasing order (it picks the
+    // smallest of the memtable cursor and the heap top each step), so every
+    // copy of a given key is contiguous. Tracking only the last key consumed
+    // is therefore enough to drop older duplicates — no need for an O(range)
+    // `HashSet` that retains the whole scan in memory.
+    last_key: Option<DbKey>,
     end: DbKey,
 }
 
@@ -71,7 +76,7 @@ impl ScanIterator {
             mem_idx: 0,
             sst_iters,
             heap,
-            seen: HashSet::new(),
+            last_key: None,
             end,
         })
     }
@@ -103,10 +108,13 @@ impl ScanIterator {
                     return Ok(None);
                 }
 
-                if self.seen.insert(k.clone())
-                    && let Some(val) = v
-                {
-                    return Ok(Some((k.clone(), val.clone())));
+                // Record the key as consumed even when it's a tombstone, so any
+                // older copy from a lower-priority source is suppressed.
+                if self.last_key.as_ref() != Some(k) {
+                    self.last_key = Some(k.clone());
+                    if let Some(val) = v {
+                        return Ok(Some((k.clone(), val.clone())));
+                    }
                 }
             } else {
                 let entry = self.heap.pop().unwrap();
@@ -128,10 +136,11 @@ impl ScanIterator {
                     });
                 }
 
-                if self.seen.insert(entry.key.clone())
-                    && let Some(val) = entry.value
-                {
-                    return Ok(Some((entry.key, val)));
+                if self.last_key.as_ref() != Some(&entry.key) {
+                    self.last_key = Some(entry.key.clone());
+                    if let Some(val) = entry.value {
+                        return Ok(Some((entry.key, val)));
+                    }
                 }
             }
         }

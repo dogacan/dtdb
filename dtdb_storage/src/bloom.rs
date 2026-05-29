@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 /// A simple, self-contained Bloom Filter for checking set membership probabilistically.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -81,19 +81,20 @@ impl BloomFilter {
         true
     }
 
-    /// Helper to compute two independent 64-bit hashes using Xxh64.
+    /// Helper to compute two independent 64-bit hashes for double hashing.
+    ///
+    /// A single xxh3 pass produces a 128-bit digest, whose two halves serve as
+    /// the independent `(h1, h2)` pair for the `h1 + i*h2` probe sequence. This
+    /// hashes the key once (cheaper than two passes for long keys) while keeping
+    /// 128 bits of entropy, so the false-positive rate is unchanged.
     fn get_hashes<T: Hash>(&self, key: &T) -> (u64, u64) {
-        use xxhash_rust::xxh64::Xxh64;
+        use xxhash_rust::xxh3::Xxh3;
 
-        let mut h1 = Xxh64::new(0);
-        key.hash(&mut h1);
-        let hash1 = h1.finish();
+        let mut h = Xxh3::new();
+        key.hash(&mut h);
+        let wide = h.digest128();
 
-        let mut h2 = Xxh64::new(1234567890u64);
-        key.hash(&mut h2);
-        let hash2 = h2.finish();
-
-        (hash1, hash2)
+        (wide as u64, (wide >> 64) as u64)
     }
 }
 
@@ -110,5 +111,39 @@ mod tests {
         assert!(bloom.contains(&"key_a"));
         assert!(bloom.contains(&"key_b"));
         assert!(!bloom.contains(&"key_c"));
+    }
+
+    #[test]
+    fn test_bloom_no_false_negatives_and_low_fp_rate() {
+        // The hard guarantee: every inserted key must test present.
+        let n = 10_000;
+        let target_fp = 0.01;
+        let mut bloom = BloomFilter::new(n, target_fp);
+        for i in 0..n as i64 {
+            bloom.insert(&crate::DbKey::Int(i));
+        }
+        for i in 0..n as i64 {
+            assert!(
+                bloom.contains(&crate::DbKey::Int(i)),
+                "false negative for inserted key {i}"
+            );
+        }
+
+        // Quality check: the observed false-positive rate over keys that were
+        // never inserted should stay near the configured target. A loose 5x
+        // bound keeps the test deterministic across hash details while still
+        // catching a derivation that collapses the probe sequence.
+        let mut false_positives = 0;
+        let probes = 10_000i64;
+        for i in n as i64..(n as i64 + probes) {
+            if bloom.contains(&crate::DbKey::Int(i)) {
+                false_positives += 1;
+            }
+        }
+        let observed = false_positives as f64 / probes as f64;
+        assert!(
+            observed < target_fp * 5.0,
+            "false-positive rate {observed} far exceeds target {target_fp}"
+        );
     }
 }
