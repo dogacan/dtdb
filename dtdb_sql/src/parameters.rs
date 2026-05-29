@@ -315,3 +315,157 @@ pub fn bind_statement(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn params(pairs: &[(&str, DbValue)]) -> HashMap<String, DbValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// Parse one SQL statement, bind the given params, and render it back to text.
+    fn bind_and_render(sql: &str, params: &HashMap<String, DbValue>) -> Result<String, String> {
+        let dialect = GenericDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
+        let mut stmt = statements.remove(0);
+        bind_statement(&mut stmt, params)?;
+        Ok(stmt.to_string())
+    }
+
+    #[test]
+    fn binds_named_placeholder_in_select_where() {
+        let p = params(&[("id", DbValue::Int(42))]);
+        let out = bind_and_render("SELECT * FROM t WHERE id = :id", &p).unwrap();
+        assert!(out.contains("42"), "got: {out}");
+        assert!(!out.contains(':'), "placeholder not substituted: {out}");
+    }
+
+    #[test]
+    fn binds_at_identifier_parameter() {
+        let p = params(&[("name", DbValue::String("alice".to_string()))]);
+        let out = bind_and_render("SELECT * FROM t WHERE name = @name", &p).unwrap();
+        assert!(out.contains("'alice'"), "got: {out}");
+        assert!(!out.contains('@'), "got: {out}");
+    }
+
+    #[test]
+    fn unbound_parameters_error() {
+        let empty = params(&[]);
+        assert!(bind_and_render("SELECT * FROM t WHERE id = :id", &empty).is_err());
+        assert!(bind_and_render("SELECT * FROM t WHERE id = @id", &empty).is_err());
+    }
+
+    #[test]
+    fn binds_all_db_value_types() {
+        let p = params(&[
+            ("i", DbValue::Int(1)),
+            ("f", DbValue::Float(2.5)),
+            ("b", DbValue::Bool(true)),
+            ("s", DbValue::String("hi".to_string())),
+            ("n", DbValue::Null),
+            ("by", DbValue::Bytes(vec![0xde, 0xad])),
+        ]);
+        let out = bind_and_render(
+            "SELECT * FROM t WHERE i = :i AND f = :f AND b = :b AND s = :s AND n = :n AND by = :by",
+            &p,
+        )
+        .unwrap();
+        assert!(out.contains('1'));
+        assert!(out.contains("2.5"));
+        assert!(out.contains("true") || out.contains("TRUE"));
+        assert!(out.contains("'hi'"));
+        assert!(out.to_uppercase().contains("NULL"));
+        // Bytes render as a hex string literal.
+        assert!(out.to_lowercase().contains("dead"), "got: {out}");
+    }
+
+    #[test]
+    fn binds_inside_expression_nodes() {
+        // Exercise BinaryOp, Between, Function args, Like, InList, IsNull, Nested, UnaryOp, Case.
+        let p = params(&[
+            ("lo", DbValue::Int(1)),
+            ("hi", DbValue::Int(10)),
+            ("pat", DbValue::String("a%".to_string())),
+            ("x", DbValue::Int(5)),
+            ("y", DbValue::Int(6)),
+            ("z", DbValue::Int(7)),
+        ]);
+        let sql = "SELECT * FROM t WHERE (a BETWEEN :lo AND :hi) \
+                   AND b LIKE :pat \
+                   AND c IN (:x, :y) \
+                   AND ABS(:z) > 0 \
+                   AND d IS NOT NULL \
+                   AND -:x < 0";
+        let out = bind_and_render(sql, &p).unwrap();
+        assert!(!out.contains(':'), "unbound placeholders remain: {out}");
+    }
+
+    #[test]
+    fn binds_in_insert_update_delete() {
+        let p = params(&[
+            ("v", DbValue::Int(9)),
+            ("w", DbValue::String("x".to_string())),
+            ("id", DbValue::Int(3)),
+        ]);
+        let insert = bind_and_render("INSERT INTO t (a) VALUES (:v)", &p).unwrap();
+        assert!(
+            insert.contains('9') && !insert.contains(':'),
+            "got: {insert}"
+        );
+
+        let update = bind_and_render("UPDATE t SET a = :w WHERE id = :id", &p).unwrap();
+        assert!(
+            update.contains("'x'") && update.contains('3'),
+            "got: {update}"
+        );
+
+        let delete = bind_and_render("DELETE FROM t WHERE id = :id", &p).unwrap();
+        assert!(
+            delete.contains('3') && !delete.contains(':'),
+            "got: {delete}"
+        );
+    }
+
+    #[test]
+    fn binds_in_join_subquery_and_order_limit() {
+        let p = params(&[
+            ("j", DbValue::Int(1)),
+            ("s", DbValue::Int(2)),
+            ("n", DbValue::Int(5)),
+        ]);
+        let sql = "SELECT * FROM a JOIN (SELECT * FROM b WHERE b.x = :s) sub \
+                   ON a.id = sub.id AND a.k = :j \
+                   ORDER BY a.id \
+                   LIMIT :n";
+        let out = bind_and_render(sql, &p).unwrap();
+        assert!(!out.contains(':'), "unbound placeholders remain: {out}");
+    }
+
+    #[test]
+    fn binds_through_explain_and_set_operations() {
+        let p = params(&[("x", DbValue::Int(1)), ("y", DbValue::Int(2))]);
+        let explain = bind_and_render("EXPLAIN SELECT * FROM t WHERE a = :x", &p).unwrap();
+        assert!(!explain.contains(':'), "got: {explain}");
+
+        let union = bind_and_render(
+            "SELECT a FROM t WHERE a = :x UNION SELECT b FROM u WHERE b = :y",
+            &p,
+        )
+        .unwrap();
+        assert!(!union.contains(':'), "got: {union}");
+    }
+
+    #[test]
+    fn bind_expr_leaves_non_parameter_literals_untouched() {
+        let p = params(&[]);
+        // No placeholders at all -> unchanged and no error.
+        let out = bind_and_render("SELECT * FROM t WHERE a = 1 AND b = 'x'", &p).unwrap();
+        assert!(out.contains('1') && out.contains("'x'"));
+    }
+}
