@@ -427,7 +427,7 @@ impl SstableReader {
             }
         }
 
-        crate::PHYSICAL_BLOCKS_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::record_physical_block_read();
 
         let entry = &self.index[idx];
         // Defensively bound entry.size against the file. A corrupted index

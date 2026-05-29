@@ -669,7 +669,7 @@ fn test_scan_iter_stops_loading_blocks_past_end() {
     }
     assert_eq!(results.len(), 5);
 
-    let blocks_read = dtdb_storage::PHYSICAL_BLOCKS_READ.load(std::sync::atomic::Ordering::SeqCst);
+    let blocks_read = dtdb_storage::get_physical_blocks_read();
     // With ~64-byte blocks the file has hundreds of blocks; a correctly bounded
     // iterator only needs a handful of them.
     assert!(

@@ -247,15 +247,33 @@ pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
     }
 }
 
-pub static PHYSICAL_BLOCKS_READ: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub fn reset_physical_blocks_read() {
-    PHYSICAL_BLOCKS_READ.store(0, std::sync::atomic::Ordering::SeqCst);
+// Counts physical SSTable block reads (cache misses) for the *current thread*.
+//
+// This is thread-local rather than a process-global atomic so that tests
+// asserting on block-read counts (e.g. locality-group pruning) are not
+// polluted by reads performed concurrently on other threads — both parallel
+// test cases and background compaction/analyze threads. Since query reads
+// happen synchronously on the calling thread, a thread-local correctly
+// attributes them to the query under measurement.
+thread_local! {
+    static PHYSICAL_BLOCKS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Records that one physical SSTable block was read (cache miss) on the
+/// current thread.
+pub fn record_physical_block_read() {
+    PHYSICAL_BLOCKS_READ.with(|c| c.set(c.get() + 1));
+}
+
+/// Resets the current thread's physical block-read counter to zero.
+pub fn reset_physical_blocks_read() {
+    PHYSICAL_BLOCKS_READ.with(|c| c.set(0));
+}
+
+/// Returns the number of physical block reads recorded on the current thread
+/// since the last reset.
 pub fn get_physical_blocks_read() -> u64 {
-    PHYSICAL_BLOCKS_READ.load(std::sync::atomic::Ordering::SeqCst)
+    PHYSICAL_BLOCKS_READ.with(|c| c.get())
 }
 
 #[cfg(test)]
@@ -385,7 +403,9 @@ mod tests {
     fn test_physical_blocks_read_counter() {
         reset_physical_blocks_read();
         assert_eq!(get_physical_blocks_read(), 0);
-        PHYSICAL_BLOCKS_READ.fetch_add(3, std::sync::atomic::Ordering::SeqCst);
+        record_physical_block_read();
+        record_physical_block_read();
+        record_physical_block_read();
         assert_eq!(get_physical_blocks_read(), 3);
         reset_physical_blocks_read();
         assert_eq!(get_physical_blocks_read(), 0);
