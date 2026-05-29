@@ -1,5 +1,7 @@
 # DuctTapeDB 🛠️
 
+[![codecov](https://codecov.io/github/dogacan/dtdb/graph/badge.svg?token=SJ8GJ37WTD)](https://codecov.io/github/dogacan/dtdb)
+
 **DuctTapeDB** is a from-scratch relational database written in Rust. It prioritizes clean abstractions, highly readable code, and simplicity over high performance and absolute reliability.
 
 ---
