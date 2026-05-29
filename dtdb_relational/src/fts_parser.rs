@@ -198,4 +198,180 @@ mod tests {
             other => panic!("expected Phrase, got {other:?}"),
         }
     }
+
+    #[test]
+    fn single_token_parses() {
+        let tokenizer = SimpleTokenizer;
+        let q = FullTextQuery::parse("Rust", &tokenizer).unwrap();
+        // SimpleTokenizer lowercases the term.
+        assert_eq!(q, FullTextQuery::Token("rust".to_string()));
+    }
+
+    #[test]
+    fn explicit_and_operator() {
+        let tokenizer = SimpleTokenizer;
+        let q = FullTextQuery::parse("foo AND bar", &tokenizer).unwrap();
+        assert_eq!(
+            q,
+            FullTextQuery::And(
+                Box::new(FullTextQuery::Token("foo".to_string())),
+                Box::new(FullTextQuery::Token("bar".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_or_operator() {
+        let tokenizer = SimpleTokenizer;
+        let q = FullTextQuery::parse("foo OR bar", &tokenizer).unwrap();
+        assert_eq!(
+            q,
+            FullTextQuery::Or(
+                Box::new(FullTextQuery::Token("foo".to_string())),
+                Box::new(FullTextQuery::Token("bar".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn operators_are_case_insensitive() {
+        let tokenizer = SimpleTokenizer;
+        let lower = FullTextQuery::parse("foo and bar", &tokenizer).unwrap();
+        let mixed = FullTextQuery::parse("foo And bar", &tokenizer).unwrap();
+        let upper = FullTextQuery::parse("foo AND bar", &tokenizer).unwrap();
+        assert_eq!(lower, upper);
+        assert_eq!(mixed, upper);
+    }
+
+    #[test]
+    fn implicit_and_between_adjacent_terms() {
+        let tokenizer = SimpleTokenizer;
+        // Two bare terms with no operator are joined by an implicit AND.
+        let q = FullTextQuery::parse("foo bar", &tokenizer).unwrap();
+        assert_eq!(
+            q,
+            FullTextQuery::And(
+                Box::new(FullTextQuery::Token("foo".to_string())),
+                Box::new(FullTextQuery::Token("bar".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn implicit_and_before_phrase_and_paren() {
+        let tokenizer = SimpleTokenizer;
+        // A bare term followed directly by a phrase, then by a parenthesized
+        // group, exercises the implicit-AND branches for PhraseString and LParen.
+        let q = FullTextQuery::parse("foo \"bar baz\" (qux)", &tokenizer).unwrap();
+        assert_eq!(
+            q,
+            FullTextQuery::And(
+                Box::new(FullTextQuery::And(
+                    Box::new(FullTextQuery::Token("foo".to_string())),
+                    Box::new(FullTextQuery::Phrase(vec![
+                        "bar".to_string(),
+                        "baz".to_string()
+                    ])),
+                )),
+                Box::new(FullTextQuery::Token("qux".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn or_has_lower_precedence_than_and() {
+        let tokenizer = SimpleTokenizer;
+        // `a AND b OR c` should parse as `(a AND b) OR c`.
+        let q = FullTextQuery::parse("a AND b OR c", &tokenizer).unwrap();
+        assert_eq!(
+            q,
+            FullTextQuery::Or(
+                Box::new(FullTextQuery::And(
+                    Box::new(FullTextQuery::Token("a".to_string())),
+                    Box::new(FullTextQuery::Token("b".to_string())),
+                )),
+                Box::new(FullTextQuery::Token("c".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        let tokenizer = SimpleTokenizer;
+        // `a AND (b OR c)` forces the OR to bind first.
+        let q = FullTextQuery::parse("a AND (b OR c)", &tokenizer).unwrap();
+        assert_eq!(
+            q,
+            FullTextQuery::And(
+                Box::new(FullTextQuery::Token("a".to_string())),
+                Box::new(FullTextQuery::Or(
+                    Box::new(FullTextQuery::Token("b".to_string())),
+                    Box::new(FullTextQuery::Token("c".to_string())),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn empty_query_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        let err = FullTextQuery::parse("   ", &tokenizer).unwrap_err();
+        assert!(err.contains("Empty search query"), "got: {err}");
+    }
+
+    #[test]
+    fn unterminated_phrase_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        let err = FullTextQuery::parse("\"hello world", &tokenizer).unwrap_err();
+        assert!(err.contains("Unterminated phrase"), "got: {err}");
+    }
+
+    #[test]
+    fn unclosed_parenthesis_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        let err = FullTextQuery::parse("(foo OR bar", &tokenizer).unwrap_err();
+        assert!(err.contains("closing parenthesis"), "got: {err}");
+    }
+
+    #[test]
+    fn trailing_unexpected_token_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        // A stray closing paren leaves an unconsumed token after parsing.
+        let err = FullTextQuery::parse("foo)", &tokenizer).unwrap_err();
+        assert!(err.contains("Unexpected token"), "got: {err}");
+    }
+
+    #[test]
+    fn leading_operator_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        // An expression cannot start with a binary operator: parse_primary sees
+        // the AndOp and reports it as an unexpected primary token.
+        let err = FullTextQuery::parse("AND foo", &tokenizer).unwrap_err();
+        assert!(err.contains("Expected term"), "got: {err}");
+    }
+
+    #[test]
+    fn dangling_operator_at_end_is_rejected() {
+        let tokenizer = SimpleTokenizer;
+        // `foo OR` has nothing on the right-hand side of the operator.
+        let err = FullTextQuery::parse("foo OR", &tokenizer).unwrap_err();
+        assert!(err.contains("Unexpected end of query"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_parentheses_are_rejected() {
+        let tokenizer = SimpleTokenizer;
+        // `()` has no inner expression for parse_or to consume.
+        let err = FullTextQuery::parse("()", &tokenizer).unwrap_err();
+        assert!(err.contains("Expected term"), "got: {err}");
+    }
+
+    #[test]
+    fn query_is_serde_roundtrippable() {
+        let tokenizer = SimpleTokenizer;
+        let q = FullTextQuery::parse("a AND (b OR c)", &tokenizer).unwrap();
+        let bytes = bincode::serialize(&q).unwrap();
+        let decoded: FullTextQuery = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(q, decoded);
+    }
 }

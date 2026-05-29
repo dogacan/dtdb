@@ -847,3 +847,732 @@ where
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtdb_relational::{Column, DataType};
+
+    fn col(name: &str, dt: DataType) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: dt,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        }
+    }
+
+    /// Schema with columns `id INT`, `name STRING`, `score FLOAT`.
+    fn sample_schema() -> Schema {
+        Schema::new(vec![
+            col("id", DataType::Int),
+            col("name", DataType::String),
+            col("score", DataType::Float),
+        ])
+    }
+
+    fn sample_row() -> Row {
+        Row::new(vec![
+            DbValue::Int(1),
+            DbValue::String("alice".to_string()),
+            DbValue::Float(9.5),
+        ])
+    }
+
+    fn lit(v: DbValue) -> Box<Expr> {
+        Box::new(Expr::Literal(v))
+    }
+
+    fn binop(l: Expr, op: Operator, r: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(l),
+            op,
+            right: Box::new(r),
+        }
+    }
+
+    fn eval(expr: &Expr) -> Result<DbValue, String> {
+        expr.eval(&sample_row(), &sample_schema())
+    }
+
+    // ----- literals and column access -----
+
+    #[test]
+    fn literal_and_column_eval() {
+        let schema = sample_schema();
+        let row = sample_row();
+        assert_eq!(
+            Expr::Literal(DbValue::Int(7)).eval(&row, &schema).unwrap(),
+            DbValue::Int(7)
+        );
+        // Unbound column resolves by name.
+        assert_eq!(
+            Expr::Column("name".to_string(), None)
+                .eval(&row, &schema)
+                .unwrap(),
+            DbValue::String("alice".to_string())
+        );
+        // Pre-bound index is used directly.
+        assert_eq!(
+            Expr::Column("ignored".to_string(), Some(0))
+                .eval(&row, &schema)
+                .unwrap(),
+            DbValue::Int(1)
+        );
+    }
+
+    #[test]
+    fn column_errors() {
+        let schema = sample_schema();
+        let row = sample_row();
+        // Unknown column name.
+        assert!(
+            Expr::Column("missing".to_string(), None)
+                .eval(&row, &schema)
+                .is_err()
+        );
+        // Bound index past the end of the row.
+        assert!(
+            Expr::Column("x".to_string(), Some(99))
+                .eval(&row, &schema)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_column_ambiguous_is_error() {
+        // Two columns whose trailing portion is `id` -> ambiguous unqualified ref.
+        let schema = Schema::new(vec![col("a.id", DataType::Int), col("b.id", DataType::Int)]);
+        let err = Expr::Column("id".to_string(), None)
+            .eval(&Row::new(vec![DbValue::Int(1), DbValue::Int(2)]), &schema)
+            .unwrap_err();
+        assert!(err.contains("Ambiguous"), "got: {err}");
+    }
+
+    // ----- comparisons -----
+
+    #[test]
+    fn comparison_operators() {
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(1)),
+                Operator::Eq,
+                Expr::Literal(DbValue::Int(1))
+            ))
+            .unwrap(),
+            DbValue::Bool(true)
+        );
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(1)),
+                Operator::NotEq,
+                Expr::Literal(DbValue::Int(2))
+            ))
+            .unwrap(),
+            DbValue::Bool(true)
+        );
+        for (op, expect) in [
+            (Operator::Gt, false),
+            (Operator::Lt, true),
+            (Operator::GtEq, false),
+            (Operator::LtEq, true),
+        ] {
+            assert_eq!(
+                eval(&binop(
+                    Expr::Literal(DbValue::Int(1)),
+                    op,
+                    Expr::Literal(DbValue::Int(2))
+                ))
+                .unwrap(),
+                DbValue::Bool(expect),
+                "op {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_propagates_null() {
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Null),
+                Operator::Eq,
+                Expr::Literal(DbValue::Int(1))
+            ))
+            .unwrap(),
+            DbValue::Null
+        );
+    }
+
+    #[test]
+    fn compare_values_mixed_numeric_and_bool() {
+        assert_eq!(
+            compare_values(&DbValue::Int(2), &DbValue::Float(2.0)).unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_values(&DbValue::Float(1.0), &DbValue::Int(2)).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&DbValue::Bool(true), &DbValue::Int(1)).unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_values(&DbValue::Int(0), &DbValue::Bool(false)).unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        // NULL sorts before everything; two NULLs are equal.
+        assert_eq!(
+            compare_values(&DbValue::Null, &DbValue::Int(1)).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&DbValue::Int(1), &DbValue::Null).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        // Incomparable types error.
+        assert!(compare_values(&DbValue::String("a".to_string()), &DbValue::Int(1)).is_err());
+        // NaN comparison errors.
+        assert!(compare_values(&DbValue::Float(f64::NAN), &DbValue::Float(1.0)).is_err());
+    }
+
+    // ----- arithmetic -----
+
+    #[test]
+    fn arithmetic_add_sub_mul_div() {
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(6)),
+                Operator::Add,
+                Expr::Literal(DbValue::Int(4))
+            ))
+            .unwrap(),
+            DbValue::Int(10)
+        );
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(6)),
+                Operator::Sub,
+                Expr::Literal(DbValue::Int(4))
+            ))
+            .unwrap(),
+            DbValue::Int(2)
+        );
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(6)),
+                Operator::Mul,
+                Expr::Literal(DbValue::Int(4))
+            ))
+            .unwrap(),
+            DbValue::Int(24)
+        );
+        // Int / Float promotes to Float.
+        assert_eq!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(9)),
+                Operator::Div,
+                Expr::Literal(DbValue::Float(2.0))
+            ))
+            .unwrap(),
+            DbValue::Float(4.5)
+        );
+    }
+
+    #[test]
+    fn arithmetic_errors() {
+        // Division by zero (int and float).
+        assert!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(1)),
+                Operator::Div,
+                Expr::Literal(DbValue::Int(0))
+            ))
+            .is_err()
+        );
+        assert!(
+            eval(&binop(
+                Expr::Literal(DbValue::Float(1.0)),
+                Operator::Div,
+                Expr::Literal(DbValue::Float(0.0))
+            ))
+            .is_err()
+        );
+        // Integer overflow.
+        assert!(
+            eval(&binop(
+                Expr::Literal(DbValue::Int(i64::MAX)),
+                Operator::Add,
+                Expr::Literal(DbValue::Int(1))
+            ))
+            .is_err()
+        );
+        // Non-numeric operands.
+        assert!(
+            eval(&binop(
+                Expr::Literal(DbValue::String("x".to_string())),
+                Operator::Add,
+                Expr::Literal(DbValue::Int(1))
+            ))
+            .is_err()
+        );
+    }
+
+    // ----- three-valued logic AND/OR -----
+
+    #[test]
+    fn three_valued_and() {
+        let t = || Expr::Literal(DbValue::Bool(true));
+        let f = || Expr::Literal(DbValue::Bool(false));
+        let n = || Expr::Literal(DbValue::Null);
+        assert_eq!(
+            eval(&binop(t(), Operator::And, t())).unwrap(),
+            DbValue::Bool(true)
+        );
+        assert_eq!(
+            eval(&binop(t(), Operator::And, f())).unwrap(),
+            DbValue::Bool(false)
+        );
+        // FALSE short-circuits regardless of right side.
+        assert_eq!(
+            eval(&binop(f(), Operator::And, n())).unwrap(),
+            DbValue::Bool(false)
+        );
+        // TRUE AND NULL = NULL.
+        assert_eq!(
+            eval(&binop(t(), Operator::And, n())).unwrap(),
+            DbValue::Null
+        );
+        // NULL AND TRUE = NULL; NULL AND FALSE = FALSE.
+        assert_eq!(
+            eval(&binop(n(), Operator::And, t())).unwrap(),
+            DbValue::Null
+        );
+        assert_eq!(
+            eval(&binop(n(), Operator::And, f())).unwrap(),
+            DbValue::Bool(false)
+        );
+        assert_eq!(
+            eval(&binop(n(), Operator::And, n())).unwrap(),
+            DbValue::Null
+        );
+    }
+
+    #[test]
+    fn three_valued_or() {
+        let t = || Expr::Literal(DbValue::Bool(true));
+        let f = || Expr::Literal(DbValue::Bool(false));
+        let n = || Expr::Literal(DbValue::Null);
+        // TRUE short-circuits.
+        assert_eq!(
+            eval(&binop(t(), Operator::Or, n())).unwrap(),
+            DbValue::Bool(true)
+        );
+        assert_eq!(
+            eval(&binop(f(), Operator::Or, t())).unwrap(),
+            DbValue::Bool(true)
+        );
+        assert_eq!(
+            eval(&binop(f(), Operator::Or, f())).unwrap(),
+            DbValue::Bool(false)
+        );
+        // FALSE OR NULL = NULL.
+        assert_eq!(eval(&binop(f(), Operator::Or, n())).unwrap(), DbValue::Null);
+        // NULL OR TRUE = TRUE; NULL OR FALSE = NULL.
+        assert_eq!(
+            eval(&binop(n(), Operator::Or, t())).unwrap(),
+            DbValue::Bool(true)
+        );
+        assert_eq!(eval(&binop(n(), Operator::Or, f())).unwrap(), DbValue::Null);
+        assert_eq!(eval(&binop(n(), Operator::Or, n())).unwrap(), DbValue::Null);
+    }
+
+    // ----- NOT / IS NULL / IN -----
+
+    #[test]
+    fn not_and_is_null() {
+        assert_eq!(
+            eval(&Expr::Not(lit(DbValue::Bool(true)))).unwrap(),
+            DbValue::Bool(false)
+        );
+        // NOT NULL is NULL.
+        assert_eq!(eval(&Expr::Not(lit(DbValue::Null))).unwrap(), DbValue::Null);
+        assert_eq!(
+            eval(&Expr::IsNull(lit(DbValue::Null))).unwrap(),
+            DbValue::Bool(true)
+        );
+        assert_eq!(
+            eval(&Expr::IsNull(lit(DbValue::Int(1)))).unwrap(),
+            DbValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn in_list_semantics() {
+        let in_list = |val: DbValue, items: Vec<DbValue>| Expr::InList {
+            expr: lit(val),
+            list: items.into_iter().map(|v| Expr::Literal(v)).collect(),
+        };
+        assert_eq!(
+            eval(&in_list(
+                DbValue::Int(2),
+                vec![DbValue::Int(1), DbValue::Int(2)]
+            ))
+            .unwrap(),
+            DbValue::Bool(true)
+        );
+        // Not present, no NULL -> false.
+        assert_eq!(
+            eval(&in_list(
+                DbValue::Int(3),
+                vec![DbValue::Int(1), DbValue::Int(2)]
+            ))
+            .unwrap(),
+            DbValue::Bool(false)
+        );
+        // Not present but NULL in list -> NULL (unknown).
+        assert_eq!(
+            eval(&in_list(
+                DbValue::Int(3),
+                vec![DbValue::Int(1), DbValue::Null]
+            ))
+            .unwrap(),
+            DbValue::Null
+        );
+        // NULL test value -> NULL.
+        assert_eq!(
+            eval(&in_list(DbValue::Null, vec![DbValue::Int(1)])).unwrap(),
+            DbValue::Null
+        );
+    }
+
+    // ----- LIKE -----
+
+    #[test]
+    fn like_matching() {
+        let like = |text: &str, pat: &str| {
+            eval(&binop(
+                Expr::Literal(DbValue::String(text.to_string())),
+                Operator::Like,
+                Expr::Literal(DbValue::String(pat.to_string())),
+            ))
+            .unwrap()
+        };
+        assert_eq!(like("hello", "h%o"), DbValue::Bool(true));
+        assert_eq!(like("hello", "h_llo"), DbValue::Bool(true));
+        assert_eq!(like("hello", "world"), DbValue::Bool(false));
+        // Regex metacharacters in the pattern are treated literally.
+        assert_eq!(like("a.b", "a.b"), DbValue::Bool(true));
+        assert_eq!(like("axb", "a.b"), DbValue::Bool(false));
+    }
+
+    #[test]
+    fn like_pattern_translation_escapes_metachars() {
+        assert_eq!(like_pattern_to_regex("a%b_c"), "(?s)^a.*b.c$");
+        assert_eq!(like_pattern_to_regex("a.b"), "(?s)^a\\.b$");
+    }
+
+    // ----- CASE -----
+
+    #[test]
+    fn searched_case() {
+        // CASE WHEN false THEN 'a' WHEN true THEN 'b' ELSE 'c' END
+        let expr = Expr::Case {
+            operand: None,
+            conditions: vec![
+                Expr::Literal(DbValue::Bool(false)),
+                Expr::Literal(DbValue::Bool(true)),
+            ],
+            results: vec![
+                Expr::Literal(DbValue::String("a".to_string())),
+                Expr::Literal(DbValue::String("b".to_string())),
+            ],
+            else_result: Some(lit(DbValue::String("c".to_string()))),
+        };
+        assert_eq!(eval(&expr).unwrap(), DbValue::String("b".to_string()));
+    }
+
+    #[test]
+    fn simple_case_with_operand_and_no_match() {
+        // CASE 5 WHEN 1 THEN 'a' END  -> no match, no else -> NULL
+        let expr = Expr::Case {
+            operand: Some(lit(DbValue::Int(5))),
+            conditions: vec![Expr::Literal(DbValue::Int(1))],
+            results: vec![Expr::Literal(DbValue::String("a".to_string()))],
+            else_result: None,
+        };
+        assert_eq!(eval(&expr).unwrap(), DbValue::Null);
+    }
+
+    #[test]
+    fn case_length_mismatch_errors() {
+        let expr = Expr::Case {
+            operand: None,
+            conditions: vec![Expr::Literal(DbValue::Bool(true))],
+            results: vec![],
+            else_result: None,
+        };
+        assert!(eval(&expr).is_err());
+    }
+
+    // ----- scalar functions -----
+
+    fn func(name: &str, args: Vec<DbValue>) -> Expr {
+        Expr::Function {
+            name: name.to_string(),
+            args: args.into_iter().map(Expr::Literal).collect(),
+        }
+    }
+
+    #[test]
+    fn string_functions() {
+        assert_eq!(
+            eval(&func("LENGTH", vec![DbValue::String("héllo".to_string())])).unwrap(),
+            DbValue::Int(5)
+        );
+        assert_eq!(
+            eval(&func("UPPER", vec![DbValue::String("abc".to_string())])).unwrap(),
+            DbValue::String("ABC".to_string())
+        );
+        assert_eq!(
+            eval(&func("LOWER", vec![DbValue::String("ABC".to_string())])).unwrap(),
+            DbValue::String("abc".to_string())
+        );
+        assert_eq!(
+            eval(&func(
+                "CONCAT",
+                vec![DbValue::String("a".to_string()), DbValue::Int(2)]
+            ))
+            .unwrap(),
+            DbValue::String("a2".to_string())
+        );
+        // case-insensitive name.
+        assert_eq!(
+            eval(&func("length", vec![DbValue::String("ab".to_string())])).unwrap(),
+            DbValue::Int(2)
+        );
+    }
+
+    #[test]
+    fn substr_variants() {
+        let s = || DbValue::String("hello".to_string());
+        // 1-based start, no length: from 2nd char.
+        assert_eq!(
+            eval(&func("SUBSTR", vec![s(), DbValue::Int(2)])).unwrap(),
+            DbValue::String("ello".to_string())
+        );
+        // start + length.
+        assert_eq!(
+            eval(&func(
+                "SUBSTRING",
+                vec![s(), DbValue::Int(1), DbValue::Int(3)]
+            ))
+            .unwrap(),
+            DbValue::String("hel".to_string())
+        );
+        // negative start counts from end.
+        assert_eq!(
+            eval(&func("SUBSTR", vec![s(), DbValue::Int(-2)])).unwrap(),
+            DbValue::String("lo".to_string())
+        );
+        // length 0 -> empty.
+        assert_eq!(
+            eval(&func("SUBSTR", vec![s(), DbValue::Int(1), DbValue::Int(0)])).unwrap(),
+            DbValue::String("".to_string())
+        );
+        // absurd length saturates to "rest of string".
+        assert_eq!(
+            eval(&func(
+                "SUBSTR",
+                vec![s(), DbValue::Int(1), DbValue::Int(i64::MAX)]
+            ))
+            .unwrap(),
+            DbValue::String("hello".to_string())
+        );
+        // start past the end -> empty.
+        assert_eq!(
+            eval(&func("SUBSTR", vec![s(), DbValue::Int(100)])).unwrap(),
+            DbValue::String("".to_string())
+        );
+    }
+
+    #[test]
+    fn substr_errors() {
+        let s = || DbValue::String("hello".to_string());
+        // non-integer start.
+        assert!(eval(&func("SUBSTR", vec![s(), DbValue::String("x".to_string())])).is_err());
+        // negative length.
+        assert!(
+            eval(&func(
+                "SUBSTR",
+                vec![s(), DbValue::Int(1), DbValue::Int(-1)]
+            ))
+            .is_err()
+        );
+        // wrong arg count.
+        assert!(eval(&func("SUBSTR", vec![s()])).is_err());
+    }
+
+    #[test]
+    fn coalesce_and_numeric_functions() {
+        assert_eq!(
+            eval(&func(
+                "COALESCE",
+                vec![DbValue::Null, DbValue::Null, DbValue::Int(3)]
+            ))
+            .unwrap(),
+            DbValue::Int(3)
+        );
+        // all null -> null.
+        assert_eq!(
+            eval(&func("COALESCE", vec![DbValue::Null, DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
+        assert_eq!(
+            eval(&func("ABS", vec![DbValue::Int(-5)])).unwrap(),
+            DbValue::Int(5)
+        );
+        assert_eq!(
+            eval(&func("ABS", vec![DbValue::Float(-2.5)])).unwrap(),
+            DbValue::Float(2.5)
+        );
+        assert_eq!(
+            eval(&func("ROUND", vec![DbValue::Float(2.6)])).unwrap(),
+            DbValue::Float(3.0)
+        );
+        assert_eq!(
+            eval(&func("ROUND", vec![DbValue::Int(4)])).unwrap(),
+            DbValue::Int(4)
+        );
+    }
+
+    #[test]
+    fn function_null_and_error_paths() {
+        // NULL propagation through string functions.
+        assert_eq!(
+            eval(&func("LENGTH", vec![DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
+        assert_eq!(
+            eval(&func("UPPER", vec![DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
+        // ABS/ROUND on non-numeric error.
+        assert!(eval(&func("ABS", vec![DbValue::String("x".to_string())])).is_err());
+        assert!(eval(&func("ROUND", vec![DbValue::String("x".to_string())])).is_err());
+        // empty COALESCE / CONCAT.
+        assert!(eval(&func("COALESCE", vec![])).is_err());
+        assert!(eval(&func("CONCAT", vec![])).is_err());
+        // unknown function.
+        assert!(eval(&func("NOPE", vec![DbValue::Int(1)])).is_err());
+        // wrong arity.
+        assert!(eval(&func("UPPER", vec![DbValue::Int(1), DbValue::Int(2)])).is_err());
+    }
+
+    // ----- MATCH (full-text) -----
+
+    #[test]
+    fn match_full_text() {
+        let schema = sample_schema();
+        let row = Row::new(vec![
+            DbValue::Int(1),
+            DbValue::String("the quick brown fox".to_string()),
+            DbValue::Float(0.0),
+        ]);
+        let m = |q: &str| {
+            Expr::Match {
+                column: "name".to_string(),
+                index: None,
+                query_str: q.to_string(),
+            }
+            .eval(&row, &schema)
+            .unwrap()
+        };
+        assert_eq!(m("quick"), DbValue::Bool(true));
+        assert_eq!(m("quick AND fox"), DbValue::Bool(true));
+        assert_eq!(m("quick AND missing"), DbValue::Bool(false));
+        assert_eq!(m("\"quick brown\""), DbValue::Bool(true));
+        assert_eq!(m("\"brown quick\""), DbValue::Bool(false));
+
+        // Non-string column never matches.
+        let m_int = Expr::Match {
+            column: "id".to_string(),
+            index: None,
+            query_str: "1".to_string(),
+        }
+        .eval(&row, &schema)
+        .unwrap();
+        assert_eq!(m_int, DbValue::Bool(false));
+    }
+
+    #[test]
+    fn match_unknown_column_errors() {
+        let schema = sample_schema();
+        let row = sample_row();
+        let err = Expr::Match {
+            column: "missing".to_string(),
+            index: None,
+            query_str: "x".to_string(),
+        }
+        .eval(&row, &schema)
+        .unwrap_err();
+        assert!(err.contains("Column not found"), "got: {err}");
+    }
+
+    // ----- collect_columns / bind_columns -----
+
+    #[test]
+    fn collect_columns_walks_all_nodes() {
+        let expr = Expr::Case {
+            operand: Some(Box::new(Expr::Column("id".to_string(), None))),
+            conditions: vec![binop(
+                Expr::Column("name".to_string(), None),
+                Operator::Eq,
+                Expr::Literal(DbValue::Int(1)),
+            )],
+            results: vec![Expr::Function {
+                name: "ABS".to_string(),
+                args: vec![Expr::Column("score".to_string(), None)],
+            }],
+            else_result: Some(Box::new(Expr::InList {
+                expr: Box::new(Expr::Not(Box::new(Expr::IsNull(Box::new(Expr::Column(
+                    "id".to_string(),
+                    None,
+                )))))),
+                list: vec![Expr::Match {
+                    column: "name".to_string(),
+                    index: None,
+                    query_str: "x".to_string(),
+                }],
+            })),
+        };
+        let mut cols = HashSet::new();
+        expr.collect_columns(&mut cols);
+        assert!(cols.contains("id"));
+        assert!(cols.contains("name"));
+        assert!(cols.contains("score"));
+    }
+
+    #[test]
+    fn bind_columns_resolves_indices() {
+        let schema = sample_schema();
+        let mut expr = binop(
+            Expr::Column("name".to_string(), None),
+            Operator::Eq,
+            Expr::Literal(DbValue::String("alice".to_string())),
+        );
+        expr.bind_columns(&schema).unwrap();
+        if let Expr::BinaryOp { left, .. } = &expr {
+            assert_eq!(**left, Expr::Column("name".to_string(), Some(1)));
+        } else {
+            panic!("expected BinaryOp");
+        }
+
+        // Binding an unknown column errors.
+        let mut bad = Expr::Column("missing".to_string(), None);
+        assert!(bad.bind_columns(&schema).is_err());
+    }
+}
