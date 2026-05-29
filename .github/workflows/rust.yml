@@ -95,7 +95,10 @@ jobs:
       uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Generate coverage (lcov)
-      run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+      # Skip the C++ FFI smoke test: it shells out to a nested `cargo build`
+      # which inherits llvm-cov's instrumentation env and fails against the
+      # synthetic `llvm-cov-target` triple. It still runs in the `build` job.
+      run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info -- --skip test_cpp_bridge_smoke
 
     - name: Coverage summary
       run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
