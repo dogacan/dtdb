@@ -74,9 +74,9 @@ impl SqlEngine {
         {
             return matches!(
                 statements[0],
-                sqlparser::ast::Statement::CreateTable { .. }
+                sqlparser::ast::Statement::CreateTable(_)
                     | sqlparser::ast::Statement::Drop { .. }
-                    | sqlparser::ast::Statement::CreateIndex { .. }
+                    | sqlparser::ast::Statement::CreateIndex(_)
             );
         }
         false

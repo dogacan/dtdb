@@ -67,21 +67,35 @@ impl LogicalPlanner {
     /// Plans a parsed sqlparser AST Statement.
     pub fn plan(&self, statement: &Statement) -> Result<SqlStatement, String> {
         match statement {
-            Statement::CreateTable {
+            Statement::CreateTable(sqlparser::ast::CreateTable {
                 name,
                 columns,
                 constraints,
-                with_options,
+                table_options,
                 ..
-            } => {
+            }) => {
                 let table_name = name.to_string();
                 let mut cols = Vec::new();
 
                 let mut locality_map = std::collections::HashMap::new();
                 let mut locality_group_options = std::collections::HashMap::new();
-                for opt in with_options {
-                    if opt.name.value == "locality_groups"
-                        && let sqlparser::ast::Value::SingleQuotedString(ref val_str) = opt.value
+                let options_list = match table_options {
+                    sqlparser::ast::CreateTableOptions::With(opts) => opts.as_slice(),
+                    sqlparser::ast::CreateTableOptions::Options(opts) => opts.as_slice(),
+                    sqlparser::ast::CreateTableOptions::Plain(opts) => opts.as_slice(),
+                    sqlparser::ast::CreateTableOptions::TableProperties(opts) => opts.as_slice(),
+                    sqlparser::ast::CreateTableOptions::None => &[],
+                };
+                for opt in options_list {
+                    if let sqlparser::ast::SqlOption::KeyValue {
+                        key,
+                        value:
+                            sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                                value: sqlparser::ast::Value::SingleQuotedString(val_str),
+                                ..
+                            }),
+                    } = opt
+                        && key.value == "locality_groups"
                     {
                         for part in val_str.split(';') {
                             let part = part.trim();
@@ -108,10 +122,10 @@ impl LogicalPlanner {
                                             match key {
                                                 "compression" => {
                                                     let comp = match val.to_lowercase().as_str() {
-                                                        "lz4" => dtdb_storage::CompressionType::Lz4,
-                                                        "uncompressed" => dtdb_storage::CompressionType::Uncompressed,
-                                                        _ => return Err(format!("Unknown compression type: {}", val)),
-                                                    };
+                                                            "lz4" => dtdb_storage::CompressionType::Lz4,
+                                                            "uncompressed" => dtdb_storage::CompressionType::Uncompressed,
+                                                            _ => return Err(format!("Unknown compression type: {}", val)),
+                                                        };
                                                     opts.compression = Some(comp);
                                                 }
                                                 "memtable_size_limit" => {
@@ -198,9 +212,7 @@ impl LogicalPlanner {
                                                     {
                                                         opts.wal_sync_interval_ms = Some(None);
                                                     } else {
-                                                        let ms = val.parse::<u64>().map_err(|e| {
-                                                            format!("Invalid wal_sync_interval_ms: {}", e)
-                                                        })?;
+                                                        let ms = val.parse::<u64>().map_err(|e| format!("Invalid wal_sync_interval_ms: {}", e))?;
                                                         opts.wal_sync_interval_ms = Some(Some(ms));
                                                     }
                                                 }
@@ -221,14 +233,11 @@ impl LogicalPlanner {
 
                 let mut pk_cols = std::collections::HashSet::new();
                 for constraint in constraints {
-                    if let sqlparser::ast::TableConstraint::Unique {
-                        is_primary: true,
-                        columns,
-                        ..
-                    } = constraint
-                    {
-                        for col_ident in columns {
-                            pk_cols.insert(col_ident.value.clone());
+                    if let sqlparser::ast::TableConstraint::PrimaryKey(pk_constraint) = constraint {
+                        for col in &pk_constraint.columns {
+                            if let sqlparser::ast::Expr::Identifier(ident) = &col.column.expr {
+                                pk_cols.insert(ident.value.clone());
+                            }
                         }
                     }
                 }
@@ -254,14 +263,14 @@ impl LogicalPlanner {
                         {
                             DataType::Bool
                         }
-                        SqlDataType::Float(_) | SqlDataType::Double | SqlDataType::Real => {
+                        SqlDataType::Float(_) | SqlDataType::Double(_) | SqlDataType::Real => {
                             DataType::Float
                         }
-                        SqlDataType::Boolean => DataType::Bool,
+                        SqlDataType::Boolean | SqlDataType::Bool => DataType::Bool,
                         SqlDataType::Text
                         | SqlDataType::Varchar(_)
                         | SqlDataType::Char(_)
-                        | SqlDataType::String => DataType::String,
+                        | SqlDataType::String(_) => DataType::String,
                         SqlDataType::Bytea | SqlDataType::Blob(_) => DataType::Bytes,
                         other => return Err(format!("Unsupported SQL data type: {:?}", other)),
                     };
@@ -269,7 +278,7 @@ impl LogicalPlanner {
                     let mut is_pk = col
                         .options
                         .iter()
-                        .any(|opt| matches!(opt.option, ColumnOption::Unique { is_primary: true }));
+                        .any(|opt| matches!(opt.option, ColumnOption::PrimaryKey(_)));
                     if pk_cols.contains(&col.name.value) {
                         is_pk = true;
                     }
@@ -363,18 +372,21 @@ impl LogicalPlanner {
                     Err("Only DROP TABLE and DROP INDEX statements are supported".to_string())
                 }
             }
-            Statement::CreateIndex {
+            Statement::CreateIndex(sqlparser::ast::CreateIndex {
                 name,
                 table_name,
                 columns,
                 using,
                 ..
-            } => {
-                let index_name = name.to_string();
+            }) => {
+                let index_name = name
+                    .as_ref()
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| "CREATE INDEX requires an index name".to_string())?;
                 let table_str = table_name.to_string();
                 let mut col_names = Vec::new();
                 for col in columns {
-                    if let sqlparser::ast::Expr::Identifier(ident) = &col.expr {
+                    if let sqlparser::ast::Expr::Identifier(ident) = &col.column.expr {
                         col_names.push(ident.value.clone());
                     } else {
                         return Err(
@@ -388,7 +400,10 @@ impl LogicalPlanner {
                 } else {
                     dtdb_relational::IndexType::BTree
                 };
-                let tokenizer = using.as_ref().map(|ident| ident.value.clone());
+                let tokenizer = using.as_ref().map(|index_type| match index_type {
+                    sqlparser::ast::IndexType::Custom(ident) => ident.value.clone(),
+                    other => other.to_string(),
+                });
                 Ok(SqlStatement::CreateIndex {
                     table_name: table_str,
                     index_name,
@@ -397,13 +412,16 @@ impl LogicalPlanner {
                     tokenizer,
                 })
             }
-            Statement::Insert {
-                table_name,
+            Statement::Insert(sqlparser::ast::Insert {
+                table,
                 columns,
                 source,
                 ..
-            } => {
-                let table_str = table_name.to_string();
+            }) => {
+                let table_str = match table {
+                    sqlparser::ast::TableObject::TableName(name) => name.to_string(),
+                    other => return Err(format!("Unsupported table object in INSERT: {}", other)),
+                };
                 let table = self
                     .database
                     .get_table(&table_str)
@@ -418,10 +436,27 @@ impl LogicalPlanner {
                         .map(|c| c.name.clone())
                         .collect()
                 } else {
-                    columns.iter().map(|c| c.value.clone()).collect()
+                    columns
+                        .iter()
+                        .map(|c| {
+                            if c.0.len() != 1 {
+                                return Err(format!("Invalid column name: {}", c));
+                            }
+                            match &c.0[0] {
+                                sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                                    Ok(ident.value.clone())
+                                }
+                                _ => Err(format!("Unsupported column name: {}", c)),
+                            }
+                        })
+                        .collect::<Result<Vec<String>, String>>()?
                 };
 
-                match &*source.body {
+                let query_source = source
+                    .as_deref()
+                    .ok_or_else(|| "INSERT statement requires a query source".to_string())?;
+
+                match &*query_source.body {
                     sqlparser::ast::SetExpr::Values(values) => {
                         let mut rows = Vec::new();
                         for row_exprs in &values.rows {
@@ -433,7 +468,7 @@ impl LogicalPlanner {
                                 ));
                             }
                             let mut row_vals = Vec::new();
-                            for expr in row_exprs {
+                            for expr in &row_exprs.content {
                                 match plan_expr(expr)? {
                                     Expr::Literal(val) => row_vals.push(val),
                                     other => {
@@ -453,7 +488,7 @@ impl LogicalPlanner {
                         })
                     }
                     _ => {
-                        let logical_plan = self.plan_query(source)?;
+                        let logical_plan = self.plan_query(query_source)?;
                         Ok(SqlStatement::InsertSelect {
                             table_name: table_str,
                             columns: col_names,
@@ -462,13 +497,17 @@ impl LogicalPlanner {
                     }
                 }
             }
-            Statement::Delete {
+            Statement::Delete(sqlparser::ast::Delete {
                 from, selection, ..
-            } => {
-                if from.is_empty() {
+            }) => {
+                let from_tables = match from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+                    sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+                };
+                if from_tables.is_empty() {
                     return Err("DELETE statement requires a table name".to_string());
                 }
-                let name_str = match &from[0].relation {
+                let name_str = match &from_tables[0].relation {
                     TableFactor::Table { name, .. } => name.to_string(),
                     other => {
                         return Err(format!("Unsupported table factor in DELETE: {:?}", other));
@@ -483,12 +522,12 @@ impl LogicalPlanner {
                     filter,
                 })
             }
-            Statement::Update {
+            Statement::Update(sqlparser::ast::Update {
                 table,
                 assignments,
                 selection,
                 ..
-            } => {
+            }) => {
                 let name_str = match &table.relation {
                     TableFactor::Table { name, .. } => name.to_string(),
                     other => {
@@ -497,12 +536,28 @@ impl LogicalPlanner {
                 };
                 let mut my_assignments = Vec::new();
                 for assign in assignments {
-                    let col_name = assign
-                        .id
-                        .iter()
-                        .map(|i| i.value.clone())
-                        .collect::<Vec<_>>()
-                        .join(".");
+                    let col_name = match &assign.target {
+                        sqlparser::ast::AssignmentTarget::ColumnName(object_name) => {
+                            let mut parts = Vec::new();
+                            for part in &object_name.0 {
+                                match part {
+                                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                                        parts.push(ident.value.clone());
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "Unsupported assignment target: {}",
+                                            object_name
+                                        ));
+                                    }
+                                }
+                            }
+                            parts.join(".")
+                        }
+                        sqlparser::ast::AssignmentTarget::Tuple(_) => {
+                            return Err("Tuple assignments are not supported".to_string());
+                        }
+                    };
                     let planned_expr = plan_expr(&assign.value)?;
                     my_assignments.push((col_name, planned_expr));
                 }
@@ -520,9 +575,15 @@ impl LogicalPlanner {
                 let logical_plan = self.plan_query(query)?;
                 Ok(SqlStatement::Query(logical_plan))
             }
-            Statement::Analyze { table_name, .. } => Ok(SqlStatement::Analyze {
-                table_name: table_name.to_string(),
-            }),
+            Statement::Analyze(sqlparser::ast::Analyze { table_name, .. }) => {
+                let table_str = table_name
+                    .as_ref()
+                    .map(|name| name.to_string())
+                    .ok_or_else(|| "ANALYZE statement requires a table name".to_string())?;
+                Ok(SqlStatement::Analyze {
+                    table_name: table_str,
+                })
+            }
             Statement::Explain { statement, .. } => {
                 let inner = self.plan(statement)?;
                 match inner {
@@ -543,11 +604,20 @@ impl LogicalPlanner {
                 let mut plan = self.plan_set_expr(other)?;
 
                 // Plan ORDER BY at the query level (after the set operation)
-                if !query.order_by.is_empty() {
+                let order_by_exprs = match &query.order_by {
+                    Some(ob) => match &ob.kind {
+                        sqlparser::ast::OrderByKind::Expressions(exprs) => exprs.as_slice(),
+                        sqlparser::ast::OrderByKind::All(_) => {
+                            return Err("ORDER BY ALL is not supported".to_string());
+                        }
+                    },
+                    None => &[],
+                };
+                if !order_by_exprs.is_empty() {
                     let mut sort_keys = Vec::new();
-                    for sort_expr in &query.order_by {
+                    for sort_expr in order_by_exprs {
                         let expr = plan_expr(&sort_expr.expr)?;
-                        let asc = sort_expr.asc.unwrap_or(true);
+                        let asc = sort_expr.options.asc.unwrap_or(true);
                         sort_keys.push((expr, asc));
                     }
                     plan = LogicalPlan::Sort {
@@ -557,31 +627,93 @@ impl LogicalPlanner {
                 }
 
                 // Plan LIMIT and OFFSET at the query level
-                let limit = if let Some(limit_expr) = &query.limit {
-                    let l = match limit_expr {
-                        SqlExpr::Value(SqlValue::Number(s, _)) => {
-                            s.parse::<usize>().map_err(|e| e.to_string())?
-                        }
-                        other_expr => {
-                            return Err(format!("Unsupported limit expression: {:?}", other_expr));
-                        }
-                    };
-                    Some(l)
-                } else {
-                    None
-                };
-
-                let offset = if let Some(offset_val) = &query.offset {
-                    match &offset_val.value {
-                        SqlExpr::Value(SqlValue::Number(s, _)) => {
-                            s.parse::<usize>().map_err(|e| e.to_string())?
-                        }
-                        other_expr => {
-                            return Err(format!("Unsupported offset expression: {:?}", other_expr));
-                        }
+                let (limit, offset) = match &query.limit_clause {
+                    Some(sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. }) => {
+                        let l = if let Some(limit_expr) = limit {
+                            let l_val = match limit_expr {
+                                SqlExpr::Value(val) => match &**val {
+                                    SqlValue::Number(s, _) => {
+                                        s.parse::<usize>().map_err(|e| e.to_string())?
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "Unsupported limit expression value: {:?}",
+                                            other
+                                        ));
+                                    }
+                                },
+                                other => {
+                                    return Err(format!(
+                                        "Unsupported limit expression: {:?}",
+                                        other
+                                    ));
+                                }
+                            };
+                            Some(l_val)
+                        } else {
+                            None
+                        };
+                        let o = if let Some(offset_val) = offset {
+                            match &offset_val.value {
+                                SqlExpr::Value(val) => match &**val {
+                                    SqlValue::Number(s, _) => {
+                                        s.parse::<usize>().map_err(|e| e.to_string())?
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "Unsupported offset expression value: {:?}",
+                                            other
+                                        ));
+                                    }
+                                },
+                                other => {
+                                    return Err(format!(
+                                        "Unsupported offset expression: {:?}",
+                                        other
+                                    ));
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        (l, o)
                     }
-                } else {
-                    0
+                    Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+                        let l_val = match limit {
+                            SqlExpr::Value(val) => match &**val {
+                                SqlValue::Number(s, _) => {
+                                    s.parse::<usize>().map_err(|e| e.to_string())?
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "Unsupported limit expression value: {:?}",
+                                        other
+                                    ));
+                                }
+                            },
+                            other => {
+                                return Err(format!("Unsupported limit expression: {:?}", other));
+                            }
+                        };
+                        let o_val = match offset {
+                            SqlExpr::Value(val) => match &**val {
+                                SqlValue::Number(s, _) => {
+                                    s.parse::<usize>().map_err(|e| e.to_string())?
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "Unsupported offset expression value: {:?}",
+                                        other
+                                    ));
+                                }
+                            },
+                            other => {
+                                return Err(format!("Unsupported offset expression: {:?}", other));
+                            }
+                        };
+                        (Some(l_val), o_val)
+                    }
+                    None => (None, 0),
                 };
 
                 if limit.is_some() || offset > 0 {
@@ -618,6 +750,7 @@ impl LogicalPlanner {
                     sqlparser::ast::SetOperator::Union => SetOpType::Union,
                     sqlparser::ast::SetOperator::Except => SetOpType::Except,
                     sqlparser::ast::SetOperator::Intersect => SetOpType::Intersect,
+                    sqlparser::ast::SetOperator::Minus => SetOpType::Except,
                 };
 
                 let all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
@@ -651,15 +784,22 @@ impl LogicalPlanner {
                 let (join_cond, join_type) = match &join.join_operator {
                     sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(
                         expr,
+                    ))
+                    | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(
+                        expr,
                     )) => (plan_expr(expr)?, JoinType::Inner),
                     sqlparser::ast::JoinOperator::LeftOuter(
                         sqlparser::ast::JoinConstraint::On(expr),
-                    ) => (plan_expr(expr)?, JoinType::Left),
-                    sqlparser::ast::JoinOperator::CrossJoin => (
+                    )
+                    | sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(
+                        expr,
+                    )) => (plan_expr(expr)?, JoinType::Left),
+                    sqlparser::ast::JoinOperator::CrossJoin(_) => (
                         Expr::Literal(dtdb_storage::DbValue::Int(1)),
                         JoinType::Cross,
                     ),
-                    sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::None) => (
+                    sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::None)
+                    | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::None) => (
                         Expr::Literal(dtdb_storage::DbValue::Int(1)),
                         JoinType::Cross,
                     ),
@@ -680,14 +820,23 @@ impl LogicalPlanner {
         }
 
         // 4. Plan GROUP BY / aggregations / HAVING
-        let has_groupby = !select.group_by.is_empty();
+        let (group_by_exprs, has_groupby) = match &select.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
+                if !modifiers.is_empty() {
+                    return Err("GROUP BY modifiers are not supported".to_string());
+                }
+                (exprs, !exprs.is_empty())
+            }
+            sqlparser::ast::GroupByExpr::All(_) => {
+                return Err("GROUP BY ALL is not supported".to_string());
+            }
+        };
         let has_aggrs = select_items_have_aggrs(&select.projection);
         let has_having = select.having.is_some();
 
         if has_groupby || has_aggrs || has_having {
             // Aggregate planning
-            let group_exprs = select
-                .group_by
+            let group_exprs = group_by_exprs
                 .iter()
                 .map(plan_expr)
                 .collect::<Result<Vec<_>, String>>()?;
@@ -777,7 +926,7 @@ impl LogicalPlanner {
                 let mut sort_keys = Vec::new();
                 for sort_expr in order_by {
                     let expr = plan_expr(&sort_expr.expr)?;
-                    let asc = sort_expr.asc.unwrap_or(true);
+                    let asc = sort_expr.options.asc.unwrap_or(true);
                     sort_keys.push((expr, asc));
                 }
                 plan = LogicalPlan::Sort {
@@ -791,7 +940,7 @@ impl LogicalPlanner {
                 let mut sort_keys = Vec::new();
                 for sort_expr in order_by {
                     let expr = plan_expr(&sort_expr.expr)?;
-                    let asc = sort_expr.asc.unwrap_or(true);
+                    let asc = sort_expr.options.asc.unwrap_or(true);
                     sort_keys.push((expr, asc));
                 }
                 plan = LogicalPlan::Sort {
@@ -844,7 +993,16 @@ impl LogicalPlanner {
         select: &sqlparser::ast::Select,
         query: &Query,
     ) -> Result<LogicalPlan, String> {
-        let mut plan = self.plan_select_internal(select, &query.order_by)?;
+        let order_by_exprs = match &query.order_by {
+            Some(ob) => match &ob.kind {
+                sqlparser::ast::OrderByKind::Expressions(exprs) => exprs.as_slice(),
+                sqlparser::ast::OrderByKind::All(_) => {
+                    return Err("ORDER BY ALL is not supported".to_string());
+                }
+            },
+            None => &[],
+        };
+        let mut plan = self.plan_select_internal(select, order_by_exprs)?;
 
         if select.distinct.is_some() {
             plan = LogicalPlan::Distinct {
@@ -853,28 +1011,74 @@ impl LogicalPlanner {
         }
 
         // 7. Plan LIMIT and OFFSET
-        let limit = if let Some(limit_expr) = &query.limit {
-            let l = match limit_expr {
-                SqlExpr::Value(SqlValue::Number(s, _)) => {
-                    s.parse::<usize>().map_err(|e| e.to_string())?
-                }
-                other => return Err(format!("Unsupported limit expression: {:?}", other)),
-            };
-            Some(l)
-        } else {
-            None
+        let (limit, offset) = match &query.limit_clause {
+            Some(sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. }) => {
+                let l = if let Some(limit_expr) = limit {
+                    let l_val = match limit_expr {
+                        SqlExpr::Value(val) => match &**val {
+                            SqlValue::Number(s, _) => {
+                                s.parse::<usize>().map_err(|e| e.to_string())?
+                            }
+                            other => {
+                                return Err(format!(
+                                    "Unsupported limit expression value: {:?}",
+                                    other
+                                ));
+                            }
+                        },
+                        other => return Err(format!("Unsupported limit expression: {:?}", other)),
+                    };
+                    Some(l_val)
+                } else {
+                    None
+                };
+                let o = if let Some(offset_val) = offset {
+                    match &offset_val.value {
+                        SqlExpr::Value(val) => match &**val {
+                            SqlValue::Number(s, _) => {
+                                s.parse::<usize>().map_err(|e| e.to_string())?
+                            }
+                            other => {
+                                return Err(format!(
+                                    "Unsupported offset expression value: {:?}",
+                                    other
+                                ));
+                            }
+                        },
+                        other => return Err(format!("Unsupported offset expression: {:?}", other)),
+                    }
+                } else {
+                    0
+                };
+                (l, o)
+            }
+            Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+                let l_val = match limit {
+                    SqlExpr::Value(val) => match &**val {
+                        SqlValue::Number(s, _) => s.parse::<usize>().map_err(|e| e.to_string())?,
+                        other => {
+                            return Err(format!("Unsupported limit expression value: {:?}", other));
+                        }
+                    },
+                    other => return Err(format!("Unsupported limit expression: {:?}", other)),
+                };
+                let o_val = match offset {
+                    SqlExpr::Value(val) => match &**val {
+                        SqlValue::Number(s, _) => s.parse::<usize>().map_err(|e| e.to_string())?,
+                        other => {
+                            return Err(format!(
+                                "Unsupported offset expression value: {:?}",
+                                other
+                            ));
+                        }
+                    },
+                    other => return Err(format!("Unsupported offset expression: {:?}", other)),
+                };
+                (Some(l_val), o_val)
+            }
+            None => (None, 0),
         };
 
-        let offset = if let Some(offset_val) = &query.offset {
-            match &offset_val.value {
-                SqlExpr::Value(SqlValue::Number(s, _)) => {
-                    s.parse::<usize>().map_err(|e| e.to_string())?
-                }
-                other => return Err(format!("Unsupported offset expression: {:?}", other)),
-            }
-        } else {
-            0
-        };
         if limit.is_some() || offset > 0 {
             plan = LogicalPlan::Limit {
                 source: Box::new(plan),
@@ -951,7 +1155,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             Ok(Expr::Column(name, None))
         }
         SqlExpr::Value(val) => {
-            let db_val = match val {
+            let db_val = match &**val {
                 SqlValue::Number(num_str, _) => {
                     if let Ok(i) = num_str.parse::<i64>() {
                         DbValue::Int(i)
@@ -972,7 +1176,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
             negated,
             expr,
             pattern,
-            escape_char: _,
+            ..
         } => {
             let like_expr = Expr::BinaryOp {
                 left: Box::new(plan_expr(expr)?),
@@ -1080,21 +1284,19 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
         SqlExpr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             let planned_operand = match operand {
                 Some(expr) => Some(Box::new(plan_expr(expr)?)),
                 None => None,
             };
-            let planned_conditions = conditions
-                .iter()
-                .map(plan_expr)
-                .collect::<Result<Vec<_>, String>>()?;
-            let planned_results = results
-                .iter()
-                .map(plan_expr)
-                .collect::<Result<Vec<_>, String>>()?;
+            let mut planned_conditions = Vec::new();
+            let mut planned_results = Vec::new();
+            for cw in conditions {
+                planned_conditions.push(plan_expr(&cw.condition)?);
+                planned_results.push(plan_expr(&cw.result)?);
+            }
             let planned_else = match else_result {
                 Some(expr) => Some(Box::new(plan_expr(expr)?)),
                 None => None,
@@ -1104,6 +1306,24 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                 conditions: planned_conditions,
                 results: planned_results,
                 else_result: planned_else,
+            })
+        }
+        SqlExpr::Substring {
+            expr: sub_expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut args = vec![plan_expr(sub_expr)?];
+            if let Some(from_expr) = substring_from {
+                args.push(plan_expr(from_expr)?);
+            }
+            if let Some(for_expr) = substring_for {
+                args.push(plan_expr(for_expr)?);
+            }
+            Ok(Expr::Function {
+                name: "SUBSTRING".to_string(),
+                args,
             })
         }
         SqlExpr::Function(func) => {
@@ -1128,15 +1348,25 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                     | "ROUND"
             ) {
                 let mut args = Vec::new();
-                for arg in &func.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
-                            args.push(plan_expr(inner_expr)?);
-                        }
-                        other => {
-                            return Err(format!("Unsupported function argument type: {:?}", other));
+                if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args {
+                    for arg in &arg_list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
+                                args.push(plan_expr(inner_expr)?);
+                            }
+                            other => {
+                                return Err(format!(
+                                    "Unsupported function argument type: {:?}",
+                                    other
+                                ));
+                            }
                         }
                     }
+                } else {
+                    return Err(format!(
+                        "Unsupported function argument format: {:?}",
+                        func.args
+                    ));
                 }
                 Ok(Expr::Function { name, args })
             } else {
@@ -1153,8 +1383,8 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                     "MATCH against multiple columns is not supported in Phase 2".to_string()
                 );
             }
-            let col_name = columns[0].value.clone();
-            let query_str = match match_value {
+            let col_name = columns[0].to_string();
+            let query_str = match &**match_value {
                 sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
                 other => {
                     return Err(format!(
@@ -1201,7 +1431,7 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
 
 fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {
     match expr {
-        SqlExpr::Value(val) => match val {
+        SqlExpr::Value(val) => match &**val {
             SqlValue::Number(num_str, _) => {
                 if let Ok(i) = num_str.parse::<i64>() {
                     Ok(DbValue::Int(i))
@@ -1249,10 +1479,16 @@ fn rewrite_having_expr(
             if matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
                 let alias = func.to_string();
 
-                let arg_expr = if func.args.is_empty() {
+                let args_vec = match &func.args {
+                    sqlparser::ast::FunctionArguments::List(arg_list) => arg_list.args.as_slice(),
+                    sqlparser::ast::FunctionArguments::None => &[],
+                    other => return Err(format!("Unsupported aggregate arguments: {:?}", other)),
+                };
+
+                let arg_expr = if args_vec.is_empty() {
                     Expr::Literal(DbValue::Int(1))
                 } else {
-                    match &func.args[0] {
+                    match &args_vec[0] {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
                             plan_expr(inner_expr)?
                         }
@@ -1280,9 +1516,11 @@ fn rewrite_having_expr(
                 *expr = SqlExpr::Identifier(sqlparser::ast::Ident::new(alias));
                 Ok(())
             } else {
-                for arg in &mut func.args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) = arg {
-                        rewrite_having_expr(inner_expr, aggr_exprs, field_names)?;
+                if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut func.args {
+                    for arg in &mut arg_list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) = arg {
+                            rewrite_having_expr(inner_expr, aggr_exprs, field_names)?;
+                        }
                     }
                 }
                 Ok(())
@@ -1297,15 +1535,12 @@ fn rewrite_having_expr(
         SqlExpr::UnaryOp { expr: inner, .. } => rewrite_having_expr(inner, aggr_exprs, field_names),
         SqlExpr::Case {
             conditions,
-            results,
             else_result,
             ..
         } => {
             for cond in conditions {
-                rewrite_having_expr(cond, aggr_exprs, field_names)?;
-            }
-            for res in results {
-                rewrite_having_expr(res, aggr_exprs, field_names)?;
+                rewrite_having_expr(&mut cond.condition, aggr_exprs, field_names)?;
+                rewrite_having_expr(&mut cond.result, aggr_exprs, field_names)?;
             }
             if let Some(el) = else_result {
                 rewrite_having_expr(el, aggr_exprs, field_names)?;

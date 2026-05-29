@@ -1,24 +1,24 @@
 use dtdb_storage::DbValue;
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, JoinConstraint, JoinOperator, Offset, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue, Values,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, JoinConstraint, JoinOperator, Query, Select,
+    SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue, Values,
 };
 use std::collections::HashMap;
 
 /// Convert DbValue to a sqlparser SqlExpr literal.
 fn db_value_to_sql_expr(val: &DbValue) -> SqlExpr {
     match val {
-        DbValue::Int(i) => SqlExpr::Value(SqlValue::Number(i.to_string(), false)),
-        DbValue::Float(f) => SqlExpr::Value(SqlValue::Number(f.to_string(), false)),
-        DbValue::Bool(b) => SqlExpr::Value(SqlValue::Boolean(*b)),
-        DbValue::String(s) => SqlExpr::Value(SqlValue::SingleQuotedString(s.clone())),
-        DbValue::Null => SqlExpr::Value(SqlValue::Null),
+        DbValue::Int(i) => SqlExpr::Value(SqlValue::Number(i.to_string(), false).into()),
+        DbValue::Float(f) => SqlExpr::Value(SqlValue::Number(f.to_string(), false).into()),
+        DbValue::Bool(b) => SqlExpr::Value(SqlValue::Boolean(*b).into()),
+        DbValue::String(s) => SqlExpr::Value(SqlValue::SingleQuotedString(s.clone()).into()),
+        DbValue::Null => SqlExpr::Value(SqlValue::Null.into()),
         DbValue::Bytes(bytes) => {
             let mut hex = String::new();
             for b in bytes {
                 hex.push_str(&format!("{:02x}", b));
             }
-            SqlExpr::Value(SqlValue::HexStringLiteral(hex))
+            SqlExpr::Value(SqlValue::HexStringLiteral(hex).into())
         }
     }
 }
@@ -34,17 +34,19 @@ pub fn bind_expr(expr: &mut SqlExpr, params: &HashMap<String, DbValue>) -> Resul
                 return Err(format!("Unbound parameter: @{}", name));
             }
         }
-        SqlExpr::Value(SqlValue::Placeholder(placeholder)) => {
-            let mut lookup_name = placeholder.clone();
-            if lookup_name.starts_with(':') {
-                lookup_name = lookup_name[1..].to_string();
-            }
-            if let Some(val) = params.get(&lookup_name) {
-                *expr = db_value_to_sql_expr(val);
-            } else if let Some(val) = params.get(placeholder) {
-                *expr = db_value_to_sql_expr(val);
-            } else {
-                return Err(format!("Unbound parameter: {}", placeholder));
+        SqlExpr::Value(value_with_span) => {
+            if let SqlValue::Placeholder(placeholder) = &**value_with_span {
+                let mut lookup_name = placeholder.clone();
+                if lookup_name.starts_with(':') {
+                    lookup_name = lookup_name[1..].to_string();
+                }
+                if let Some(val) = params.get(&lookup_name) {
+                    *expr = db_value_to_sql_expr(val);
+                } else if let Some(val) = params.get(placeholder) {
+                    *expr = db_value_to_sql_expr(val);
+                } else {
+                    return Err(format!("Unbound parameter: {}", placeholder));
+                }
             }
         }
         SqlExpr::BinaryOp { left, right, .. } => {
@@ -71,17 +73,19 @@ pub fn bind_expr(expr: &mut SqlExpr, params: &HashMap<String, DbValue>) -> Resul
             bind_expr(high, params)?;
         }
         SqlExpr::Function(func) => {
-            for arg in &mut func.args {
-                match arg {
-                    FunctionArg::Named { arg: arg_expr, .. } => {
-                        if let FunctionArgExpr::Expr(e) = arg_expr {
+            if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut func.args {
+                for arg in &mut arg_list.args {
+                    match arg {
+                        FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
                             bind_expr(e, params)?;
                         }
-                    }
-                    FunctionArg::Unnamed(arg_expr) => {
-                        if let FunctionArgExpr::Expr(e) = arg_expr {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
                             bind_expr(e, params)?;
                         }
+                        _ => {}
                     }
                 }
             }
@@ -101,20 +105,32 @@ pub fn bind_expr(expr: &mut SqlExpr, params: &HashMap<String, DbValue>) -> Resul
         SqlExpr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand {
                 bind_expr(op, params)?;
             }
             for cond in conditions {
-                bind_expr(cond, params)?;
-            }
-            for res in results {
-                bind_expr(res, params)?;
+                bind_expr(&mut cond.condition, params)?;
+                bind_expr(&mut cond.result, params)?;
             }
             if let Some(else_res) = else_result {
                 bind_expr(else_res, params)?;
+            }
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            bind_expr(expr, params)?;
+            if let Some(from_expr) = substring_from {
+                bind_expr(from_expr, params)?;
+            }
+            if let Some(for_expr) = substring_for {
+                bind_expr(for_expr, params)?;
             }
         }
         _ => {}
@@ -151,10 +167,7 @@ fn bind_table_factor(
 fn bind_select(select: &mut Select, params: &HashMap<String, DbValue>) -> Result<(), String> {
     for item in &mut select.projection {
         match item {
-            SelectItem::UnnamedExpr(expr) => {
-                bind_expr(expr, params)?;
-            }
-            SelectItem::ExprWithAlias { expr, .. } => {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 bind_expr(expr, params)?;
             }
             _ => {}
@@ -165,10 +178,17 @@ fn bind_select(select: &mut Select, params: &HashMap<String, DbValue>) -> Result
         for join in &mut from_item.joins {
             bind_table_factor(&mut join.relation, params)?;
             match &mut join.join_operator {
-                JoinOperator::Inner(constraint) => bind_join_constraint(constraint, params)?,
-                JoinOperator::LeftOuter(constraint) => bind_join_constraint(constraint, params)?,
-                JoinOperator::RightOuter(constraint) => bind_join_constraint(constraint, params)?,
-                JoinOperator::FullOuter(constraint) => bind_join_constraint(constraint, params)?,
+                JoinOperator::Inner(constraint)
+                | JoinOperator::Join(constraint)
+                | JoinOperator::Left(constraint)
+                | JoinOperator::LeftOuter(constraint)
+                | JoinOperator::Right(constraint)
+                | JoinOperator::RightOuter(constraint)
+                | JoinOperator::FullOuter(constraint)
+                | JoinOperator::CrossJoin(constraint)
+                | JoinOperator::Semi(constraint)
+                | JoinOperator::LeftSemi(constraint)
+                | JoinOperator::RightSemi(constraint) => bind_join_constraint(constraint, params)?,
                 _ => {}
             }
         }
@@ -176,8 +196,13 @@ fn bind_select(select: &mut Select, params: &HashMap<String, DbValue>) -> Result
     if let Some(expr) = &mut select.selection {
         bind_expr(expr, params)?;
     }
-    for expr in &mut select.group_by {
-        bind_expr(expr, params)?;
+    match &mut select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
+            for expr in exprs {
+                bind_expr(expr, params)?;
+            }
+        }
+        sqlparser::ast::GroupByExpr::All(_) => {}
     }
     if let Some(expr) = &mut select.having {
         bind_expr(expr, params)?;
@@ -190,7 +215,7 @@ fn bind_select(select: &mut Select, params: &HashMap<String, DbValue>) -> Result
 
 fn bind_values(values: &mut Values, params: &HashMap<String, DbValue>) -> Result<(), String> {
     for row in &mut values.rows {
-        for expr in row {
+        for expr in &mut row.content {
             bind_expr(expr, params)?;
         }
     }
@@ -219,14 +244,37 @@ fn bind_set_expr(set_expr: &mut SetExpr, params: &HashMap<String, DbValue>) -> R
 
 fn bind_query(query: &mut Query, params: &HashMap<String, DbValue>) -> Result<(), String> {
     bind_set_expr(&mut query.body, params)?;
-    for order_item in &mut query.order_by {
-        bind_expr(&mut order_item.expr, params)?;
+    if let Some(sqlparser::ast::OrderBy {
+        kind: sqlparser::ast::OrderByKind::Expressions(exprs),
+        ..
+    }) = &mut query.order_by
+    {
+        for order_item in exprs {
+            bind_expr(&mut order_item.expr, params)?;
+        }
     }
-    if let Some(expr) = &mut query.limit {
-        bind_expr(expr, params)?;
-    }
-    if let Some(Offset { value, .. }) = &mut query.offset {
-        bind_expr(value, params)?;
+    if let Some(limit_clause) = &mut query.limit_clause {
+        match limit_clause {
+            sqlparser::ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if let Some(limit_expr) = limit {
+                    bind_expr(limit_expr, params)?;
+                }
+                if let Some(offset_struct) = offset {
+                    bind_expr(&mut offset_struct.value, params)?;
+                }
+                for expr in limit_by {
+                    bind_expr(expr, params)?;
+                }
+            }
+            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                bind_expr(offset, params)?;
+                bind_expr(limit, params)?;
+            }
+        }
     }
     Ok(())
 }
@@ -237,27 +285,21 @@ pub fn bind_statement(
     params: &HashMap<String, DbValue>,
 ) -> Result<(), String> {
     match statement {
-        Statement::Insert { source, .. } => {
-            bind_query(source, params)?;
+        Statement::Insert(insert) => {
+            if let Some(source) = &mut insert.source {
+                bind_query(source, params)?;
+            }
         }
-        Statement::Delete {
-            selection: Some(expr),
-            ..
-        } => {
-            bind_expr(expr, params)?;
+        Statement::Delete(delete) => {
+            if let Some(expr) = &mut delete.selection {
+                bind_expr(expr, params)?;
+            }
         }
-        Statement::Delete {
-            selection: None, ..
-        } => {}
-        Statement::Update {
-            assignments,
-            selection,
-            ..
-        } => {
-            for assign in assignments {
+        Statement::Update(update) => {
+            for assign in &mut update.assignments {
                 bind_expr(&mut assign.value, params)?;
             }
-            if let Some(expr) = selection {
+            if let Some(expr) = &mut update.selection {
                 bind_expr(expr, params)?;
             }
         }
