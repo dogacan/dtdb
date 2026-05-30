@@ -1,8 +1,9 @@
+use crate::executor::{CoalesceKey, Executor, PeriodicHandle, Priority};
 use crate::manifest::Manifest;
 use crate::memtable::MemTable;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
-use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, ThreadSpawner};
+use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,50 +34,46 @@ struct EngineInner {
     options: EngineOptions,
     write_mutex: Mutex<()>,
     compaction_mutex: Mutex<()>,
-    compaction_signal: Mutex<CompactionSignal>,
     manifest_mutex: Mutex<()>,
     next_sst_id: AtomicU64,
-    spawner: Arc<dyn ThreadSpawner>,
+    executor: Arc<dyn Executor>,
+    /// Keeps the background WAL-sync schedule alive; dropping the engine
+    /// cancels it.
+    wal_sync_handle: Mutex<Option<PeriodicHandle>>,
     block_cache: Option<Arc<crate::BlockCache>>,
     last_compacted_keys: Mutex<std::collections::HashMap<usize, DbKey>>,
-}
-
-#[derive(Default)]
-struct CompactionSignal {
-    pending: bool,
-    running: bool,
 }
 
 impl StorageEngine {
     /// Opens a StorageEngine directory.
     pub fn open(dir_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        Self::open_with_spawner(dir_path, options, Arc::new(crate::DefaultSpawner))
+        Self::open_with_executor(dir_path, options, crate::default_executor())
     }
 
-    /// Opens a StorageEngine directory with a custom ThreadSpawner.
-    pub fn open_with_spawner(
+    /// Opens a StorageEngine directory backed by the given [`Executor`].
+    pub fn open_with_executor(
         dir_path: impl AsRef<Path>,
         options: EngineOptions,
-        spawner: Arc<dyn ThreadSpawner>,
+        executor: Arc<dyn Executor>,
     ) -> Result<Self> {
-        let inner = Arc::new(EngineInner::open(dir_path, options, spawner.clone())?);
+        let inner = Arc::new(EngineInner::open(dir_path, options, executor.clone())?);
 
         if let Some(ms) = inner.options.wal_sync_interval_ms
             && ms > 0
         {
             let inner_weak = Arc::downgrade(&inner);
-            spawner.spawn(Box::new(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                    if let Some(engine) = inner_weak.upgrade() {
-                        if let Err(e) = engine.sync_wal() {
-                            tracing::error!(error = ?e, "background WAL sync failed");
-                        }
-                    } else {
-                        break;
+            let handle = executor.submit_periodic(
+                std::time::Duration::from_millis(ms),
+                Priority::Normal,
+                Box::new(move || {
+                    if let Some(engine) = inner_weak.upgrade()
+                        && let Err(e) = engine.sync_wal()
+                    {
+                        tracing::error!(error = ?e, "background WAL sync failed");
                     }
-                }
-            }));
+                }),
+            );
+            *inner.wal_sync_handle.lock().unwrap() = Some(handle);
         }
 
         Ok(Self { inner })
@@ -147,7 +144,7 @@ impl EngineInner {
     pub fn open(
         dir_path: impl AsRef<Path>,
         options: EngineOptions,
-        spawner: Arc<dyn ThreadSpawner>,
+        executor: Arc<dyn Executor>,
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
@@ -332,10 +329,10 @@ impl EngineInner {
             options: active_options,
             write_mutex: Mutex::new(()),
             compaction_mutex: Mutex::new(()),
-            compaction_signal: Mutex::new(CompactionSignal::default()),
             manifest_mutex: Mutex::new(()),
             next_sst_id: AtomicU64::new(max_id + 1),
-            spawner,
+            executor,
+            wal_sync_handle: Mutex::new(None),
             block_cache,
             last_compacted_keys: Mutex::new(std::collections::HashMap::new()),
         })
@@ -1147,32 +1144,22 @@ impl EngineInner {
     }
 
     fn trigger_compaction(self: &Arc<Self>) {
-        let mut sig = self.compaction_signal.lock().unwrap();
-        sig.pending = true;
-        if !sig.running {
-            sig.running = true;
-            let inner = self.clone();
-            self.spawner.spawn(Box::new(move || {
-                inner.run_compaction_loop();
-            }));
-        }
-    }
-
-    fn run_compaction_loop(self: Arc<Self>) {
-        let _compaction_lock = self.compaction_mutex.lock().unwrap();
-        loop {
-            if let Err(e) = self.compact_if_needed_locked() {
-                tracing::error!(error = ?e, "background compaction failed");
-                break;
-            }
-
-            let mut sig = self.compaction_signal.lock().unwrap();
-            if !sig.pending {
-                sig.running = false;
-                break;
-            }
-            sig.pending = false;
-        }
+        let inner = self.clone();
+        // Coalesce per engine: at most one compaction runs at a time, and a
+        // request arriving mid-run schedules exactly one trailing re-run. This
+        // preserves the previous CompactionSignal {running, pending} semantics
+        // while letting the worker thread be reused between rounds.
+        let key = CoalesceKey::new(format!("compact:{}", self.dir_path.display()));
+        self.executor.submit(
+            Priority::High,
+            Some(key),
+            Box::new(move || {
+                let _compaction_lock = inner.compaction_mutex.lock().unwrap();
+                if let Err(e) = inner.compact_if_needed_locked() {
+                    tracing::error!(error = ?e, "background compaction failed");
+                }
+            }),
+        );
     }
 
     pub fn sync_wal(&self) -> Result<()> {

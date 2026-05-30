@@ -26,7 +26,7 @@ pub struct DuctTapeDbServiceImpl {
     data_dir: PathBuf,
     databases: Arc<RwLock<HashMap<String, DbState>>>,
     next_tx_id: Arc<AtomicU64>,
-    spawner: Arc<dyn dtdb_storage::ThreadSpawner>,
+    executor: Arc<dyn dtdb_storage::Executor>,
 }
 
 struct DbState {
@@ -36,12 +36,12 @@ struct DbState {
 
 impl DuctTapeDbServiceImpl {
     pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, String> {
-        Self::new_with_spawner(data_dir, Arc::new(dtdb_storage::DefaultSpawner))
+        Self::new_with_executor(data_dir, dtdb_storage::default_executor())
     }
 
-    pub fn new_with_spawner(
+    pub fn new_with_executor(
         data_dir: impl AsRef<Path>,
-        spawner: Arc<dyn dtdb_storage::ThreadSpawner>,
+        executor: Arc<dyn dtdb_storage::Executor>,
     ) -> Result<Self, String> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
@@ -51,7 +51,7 @@ impl DuctTapeDbServiceImpl {
             data_dir: data_dir.clone(),
             databases,
             next_tx_id: Arc::new(AtomicU64::new(1)),
-            spawner,
+            executor,
         };
 
         // Scan and restore databases
@@ -72,16 +72,12 @@ impl DuctTapeDbServiceImpl {
                 if path.join("db_options.bin").exists() {
                     tracing::info!(db = %db_name, "restoring database");
                     let database = Arc::new(
-                        Database::open_with_spawner(&path, self.spawner.clone())
+                        Database::open_with_executor(&path, self.executor.clone())
                             .map_err(|e| e.to_string())?,
                     );
                     database.start_background_analyze_if_needed(&database);
+                    database.start_background_flush_if_needed(&database);
                     let sql_engine = Arc::new(SqlEngine::new(database.clone()));
-
-                    // Spawn periodic flush if configured
-                    if let Some(ms) = database.options.flush_interval_ms {
-                        Self::spawn_periodic_flush(database.clone(), ms);
-                    }
 
                     dbs.insert(
                         db_name.to_string(),
@@ -94,35 +90,6 @@ impl DuctTapeDbServiceImpl {
             }
         }
         Ok(())
-    }
-
-    fn spawn_periodic_flush(database: Arc<Database>, interval_ms: u64) {
-        let db_weak = Arc::downgrade(&database);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
-            // First tick fires immediately, so skip it to wait for the interval
-            interval.tick().await;
-
-            loop {
-                interval.tick().await;
-                if let Some(db) = db_weak.upgrade() {
-                    let tables = db.list_tables();
-                    for table_name in tables {
-                        if let Ok(table) = db.get_table(&table_name)
-                            && let Err(e) = table.flush_memtable()
-                        {
-                            tracing::error!(
-                                table = %table_name,
-                                error = %e,
-                                "periodic flush failed"
-                            );
-                        }
-                    }
-                } else {
-                    break; // Database was dropped, exit loop
-                }
-            }
-        });
     }
 
     /// Returns the database and SQL engine for the given database name, if it exists.
@@ -288,20 +255,16 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         };
 
         let database = Arc::new(
-            Database::open_with_options_and_spawner(
+            Database::open_with_options_and_executor(
                 &db_path,
                 options.clone(),
-                self.spawner.clone(),
+                self.executor.clone(),
             )
             .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?,
         );
         database.start_background_analyze_if_needed(&database);
+        database.start_background_flush_if_needed(&database);
         let sql_engine = Arc::new(SqlEngine::new(database.clone()));
-
-        // Spawn periodic flush task if flush_interval_ms is configured
-        if let Some(ms) = options.flush_interval_ms {
-            Self::spawn_periodic_flush(database.clone(), ms);
-        }
 
         dbs.insert(
             db_name.to_string(),

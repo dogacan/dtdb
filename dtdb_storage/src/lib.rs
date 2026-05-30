@@ -4,6 +4,7 @@ use thiserror::Error;
 pub mod block_cache;
 pub mod bloom;
 pub mod engine;
+pub mod executor;
 pub mod manifest;
 pub mod memtable;
 pub mod merge_iter;
@@ -13,20 +14,12 @@ pub mod wal;
 pub use block_cache::{BlockCache, LruCache};
 pub use bloom::BloomFilter;
 pub use engine::{StorageEngine, StorageEngineStatistics};
+pub use executor::{
+    CoalesceKey, Executor, ExecutorConfig, InlineExecutor, MIN_WORKER_THREADS, PeriodicHandle,
+    Priority, ThreadPoolExecutor, default_executor,
+};
 pub use scan_iter::ScanIterator;
 pub use wal::WalEntry;
-
-pub trait ThreadSpawner: Send + Sync + 'static {
-    fn spawn(&self, f: Box<dyn FnOnce() + Send + 'static>);
-}
-
-#[derive(Clone)]
-pub struct DefaultSpawner;
-impl ThreadSpawner for DefaultSpawner {
-    fn spawn(&self, f: Box<dyn FnOnce() + Send + 'static>) {
-        std::thread::spawn(f);
-    }
-}
 
 /// Result type wrapper for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
