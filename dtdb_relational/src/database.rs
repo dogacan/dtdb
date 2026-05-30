@@ -973,7 +973,8 @@ impl Database {
         let db_options_path = dir_path.join("db_options.bin");
         let bytes = bincode::serialize(&options)
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
-        fs::write(&db_options_path, bytes)?;
+        dtdb_storage::atomic_write(&db_options_path, &bytes, options.fsync_method)
+            .map_err(RelationalError::Storage)?;
 
         let mut tables = HashMap::new();
         let mut statistics = HashMap::new();
@@ -1172,7 +1173,7 @@ impl Database {
 
         // Save schema configuration
         let schema_path = table_path.join("schema.bin");
-        schema.save_to_file(&schema_path)?;
+        schema.save_to_file(&schema_path, self.options.fsync_method)?;
 
         // Pass EngineOptions based on self.options
         let engine_opts = EngineOptions {
@@ -2037,7 +2038,7 @@ impl Database {
         //     truncate the schema file.
         let mut new_schema = table.schema.clone();
         new_schema.indexes.push(new_index_def.clone());
-        new_schema.save_to_file_atomic(&schema_path)?;
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
 
         // 11. Publish the new index in-memory.
         table.schema.indexes.push(new_index_def);
@@ -2089,7 +2090,9 @@ impl Database {
         let table_path = self.dir_path.join(table_name);
         let schema_path = table_path.join("schema.bin");
         table.schema.indexes.remove(idx_pos);
-        table.schema.save_to_file(&schema_path)?;
+        table
+            .schema
+            .save_to_file(&schema_path, self.options.fsync_method)?;
 
         // 5. Delete on-disk index directory
         let idx_path = Table::index_dir(&table_path, index_name);

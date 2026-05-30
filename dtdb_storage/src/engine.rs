@@ -156,7 +156,7 @@ impl EngineInner {
             bincode::deserialize::<EngineOptions>(&bytes)?
         } else {
             let bytes = bincode::serialize(&options)?;
-            fs::write(&options_path, bytes)?;
+            crate::atomic_write(&options_path, &bytes, options.fsync_method)?;
             options
         };
 

@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions};
+use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, FsyncMethod};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -505,38 +505,18 @@ impl Schema {
         self.columns.iter().position(|col| col.name == name)
     }
 
-    /// Saves the schema to a file at the given path.
-    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<()> {
-        let bytes = bincode::serialize(self)?;
-        std::fs::write(path, bytes)?;
-        Ok(())
-    }
-
-    /// Atomically replaces the on-disk schema file via temp-write + rename.
+    /// Durably and atomically writes the schema to `path`.
     ///
-    /// Use this rather than `save_to_file` for in-place schema updates
-    /// (e.g. adding an index) where a partial write or a crash mid-update
-    /// must not leave the schema file truncated or pointing at an index
-    /// whose data hasn't been written yet.
-    pub fn save_to_file_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
+    /// Always goes through [`dtdb_storage::atomic_write`] (temp-write → fsync →
+    /// rename → parent-dir fsync), so a partial write or a crash mid-update can
+    /// never leave the schema file truncated or pointing at an index whose data
+    /// hasn't been written yet. Callers performing a schema change alongside
+    /// on-disk index data must still order this write *after* the index data is
+    /// durable, so a crash can't surface a schema that references missing data.
+    pub fn save_to_file(&self, path: impl AsRef<Path>, fsync_method: FsyncMethod) -> Result<()> {
         let bytes = bincode::serialize(self)?;
-        let tmp_path = match path.file_name() {
-            Some(name) => {
-                let mut tmp_name = std::ffi::OsString::from(".");
-                tmp_name.push(name);
-                tmp_name.push(".tmp");
-                path.with_file_name(tmp_name)
-            }
-            None => path.with_extension("tmp"),
-        };
-        std::fs::write(&tmp_path, bytes)?;
-        std::fs::rename(&tmp_path, path)?;
-        if let Err(e) = dtdb_storage::fsync_parent_dir(path) {
-            // Mirror the storage layer's tolerance for filesystems that don't
-            // support directory fsync (the rename itself is durable on POSIX).
-            return Err(RelationalError::Storage(e));
-        }
+        dtdb_storage::atomic_write(path.as_ref(), &bytes, fsync_method)
+            .map_err(RelationalError::Storage)?;
         Ok(())
     }
 
@@ -1036,23 +1016,12 @@ mod tests {
             col("id", DataType::Int, true),
             col("name", DataType::String, false),
         ]);
-        schema.save_to_file(&path).unwrap();
-        let loaded = Schema::load_from_file(&path).unwrap();
-        assert_eq!(schema, loaded);
-    }
-
-    #[test]
-    fn save_to_file_atomic_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("schema.bin");
-        let schema = Schema::new_with_options(vec![col("id", DataType::Int, true)], HashMap::new());
-        schema.save_to_file_atomic(&path).unwrap();
-        assert!(path.exists());
+        schema.save_to_file(&path, FsyncMethod::Fullfsync).unwrap();
         let loaded = Schema::load_from_file(&path).unwrap();
         assert_eq!(schema, loaded);
 
-        // Atomic replace over an existing file leaves no stray temp file.
-        schema.save_to_file_atomic(&path).unwrap();
+        // An atomic replace over an existing file leaves no stray temp file.
+        schema.save_to_file(&path, FsyncMethod::Fullfsync).unwrap();
         let tmp = dir.path().join(".schema.bin.tmp");
         assert!(!tmp.exists());
     }
