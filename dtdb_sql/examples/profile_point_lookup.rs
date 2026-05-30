@@ -11,8 +11,8 @@
 //!   cargo run -p dtdb_sql --release --example profile_point_lookup
 
 use dtdb_relational::{Database, Transaction};
-use dtdb_sql::{LogicalPlanner, Optimizer, SqlEngine, SqlStatement};
-use dtdb_storage::DbValue;
+use dtdb_sql::{ExecutionResult, LogicalPlanner, Optimizer, SqlEngine, SqlStatement};
+use dtdb_storage::{DbKey, DbValue};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::hint::black_box;
@@ -71,6 +71,17 @@ fn main() {
                 )
                 .unwrap();
         }
+        tx.commit().unwrap();
+    }
+
+    // A secondary index on `k`. In this dataset `k = (i*31) % 100000` is
+    // distinct across rows, so `k = ?` matches exactly one row — directly
+    // comparable to the primary-key point lookup.
+    {
+        let tx = Transaction::new(3, db.clone());
+        engine
+            .execute("CREATE INDEX bench_k ON bench (k)", &tx)
+            .unwrap();
         tx.commit().unwrap();
     }
 
@@ -181,6 +192,118 @@ fn main() {
         t_prepared / 1000.0,
         100.0 * t_prepared / t_full,
         t_full / t_prepared
+    );
+
+    // --- Secondary-index equality: SELECT v FROM bench WHERE k = ? ---
+    // The index is non-covering, so `index_scan` does two hops internally:
+    // a prefix range-scan of the index to recover the primary key, then a
+    // (batched) point `get` of the row. This measures the full cost so we can
+    // size what an index point-get fast path could save versus the PK path.
+    let k_for = |i: usize| ((i * 97) % ROWS) * 31 % 100_000;
+    let idx_sql_for = |i: usize| format!("SELECT v FROM bench WHERE k = {}", k_for(i));
+
+    // Confirm the optimizer actually chose the index (not a full scan); an
+    // accidental full scan would make these numbers meaningless.
+    let idx_plan = {
+        let tx = Transaction::new(4, db.clone());
+        let res = engine
+            .execute(&format!("EXPLAIN {}", idx_sql_for(0)), &tx)
+            .unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
+                DbValue::String(s) => s.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    };
+    let uses_index = idx_plan.contains("IndexScan");
+
+    let mut txid4 = 3_000_000u64;
+    let t_idx_full = bench(|i| {
+        let tx = Transaction::new(txid4, db.clone());
+        txid4 += 1;
+        let res = engine.execute(&idx_sql_for(i), &tx).unwrap();
+        tx.commit().unwrap();
+        black_box(res);
+    });
+
+    let idx_prepared = engine.prepare("SELECT v FROM bench WHERE k = :k").unwrap();
+    let mut txid5 = 4_000_000u64;
+    let t_idx_prepared = bench(|i| {
+        let tx = Transaction::new(txid5, db.clone());
+        txid5 += 1;
+        let mut params = std::collections::HashMap::new();
+        params.insert("k".to_string(), DbValue::Int(k_for(i) as i64));
+        let res = engine
+            .execute_prepared(&idx_prepared, &tx, &params)
+            .unwrap();
+        tx.commit().unwrap();
+        black_box(res);
+    });
+
+    // Raw two-hop storage cost: `index_scan` directly (index prefix-scan + PK
+    // get), with no parse/plan/optimize and no operator tree. This is the
+    // irreducible part; the gap up to the prepared cycle is what a fast path
+    // (skipping operators/allocations) could hope to reclaim.
+    let v_cols = vec!["v".to_string()];
+    let mut txid6 = 5_000_000u64;
+    let t_idx_raw = bench(|i| {
+        let tx = Transaction::new(txid6, db.clone());
+        txid6 += 1;
+        let k = DbKey::Int(k_for(i) as i64);
+        let rows = tx
+            .index_scan("bench", "bench_k", &k, &k, Some(&v_cols))
+            .unwrap();
+        tx.commit().unwrap();
+        black_box(rows);
+    });
+
+    println!("Secondary-index equality: SELECT v FROM bench WHERE k = ?   (unique values)\n");
+    println!("  optimizer chose IndexScan: {uses_index}");
+    println!(
+        "  {:<28} {:>9.0} ns/query  ({:.2} us)",
+        "full cycle (measured)",
+        t_idx_full,
+        t_idx_full / 1000.0
+    );
+    println!(
+        "  {:<28} {:>9.0} ns/query  ({:.2} us)",
+        "prepared",
+        t_idx_prepared,
+        t_idx_prepared / 1000.0
+    );
+    println!(
+        "  {:<28} {:>9.0} ns/query  ({:.2} us)",
+        "raw index_scan (storage)",
+        t_idx_raw,
+        t_idx_raw / 1000.0
+    );
+    // Decompose the prepared cycle:
+    //   prepared = raw storage + optimize(re-run) + txn + operator overhead
+    // A point-get fast path would NOT remove the optimize pass, the txn, the
+    // irreducible storage, or the residual filter/projection eval — only the
+    // operator construction/teardown and `index_scan`'s eager Vec/HashSet
+    // allocations. So the operator-overhead term is the realistic ceiling on
+    // what such a fast path could save (and even part of it — the eval — stays).
+    let operator_overhead = (t_idx_prepared - t_idx_raw - optimize - t_txn).max(0.0);
+    println!(
+        "\n  index vs PK point: full {:.2}x, prepared {:.2}x  (the extra over PK is\n  \
+         mostly the index prefix-scan; the PK->row hop is already a point get)",
+        t_idx_full / t_full,
+        t_idx_prepared / t_prepared
+    );
+    println!(
+        "  prepared breakdown: raw storage {:.0} + optimize {:.0} + txn {:.0} + operators {:.0} ns",
+        t_idx_raw, optimize, t_txn, operator_overhead
+    );
+    println!(
+        "  -> a fast path could target ~{:.0} ns ({:.0}% of prepared) at most; the\n  \
+         {:.0} ns raw index_scan is irreducible (the index hop can't become a point get).\n",
+        operator_overhead,
+        100.0 * operator_overhead / t_idx_prepared,
+        t_idx_raw,
     );
 
     let _ = std::fs::remove_dir_all(&dir);
