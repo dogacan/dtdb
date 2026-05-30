@@ -7,7 +7,7 @@ pub mod tokenizer;
 pub mod transaction;
 
 pub use database::{
-    Database, DatabaseOptions, GroupStats, IndexStats, RelationalMutation, Table,
+    Database, DatabaseOptions, GroupStats, IndexStats, RelationalMutation, TXN_LOG_FORMAT, Table,
     TableScanIterator, TableStatistics, TransactionRecord,
 };
 pub use error::{RelationalError, Result};
