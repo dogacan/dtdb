@@ -1,0 +1,23 @@
+# ThreadSanitizer suppressions for DuctTapeDB.
+#
+# Format: https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
+# `race:<substr>` suppresses a data-race report if the substring matches any
+# frame in either stack trace (matched against symbolized function names).
+#
+# ---------------------------------------------------------------------------
+# Tokio multi-threaded runtime internals.
+#
+# Tokio's work-stealing scheduler and I/O driver synchronize with atomic
+# operations whose memory orderings ThreadSanitizer cannot fully model
+# (notably under `-Zbuild-std`, where parts of std are recompiled without the
+# happens-before annotations tsan relies on). This produces benign
+# false-positive race reports entirely inside the runtime (e.g.
+# `tokio::runtime::io::scheduled_io::set_readiness`,
+# `multi_thread::worker::park`, waker `mem::replace`), with no DuctTapeDB frame
+# involved. They reproduce on a clean checkout independent of our code.
+#
+# DuctTapeDB's own background executor (dtdb_storage::executor) is plain
+# std threads/Mutex/Condvar and is NOT suppressed here, so real races in our
+# code are still caught.
+race:tokio::runtime
+race:tokio::loom
