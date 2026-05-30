@@ -3,14 +3,11 @@ use crate::row::Row;
 use crate::schema::{IndexDefinition, IndexType, Schema};
 use crate::transaction::Transaction;
 use dtdb_storage::{
-    CompressionType, DbKey, DbValue, EngineOptions, Executor, FsyncMethod, PeriodicHandle,
-    Priority, StorageEngine, WalEntry,
+    CompressionType, DbKey, DbValue, EngineOptions, Executor, FramedLog, FsyncMethod, LogFormat,
+    PeriodicHandle, Priority, StorageEngine, WalEntry,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -38,6 +35,15 @@ impl From<RelationalMutation> for WalEntry {
         }
     }
 }
+
+/// On-disk format tag for the transaction log. The magic distinguishes it from
+/// other `FramedLog` files (e.g. a storage WAL) so opening the wrong kind fails
+/// loudly on the header check. Exposed so white-box tests and offline tooling
+/// can read/write the log in its real framed format.
+pub const TXN_LOG_FORMAT: LogFormat = LogFormat {
+    magic: *b"DTXN",
+    version: 1,
+};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum TransactionRecord {
@@ -873,7 +879,7 @@ pub struct Database {
     tables: RwLock<HashMap<String, Table>>,
     pub options: DatabaseOptions,
     transaction_log_path: PathBuf,
-    transaction_log_file: Mutex<Option<File>>,
+    transaction_log: Mutex<Option<FramedLog<TransactionRecord>>>,
     active_transactions: Mutex<HashSet<u64>>,
     global_commit_version: std::sync::atomic::AtomicU64,
     occ_active_transactions: Mutex<HashMap<u64, u64>>,
@@ -1086,7 +1092,7 @@ impl Database {
         }
 
         let transaction_log_path = dir_path.join("transactions.log");
-        let transaction_log_file = Mutex::new(None);
+        let transaction_log = Mutex::new(None);
         let active_transactions = Mutex::new(HashSet::new());
         let global_commit_version = std::sync::atomic::AtomicU64::new(0);
         let occ_active_transactions = Mutex::new(HashMap::new());
@@ -1099,7 +1105,7 @@ impl Database {
             tables: RwLock::new(tables),
             options,
             transaction_log_path,
-            transaction_log_file,
+            transaction_log,
             active_transactions,
             global_commit_version,
             occ_active_transactions,
@@ -1147,14 +1153,17 @@ impl Database {
             }
         }
 
-        // Open the persistent log file handle
-        let log_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&db.transaction_log_path)?;
-        *db.transaction_log_file.lock().unwrap() = Some(log_file);
+        // Open the persistent transaction log. A `None` sync interval makes
+        // every append fsync, which is required: a transaction's `Prepared`
+        // record must be durable before its mutations are applied.
+        let log = FramedLog::open(
+            &db.transaction_log_path,
+            TXN_LOG_FORMAT,
+            None,
+            db.options.fsync_method,
+        )
+        .map_err(RelationalError::Storage)?;
+        *db.transaction_log.lock().unwrap() = Some(log);
 
         Ok(db)
     }
@@ -1391,20 +1400,12 @@ impl Database {
         tables_guard.keys().cloned().collect()
     }
 
-    fn append_record(&self, record: &TransactionRecord, sync: bool) -> Result<()> {
-        let mut file_guard = self.transaction_log_file.lock().unwrap();
-        if let Some(ref mut file) = *file_guard {
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::End(0))?;
-            let bytes = bincode::serialize(record).map_err(|e| {
-                RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
-            })?;
-            let len = bytes.len() as u32;
-            file.write_all(&len.to_le_bytes())?;
-            file.write_all(&bytes)?;
-            if sync {
-                dtdb_storage::sync_file(file, self.options.fsync_method)?;
-            }
+    fn append_record(&self, record: &TransactionRecord) -> Result<()> {
+        let mut log_guard = self.transaction_log.lock().unwrap();
+        if let Some(ref mut log) = *log_guard {
+            // The log is opened with a `None` sync interval, so this append
+            // fsyncs before returning.
+            log.append(record).map_err(RelationalError::Storage)?;
         }
         Ok(())
     }
@@ -1415,7 +1416,7 @@ impl Database {
             active.insert(*tx_id);
         }
         drop(active);
-        self.append_record(record, true)?;
+        self.append_record(record)?;
         Ok(())
     }
 
@@ -1444,9 +1445,9 @@ impl Database {
 
     /// Returns the current size of the transaction log in bytes.
     fn transaction_log_len(&self) -> Result<u64> {
-        let file_guard = self.transaction_log_file.lock().unwrap();
-        match *file_guard {
-            Some(ref file) => Ok(file.metadata()?.len()),
+        let log_guard = self.transaction_log.lock().unwrap();
+        match *log_guard {
+            Some(ref log) => Ok(log.size()),
             None => Ok(0),
         }
     }
@@ -1486,75 +1487,52 @@ impl Database {
         self.sync_all_table_engines()?;
 
         // 2. The log's redo records are now redundant — discard them.
-        let mut file_guard = self.transaction_log_file.lock().unwrap();
-        if let Some(ref mut file) = *file_guard {
-            use std::io::Seek;
-            file.set_len(0)?;
-            file.seek(std::io::SeekFrom::Start(0))?;
-            dtdb_storage::sync_file(file, self.options.fsync_method)?;
+        let mut log_guard = self.transaction_log.lock().unwrap();
+        if let Some(ref mut log) = *log_guard {
+            log.reset().map_err(RelationalError::Storage)?;
         }
         Ok(())
     }
 
     fn recover_transactions(&self) -> Result<()> {
-        if !self.transaction_log_path.exists() {
-            return Ok(());
-        }
+        // Read every record in *log order*, which is commit order (records are
+        // appended sequentially under the commit lock). Replay must preserve
+        // this order so later writes to a key win. Framing, checksums, and
+        // truncation handling all live in `FramedLog::recover`; a missing file
+        // recovers as empty.
+        let records =
+            FramedLog::<TransactionRecord>::recover(&self.transaction_log_path, TXN_LOG_FORMAT)
+                .map_err(RelationalError::Storage)?;
 
-        let file = File::open(&self.transaction_log_path)?;
-        let mut reader = std::io::BufReader::new(file);
-
-        // Collect every `Prepared` record in *log order*, which is commit
-        // order (records are appended sequentially under the commit lock).
-        // Replay must preserve this order so later writes to a key win.
-        //
-        // A `Prepared` record is the durable commit point, so every one found
-        // here is a committed transaction whose mutations must be present in
-        // the engines. The `Committed` marker is informational and ignored:
-        // re-applying a transaction is idempotent (LSM is last-writer-wins and
-        // each record carries its own pre-image `old_rows` for deterministic
-        // index maintenance), so replaying records that a background WAL sync
-        // had already persisted before the crash is harmless.
+        // Keep only the `Prepared` records. A `Prepared` record is the durable
+        // commit point, so every one found here is a committed transaction
+        // whose mutations must be present in the engines. The `Committed`
+        // marker is informational and ignored: re-applying a transaction is
+        // idempotent (LSM is last-writer-wins and each record carries its own
+        // pre-image `old_rows` for deterministic index maintenance), so
+        // replaying records that a background WAL sync had already persisted
+        // before the crash is harmless.
         #[allow(clippy::type_complexity)]
-        let mut prepared: Vec<(
+        let prepared: Vec<(
             u64,
             HashMap<String, Vec<RelationalMutation>>,
             Option<HashMap<String, HashMap<DbKey, Row>>>,
-        )> = Vec::new();
-
-        loop {
-            let mut len_bytes = [0u8; 4];
-            match std::io::Read::read_exact(&mut reader, &mut len_bytes) {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(RelationalError::Io(e)),
-            }
-            let len = u32::from_le_bytes(len_bytes) as usize;
-            let mut bytes = vec![0u8; len];
-            match std::io::Read::read_exact(&mut reader, &mut bytes) {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // Ignore truncated
-                Err(e) => return Err(RelationalError::Io(e)),
-            }
-
-            let record: TransactionRecord = bincode::deserialize(&bytes).map_err(|e| {
-                RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
-            })?;
-            match record {
+        )> = records
+            .into_iter()
+            .filter_map(|record| match record {
                 TransactionRecord::Prepared {
                     tx_id,
                     mutations,
                     old_rows,
-                } => {
-                    prepared.push((tx_id, mutations, old_rows));
-                }
-                // Informational only; durability is anchored by `Prepared`.
-                TransactionRecord::Committed { .. } => {}
-            }
-        }
+                } => Some((tx_id, mutations, old_rows)),
+                TransactionRecord::Committed { .. } => None,
+            })
+            .collect();
 
         if prepared.is_empty() {
-            let _ = File::create(&self.transaction_log_path)?;
+            // Nothing to roll forward; drop any stale log so the persistent
+            // handle (opened next) starts a clean epoch with a fresh header.
+            let _ = fs::remove_file(&self.transaction_log_path);
             return Ok(());
         }
 
@@ -1586,9 +1564,10 @@ impl Database {
         // The replayed mutations now live in the engine memtables/WALs. Make
         // them durable, then discard the log so the next epoch starts clean.
         // (The persistent log handle is not open yet during recovery, so we
-        // truncate by recreating the file rather than via `checkpoint`.)
+        // remove the file; the handle opened next recreates it with a fresh
+        // header.)
         self.sync_all_table_engines()?;
-        let _ = File::create(&self.transaction_log_path)?;
+        let _ = fs::remove_file(&self.transaction_log_path);
         Ok(())
     }
 

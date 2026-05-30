@@ -1,12 +1,38 @@
 use dtdb_relational::{
-    Column, DataType, Database, RelationalMutation, Row, Schema, Transaction, TransactionRecord,
+    Column, DataType, Database, RelationalMutation, Row, Schema, TXN_LOG_FORMAT, Transaction,
+    TransactionRecord,
 };
-use dtdb_storage::{DbKey, DbValue};
+use dtdb_storage::{DbKey, DbValue, FramedLog, FsyncMethod};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
+
+/// Append transaction records to the log in its real framed format (header +
+/// length + checksum + payload), the way the database itself writes them.
+fn write_log_records(log_path: &Path, records: &[TransactionRecord]) {
+    let mut log = FramedLog::<TransactionRecord>::open(
+        log_path,
+        TXN_LOG_FORMAT,
+        None,
+        FsyncMethod::Fullfsync,
+    )
+    .unwrap();
+    for record in records {
+        log.append(record).unwrap();
+    }
+}
+
+/// Number of records currently recoverable from the transaction log. An empty
+/// log is header-only on disk (not zero bytes), so tests assert on the record
+/// count rather than the file length.
+fn log_record_count(log_path: &Path) -> usize {
+    FramedLog::<TransactionRecord>::recover(log_path, TXN_LOG_FORMAT)
+        .unwrap()
+        .len()
+}
 
 // Helper to create a user schema
 fn create_user_schema() -> Schema {
@@ -185,14 +211,9 @@ fn test_crash_recovery_roll_forward() {
             old_rows: None,
         };
 
-        // Write directly to transactions.log
+        // Write directly to transactions.log in its real framed format.
         let log_path = db_path.join("transactions.log");
-        let mut file = File::create(&log_path).unwrap();
-        let bytes = bincode::serialize(&record).unwrap();
-        let len = bytes.len() as u32;
-        file.write_all(&len.to_le_bytes()).unwrap();
-        file.write_all(&bytes).unwrap();
-        file.sync_all().unwrap();
+        write_log_records(&log_path, &[record]);
     }
 
     // 3. Open the database. The recovery protocol should scan the log, see
@@ -211,10 +232,13 @@ fn test_crash_recovery_roll_forward() {
             Some(r_product("TOWEL", 42.0))
         );
 
-        // Verify that the transactions.log has been truncated to 0 bytes
+        // Verify that the transactions.log has been discarded after roll-forward.
         let log_path = db_path.join("transactions.log");
-        let metadata = std::fs::metadata(&log_path).unwrap();
-        assert_eq!(metadata.len(), 0);
+        assert_eq!(
+            log_record_count(&log_path),
+            0,
+            "log should hold no records after roll-forward"
+        );
     }
 }
 
@@ -229,19 +253,19 @@ fn test_crash_recovery_ignore_corrupt_log() {
         db.create_table("users", create_user_schema()).unwrap();
     }
 
-    // 2. Write a corrupted/truncated transaction record to the log
+    // 2. Simulate a crash mid-write: a valid log header followed by a partial /
+    // garbage trailing record that never completed. Recovery must read the
+    // header, fail to decode the torn frame, and stop without applying it.
     {
         let log_path = db_path.join("transactions.log");
-        let mut file = File::create(&log_path).unwrap();
-        // Write invalid length prefix and random bytes
-        let len = 100u32;
-        file.write_all(&len.to_le_bytes()).unwrap();
-        file.write_all(b"corrupt payload bytes that do not deserialize")
+        write_log_records(&log_path, &[]); // writes a valid, empty (header-only) log
+        let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+        file.write_all(b"corrupt trailing bytes that are not a valid frame")
             .unwrap();
         file.sync_all().unwrap();
     }
 
-    // 3. Reopen DB. It should recover fine and truncate the corrupt log without applying anything.
+    // 3. Reopen DB. It should recover fine and discard the corrupt log without applying anything.
     {
         let db = Arc::new(Database::open(&db_path).unwrap());
         let tx = Transaction::new(1, db);
@@ -249,10 +273,13 @@ fn test_crash_recovery_ignore_corrupt_log() {
         // Verify users is empty
         assert_eq!(tx.get("users", &k_int(1)).unwrap(), None);
 
-        // Verify transactions.log is truncated
+        // Verify the corrupt log was discarded (no recoverable records).
         let log_path = db_path.join("transactions.log");
-        let metadata = std::fs::metadata(&log_path).unwrap();
-        assert_eq!(metadata.len(), 0);
+        assert_eq!(
+            log_record_count(&log_path),
+            0,
+            "corrupt log should be discarded with nothing applied"
+        );
     }
 }
 
@@ -315,14 +342,9 @@ fn test_crash_recovery_secondary_index_maintenance() {
             old_rows: Some(old_rows_map),
         };
 
-        // Write directly to transactions.log
+        // Write directly to transactions.log in its real framed format.
         let log_path = db_path.join("transactions.log");
-        let mut file = File::create(&log_path).unwrap();
-        let bytes = bincode::serialize(&record).unwrap();
-        let len = bytes.len() as u32;
-        file.write_all(&len.to_le_bytes()).unwrap();
-        file.write_all(&bytes).unwrap();
-        file.sync_all().unwrap();
+        write_log_records(&log_path, &[record]);
     }
 
     // 3. Reopen DB. Recovery runs and should roll forward using the old_rows from the log.
@@ -419,14 +441,14 @@ fn test_checkpoint_truncates_log_and_persists_data() {
 
         // Before checkpoint, the commit's redo record is retained in the log.
         assert!(
-            std::fs::metadata(&log_path).unwrap().len() > 0,
+            log_record_count(&log_path) > 0,
             "transaction log should retain the commit until a checkpoint"
         );
 
         // Checkpoint fsyncs the engines and truncates the log.
         db.checkpoint().unwrap();
         assert_eq!(
-            std::fs::metadata(&log_path).unwrap().len(),
+            log_record_count(&log_path),
             0,
             "checkpoint should truncate the transaction log"
         );
