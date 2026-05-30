@@ -216,9 +216,15 @@ fn test_engine_crash_recovery() {
         assert_eq!(engine.get(&k_int(1)).unwrap(), None); // Deleted
         assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_str("two"))); // Retained
 
-        // The WAL should have been cleared/flushed into a .sst file during recovery
+        // The WAL should have been cleared/flushed into a .sst file during
+        // recovery: it holds no pending records (an empty log is still a few
+        // header bytes on disk, so check the records, not the byte length).
         let wal_path = db_path.join("active.wal");
-        assert!(!wal_path.exists() || fs::metadata(wal_path).unwrap().len() == 0);
+        let pending = dtdb_storage::wal::Wal::recover(&wal_path).unwrap();
+        assert!(
+            pending.is_empty(),
+            "WAL should hold no records after recovery flushed it"
+        );
 
         // Verify there is an sst file
         let mut sst_count = 0;
