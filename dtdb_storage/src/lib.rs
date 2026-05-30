@@ -268,6 +268,41 @@ pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Atomically replaces the file at `path` with `bytes`.
+///
+/// Writes the new contents to a sibling temp file, fsyncs that temp file,
+/// renames it over `path`, then fsyncs the parent directory so the rename
+/// itself is durable. After a crash the file is either the complete previous
+/// contents or the complete new contents — never a torn or zero-length mix.
+///
+/// This is the shared "snapshot replacement" primitive for the small,
+/// full-rewrite metadata files (statistics, schema, options, and the snapshot
+/// half of the manifest). Fsyncing the temp file *before* the rename matters:
+/// on some filesystems a rename can otherwise become durable ahead of the data
+/// it points at, exposing a zero-length file after a crash.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8], fsync_method: FsyncMethod) -> Result<()> {
+    // Hidden, path-derived temp name: concurrent writers of *different* files
+    // never collide, and the temp doesn't surface as a stray directory entry.
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut tmp_name = std::ffi::OsString::from(".");
+            tmp_name.push(name);
+            tmp_name.push(".tmp");
+            path.with_file_name(tmp_name)
+        }
+        None => path.with_extension("tmp"),
+    };
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        sync_file(&file, fsync_method)?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    fsync_parent_dir(path)?;
+    Ok(())
+}
+
 /// Synchronizes file data to disk using the selected fsync method.
 pub fn sync_file(file: &std::fs::File, method: FsyncMethod) -> std::io::Result<()> {
     match method {
@@ -338,6 +373,26 @@ mod tests {
         fsync_parent_dir(&path).expect("fsync of parent dir should succeed");
         // No parent — should be a no-op rather than an error.
         fsync_parent_dir(std::path::Path::new("")).expect("empty path should be a no-op");
+    }
+
+    #[test]
+    fn test_atomic_write_creates_and_overwrites() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("statistics.bin");
+
+        atomic_write(&path, b"first", FsyncMethod::Fullfsync).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        // Overwriting replaces the contents wholesale.
+        atomic_write(&path, b"second-and-longer", FsyncMethod::Fullfsync).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second-and-longer");
+
+        // The temp file must not linger after a successful write.
+        let temp = dir.path().join(".statistics.bin.tmp");
+        assert!(
+            !temp.exists(),
+            "temp file should be renamed away, not left behind"
+        );
     }
 
     #[test]

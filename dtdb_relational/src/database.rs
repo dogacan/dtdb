@@ -1237,7 +1237,8 @@ impl Database {
         let stats_path = table_path.join("statistics.bin");
         let bytes = bincode::serialize(&initial_stats)
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
-        fs::write(stats_path, bytes)?;
+        dtdb_storage::atomic_write(&stats_path, &bytes, self.options.fsync_method)
+            .map_err(RelationalError::Storage)?;
 
         let mut index_engines = HashMap::new();
         for idx_def in &schema.indexes {
@@ -2282,7 +2283,8 @@ impl Database {
 
             let table_path = self.dir_path.join(table_name);
             let stats_path = table_path.join("statistics.bin");
-            fs::write(stats_path, bytes)?;
+            dtdb_storage::atomic_write(&stats_path, &bytes, self.options.fsync_method)
+                .map_err(RelationalError::Storage)?;
         }
 
         Ok(())
