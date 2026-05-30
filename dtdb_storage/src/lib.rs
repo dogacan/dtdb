@@ -15,8 +15,8 @@ pub use block_cache::{BlockCache, LruCache};
 pub use bloom::BloomFilter;
 pub use engine::{StorageEngine, StorageEngineStatistics};
 pub use executor::{
-    CoalesceKey, Executor, ExecutorConfig, InlineExecutor, PeriodicHandle, Priority,
-    ThreadPoolExecutor, MIN_WORKER_THREADS,
+    CoalesceKey, Executor, ExecutorConfig, InlineExecutor, MIN_WORKER_THREADS, PeriodicHandle,
+    Priority, ThreadPoolExecutor, default_executor,
 };
 pub use scan_iter::ScanIterator;
 pub use wal::WalEntry;

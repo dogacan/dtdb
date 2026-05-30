@@ -24,7 +24,7 @@
 
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,27 @@ pub trait Executor: Send + Sync + 'static {
         priority: Priority,
         task: Box<dyn Fn() + Send + Sync + 'static>,
     ) -> PeriodicHandle;
+}
+
+/// Returns the process-wide shared [`ThreadPoolExecutor`], creating it on first
+/// use.
+///
+/// This backs the convenience `open()` constructors so that embedded/default
+/// usage gets a single bounded pool shared across every engine and database,
+/// rather than one pool per engine. Two properties matter here:
+///
+/// * **Bounded threads.** The whole point of the executor is that thread count
+///   doesn't scale with the number of engines/tables; a shared default delivers
+///   that even when callers don't supply their own executor.
+/// * **No worker self-join.** Background tasks (e.g. compaction) capture an
+///   `Arc` to the engine they serve, which transitively owns its executor. If
+///   each engine owned its own pool, a worker finishing the last such task would
+///   drop the pool *from within a worker thread* and be unable to join itself.
+///   A long-lived shared pool is never dropped, so that can't happen.
+pub fn default_executor() -> Arc<dyn Executor> {
+    static DEFAULT: OnceLock<Arc<ThreadPoolExecutor>> = OnceLock::new();
+    let pool = DEFAULT.get_or_init(|| Arc::new(ThreadPoolExecutor::with_default()));
+    pool.clone()
 }
 
 /// Cancels a registered periodic task when dropped (or via [`PeriodicHandle::cancel`]).

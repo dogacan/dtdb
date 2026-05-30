@@ -891,10 +891,7 @@ impl Database {
     ///
     /// It scans the base directory for table subdirectories containing `schema.bin`.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_executor(
-            dir_path,
-            Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
-        )
+        Self::open_with_executor(dir_path, dtdb_storage::default_executor())
     }
 
     pub fn dir_path(&self) -> &Path {
@@ -939,11 +936,7 @@ impl Database {
 
     /// Opens the database catalog directory with specified options and loads all tables.
     pub fn open_with_options(dir_path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
-        Self::open_with_options_and_executor(
-            dir_path,
-            options,
-            Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
-        )
+        Self::open_with_options_and_executor(dir_path, options, dtdb_storage::default_executor())
     }
 
     /// Opens the database catalog directory with specified options, backed by the

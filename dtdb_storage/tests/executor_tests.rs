@@ -40,10 +40,7 @@ impl Latch {
     fn wait_for(&self, n: usize) {
         let mut g = self.state.lock().unwrap();
         while *g < n {
-            let (ng, timeout) = self
-                .cv
-                .wait_timeout(g, Duration::from_secs(5))
-                .unwrap();
+            let (ng, timeout) = self.cv.wait_timeout(g, Duration::from_secs(5)).unwrap();
             g = ng;
             assert!(!timeout.timed_out(), "timed out waiting for {n} signals");
         }
@@ -75,25 +72,34 @@ fn runs_submitted_tasks() {
 
 #[test]
 fn high_priority_runs_before_low() {
-    // Single worker so the queue ordering is fully deterministic: while the
-    // first task occupies the worker, we enqueue a Low then a High; the High
-    // must come out first.
-    let pool = ThreadPoolExecutor::new(ExecutorConfig { worker_threads: 1 });
+    // Pin the pool to exactly the floor of two workers. To make queue ordering
+    // observable we first occupy BOTH workers with blocking tasks, enqueue a Low
+    // then a High while no worker is free, then free one worker at a time: the
+    // first freed worker must pick the High-priority task, the second the Low.
+    const WORKERS: usize = 2;
+    let pool = ThreadPoolExecutor::new(ExecutorConfig {
+        worker_threads: WORKERS,
+    });
     let rec = Recorder::default();
-    let gate = Arc::new(Barrier::new(2));
+    let started = Latch::new();
+    // One release gate per blocking task so we can free workers individually.
+    let gates: Vec<Arc<Barrier>> = (0..WORKERS).map(|_| Arc::new(Barrier::new(2))).collect();
     let done = Latch::new();
 
-    // Occupy the worker until we've finished enqueuing the next two tasks.
-    {
+    for gate in &gates {
+        let started = started.clone();
         let gate = gate.clone();
         pool.submit(
             Priority::Normal,
             None,
             Box::new(move || {
+                started.signal();
                 gate.wait();
             }),
         );
     }
+    // Both workers are now provably busy.
+    started.wait_for(WORKERS);
 
     {
         let rec = rec.clone();
@@ -120,8 +126,11 @@ fn high_priority_runs_before_low() {
         );
     }
 
-    // Release the worker; now the two queued tasks drain in priority order.
-    gate.wait();
+    // Free one worker; it must pick the High task. Wait for it to finish before
+    // freeing the second worker, which then picks the Low task.
+    gates[0].wait();
+    done.wait_for(1);
+    gates[1].wait();
     done.wait_for(2);
     assert_eq!(rec.snapshot(), vec![2, 1], "High priority should run first");
 }

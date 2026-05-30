@@ -1,8 +1,8 @@
+use crate::executor::{CoalesceKey, Executor, PeriodicHandle, Priority};
 use crate::manifest::Manifest;
 use crate::memtable::MemTable;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
-use crate::executor::{CoalesceKey, Executor, PeriodicHandle, Priority};
 use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -47,11 +47,7 @@ struct EngineInner {
 impl StorageEngine {
     /// Opens a StorageEngine directory.
     pub fn open(dir_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        Self::open_with_executor(
-            dir_path,
-            options,
-            Arc::new(crate::ThreadPoolExecutor::with_default()),
-        )
+        Self::open_with_executor(dir_path, options, crate::default_executor())
     }
 
     /// Opens a StorageEngine directory backed by the given [`Executor`].

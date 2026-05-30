@@ -36,10 +36,7 @@ struct DbState {
 
 impl DuctTapeDbServiceImpl {
     pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, String> {
-        Self::new_with_executor(
-            data_dir,
-            Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
-        )
+        Self::new_with_executor(data_dir, dtdb_storage::default_executor())
     }
 
     pub fn new_with_executor(

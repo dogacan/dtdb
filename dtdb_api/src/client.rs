@@ -94,10 +94,7 @@ impl DuctTapeDbClient {
 
     /// Creates an in-process DuctTapeDB client using the specified data directory.
     pub fn in_process(data_dir: impl AsRef<Path>) -> Result<Self, String> {
-        Self::in_process_with_executor(
-            data_dir,
-            Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
-        )
+        Self::in_process_with_executor(data_dir, dtdb_storage::default_executor())
     }
 
     /// Creates an in-process DuctTapeDB client using the specified data directory

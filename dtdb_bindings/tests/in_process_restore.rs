@@ -35,7 +35,7 @@ fn new_in_process_client_restores_db_with_flush_interval() {
             Database::open_with_options_and_executor(
                 &db_dir,
                 options,
-                Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
+                dtdb_storage::default_executor(),
             )
             .expect("create db"),
         );
