@@ -89,10 +89,13 @@ Design decisions with lasting structural impact are recorded under
 add a new numbered ADR when making a comparable decision.
 
 * [ADR 0001 — Unified persistence for non-LSM metadata files](docs/adr/0001-unified-metadata-persistence.md):
-  the planned three-layer scheme (`atomic_write`, `FramedLog`,
-  `SnapshotLog`) for `manifest.bin`, `transactions.log`, `schema.bin`,
-  `statistics.bin`, and friends. **Accepted, not yet implemented** — these files
-  still use their legacy hand-rolled patterns today.
+  the three-layer scheme (`atomic_write`, `FramedLog`, `SnapshotLog` in
+  `dtdb_storage`) behind every non-LSM metadata file. **Implemented.**
+  Full-rewrite files (`statistics.bin`, `schema.bin`, options) go through
+  `atomic_write`; append-only logs (the storage WAL, `transactions.log`) share
+  the checksummed, header-versioned `FramedLog`; the manifest is a
+  `SnapshotLog<Manifest>` stored as `manifest/CURRENT` + `snapshot.<gen>` +
+  `log.<gen>`. On-disk formats changed incompatibly (pre-release, no migration).
 
 ### Known Design & Transaction Constraints
 

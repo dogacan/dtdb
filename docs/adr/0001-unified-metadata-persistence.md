@@ -1,6 +1,6 @@
 # ADR 0001: Unified persistence for non-LSM metadata files
 
-- **Status:** Accepted
+- **Status:** Accepted — implemented
 - **Date:** 2026-05-30
 - **Deciders:** dtdb maintainers
 
