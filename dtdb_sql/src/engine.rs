@@ -41,6 +41,61 @@ fn is_plan_sorted_by(plan: &LogicalPlan, group_by: &[Expr]) -> bool {
     false
 }
 
+/// The pieces of a single-column primary-key point lookup, matched out of an
+/// optimized [`LogicalPlan`] by [`match_point_get`]. Borrows from the plan.
+struct PointGetPlan<'a> {
+    /// Optional top projection: `(expressions, output schema)`.
+    projection: Option<(&'a [Expr], &'a Schema)>,
+    /// Optional residual filter retained above the scan by the optimizer.
+    filter: Option<&'a Expr>,
+    table_name: &'a str,
+    /// Schema of the underlying `Scan` (the full table schema), against which
+    /// the filter/projection expressions are bound and evaluated.
+    scan_schema: &'a Schema,
+    /// The exact primary-key value to fetch.
+    key: &'a DbKey,
+}
+
+/// Recognizes an optimized plan that is a single-column primary-key point
+/// lookup: an optional `Projection` over an optional `Filter` over a `Scan`
+/// whose pushed-down `range` is a single key (`start == end`).
+///
+/// A `Scan` only carries a pushed-down `range` from primary-key extraction
+/// (`extract_key_range`), which is gated on a single-column primary key, so a
+/// single-key range is always a complete primary-key value. Returns `None` for
+/// any other shape (range scans, full scans, secondary-index/`IndexScan`
+/// lookups, joins, aggregates, composite keys, …), in which case callers fall
+/// back to the general Volcano path.
+fn match_point_get(plan: &LogicalPlan) -> Option<PointGetPlan<'_>> {
+    let (projection, after_proj) = match plan {
+        LogicalPlan::Projection {
+            source,
+            expressions,
+            schema,
+            ..
+        } => (Some((expressions.as_slice(), schema)), source.as_ref()),
+        other => (None, other),
+    };
+    let (filter, after_filter) = match after_proj {
+        LogicalPlan::Filter { source, predicate } => (Some(predicate), source.as_ref()),
+        other => (None, other),
+    };
+    match after_filter {
+        LogicalPlan::Scan {
+            table_name,
+            schema,
+            range: Some((start, end)),
+        } if start == end => Some(PointGetPlan {
+            projection,
+            filter,
+            table_name,
+            scan_schema: schema,
+            key: start,
+        }),
+        _ => None,
+    }
+}
+
 /// Substitutes bound parameter values into a planned statement, turning its
 /// symbolic `Expr::Parameter` nodes into concrete literals before execution.
 fn substitute_statement_params(
@@ -606,6 +661,12 @@ impl SqlEngine {
                 // 1. Optimize the Logical Plan
                 let optimized_plan = Optimizer::new(self.database.clone()).optimize(logical_plan);
 
+                // 1a. Fast path: primary-key point lookups skip the Volcano
+                // operator tree entirely (see `execute_point_get`).
+                if let Some(result) = self.execute_point_get(&optimized_plan, tx)? {
+                    return Ok(result);
+                }
+
                 // Collect referenced columns
                 let mut cols = HashSet::new();
                 optimized_plan.collect_columns(&mut cols);
@@ -634,15 +695,31 @@ impl SqlEngine {
                 let logical_str = format_logical_plan(&logical_plan);
                 let opt_logical_str = format_logical_plan(&optimized_plan);
 
-                // Collect referenced columns
-                let mut cols = HashSet::new();
-                optimized_plan.collect_columns(&mut cols);
-                let cols_vec: Vec<String> = cols.into_iter().collect();
+                // 3. Describe the physical plan. Point lookups bypass the
+                // Volcano tree (see `execute_point_get`), so report that here
+                // rather than compiling operators that would never run.
+                let physical_str = if let Some(pg) = match_point_get(&optimized_plan) {
+                    format!(
+                        "- PhysicalPointGet: table={}, key={:?}{}\n",
+                        pg.table_name,
+                        pg.key,
+                        if pg.filter.is_some() {
+                            " (residual filter)"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    // Collect referenced columns
+                    let mut cols = HashSet::new();
+                    optimized_plan.collect_columns(&mut cols);
+                    let cols_vec: Vec<String> = cols.into_iter().collect();
 
-                // 3. Compile physical and explain it
-                let physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
-                let mut physical_str = String::new();
-                physical_op.explain(0, &mut physical_str);
+                    let physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+                    let mut s = String::new();
+                    physical_op.explain(0, &mut s);
+                    s
+                };
 
                 // 4. Wrap the result in a select output with "Query Plan" schema column
                 let schema = Schema::new(vec![dtdb_relational::Column {
@@ -673,6 +750,106 @@ impl SqlEngine {
                 Ok(ExecutionResult::Analyze)
             }
         }
+    }
+
+    /// Fast path for single-column primary-key point lookups
+    /// (`SELECT ... FROM t WHERE pk = <value>`).
+    ///
+    /// The cost-based optimizer compiles such a query to
+    /// `Projection -> Filter -> Scan { range: Some((k, k)) }`. The residual
+    /// `Filter` is retained even when the key range is exact, as a correctness
+    /// safety net (the pushed-down range can be an over-approximation in
+    /// general). For this shape the general Volcano path would build a
+    /// range-scan iterator plus boxed `Projection`/`Filter`/`SeqScan` operators
+    /// to produce at most a single row.
+    ///
+    /// Instead, when the optimized plan matches that shape with `start == end`
+    /// on the primary-key `Scan`, we issue one [`Transaction::get_projected`]
+    /// (a bloom-filter-short-circuited point get) and evaluate the residual
+    /// filter and projection inline. The same `bind_columns`/`eval` calls and
+    /// filter-truthiness rule as [`PhysicalFilter`]/[`PhysicalProjection`] are
+    /// reused, so results are identical to the general path.
+    ///
+    /// A `Scan` only ever carries a pushed-down `range` from primary-key
+    /// extraction (`extract_key_range`), which is gated on a *single-column*
+    /// primary key (`Schema::primary_key_index`). So a single-key `Scan` range
+    /// is always a full primary-key value that `get` can resolve directly;
+    /// composite keys and secondary-index lookups never reach this path.
+    ///
+    /// Returns `Ok(None)` when the plan is not a point lookup, in which case the
+    /// caller falls back to the general compile-and-execute path.
+    fn execute_point_get(
+        &self,
+        plan: &LogicalPlan,
+        tx: &Transaction,
+    ) -> Result<Option<ExecutionResult>, String> {
+        let Some(pg) = match_point_get(plan) else {
+            return Ok(None);
+        };
+
+        // Columns to read = union of those referenced by the projection and the
+        // residual filter. This mirrors the locality-group I/O hint the general
+        // path pushes down to the scan. Row width is always the full schema
+        // (locality-group merge), so expression evaluation below is unaffected.
+        let mut needed = HashSet::new();
+        if let Some((exprs, _)) = &pg.projection {
+            for e in exprs.iter() {
+                e.collect_columns(&mut needed);
+            }
+        }
+        if let Some(pred) = pg.filter {
+            pred.collect_columns(&mut needed);
+        }
+        let needed_cols: Vec<String> = needed.into_iter().collect();
+
+        let row = tx
+            .get_projected(pg.table_name, pg.key, Some(&needed_cols))
+            .map_err(|e| e.to_string())?;
+
+        let output_schema = match &pg.projection {
+            Some((_, schema)) => (*schema).clone(),
+            None => pg.scan_schema.clone(),
+        };
+
+        let mut rows = Vec::new();
+        if let Some(row) = row {
+            // Residual filter, using the identical truthiness rule as
+            // `PhysicalFilter::next`.
+            let passes = match pg.filter {
+                Some(pred) => {
+                    let mut pred = pred.clone();
+                    pred.bind_columns(pg.scan_schema)
+                        .map_err(|e| e.to_string())?;
+                    match pred.eval(&row, pg.scan_schema)? {
+                        DbValue::Bool(b) => b,
+                        DbValue::Int(v) => v != 0,
+                        _ => false,
+                    }
+                }
+                None => true,
+            };
+            if passes {
+                let out_row = match &pg.projection {
+                    Some((expressions, _)) => {
+                        let mut vals = Vec::with_capacity(expressions.len());
+                        for e in expressions.iter() {
+                            let mut e = (*e).clone();
+                            e.bind_columns(pg.scan_schema)
+                                .map_err(|er| er.to_string())?;
+                            vals.push(e.eval(&row, pg.scan_schema)?);
+                        }
+                        Row::new(vals)
+                    }
+                    None => row,
+                };
+                rows.push(out_row);
+            }
+        }
+
+        Ok(Some(ExecutionResult::Select {
+            schema: output_schema,
+            rows,
+        }))
     }
 
     /// Compiles a logical plan node into a Volcano Physical Operator tree.

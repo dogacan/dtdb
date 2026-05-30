@@ -144,8 +144,10 @@ fn main() {
     let plan = t_parse_plan - t_parse;
     let optimize = t_parse_plan_opt - t_parse_plan;
     // `execute()` internally redoes parse+plan+optimize, so subtracting the
-    // standalone pipeline plus the txn begin/commit leaves physical compilation
-    // + storage execution (the actual point get + projection).
+    // standalone pipeline plus the txn begin/commit leaves "physical compile +
+    // execute". For a primary-key point lookup this is now the inline fast path
+    // (`SqlEngine::execute_point_get`): a single storage `get` plus the residual
+    // filter/projection, with no Volcano operator tree built.
     let physical = (t_full - t_txn - t_parse_plan_opt).max(0.0);
 
     let row = |label: &str, ns: f64| {

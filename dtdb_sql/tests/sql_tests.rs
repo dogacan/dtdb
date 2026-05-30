@@ -426,24 +426,223 @@ fn test_sql_explain() {
         .unwrap();
     tx1.commit().unwrap();
 
-    let tx2 = Transaction::new(2, db.clone());
-    let res = engine
-        .execute("EXPLAIN SELECT name FROM users WHERE id = 10", &tx2)
-        .unwrap();
+    let explain = |sql: &str| -> String {
+        let tx = Transaction::new(2, db.clone());
+        let res = engine.execute(sql, &tx).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { schema, rows } => {
+                assert_eq!(schema.columns[0].name, "Query Plan");
+                assert_eq!(rows.len(), 1);
+                match &rows[0].values[0] {
+                    DbValue::String(s) => s.clone(),
+                    _ => panic!("Expected string plan text"),
+                }
+            }
+            _ => panic!("Expected EXPLAIN Select output"),
+        }
+    };
 
-    if let ExecutionResult::Select { schema, rows } = res {
-        assert_eq!(schema.columns[0].name, "Query Plan");
-        assert_eq!(rows.len(), 1);
-        let plan_text = match &rows[0].values[0] {
-            DbValue::String(s) => s.clone(),
-            _ => panic!("Expected string plan text"),
-        };
-        assert!(plan_text.contains("--- Logical Plan ---"));
-        assert!(plan_text.contains("--- Optimized Plan ---"));
-        assert!(plan_text.contains("--- Physical Plan ---"));
-        assert!(plan_text.contains("PhysicalSeqScan"));
+    // A primary-key equality is recognized as a point lookup and takes the
+    // `execute_point_get` fast path instead of building a scan operator tree.
+    let point_plan = explain("EXPLAIN SELECT name FROM users WHERE id = 10");
+    assert!(point_plan.contains("--- Logical Plan ---"));
+    assert!(point_plan.contains("--- Optimized Plan ---"));
+    assert!(point_plan.contains("--- Physical Plan ---"));
+    assert!(
+        point_plan.contains("PhysicalPointGet"),
+        "expected point-get fast path, got:\n{point_plan}"
+    );
+    assert!(!point_plan.contains("PhysicalSeqScan"));
+
+    // A non-point query (full table scan) still compiles to the general
+    // Volcano operator tree.
+    let scan_plan = explain("EXPLAIN SELECT name FROM users");
+    assert!(
+        scan_plan.contains("PhysicalSeqScan"),
+        "expected general scan path, got:\n{scan_plan}"
+    );
+    assert!(!scan_plan.contains("PhysicalPointGet"));
+}
+
+#[test]
+fn test_sql_point_get_fast_path() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, v STRING)", &tx)
+        .unwrap();
+    for i in 0..50 {
+        engine
+            .execute(
+                &format!("INSERT INTO t (id, k, v) VALUES ({i}, {}, 'v{i}')", i * 10),
+                &tx,
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    // Run a query in its own transaction and return the result rows.
+    let select = |sql: &str| -> Vec<Vec<DbValue>> {
+        let tx = Transaction::new(100, db.clone());
+        let res = engine.execute(sql, &tx).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => rows.into_iter().map(|r| r.values).collect(),
+            other => panic!("expected Select, got {other:?}"),
+        }
+    };
+    let plan_for = |sql: &str| -> String {
+        let tx = Transaction::new(101, db.clone());
+        let res = engine.execute(&format!("EXPLAIN {sql}"), &tx).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
+                DbValue::String(s) => s.clone(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    };
+
+    // 1. Point hit: correct projected row, and the fast path is chosen.
+    assert_eq!(
+        select("SELECT k, v FROM t WHERE id = 7"),
+        vec![vec![DbValue::Int(70), DbValue::String("v7".to_string())]]
+    );
+    assert!(plan_for("SELECT k, v FROM t WHERE id = 7").contains("PhysicalPointGet"));
+
+    // 2. Point miss: empty result (key absent), still the fast path.
+    assert_eq!(
+        select("SELECT k FROM t WHERE id = 999"),
+        Vec::<Vec<DbValue>>::new()
+    );
+    assert!(plan_for("SELECT k FROM t WHERE id = 999").contains("PhysicalPointGet"));
+
+    // 3. SELECT * point lookup returns the full row in schema order.
+    assert_eq!(
+        select("SELECT * FROM t WHERE id = 3"),
+        vec![vec![
+            DbValue::Int(3),
+            DbValue::Int(30),
+            DbValue::String("v3".to_string())
+        ]]
+    );
+
+    // 4. Residual filter on top of the point key: must still be applied.
+    //    id = 5 exists but k = 50, so `k > 1000` filters it out.
+    assert_eq!(
+        select("SELECT v FROM t WHERE id = 5 AND k > 1000"),
+        Vec::<Vec<DbValue>>::new()
+    );
+    assert!(plan_for("SELECT v FROM t WHERE id = 5 AND k > 1000").contains("residual filter"));
+    //    ...and a residual filter that passes keeps the row.
+    assert_eq!(
+        select("SELECT v FROM t WHERE id = 5 AND k = 50"),
+        vec![vec![DbValue::String("v5".to_string())]]
+    );
+
+    // 5. Expression projection over a point lookup evaluates per-row.
+    assert_eq!(
+        select("SELECT id + 1, k * 2 FROM t WHERE id = 4"),
+        vec![vec![DbValue::Int(5), DbValue::Int(80)]]
+    );
+
+    // 6. Non-point queries do NOT take the fast path but stay correct.
+    assert!(!plan_for("SELECT k FROM t WHERE id > 45").contains("PhysicalPointGet"));
+    assert_eq!(select("SELECT id FROM t WHERE id > 47").len(), 2); // 48, 49
+    assert!(!plan_for("SELECT k FROM t").contains("PhysicalPointGet"));
+}
+
+#[test]
+fn test_sql_point_get_string_pk_and_read_your_writes() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE u (name STRING PRIMARY KEY, age INT)", &tx)
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO u (name, age) VALUES ('alice', 30), ('bob', 40)",
+            &tx,
+        )
+        .unwrap();
+    tx.commit().unwrap();
+
+    // String primary key point lookup.
+    let tx = Transaction::new(2, db.clone());
+    let res = engine
+        .execute("SELECT age FROM u WHERE name = 'bob'", &tx)
+        .unwrap();
+    tx.commit().unwrap();
+    match res {
+        ExecutionResult::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values, vec![DbValue::Int(40)]);
+        }
+        _ => panic!("expected Select"),
+    }
+
+    // Read-your-writes: a point lookup must see an uncommitted insert from the
+    // same transaction (the fast path consults the transaction write buffer).
+    let tx = Transaction::new(3, db.clone());
+    engine
+        .execute("INSERT INTO u (name, age) VALUES ('carol', 25)", &tx)
+        .unwrap();
+    let res = engine
+        .execute("SELECT age FROM u WHERE name = 'carol'", &tx)
+        .unwrap();
+    match res {
+        ExecutionResult::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values, vec![DbValue::Int(25)]);
+        }
+        _ => panic!("expected Select"),
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn test_sql_composite_pk_not_point_get() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE ck (a INT, b INT, v STRING, PRIMARY KEY (a, b))",
+            &tx,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO ck (a, b, v) VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')",
+            &tx,
+        )
+        .unwrap();
+    tx.commit().unwrap();
+
+    // A partial composite-key predicate must NOT use the single-key fast path
+    // (it can match multiple rows), and must return all matching rows.
+    let tx = Transaction::new(2, db.clone());
+    let explain = engine
+        .execute("EXPLAIN SELECT v FROM ck WHERE a = 1", &tx)
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = explain
+        && let DbValue::String(s) = &rows[0].values[0]
+    {
+        assert!(
+            !s.contains("PhysicalPointGet"),
+            "composite key must not point-get:\n{s}"
+        );
+    }
+    let res = engine.execute("SELECT v FROM ck WHERE a = 1", &tx).unwrap();
+    tx.commit().unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows.len(), 2);
     } else {
-        panic!("Expected EXPLAIN Select output");
+        panic!("expected Select");
     }
 }
 
