@@ -5,6 +5,7 @@ pub mod block_cache;
 pub mod bloom;
 pub mod engine;
 pub mod executor;
+pub mod framed_log;
 pub mod manifest;
 pub mod memtable;
 pub mod merge_iter;
@@ -18,6 +19,7 @@ pub use executor::{
     CoalesceKey, Executor, ExecutorConfig, InlineExecutor, MIN_WORKER_THREADS, PeriodicHandle,
     Priority, ThreadPoolExecutor, default_executor,
 };
+pub use framed_log::{FramedLog, LogFormat};
 pub use scan_iter::ScanIterator;
 pub use wal::WalEntry;
 
