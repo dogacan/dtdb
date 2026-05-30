@@ -12,7 +12,7 @@
 //! Run (release build with the workspace's optimization settings):
 //!   cargo run -p dtdb_sql --release --example profile_scan_aggregate
 
-use dtdb_relational::{Database, Row, Transaction};
+use dtdb_relational::{Column, DataType, Database, Row, Schema, Transaction};
 use dtdb_sql::{LogicalPlanner, Optimizer, SqlEngine, SqlStatement};
 use dtdb_storage::{DbKey, DbValue};
 use sqlparser::dialect::GenericDialect;
@@ -125,8 +125,8 @@ fn main() {
     // --- Raw storage scan: produce every row, touch `k`, count. ---
     // This is exactly what the operator tree consumes: `scan_iter` with the
     // referenced-column hint (`k`), driven to exhaustion. It isolates the
-    // per-row storage cost (Row::from_bytes + merge_rows + the per-row HashMap
-    // churn in TableScanIterator::advance) from the filter/aggregate operators.
+    // per-row storage cost (Row::from_bytes + TableScanIterator::advance) from
+    // the filter/aggregate operators.
     let k_cols = vec!["k".to_string()];
     let (lo, hi) = (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX));
     let mut txid3 = 2_000_000u64;
@@ -168,13 +168,13 @@ fn main() {
     // Grab the default-locality-group engine directly. On the default schema
     // (no LOCALITY GROUP clause) every column lives in group "".
     let table = db.get_table("bench").unwrap();
-    let engine = table.engines.get("").unwrap().clone();
+    let storage_engine = table.engines.get("").unwrap().clone();
 
     // Layer 0: raw storage read only. Iterate the engine's ScanIterator and
     // touch each (key, Bytes) pair WITHOUT deserializing. This is the
     // irreducible cost of pulling rows out of the LSM.
     let t_engine_read = bench(|_i| {
-        let mut it = engine.scan_iter(&lo, &hi).unwrap();
+        let mut it = storage_engine.scan_iter(&lo, &hi).unwrap();
         let mut n = 0u64;
         while let Some((k, v)) = it.next().unwrap() {
             black_box(&k);
@@ -188,7 +188,7 @@ fn main() {
     // row's bytes into a Row (the unavoidable `Row::from_bytes` in advance()).
     // The delta over layer 0 is the pure deserialize cost.
     let t_engine_read_deser = bench(|_i| {
-        let mut it = engine.scan_iter(&lo, &hi).unwrap();
+        let mut it = storage_engine.scan_iter(&lo, &hi).unwrap();
         let mut n = 0u64;
         while let Some((_k, v)) = it.next().unwrap() {
             if let DbValue::Bytes(bytes) = &v {
@@ -201,10 +201,10 @@ fn main() {
     });
 
     // Layer 2: the table-level merge (TableScanIterator), driven by peek/advance
-    // but WITHOUT the transaction wrapper. This adds, per row, the row_parts
-    // HashMap, the group-name String clones, and merge_rows' per-column
-    // String-keyed lookups + second Vec. The delta over layer 1 is the merge
-    // churn the fast paths would target.
+    // but WITHOUT the transaction wrapper. On this single-group table the
+    // single-group fast path applies, so the delta over layer 1 is just the
+    // fast path's take/refill bookkeeping (~0 ns after the slot-indexed
+    // rewrite). The multi-group merge cost is measured separately below.
     let t_table_scan = bench(|_i| {
         let mut it = table.scan_iter(&lo, &hi, Some(&k_cols)).unwrap();
         let mut n = 0u64;
@@ -273,8 +273,9 @@ fn main() {
         pct(operators)
     );
 
-    // --- The key question: of the ~400 ns/row raw scan, how much is INHERENT
-    // (storage read + deserialize) vs CHURN (merge HashMap dance + txn layer)? ---
+    // --- The key question: of the raw scan, how much is INHERENT (storage read
+    // + deserialize) vs CHURN (the table merge + txn wrapper bookkeeping)? After
+    // levers (1)-(3) the churn is essentially gone for single-group scans. ---
     let per = |ns: f64| ns / ROWS as f64;
     let deserialize = (t_engine_read_deser - t_engine_read).max(0.0);
     let merge_churn = (t_table_scan - t_engine_read_deser).max(0.0);
@@ -292,7 +293,7 @@ fn main() {
         per(deserialize)
     );
     println!(
-        "    table merge (HashMap/merge) {:>7.1}   <- churn (G=1 fast path + index-keying)",
+        "    table merge (fast path)     {:>7.1}   <- ~0 after single-group + slot-index",
         per(merge_churn)
     );
     println!(
@@ -306,6 +307,112 @@ fn main() {
         100.0 * inherent / t_scan_raw,
         100.0 * churn / t_scan_raw
     );
+
+    // --- Multi-group merge path ---------------------------------------------
+    // The single-group fast path does NOT apply when a scan spans more than one
+    // locality group, so this isolates the cost of the index-keyed merge that
+    // stitches per-group sub-rows back together. We build a 2-group copy of the
+    // dataset (id, k in the default group; v in "lg_v"), scan all columns
+    // (forcing both groups), and decompose: 2 raw storage reads + 2 deserializes
+    // (inherent) vs the merge glue on top.
+    let mg_schema = Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            name: "k".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            name: "v".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_v".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ]);
+    db.create_table("bench2", mg_schema).unwrap();
+    {
+        let tx = Transaction::new(9_000_000, db.clone());
+        for i in 0..ROWS {
+            engine
+                .execute(
+                    &format!(
+                        "INSERT INTO bench2 (id, k, v) VALUES ({i}, {}, 'val_{i:08}')",
+                        (i * 31) % 100_000
+                    ),
+                    &tx,
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let table2 = db.get_table("bench2").unwrap();
+    let eng_default = table2.engines.get("").unwrap().clone();
+    let eng_v = table2.engines.get("lg_v").unwrap().clone();
+
+    // Inherent 2-group cost: read both engines in lockstep + deserialize both
+    // sub-rows, with no merge.
+    let mut txid7 = 6_000_000u64;
+    let t_mg_raw = bench(|_i| {
+        let _tx = Transaction::new(txid7, db.clone());
+        txid7 += 1;
+        let mut it1 = eng_default.scan_iter(&lo, &hi).unwrap();
+        let mut it2 = eng_v.scan_iter(&lo, &hi).unwrap();
+        let mut n = 0u64;
+        while let (Some((_, a)), Some((_, b))) = (it1.next().unwrap(), it2.next().unwrap()) {
+            if let DbValue::Bytes(ba) = &a {
+                black_box(Row::from_bytes(ba).unwrap());
+            }
+            if let DbValue::Bytes(bb) = &b {
+                black_box(Row::from_bytes(bb).unwrap());
+            }
+            n += 1;
+        }
+        black_box(n);
+    });
+
+    // Table-level merge path (no txn wrapper): exercises the index-keyed merge.
+    let t_mg_table = bench(|_i| {
+        let mut it = table2.scan_iter(&lo, &hi, None).unwrap();
+        let mut n = 0u64;
+        // Borrow-only (no per-row clone), matching the single-group probe.
+        while it.peek().is_some() {
+            let (k, row) = it.peek().unwrap();
+            black_box(k);
+            black_box(row);
+            n += 1;
+            it.advance().unwrap();
+        }
+        black_box(n);
+    });
+
+    let mg_merge = (t_mg_table - t_mg_raw).max(0.0);
+    println!("\n  Multi-group (2 locality groups) merge path (ns per row):");
+    println!(
+        "    2x raw read + deserialize   {:>7.1}   <- inherent",
+        per(t_mg_raw)
+    );
+    println!(
+        "    index-keyed merge glue      {:>7.1}   <- the (3) path",
+        per(mg_merge)
+    );
+    println!("    {:-<40}", "");
+    println!("    table scan total            {:>7.1}", per(t_mg_table));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

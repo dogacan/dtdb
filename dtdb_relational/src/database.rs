@@ -706,68 +706,94 @@ impl Table {
         }
 
         let needed_groups_vec: Vec<String> = needed_groups.into_iter().collect();
-        let mut group_iters = HashMap::new();
+        // One storage iterator per group *slot* (parallel to `needed_groups_vec`),
+        // `None` if the group has no engine yet (nothing written). Slot indexing
+        // replaces the old group-name-keyed HashMaps so the per-row merge is flat
+        // Vec access with no string hashing.
+        let mut group_iters: Vec<Option<dtdb_storage::ScanIterator>> =
+            Vec::with_capacity(needed_groups_vec.len());
         for group in &needed_groups_vec {
-            let Some(engine) = self.engines.get(group) else {
-                continue;
-            };
-            let iter = engine.scan_iter(start, end)?;
-            group_iters.insert(group.clone(), iter);
+            match self.engines.get(group) {
+                Some(engine) => group_iters.push(Some(engine.scan_iter(start, end)?)),
+                None => group_iters.push(None),
+            }
         }
 
-        TableScanIterator::new(self.schema.clone(), needed_groups_vec, group_iters)
+        TableScanIterator::new(self.schema.clone(), &needed_groups_vec, group_iters)
     }
 }
 
 pub struct TableScanIterator {
     schema: Schema,
-    needed_groups: Vec<String>,
-    group_iters: HashMap<String, dtdb_storage::ScanIterator>,
-    group_peeks: HashMap<String, Option<(DbKey, DbValue)>>,
+    /// Per-group storage iterators, indexed by group *slot* (0..N). `None` when
+    /// the group had no engine. Parallel to `group_peeks` and `row_parts`.
+    group_iters: Vec<Option<dtdb_storage::ScanIterator>>,
+    /// Current peeked `(key, value)` for each group slot. Parallel to
+    /// `group_iters`.
+    group_peeks: Vec<Option<(DbKey, DbValue)>>,
+    /// Per-column merge plan: for each schema column, the `(group_slot,
+    /// relative_index)` to copy its value from, or `None` slot if the column's
+    /// group is not part of this scan (the column is NULL-filled). Precomputed
+    /// once at construction so the per-row merge is pure index arithmetic --
+    /// no group-name hashing or lookups.
+    column_mapping: Vec<(Option<usize>, usize)>,
+    /// Reusable per-row scratch holding each slot's deserialized sub-row, so the
+    /// merge does not allocate a fresh map/Vec every row.
+    row_parts: Vec<Option<Row>>,
     peeked: Option<(DbKey, Row)>,
     /// True when the whole table is a single locality group. In that case the
-    /// stored sub-row already *is* the full row in schema order, so `advance`
-    /// can skip the cross-group merge entirely (no per-row min-key scan, no
-    /// `row_parts` HashMap, no group-name clones, no `merge_rows`).
+    /// sole group's stored sub-row already *is* the full row in schema order, so
+    /// `advance` returns it directly and skips the merge (and its second Vec +
+    /// per-column value clones) entirely.
     single_group: bool,
-    /// Name of the sole locality group when `single_group` is true (unused
-    /// otherwise). Lets the fast path index `group_iters`/`group_peeks`
-    /// without re-deriving it per row.
-    single_group_name: String,
 }
 
 impl TableScanIterator {
     pub fn new(
         schema: Schema,
-        needed_groups: Vec<String>,
-        mut group_iters: HashMap<String, dtdb_storage::ScanIterator>,
+        needed_groups: &[String],
+        mut group_iters: Vec<Option<dtdb_storage::ScanIterator>>,
     ) -> Result<Self> {
-        let mut group_peeks = HashMap::new();
-        for group in &needed_groups {
-            if let Some(iter) = group_iters.get_mut(group) {
-                let peeked = iter.next()?;
-                group_peeks.insert(group.clone(), peeked);
+        // Prime one peek per slot (parallel to `group_iters`).
+        let mut group_peeks = Vec::with_capacity(group_iters.len());
+        for iter in group_iters.iter_mut() {
+            match iter {
+                Some(it) => group_peeks.push(it.next()?),
+                None => group_peeks.push(None),
             }
         }
+
+        // Build the per-column merge plan: map each column's (group_name,
+        // relative_index) -- from the schema -- to the *slot* of that group
+        // within this scan. A column whose group isn't scanned gets `None`
+        // (NULL-filled), which is exactly the subset-scan behaviour.
+        let column_mapping: Vec<(Option<usize>, usize)> = schema
+            .get_relative_indices()
+            .iter()
+            .map(|(group_name, rel_idx)| {
+                let slot = needed_groups.iter().position(|g| g == group_name);
+                (slot, *rel_idx)
+            })
+            .collect();
+
+        let row_parts = vec![None; group_iters.len()];
+
         // Fast-path eligibility: the table itself is a single locality group.
         // We gate on the *schema* (not just `needed_groups.len() == 1`): a
-        // multi-group table queried for one group still needs `merge_rows` to
+        // multi-group table queried for one group still needs the merge to
         // place that group's columns at their absolute positions and null-fill
-        // the rest, so passthrough would be wrong there.
-        let single_group = schema.locality_groups().len() == 1;
-        let single_group_name = if single_group {
-            needed_groups.first().cloned().unwrap_or_default()
-        } else {
-            String::new()
-        };
+        // the rest, so passthrough would be wrong there. The `len() == 1` guard
+        // also makes the slot-0 indexing in the fast path provably in-bounds.
+        let single_group = schema.locality_groups().len() == 1 && group_peeks.len() == 1;
+
         let mut it = Self {
             schema,
-            needed_groups,
             group_iters,
             group_peeks,
+            column_mapping,
+            row_parts,
             peeked: None,
             single_group,
-            single_group_name,
         };
         it.advance()?;
         Ok(it)
@@ -799,35 +825,31 @@ impl TableScanIterator {
         // group-name String clones, and `merge_rows`' per-column String-keyed
         // lookups + second Vec allocation -- the bulk of the per-row churn.
         if self.single_group {
-            // Take the current peek for the sole group (advancing past it).
-            let taken = match self.group_peeks.get_mut(&self.single_group_name) {
-                Some(slot) => slot.take(),
-                None => None,
-            };
-            let Some((k, value)) = taken else {
+            // Sole group lives in slot 0 (guaranteed by the `single_group` gate).
+            let Some((k, value)) = self.group_peeks[0].take() else {
                 self.peeked = None;
                 return Ok(());
             };
             // Refill the peek from the underlying storage iterator.
-            if let Some(iter) = self.group_iters.get_mut(&self.single_group_name) {
-                let next = iter.next()?;
-                if let Some(slot) = self.group_peeks.get_mut(&self.single_group_name) {
-                    *slot = next;
-                }
+            if let Some(iter) = &mut self.group_iters[0] {
+                self.group_peeks[0] = iter.next()?;
             }
             let row = match value {
                 DbValue::Bytes(bytes) => Row::from_bytes(&bytes)?,
                 // Mirror the general path: a non-Bytes value yields a row of
-                // all-NULLs (merge_rows fills NULL for a missing/None group).
+                // all-NULLs (a missing/None group contributes only NULLs).
                 _ => Row::new(vec![DbValue::Null; self.schema.columns.len()]),
             };
             self.peeked = Some((k, row));
             return Ok(());
         }
 
+        // Multi-group merge path. Find the smallest key across all slots' peeks.
         let mut min_key: Option<DbKey> = None;
-        for (k, _) in self.group_peeks.values().flatten() {
-            if min_key.is_none() || k < min_key.as_ref().unwrap() {
+        for peek in &self.group_peeks {
+            if let Some((k, _)) = peek
+                && min_key.as_ref().is_none_or(|m| k < m)
+            {
                 min_key = Some(k.clone());
             }
         }
@@ -837,28 +859,37 @@ impl TableScanIterator {
             return Ok(());
         };
 
-        let mut row_parts = HashMap::new();
-        for group in &self.needed_groups {
-            if let Some(Some((peek_k, peek_v))) = self.group_peeks.get(group) {
-                if peek_k == &k {
-                    if let DbValue::Bytes(bytes) = peek_v {
-                        let sub_row = Row::from_bytes(bytes)?;
-                        row_parts.insert(group.clone(), Some(sub_row));
-                    } else {
-                        row_parts.insert(group.clone(), None);
-                    }
-                    let iter = self.group_iters.get_mut(group).unwrap();
-                    self.group_peeks.insert(group.clone(), iter.next()?);
-                } else {
-                    row_parts.insert(group.clone(), None);
+        // Gather each slot's sub-row for this key into the reusable scratch,
+        // advancing the slots that matched. A slot not at `k` contributes NULLs.
+        for slot in 0..self.group_peeks.len() {
+            let matches = matches!(&self.group_peeks[slot], Some((peek_k, _)) if *peek_k == k);
+            if matches {
+                let (_peek_k, peek_v) = self.group_peeks[slot].take().unwrap();
+                self.row_parts[slot] = match peek_v {
+                    DbValue::Bytes(bytes) => Some(Row::from_bytes(&bytes)?),
+                    _ => None,
+                };
+                if let Some(iter) = &mut self.group_iters[slot] {
+                    self.group_peeks[slot] = iter.next()?;
                 }
             } else {
-                row_parts.insert(group.clone(), None);
+                self.row_parts[slot] = None;
             }
         }
 
-        let merged_row = self.schema.merge_rows(&row_parts);
-        self.peeked = Some((k, merged_row));
+        // Index-keyed merge: copy each column from its slot's sub-row at the
+        // precomputed relative index. No group-name hashing, no per-row map.
+        let mut full_values = vec![DbValue::Null; self.schema.columns.len()];
+        for (col_idx, (slot, rel_idx)) in self.column_mapping.iter().enumerate() {
+            if let Some(slot) = slot
+                && let Some(sub_row) = &self.row_parts[*slot]
+                && let Some(val) = sub_row.values.get(*rel_idx)
+            {
+                full_values[col_idx] = val.clone();
+            }
+        }
+
+        self.peeked = Some((k, Row::new(full_values)));
         Ok(())
     }
 }
