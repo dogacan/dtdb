@@ -154,6 +154,168 @@ fn test_occ_phantom_read_conflict() {
     );
 }
 
+/// Drains a `TransactionScanIterator` into a Vec of rows.
+fn drain_tx_scan(mut it: dtdb_relational::TransactionScanIterator) -> Vec<Row> {
+    let mut rows = Vec::new();
+    while let Some(row) = it.next().unwrap() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// The SQL SELECT scan path is `scan_iter` -> `TransactionScanIterator`, which
+/// (unlike `filtered_scan`) no longer publishes per-key read_set entries under
+/// SnapshotIsolation -- it relies on the scan range recorded by `scan_iter`.
+/// A phantom insert into the scanned range must still conflict at commit.
+#[test]
+fn test_occ_scan_iter_phantom_conflict_si() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+        tx.put("users", k_int(15), r_user(15, "Fifteen")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Tx1 (SI by default) scans [1, 10] through the iterator and drains it.
+    let tx1 = Transaction::new(2, db.clone());
+    let rows = drain_tx_scan(tx1.scan_iter("users", &k_int(1), &k_int(10), None).unwrap());
+    assert_eq!(rows, vec![r_user(5, "Five")]);
+
+    // Tx2 inserts id = 7 within the scanned range and commits.
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(7), r_user(7, "Seven")).unwrap();
+    tx2.commit().unwrap();
+
+    let res = tx1.commit();
+    assert!(
+        matches!(res, Err(RelationalError::TransactionConflict(_))),
+        "Expected phantom conflict via scan range, got {:?}",
+        res
+    );
+}
+
+/// SI iterator scan that *returns* a key must still conflict if that key is
+/// concurrently modified -- this is the case the per-key read_set used to
+/// catch and the scan range now subsumes (the modified key lies in the range).
+#[test]
+fn test_occ_scan_iter_modified_key_conflict_si() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx1 = Transaction::new(2, db.clone());
+    let rows = drain_tx_scan(tx1.scan_iter("users", &k_int(1), &k_int(10), None).unwrap());
+    assert_eq!(rows, vec![r_user(5, "Five")]);
+
+    // Tx2 modifies the key Tx1 read, within Tx1's scanned range.
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(5), r_user(5, "FiveModified"))
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let res = tx1.commit();
+    assert!(
+        matches!(res, Err(RelationalError::TransactionConflict(_))),
+        "Expected conflict on modified scanned key, got {:?}",
+        res
+    );
+}
+
+/// Guard against over-broad detection: an SI iterator scan must NOT conflict
+/// with a concurrent modification to a key *outside* the scanned range.
+#[test]
+fn test_occ_scan_iter_no_conflict_outside_range_si() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+        tx.put("users", k_int(15), r_user(15, "Fifteen")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx1 = Transaction::new(2, db.clone());
+    let rows = drain_tx_scan(tx1.scan_iter("users", &k_int(1), &k_int(10), None).unwrap());
+    assert_eq!(rows, vec![r_user(5, "Five")]);
+
+    // Tx2 modifies id = 15, outside Tx1's [1, 10] scan range.
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(15), r_user(15, "FifteenModified"))
+        .unwrap();
+    tx2.commit().unwrap();
+
+    assert!(
+        tx1.commit().is_ok(),
+        "SI scan must not conflict with an out-of-range modification"
+    );
+}
+
+/// RepeatableRead has no scan_ranges, so the iterator still publishes per-key
+/// read_set entries: a modification to a key it returned must conflict, but a
+/// phantom insert into the range must NOT (RR permits phantoms).
+#[test]
+fn test_occ_scan_iter_repeatable_read_semantics() {
+    use dtdb_relational::IsolationLevel;
+
+    // Case A: modified read key -> conflict.
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_user_schema()).unwrap();
+        {
+            let tx = Transaction::new(1, db.clone());
+            tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+            tx.commit().unwrap();
+        }
+        let tx1 = Transaction::new_with_isolation(2, db.clone(), IsolationLevel::RepeatableRead);
+        let rows = drain_tx_scan(tx1.scan_iter("users", &k_int(1), &k_int(10), None).unwrap());
+        assert_eq!(rows, vec![r_user(5, "Five")]);
+
+        let tx2 = Transaction::new(3, db.clone());
+        tx2.put("users", k_int(5), r_user(5, "FiveModified"))
+            .unwrap();
+        tx2.commit().unwrap();
+
+        assert!(
+            matches!(tx1.commit(), Err(RelationalError::TransactionConflict(_))),
+            "RR must conflict on a modified read key (read_set)"
+        );
+    }
+
+    // Case B: phantom insert -> no conflict.
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_user_schema()).unwrap();
+        {
+            let tx = Transaction::new(1, db.clone());
+            tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+            tx.commit().unwrap();
+        }
+        let tx1 = Transaction::new_with_isolation(2, db.clone(), IsolationLevel::RepeatableRead);
+        let rows = drain_tx_scan(tx1.scan_iter("users", &k_int(1), &k_int(10), None).unwrap());
+        assert_eq!(rows, vec![r_user(5, "Five")]);
+
+        let tx2 = Transaction::new(3, db.clone());
+        tx2.put("users", k_int(7), r_user(7, "Seven")).unwrap();
+        tx2.commit().unwrap();
+
+        assert!(
+            tx1.commit().is_ok(),
+            "RR must permit a phantom insert (no scan_ranges)"
+        );
+    }
+}
+
 #[test]
 fn test_occ_no_conflict_disjoint_keys() {
     let temp_dir = TempDir::new().unwrap();

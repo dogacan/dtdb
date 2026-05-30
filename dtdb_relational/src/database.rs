@@ -777,6 +777,21 @@ impl TableScanIterator {
         self.peeked.as_ref()
     }
 
+    /// Consumes the current row and advances to the next one, returning the
+    /// row by value. Equivalent to `peek().cloned()` followed by `advance()`,
+    /// but without cloning the row -- the caller takes ownership of the row the
+    /// iterator already materialized. Used by hot scan loops that consume every
+    /// row anyway.
+    pub fn take_next(&mut self) -> Result<Option<(DbKey, Row)>> {
+        match self.peeked.take() {
+            Some(pair) => {
+                self.advance()?;
+                Ok(Some(pair))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn advance(&mut self) -> Result<()> {
         // Single-locality-group fast path: the sole group's stored sub-row is
         // already the full row in schema order, so there is nothing to merge.

@@ -1045,7 +1045,19 @@ pub struct TransactionScanIterator {
     seen: HashSet<DbKey>,
     read_set: Arc<Mutex<HashMap<String, HashSet<DbKey>>>>,
     table_name: String,
-    isolation_level: IsolationLevel,
+    /// Whether to dedup yielded keys via `seen`. Only needed when the write
+    /// buffer is non-empty (a buffered key can shadow a storage key); a
+    /// read-only scan yields each storage key exactly once, so we skip the
+    /// per-row HashSet insert + key clone entirely.
+    dedup: bool,
+    /// Whether to publish each yielded key into the shared `read_set`. True
+    /// only under RepeatableRead. SnapshotIsolation deliberately does NOT
+    /// publish per key here: `scan_iter` records the scanned [start, end]
+    /// range in `scan_ranges`, and the commit-time phantom check already
+    /// conflicts on any committed key within that range -- which is a superset
+    /// of every key this scan can yield (write-buffer entries are range-
+    /// filtered too). So the per-key read_set would be pure redundant work.
+    track_read_keys: bool,
 }
 
 impl TransactionScanIterator {
@@ -1056,6 +1068,8 @@ impl TransactionScanIterator {
         table_name: String,
         isolation_level: IsolationLevel,
     ) -> Self {
+        let dedup = !write_buffer_entries.is_empty();
+        let track_read_keys = isolation_level == IsolationLevel::RepeatableRead;
         Self {
             table_iter,
             write_buffer_entries,
@@ -1063,7 +1077,8 @@ impl TransactionScanIterator {
             seen: HashSet::new(),
             read_set,
             table_name,
-            isolation_level,
+            dedup,
+            track_read_keys,
         }
     }
 
@@ -1089,15 +1104,15 @@ impl TransactionScanIterator {
                 let (k, v) = self.write_buffer_entries[self.write_buffer_idx].clone();
                 self.write_buffer_idx += 1;
 
-                if self.seen.insert(k.clone()) {
-                    // Record read-set for isolation level repeatable read / snapshot isolation.
-                    // Publish to the shared read_set immediately rather than deferring to Drop:
-                    // commit() may run while this iterator is still alive (e.g. inside a
-                    // for-loop that calls commit at the end), and OCC validation must see
-                    // every iterated key to detect concurrent modifications.
-                    if self.isolation_level == IsolationLevel::SnapshotIsolation
-                        || self.isolation_level == IsolationLevel::RepeatableRead
-                    {
+                // `choose_write` implies the write buffer is non-empty, so
+                // `dedup` is true here; the guard is kept for clarity.
+                if !self.dedup || self.seen.insert(k.clone()) {
+                    // Publish to the shared read_set immediately (RepeatableRead
+                    // only) rather than deferring to Drop: commit() may run while
+                    // this iterator is still alive (e.g. inside a for-loop that
+                    // calls commit at the end), and OCC validation must see every
+                    // iterated key to detect concurrent modifications.
+                    if self.track_read_keys {
                         self.publish_read_key(k);
                     }
 
@@ -1106,14 +1121,14 @@ impl TransactionScanIterator {
                     }
                 }
             } else {
-                let (k, row) = self.table_iter.peek().unwrap().clone();
-                self.table_iter.advance()?;
+                // Take the row by value (no clone) and advance in one step.
+                let Some((k, row)) = self.table_iter.take_next()? else {
+                    continue;
+                };
 
-                if self.seen.insert(k.clone()) {
-                    if self.isolation_level == IsolationLevel::SnapshotIsolation
-                        || self.isolation_level == IsolationLevel::RepeatableRead
-                    {
-                        self.publish_read_key(k.clone());
+                if !self.dedup || self.seen.insert(k.clone()) {
+                    if self.track_read_keys {
+                        self.publish_read_key(k);
                     }
 
                     return Ok(Some(row));
@@ -1126,9 +1141,16 @@ impl TransactionScanIterator {
 impl TransactionScanIterator {
     fn publish_read_key(&self, key: DbKey) {
         let mut read_set = self.read_set.lock().unwrap();
-        read_set
-            .entry(self.table_name.clone())
-            .or_default()
-            .insert(key);
+        // Avoid cloning `table_name` on every row: after the first key the
+        // table's entry already exists, so `get_mut` hits the common path with
+        // no allocation; only the first key pays for the inserted entry.
+        if let Some(set) = read_set.get_mut(&self.table_name) {
+            set.insert(key);
+        } else {
+            read_set
+                .entry(self.table_name.clone())
+                .or_default()
+                .insert(key);
+        }
     }
 }
