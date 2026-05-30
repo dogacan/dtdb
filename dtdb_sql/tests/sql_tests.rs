@@ -1319,17 +1319,17 @@ fn test_locality_groups_end_to_end() {
     // Default group directory should contain manifest and WAL
     let default_dir = table_path.join("default");
     assert!(default_dir.exists());
-    assert!(default_dir.join("manifest.bin").exists());
+    assert!(default_dir.join("manifest").join("CURRENT").exists());
 
     // lg_name directory should contain manifest and WAL
     let lg_name_dir = table_path.join("lg_lg_name");
     assert!(lg_name_dir.exists());
-    assert!(lg_name_dir.join("manifest.bin").exists());
+    assert!(lg_name_dir.join("manifest").join("CURRENT").exists());
 
     // lg_finance directory should contain manifest and WAL
     let lg_finance_dir = table_path.join("lg_lg_finance");
     assert!(lg_finance_dir.exists());
-    assert!(lg_finance_dir.join("manifest.bin").exists());
+    assert!(lg_finance_dir.join("manifest").join("CURRENT").exists());
 }
 
 #[test]

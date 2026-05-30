@@ -1027,10 +1027,12 @@ impl Database {
                     let mut engines = HashMap::new();
                     let groups = schema.locality_groups();
 
-                    // Check for old table layout (backward compatibility)
+                    // Check for old table layout (backward compatibility): a
+                    // table dir that is itself a single storage engine, marked
+                    // by the engine's own files (its manifest dir or options).
                     if groups.len() <= 1
                         && groups.contains("")
-                        && (path.join("manifest.bin").exists() || path.join("wal.log").exists())
+                        && (path.join("manifest").is_dir() || path.join("options.bin").exists())
                     {
                         let mut group_opts = engine_opts;
                         if let Some(opts) = schema.locality_group_options.get("") {

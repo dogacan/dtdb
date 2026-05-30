@@ -870,10 +870,10 @@ fn test_open_reconstructs_missing_manifest_and_cleans_tmp_files() {
         engine.flush_memtable().unwrap();
     }
 
-    // Simulate an older/lost manifest plus a leftover temp file from a crash
+    // Simulate a lost manifest plus a leftover temp file from a crash
     // mid-write. Reopen must rebuild the manifest from the on-disk L*.sst files
     // and sweep away the orphaned .tmp.
-    fs::remove_file(db_path.join("manifest.bin")).unwrap();
+    fs::remove_dir_all(db_path.join("manifest")).unwrap();
     let stray_tmp = db_path.join("L9_99999.sst.tmp");
     fs::write(&stray_tmp, b"garbage").unwrap();
 
@@ -886,7 +886,7 @@ fn test_open_reconstructs_missing_manifest_and_cleans_tmp_files() {
         "leftover .tmp file should be cleaned up"
     );
     assert!(
-        db_path.join("manifest.bin").exists(),
+        db_path.join("manifest").join("CURRENT").exists(),
         "manifest should have been rebuilt"
     );
 }

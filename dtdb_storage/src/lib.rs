@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod memtable;
 pub mod merge_iter;
 pub mod scan_iter;
+pub mod snapshot_log;
 pub mod sstable;
 pub mod wal;
 pub use block_cache::{BlockCache, LruCache};
@@ -20,7 +21,9 @@ pub use executor::{
     Priority, ThreadPoolExecutor, default_executor,
 };
 pub use framed_log::{FramedLog, LogFormat};
+pub use manifest::{Manifest, ManifestEdit};
 pub use scan_iter::ScanIterator;
+pub use snapshot_log::{SnapshotLog, Snapshotable};
 pub use wal::WalEntry;
 
 /// Result type wrapper for storage operations.

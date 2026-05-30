@@ -1,36 +1,42 @@
-use crate::{Result, fsync_parent_dir};
+use crate::framed_log::LogFormat;
+use crate::snapshot_log::Snapshotable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// On-disk format tag for the manifest's edit log (see [`crate::SnapshotLog`]).
+/// The magic distinguishes it from other framed logs (WAL, transaction log).
+pub const MANIFEST_LOG_FORMAT: LogFormat = LogFormat {
+    magic: *b"DMAN",
+    version: 1,
+};
+
+/// The set of SSTables currently live in a storage engine, keyed by
+/// `(level, id)`. Persisted as a [`crate::SnapshotLog`]: a base snapshot of the
+/// set plus an append-only log of add/remove edits, rather than a full rewrite
+/// on every flush and compaction.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Manifest {
     pub active_sstables: HashSet<(usize, u64)>, // (level, id)
 }
 
-impl Manifest {
-    /// Loads the active SSTable manifest from disk.
-    pub fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)?;
-        let manifest: Manifest = bincode::deserialize(&bytes)?;
-        Ok(manifest)
-    }
+/// An incremental change to the active-SSTable set.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ManifestEdit {
+    AddSstable { level: usize, id: u64 },
+    RemoveSstable { level: usize, id: u64 },
+}
 
-    /// Saves the active SSTable manifest atomically by writing to a temp file and renaming it.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let temp_path = path.with_extension("tmp");
-        let bytes = bincode::serialize(self)?;
-        {
-            let mut file = File::create(&temp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+impl Snapshotable for Manifest {
+    type Edit = ManifestEdit;
+
+    fn apply(&mut self, edit: &ManifestEdit) {
+        match edit {
+            ManifestEdit::AddSstable { level, id } => {
+                self.active_sstables.insert((*level, *id));
+            }
+            ManifestEdit::RemoveSstable { level, id } => {
+                self.active_sstables.remove(&(*level, *id));
+            }
         }
-        fs::rename(&temp_path, path)?;
-        // Persist the directory entry change so a crash can't lose the new
-        // manifest and collapse the DB to "empty" on restart.
-        fsync_parent_dir(path)?;
-        Ok(())
     }
 }

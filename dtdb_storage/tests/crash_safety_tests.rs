@@ -129,7 +129,7 @@ fn test_compaction_crash_garbage_collection() {
     assert!(
         files_before
             .iter()
-            .any(|p| p.file_name().unwrap() == "manifest.bin")
+            .any(|p| p.file_name().unwrap() == "manifest" && p.is_dir())
     );
 
     // 2. Simulate a compaction crash by creating a dummy garbage SSTable on disk
