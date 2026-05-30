@@ -84,6 +84,9 @@ mod imp {
             let stmts: Vec<String> = (0..n).map(insert_sql).collect();
             self.exec_txn(&stmts);
         }
+
+        /// Spawns concurrent threads, each executing write transactions.
+        fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize);
     }
 
     // ----- dtdb target --------------------------------------------------------
@@ -154,6 +157,30 @@ mod imp {
                 _ => 0,
             }
         }
+
+        fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize) {
+            std::thread::scope(|s| {
+                for thread_idx in 0..num_threads {
+                    s.spawn(move || {
+                        let engine = SqlEngine::new(self.db.clone());
+                        for i in 0..txns_per_thread {
+                            let key = thread_idx * txns_per_thread + i;
+                            let sql = format!(
+                                "INSERT INTO bench (id, k, v) VALUES ({key}, {}, 'val_{key:08}')",
+                                (key * 31) % 100_000
+                            );
+                            let tx = Transaction::new(
+                                self.next_tx
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                self.db.clone(),
+                            );
+                            engine.execute(&sql, &tx).unwrap();
+                            tx.commit().unwrap();
+                        }
+                    });
+                }
+            });
+        }
     }
 
     // ----- SQLite target ------------------------------------------------------
@@ -203,6 +230,30 @@ mod imp {
                 n += 1;
             }
             n
+        }
+
+        fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize) {
+            let db_path = self._tmp.path().join("bench.sqlite");
+            std::thread::scope(|s| {
+                for thread_idx in 0..num_threads {
+                    let db_path = db_path.clone();
+                    s.spawn(move || {
+                        let conn = rusqlite::Connection::open(db_path).unwrap();
+                        conn.busy_timeout(std::time::Duration::from_secs(30))
+                            .unwrap();
+                        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+                            .unwrap();
+                        for i in 0..txns_per_thread {
+                            let key = thread_idx * txns_per_thread + i;
+                            let sql = format!(
+                                "INSERT INTO bench (id, k, v) VALUES ({key}, {}, 'val_{key:08}')",
+                                (key * 31) % 100_000
+                            );
+                            conn.execute(&sql, []).unwrap();
+                        }
+                    });
+                }
+            });
         }
     }
 
@@ -333,6 +384,20 @@ mod imp {
         g.finish();
     }
 
+    /// Concurrent transactions inserting disjoint keys.
+    fn bench_concurrent_inserts(c: &mut Criterion) {
+        let mut g = c.benchmark_group("dml/concurrent_inserts");
+        let num_threads = 4;
+        let txns_per_thread = 100;
+        g.throughput(Throughput::Elements((num_threads * txns_per_thread) as u64));
+        write_bench(
+            &mut g,
+            |_t| {},
+            move |t| t.run_concurrent_inserts(num_threads, txns_per_thread),
+        );
+        g.finish();
+    }
+
     pub fn run() {
         let mut c = Criterion::default().configure_from_args();
         bench_insert_autocommit(&mut c);
@@ -341,6 +406,7 @@ mod imp {
         bench_select_point(&mut c);
         bench_update_point(&mut c);
         bench_delete_range(&mut c);
+        bench_concurrent_inserts(&mut c);
         c.final_summary();
     }
 }
