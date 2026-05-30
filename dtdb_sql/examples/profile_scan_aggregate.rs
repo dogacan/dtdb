@@ -12,9 +12,9 @@
 //! Run (release build with the workspace's optimization settings):
 //!   cargo run -p dtdb_sql --release --example profile_scan_aggregate
 
-use dtdb_relational::{Database, Transaction};
+use dtdb_relational::{Database, Row, Transaction};
 use dtdb_sql::{LogicalPlanner, Optimizer, SqlEngine, SqlStatement};
-use dtdb_storage::DbKey;
+use dtdb_storage::{DbKey, DbValue};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::hint::black_box;
@@ -159,6 +159,71 @@ fn main() {
         black_box(n);
     });
 
+    // --- Layered decomposition of the raw scan: peel back one layer at a time
+    // so we can split the 400 ns/row into INHERENT work (storage read +
+    // bincode deserialize) versus CHURN (the per-row HashMap/merge dance and
+    // the transaction wrapper). Each probe drops one layer relative to
+    // `t_scan_raw` (= tx.scan_iter, the full thing).
+
+    // Grab the default-locality-group engine directly. On the default schema
+    // (no LOCALITY GROUP clause) every column lives in group "".
+    let table = db.get_table("bench").unwrap();
+    let engine = table.engines.get("").unwrap().clone();
+
+    // Layer 0: raw storage read only. Iterate the engine's ScanIterator and
+    // touch each (key, Bytes) pair WITHOUT deserializing. This is the
+    // irreducible cost of pulling rows out of the LSM.
+    let t_engine_read = bench(|_i| {
+        let mut it = engine.scan_iter(&lo, &hi).unwrap();
+        let mut n = 0u64;
+        while let Some((k, v)) = it.next().unwrap() {
+            black_box(&k);
+            black_box(&v);
+            n += 1;
+        }
+        black_box(n);
+    });
+
+    // Layer 1: storage read + bincode deserialize. Same scan, but decode each
+    // row's bytes into a Row (the unavoidable `Row::from_bytes` in advance()).
+    // The delta over layer 0 is the pure deserialize cost.
+    let t_engine_read_deser = bench(|_i| {
+        let mut it = engine.scan_iter(&lo, &hi).unwrap();
+        let mut n = 0u64;
+        while let Some((_k, v)) = it.next().unwrap() {
+            if let DbValue::Bytes(bytes) = &v {
+                let row = Row::from_bytes(bytes).unwrap();
+                black_box(&row);
+            }
+            n += 1;
+        }
+        black_box(n);
+    });
+
+    // Layer 2: the table-level merge (TableScanIterator), driven by peek/advance
+    // but WITHOUT the transaction wrapper. This adds, per row, the row_parts
+    // HashMap, the group-name String clones, and merge_rows' per-column
+    // String-keyed lookups + second Vec. The delta over layer 1 is the merge
+    // churn the fast paths would target.
+    let t_table_scan = bench(|_i| {
+        let mut it = table.scan_iter(&lo, &hi, Some(&k_cols)).unwrap();
+        let mut n = 0u64;
+        // peek() only returns the already-materialized row ref (no work);
+        // advance() does the per-row merge. The borrow from peek() must end
+        // before advance(), hence the is_some()/unwrap shape.
+        while it.peek().is_some() {
+            let (k, row) = it.peek().unwrap();
+            black_box(k);
+            black_box(row);
+            n += 1;
+            it.advance().unwrap();
+        }
+        black_box(n);
+    });
+
+    // (Layer 3 = `t_scan_raw` above: adds the transaction wrapper's write-buffer
+    // merge + read-set tracking on top of the table merge.)
+
     // Derived per-stage costs.
     let plan = t_parse_plan - t_parse;
     let optimize = t_parse_plan_opt - t_parse_plan;
@@ -206,6 +271,40 @@ fn main() {
         "\n  storage scan is {:.0}% of the full cycle; operators are {:.0}%.",
         pct(t_scan_raw),
         pct(operators)
+    );
+
+    // --- The key question: of the ~400 ns/row raw scan, how much is INHERENT
+    // (storage read + deserialize) vs CHURN (merge HashMap dance + txn layer)? ---
+    let per = |ns: f64| ns / ROWS as f64;
+    let deserialize = (t_engine_read_deser - t_engine_read).max(0.0);
+    let merge_churn = (t_table_scan - t_engine_read_deser).max(0.0);
+    let txn_layer = (t_scan_raw - t_table_scan).max(0.0);
+    let inherent = t_engine_read + deserialize;
+    let churn = merge_churn + txn_layer;
+
+    println!("\n  Raw-scan decomposition (ns per row):");
+    println!(
+        "    storage read (LSM)          {:>7.1}   <- inherent",
+        per(t_engine_read)
+    );
+    println!(
+        "    bincode deserialize         {:>7.1}   <- inherent",
+        per(deserialize)
+    );
+    println!(
+        "    table merge (HashMap/merge) {:>7.1}   <- churn (G=1 fast path + index-keying)",
+        per(merge_churn)
+    );
+    println!(
+        "    txn wrapper (wbuf/read-set) {:>7.1}   <- churn-ish",
+        per(txn_layer)
+    );
+    println!("    {:-<40}", "");
+    println!(
+        "    raw scan total              {:>7.1}   (inherent {:.0}% / churn {:.0}%)",
+        per(t_scan_raw),
+        100.0 * inherent / t_scan_raw,
+        100.0 * churn / t_scan_raw
     );
 
     let _ = std::fs::remove_dir_all(&dir);
