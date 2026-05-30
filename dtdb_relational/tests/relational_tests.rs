@@ -553,6 +553,149 @@ fn test_locality_group_pruning_verification() {
     );
 }
 
+/// Drains a `TableScanIterator` (peek/advance) into a Vec, cloning each row.
+fn drain_scan(mut it: dtdb_relational::TableScanIterator) -> Vec<(DbKey, Row)> {
+    let mut out = Vec::new();
+    // `cloned()` ends the peek() borrow immediately, so advance() is free to run.
+    while let Some(pair) = it.peek().cloned() {
+        out.push(pair);
+        it.advance().unwrap();
+    }
+    out
+}
+
+/// Exercises the single-locality-group fast path in `TableScanIterator::advance`.
+/// `create_test_schema` puts every column in the default group, so the whole
+/// table is one locality group and the scan takes the passthrough path that
+/// skips `merge_rows`. The output must be byte-for-byte what the merge path
+/// would have produced: full rows, in key order.
+#[test]
+fn test_scan_iter_single_group_fast_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    // Insert out of key order to confirm the scan returns them sorted, and use
+    // several rows so the per-row refill logic is exercised, not just the first.
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", k_int(3), r_user(3, "Carol", 70.0)).unwrap();
+    tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+    tx.put("users", k_int(2), r_user(2, "Bob", 80.25)).unwrap();
+    tx.commit().unwrap();
+
+    let table = db.get_table("users").unwrap();
+
+    // Full scan over the whole key range -> every row, full width, sorted.
+    let rows = drain_scan(
+        table
+            .scan_iter(&k_int(i64::MIN), &k_int(i64::MAX), None)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (k_int(1), r_user(1, "Alice", 95.5)),
+            (k_int(2), r_user(2, "Bob", 80.25)),
+            (k_int(3), r_user(3, "Carol", 70.0)),
+        ]
+    );
+
+    // A column hint is I/O-only on a single-group table: the whole row lives in
+    // one blob, so the fast path still returns every column populated (not just
+    // the hinted one).
+    let hinted = drain_scan(
+        table
+            .scan_iter(&k_int(2), &k_int(2), Some(&["name".to_string()]))
+            .unwrap(),
+    );
+    assert_eq!(hinted, vec![(k_int(2), r_user(2, "Bob", 80.25))]);
+
+    // Empty range: the fast path must terminate cleanly with no rows.
+    let empty = drain_scan(table.scan_iter(&k_int(100), &k_int(200), None).unwrap());
+    assert!(empty.is_empty());
+}
+
+/// Guards the *other* side of the gate: a genuinely multi-locality-group table
+/// must keep using the merge path. A full scan (all groups) has to reassemble
+/// each row from its per-group sub-rows; the fast path would be wrong here, so
+/// this confirms the gate (`schema.locality_groups().len() == 1`) holds.
+#[test]
+fn test_scan_iter_multi_group_uses_merge_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    let schema = Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            name: "name".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_name".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            name: "score".to_string(),
+            data_type: DataType::Float,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_score".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ]);
+    db.create_table("users", schema).unwrap();
+
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+    tx.put("users", k_int(2), r_user(2, "Bob", 80.25)).unwrap();
+    tx.commit().unwrap();
+
+    let table = db.get_table("users").unwrap();
+
+    // Full scan must merge the three groups back into complete rows.
+    let rows = drain_scan(
+        table
+            .scan_iter(&k_int(i64::MIN), &k_int(i64::MAX), None)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (k_int(1), r_user(1, "Alice", 95.5)),
+            (k_int(2), r_user(2, "Bob", 80.25)),
+        ]
+    );
+
+    // Subset scan must still produce full-width rows with NULLs for the unread
+    // group -- the case the fast path must never take.
+    let only_name = drain_scan(
+        table
+            .scan_iter(&k_int(1), &k_int(1), Some(&["name".to_string()]))
+            .unwrap(),
+    );
+    assert_eq!(
+        only_name,
+        vec![(
+            k_int(1),
+            Row::new(vec![
+                DbValue::Null,
+                DbValue::String("Alice".to_string()),
+                DbValue::Null,
+            ]),
+        )]
+    );
+}
+
 #[test]
 fn test_background_statistics_collector() {
     let temp_dir = TempDir::new().unwrap();

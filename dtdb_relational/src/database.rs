@@ -725,6 +725,15 @@ pub struct TableScanIterator {
     group_iters: HashMap<String, dtdb_storage::ScanIterator>,
     group_peeks: HashMap<String, Option<(DbKey, DbValue)>>,
     peeked: Option<(DbKey, Row)>,
+    /// True when the whole table is a single locality group. In that case the
+    /// stored sub-row already *is* the full row in schema order, so `advance`
+    /// can skip the cross-group merge entirely (no per-row min-key scan, no
+    /// `row_parts` HashMap, no group-name clones, no `merge_rows`).
+    single_group: bool,
+    /// Name of the sole locality group when `single_group` is true (unused
+    /// otherwise). Lets the fast path index `group_iters`/`group_peeks`
+    /// without re-deriving it per row.
+    single_group_name: String,
 }
 
 impl TableScanIterator {
@@ -740,12 +749,25 @@ impl TableScanIterator {
                 group_peeks.insert(group.clone(), peeked);
             }
         }
+        // Fast-path eligibility: the table itself is a single locality group.
+        // We gate on the *schema* (not just `needed_groups.len() == 1`): a
+        // multi-group table queried for one group still needs `merge_rows` to
+        // place that group's columns at their absolute positions and null-fill
+        // the rest, so passthrough would be wrong there.
+        let single_group = schema.locality_groups().len() == 1;
+        let single_group_name = if single_group {
+            needed_groups.first().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
         let mut it = Self {
             schema,
             needed_groups,
             group_iters,
             group_peeks,
             peeked: None,
+            single_group,
+            single_group_name,
         };
         it.advance()?;
         Ok(it)
@@ -756,6 +778,38 @@ impl TableScanIterator {
     }
 
     pub fn advance(&mut self) -> Result<()> {
+        // Single-locality-group fast path: the sole group's stored sub-row is
+        // already the full row in schema order, so there is nothing to merge.
+        // This skips the per-row min-key scan, the `row_parts` HashMap and its
+        // group-name String clones, and `merge_rows`' per-column String-keyed
+        // lookups + second Vec allocation -- the bulk of the per-row churn.
+        if self.single_group {
+            // Take the current peek for the sole group (advancing past it).
+            let taken = match self.group_peeks.get_mut(&self.single_group_name) {
+                Some(slot) => slot.take(),
+                None => None,
+            };
+            let Some((k, value)) = taken else {
+                self.peeked = None;
+                return Ok(());
+            };
+            // Refill the peek from the underlying storage iterator.
+            if let Some(iter) = self.group_iters.get_mut(&self.single_group_name) {
+                let next = iter.next()?;
+                if let Some(slot) = self.group_peeks.get_mut(&self.single_group_name) {
+                    *slot = next;
+                }
+            }
+            let row = match value {
+                DbValue::Bytes(bytes) => Row::from_bytes(&bytes)?,
+                // Mirror the general path: a non-Bytes value yields a row of
+                // all-NULLs (merge_rows fills NULL for a missing/None group).
+                _ => Row::new(vec![DbValue::Null; self.schema.columns.len()]),
+            };
+            self.peeked = Some((k, row));
+            return Ok(());
+        }
+
         let mut min_key: Option<DbKey> = None;
         for (k, _) in self.group_peeks.values().flatten() {
             if min_key.is_none() || k < min_key.as_ref().unwrap() {
