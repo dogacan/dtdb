@@ -1,6 +1,7 @@
 use crate::executor::{CoalesceKey, Executor, PeriodicHandle, Priority};
-use crate::manifest::Manifest;
+use crate::manifest::{MANIFEST_LOG_FORMAT, Manifest, ManifestEdit};
 use crate::memtable::MemTable;
+use crate::snapshot_log::SnapshotLog;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
 use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator};
@@ -22,6 +23,11 @@ pub struct StorageEngineStatistics {
     pub memtable_uncompressed_bytes: u64,
 }
 
+/// Compact the manifest's edit log into a fresh snapshot once it grows past
+/// this size. Manifest edits are tiny, so this bounds the log's size without
+/// compacting too eagerly.
+const MANIFEST_COMPACT_THRESHOLD_BYTES: u64 = 1024 * 1024;
+
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
@@ -34,7 +40,9 @@ struct EngineInner {
     options: EngineOptions,
     write_mutex: Mutex<()>,
     compaction_mutex: Mutex<()>,
-    manifest_mutex: Mutex<()>,
+    /// The active-SSTable set, persisted as a snapshot + edit log. The mutex
+    /// serializes manifest updates (and provides the `&mut` the log needs).
+    manifest: Mutex<SnapshotLog<Manifest>>,
     next_sst_id: AtomicU64,
     executor: Arc<dyn Executor>,
     /// Keeps the background WAL-sync schedule alive; dropping the engine
@@ -168,12 +176,19 @@ impl EngineInner {
             None
         };
 
-        // 1. Load or initialize/migrate the Manifest.
-        let manifest_path = dir_path.join("manifest.bin");
-        let manifest = if manifest_path.exists() {
-            Manifest::load(&manifest_path)?
-        } else {
-            let mut active_sstables = HashSet::new();
+        // 1. Open the manifest (snapshot + edit log). If none exists yet (a
+        // fresh directory), rebuild the active-SSTable set from the L*.sst
+        // files on disk and record it as the initial manifest.
+        let manifest_dir = dir_path.join("manifest");
+        let had_manifest = manifest_dir.join("CURRENT").exists();
+        let mut manifest = SnapshotLog::<Manifest>::open(
+            &manifest_dir,
+            MANIFEST_LOG_FORMAT,
+            active_options.fsync_method,
+            MANIFEST_COMPACT_THRESHOLD_BYTES,
+        )?;
+        if !had_manifest {
+            let mut edits = Vec::new();
             for entry in fs::read_dir(&dir_path)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -186,14 +201,14 @@ impl EngineInner {
                         && let (Ok(level), Ok(id)) =
                             (parts[0].parse::<usize>(), parts[1].parse::<u64>())
                     {
-                        active_sstables.insert((level, id));
+                        edits.push(ManifestEdit::AddSstable { level, id });
                     }
                 }
             }
-            let m = Manifest { active_sstables };
-            m.save(&manifest_path)?;
-            m
-        };
+            if !edits.is_empty() {
+                manifest.append_batch(edits)?;
+            }
+        }
 
         // 2. Discover active SSTables and clean up orphan/garbage files.
         let mut max_id = 0;
@@ -217,7 +232,7 @@ impl EngineInner {
                     && let (Ok(level), Ok(id)) =
                         (parts[0].parse::<usize>(), parts[1].parse::<u64>())
                 {
-                    if manifest.active_sstables.contains(&(level, id)) {
+                    if manifest.state().active_sstables.contains(&(level, id)) {
                         max_id = max_id.max(id);
                         discovered_ssts.push((level, id, path));
                     } else {
@@ -300,13 +315,11 @@ impl EngineInner {
                 }
                 writer.finish()?;
 
-                // Update manifest
-                {
-                    let manifest_path = dir_path.join("manifest.bin");
-                    let mut manifest = Manifest::load(&manifest_path)?;
-                    manifest.active_sstables.insert((0, next_id));
-                    manifest.save(&manifest_path)?;
-                }
+                // Record the recovered SSTable in the manifest.
+                manifest.append(ManifestEdit::AddSstable {
+                    level: 0,
+                    id: next_id,
+                })?;
 
                 let reader = SstableReader::open(&sst_path, next_id, 0, block_cache.clone())?;
                 sstables_map
@@ -333,7 +346,7 @@ impl EngineInner {
             options: active_options,
             write_mutex: Mutex::new(()),
             compaction_mutex: Mutex::new(()),
-            manifest_mutex: Mutex::new(()),
+            manifest: Mutex::new(manifest),
             next_sst_id: AtomicU64::new(max_id + 1),
             executor,
             wal_sync_handle: Mutex::new(None),
@@ -1029,20 +1042,24 @@ impl EngineInner {
             new_sstables.push(Arc::new(reader));
         }
 
-        // Update manifest under manifest_mutex lock
+        // Atomically swap the compacted SSTables for the new ones in the
+        // manifest: one batched append (a single fsync) replaces the old
+        // full-file rewrite.
         {
-            let _manifest_lock = self.manifest_mutex.lock().unwrap();
-            let manifest_path = self.dir_path.join("manifest.bin");
-            let mut manifest = Manifest::load(&manifest_path)?;
+            let mut edits = Vec::new();
             for f in source_files.iter().chain(overlapping_target_files.iter()) {
-                let reader = f;
-                manifest.active_sstables.remove(&(reader.level, reader.id));
+                edits.push(ManifestEdit::RemoveSstable {
+                    level: f.level,
+                    id: f.id,
+                });
             }
             for f in &new_sstables {
-                let reader = f;
-                manifest.active_sstables.insert((reader.level, reader.id));
+                edits.push(ManifestEdit::AddSstable {
+                    level: f.level,
+                    id: f.id,
+                });
             }
-            manifest.save(&manifest_path)?;
+            self.manifest.lock().unwrap().append_batch(edits)?;
         }
 
         // 4. Update the active sstables map
@@ -1116,14 +1133,14 @@ impl EngineInner {
         writer.finish()?;
         drop(map);
 
-        // Update manifest under manifest_mutex lock
-        {
-            let _manifest_lock = self.manifest_mutex.lock().unwrap();
-            let manifest_path = self.dir_path.join("manifest.bin");
-            let mut manifest = Manifest::load(&manifest_path)?;
-            manifest.active_sstables.insert((0, next_id));
-            manifest.save(&manifest_path)?;
-        }
+        // Record the newly flushed SSTable in the manifest.
+        self.manifest
+            .lock()
+            .unwrap()
+            .append(ManifestEdit::AddSstable {
+                level: 0,
+                id: next_id,
+            })?;
 
         let reader = SstableReader::open(&sst_path, next_id, 0, self.block_cache.clone())?;
         {
