@@ -32,10 +32,10 @@ fn new_in_process_client_restores_db_with_flush_interval() {
             memory_budget: None,
         };
         let _db = Arc::new(
-            Database::open_with_options_and_spawner(
+            Database::open_with_options_and_executor(
                 &db_dir,
                 options,
-                Arc::new(dtdb_storage::DefaultSpawner),
+                Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
             )
             .expect("create db"),
         );

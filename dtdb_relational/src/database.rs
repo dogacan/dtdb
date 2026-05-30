@@ -3,7 +3,8 @@ use crate::row::Row;
 use crate::schema::{IndexDefinition, IndexType, Schema};
 use crate::transaction::Transaction;
 use dtdb_storage::{
-    CompressionType, DbKey, DbValue, EngineOptions, StorageEngine, ThreadSpawner, WalEntry,
+    CompressionType, DbKey, DbValue, EngineOptions, Executor, PeriodicHandle, Priority,
+    StorageEngine, WalEntry,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -875,12 +876,14 @@ pub struct Database {
     global_commit_version: std::sync::atomic::AtomicU64,
     occ_active_transactions: Mutex<HashMap<u64, u64>>,
     commit_history: RwLock<Vec<CommitRecord>>,
-    spawner: Arc<dyn ThreadSpawner>,
+    executor: Arc<dyn Executor>,
     active_table_access: Mutex<HashMap<String, HashSet<u64>>>,
     pub auto_increment_sequences: Mutex<HashMap<String, i64>>,
     pub statistics: RwLock<HashMap<String, TableStatistics>>,
-    is_background_analyze_started: std::sync::atomic::AtomicBool,
-    background_analyze_shutdown: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Keeps the background ANALYZE and periodic-flush schedules alive; dropping
+    /// the database cancels them.
+    background_analyze_handle: Mutex<Option<PeriodicHandle>>,
+    background_flush_handle: Mutex<Option<PeriodicHandle>>,
 }
 
 impl Database {
@@ -888,7 +891,10 @@ impl Database {
     ///
     /// It scans the base directory for table subdirectories containing `schema.bin`.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_spawner(dir_path, Arc::new(dtdb_storage::DefaultSpawner))
+        Self::open_with_executor(
+            dir_path,
+            Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
+        )
     }
 
     pub fn dir_path(&self) -> &Path {
@@ -899,9 +905,9 @@ impl Database {
         crate::tokenizer::register_global_tokenizer(name, tokenizer);
     }
 
-    pub fn open_with_spawner(
+    pub fn open_with_executor(
         dir_path: impl AsRef<Path>,
-        spawner: Arc<dyn ThreadSpawner>,
+        executor: Arc<dyn Executor>,
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         let db_options_path = dir_path.join("db_options.bin");
@@ -928,23 +934,24 @@ impl Database {
                 memory_budget: None,
             }
         };
-        Self::open_with_options_and_spawner(dir_path, options, spawner)
+        Self::open_with_options_and_executor(dir_path, options, executor)
     }
 
     /// Opens the database catalog directory with specified options and loads all tables.
     pub fn open_with_options(dir_path: impl AsRef<Path>, options: DatabaseOptions) -> Result<Self> {
-        Self::open_with_options_and_spawner(
+        Self::open_with_options_and_executor(
             dir_path,
             options,
-            Arc::new(dtdb_storage::DefaultSpawner),
+            Arc::new(dtdb_storage::ThreadPoolExecutor::with_default()),
         )
     }
 
-    /// Opens the database catalog directory with specified options and a custom ThreadSpawner, and loads all tables.
-    pub fn open_with_options_and_spawner(
+    /// Opens the database catalog directory with specified options, backed by the
+    /// given [`Executor`], and loads all tables.
+    pub fn open_with_options_and_executor(
         dir_path: impl AsRef<Path>,
         options: DatabaseOptions,
-        spawner: Arc<dyn ThreadSpawner>,
+        executor: Arc<dyn Executor>,
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
@@ -1025,10 +1032,10 @@ impl Database {
                         if let Some(opts) = schema.locality_group_options.get("") {
                             group_opts = opts.apply_to(group_opts);
                         }
-                        let engine = Arc::new(StorageEngine::open_with_spawner(
+                        let engine = Arc::new(StorageEngine::open_with_executor(
                             &path,
                             group_opts,
-                            spawner.clone(),
+                            executor.clone(),
                         )?);
                         engines.insert("".to_string(), engine);
                     } else {
@@ -1039,10 +1046,10 @@ impl Database {
                             if let Some(opts) = schema.locality_group_options.get(&group) {
                                 group_opts = opts.apply_to(group_opts);
                             }
-                            let engine = Arc::new(StorageEngine::open_with_spawner(
+                            let engine = Arc::new(StorageEngine::open_with_executor(
                                 &g_path,
                                 group_opts,
-                                spawner.clone(),
+                                executor.clone(),
                             )?);
                             engines.insert(group, engine);
                         }
@@ -1051,10 +1058,10 @@ impl Database {
                     let mut index_engines = HashMap::new();
                     for idx_def in &schema.indexes {
                         let idx_path = Table::index_dir(&path, &idx_def.name);
-                        let engine = Arc::new(StorageEngine::open_with_spawner(
+                        let engine = Arc::new(StorageEngine::open_with_executor(
                             &idx_path,
                             engine_opts,
-                            spawner.clone(),
+                            executor.clone(),
                         )?);
                         index_engines.insert(idx_def.name.clone(), engine);
                     }
@@ -1099,12 +1106,12 @@ impl Database {
             global_commit_version,
             occ_active_transactions,
             commit_history,
-            spawner,
+            executor,
             active_table_access,
             auto_increment_sequences,
             statistics: RwLock::new(statistics),
-            is_background_analyze_started: std::sync::atomic::AtomicBool::new(false),
-            background_analyze_shutdown: Mutex::new(None),
+            background_analyze_handle: Mutex::new(None),
+            background_flush_handle: Mutex::new(None),
         };
 
         db.recover_transactions()?;
@@ -1195,10 +1202,10 @@ impl Database {
             if let Some(opts) = schema.locality_group_options.get("") {
                 group_opts = opts.apply_to(group_opts);
             }
-            let engine = Arc::new(StorageEngine::open_with_spawner(
+            let engine = Arc::new(StorageEngine::open_with_executor(
                 &table_path,
                 group_opts,
-                self.spawner.clone(),
+                self.executor.clone(),
             )?);
             engines.insert("".to_string(), engine);
         } else {
@@ -1208,10 +1215,10 @@ impl Database {
                 if let Some(opts) = schema.locality_group_options.get(&group) {
                     group_opts = opts.apply_to(group_opts);
                 }
-                let engine = Arc::new(StorageEngine::open_with_spawner(
+                let engine = Arc::new(StorageEngine::open_with_executor(
                     &g_path,
                     group_opts,
-                    self.spawner.clone(),
+                    self.executor.clone(),
                 )?);
                 engines.insert(group, engine);
             }
@@ -1237,10 +1244,10 @@ impl Database {
         let mut index_engines = HashMap::new();
         for idx_def in &schema.indexes {
             let idx_path = Table::index_dir(&table_path, &idx_def.name);
-            let engine = Arc::new(StorageEngine::open_with_spawner(
+            let engine = Arc::new(StorageEngine::open_with_executor(
                 &idx_path,
                 engine_opts,
-                self.spawner.clone(),
+                self.executor.clone(),
             )?);
             index_engines.insert(idx_def.name.clone(), engine);
         }
@@ -1934,10 +1941,10 @@ impl Database {
         fs::create_dir_all(&idx_path)?;
 
         // 7. Open the storage engine
-        let engine = Arc::new(StorageEngine::open_with_spawner(
+        let engine = Arc::new(StorageEngine::open_with_executor(
             &idx_path,
             engine_opts,
-            self.spawner.clone(),
+            self.executor.clone(),
         )?);
 
         // 8. Wait until all active transactions accessing this table have finished (matching DDL behavior)
@@ -2099,44 +2106,66 @@ impl Database {
 
     /// Triggers background stats collection if options specify it and it hasn't been started.
     pub fn start_background_analyze_if_needed(&self, db_arc: &Arc<Database>) {
-        if let Some(ms) = self.options.analyze_frequency_ms
-            && !self
-                .is_background_analyze_started
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            let (tx, rx) = std::sync::mpsc::channel();
-            if let Ok(mut shutdown_guard) = self.background_analyze_shutdown.lock() {
-                *shutdown_guard = Some(tx);
-            }
-            let weak_db = Arc::downgrade(db_arc);
-            let spawner = self.spawner.clone();
-            spawner.spawn(Box::new(move || {
-                let mut i = 0;
-                loop {
-                    match rx.recv_timeout(std::time::Duration::from_millis(ms)) {
-                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            break;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if let Some(db) = weak_db.upgrade() {
-                                let tx_id = 1_000_000_000_000 + i;
-                                i += 1;
-                                let tx = Transaction::new_with_isolation(
-                                    tx_id,
-                                    db.clone(),
-                                    crate::transaction::IsolationLevel::ReadUncommitted,
-                                );
-                                if let Err(e) = db.analyze_all(&tx) {
-                                    tracing::error!(error = ?e, "background analyze failed");
-                                }
-                            } else {
-                                break;
-                            }
-                        }
+        let Some(ms) = self.options.analyze_frequency_ms else {
+            return;
+        };
+        let mut guard = self.background_analyze_handle.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let weak_db = Arc::downgrade(db_arc);
+        // Per-run synthetic transaction id, advanced on each tick.
+        let tx_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handle = self.executor.submit_periodic(
+            std::time::Duration::from_millis(ms),
+            Priority::Low,
+            Box::new(move || {
+                let Some(db) = weak_db.upgrade() else {
+                    return;
+                };
+                let i = tx_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tx_id = 1_000_000_000_000 + i;
+                let tx = Transaction::new_with_isolation(
+                    tx_id,
+                    db.clone(),
+                    crate::transaction::IsolationLevel::ReadUncommitted,
+                );
+                if let Err(e) = db.analyze_all(&tx) {
+                    tracing::error!(error = ?e, "background analyze failed");
+                }
+            }),
+        );
+        *guard = Some(handle);
+    }
+
+    /// Triggers periodic memtable flushing if `flush_interval_ms` is configured
+    /// and it hasn't been started.
+    pub fn start_background_flush_if_needed(&self, db_arc: &Arc<Database>) {
+        let Some(ms) = self.options.flush_interval_ms else {
+            return;
+        };
+        let mut guard = self.background_flush_handle.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let weak_db = Arc::downgrade(db_arc);
+        let handle = self.executor.submit_periodic(
+            std::time::Duration::from_millis(ms),
+            Priority::High,
+            Box::new(move || {
+                let Some(db) = weak_db.upgrade() else {
+                    return;
+                };
+                for table_name in db.list_tables() {
+                    if let Ok(table) = db.get_table(&table_name)
+                        && let Err(e) = table.flush_memtable()
+                    {
+                        tracing::error!(table = %table_name, error = %e, "periodic flush failed");
                     }
                 }
-            }));
-        }
+            }),
+        );
+        *guard = Some(handle);
     }
 
     /// Gathers database statistics for a single table.
@@ -2278,12 +2307,6 @@ impl Database {
     }
 }
 
-impl Drop for Database {
-    fn drop(&mut self) {
-        if let Ok(mut shutdown_guard) = self.background_analyze_shutdown.lock()
-            && let Some(tx) = shutdown_guard.take()
-        {
-            let _ = tx.send(());
-        }
-    }
-}
+// Background ANALYZE and periodic-flush schedules are cancelled automatically
+// when the `PeriodicHandle`s stored on `Database` are dropped, so no explicit
+// `Drop` impl is required.
