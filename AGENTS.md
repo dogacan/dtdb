@@ -82,6 +82,18 @@ Keep the database's layered, bottom-up design in mind. Lower-level crates must n
 3. **`dtdb_sql`** (AST Parsing, Query Planning, Optimization, and Physical Volcano execution)
 4. **`dtdb_api`** (In-Process and gRPC Client API, Server, and SQL CLI prompt)
 
+### Architecture Decision Records
+
+Design decisions with lasting structural impact are recorded under
+[`docs/adr/`](docs/adr/). Consult them before reworking the areas they cover, and
+add a new numbered ADR when making a comparable decision.
+
+* [ADR 0001 — Unified persistence for non-LSM metadata files](docs/adr/0001-unified-metadata-persistence.md):
+  the planned three-layer scheme (`atomic_write`, `FramedLog`,
+  `SnapshotLog`) for `manifest.bin`, `transactions.log`, `schema.bin`,
+  `statistics.bin`, and friends. **Accepted, not yet implemented** — these files
+  still use their legacy hand-rolled patterns today.
+
 ### Known Design & Transaction Constraints
 
 * **No DDL in Transactions**: DDL statements (e.g., `CREATE TABLE`, `DROP TABLE`) are **strictly prohibited** within transactions. This is a primary architectural constraint.
