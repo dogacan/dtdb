@@ -894,7 +894,7 @@ impl TableScanIterator {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct TableStatistics {
     pub table_name: String,
     pub row_count: u64,
@@ -903,7 +903,7 @@ pub struct TableStatistics {
     pub index_stats: HashMap<String, IndexStats>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct GroupStats {
     pub num_sstables: usize,
     pub total_sstable_size: u64,
@@ -911,7 +911,7 @@ pub struct GroupStats {
     pub tombstone_count: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct IndexStats {
     pub entry_count: u64,
     pub unique_values: u64,
@@ -994,6 +994,15 @@ pub struct Database {
     active_table_access: Mutex<HashMap<String, HashSet<u64>>>,
     pub auto_increment_sequences: Mutex<HashMap<String, i64>>,
     pub statistics: RwLock<HashMap<String, TableStatistics>>,
+    /// Per-table statistics epoch, bumped by `analyze_table` only when the
+    /// recomputed statistics actually differ from the previous ones. Unlike
+    /// [`schema_version`](Self::schema_version) (which tracks schema *shape* and
+    /// gates correctness), this tracks the cost inputs the optimizer reads, so a
+    /// plan cache can drop a cost-stale plan when, and only when, the stats it
+    /// was compiled against have moved. Process-local and starts empty on open,
+    /// matching the in-memory plan cache it serves. Entries are removed on
+    /// `drop_table`.
+    stats_versions: RwLock<HashMap<String, u64>>,
     /// Keeps the background ANALYZE and periodic-flush schedules alive; dropping
     /// the database cancels them.
     background_analyze_handle: Mutex<Option<PeriodicHandle>>,
@@ -1016,6 +1025,21 @@ impl Database {
     pub fn schema_version(&self) -> u64 {
         self.schema_version
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Exposes the current statistics epoch for `table_name`.
+    ///
+    /// Returns 0 when the table has never been analyzed (or its stats have not
+    /// changed since open). `analyze_table` advances this only when a table's
+    /// recomputed statistics actually differ, so a cached plan compiled against
+    /// version `v` is cost-current as long as this still returns `v`.
+    pub fn stats_version(&self, table_name: &str) -> u64 {
+        self.stats_versions
+            .read()
+            .unwrap()
+            .get(table_name)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn register_tokenizer(&self, name: &str, tokenizer: Arc<dyn crate::tokenizer::Tokenizer>) {
@@ -1229,6 +1253,7 @@ impl Database {
             active_table_access,
             auto_increment_sequences,
             statistics: RwLock::new(statistics),
+            stats_versions: RwLock::new(HashMap::new()),
             background_analyze_handle: Mutex::new(None),
             background_flush_handle: Mutex::new(None),
         };
@@ -1416,6 +1441,13 @@ impl Database {
         {
             let mut stats_guard = self.statistics.write().unwrap();
             stats_guard.remove(name);
+        }
+        {
+            // Forget the stats epoch so a future table reusing this name starts
+            // fresh; any plan referencing the old table is already invalidated
+            // by the schema_version bump below.
+            let mut versions = self.stats_versions.write().unwrap();
+            versions.remove(name);
         }
 
         // Wait until all transactions currently accessing this table have finished.
@@ -2390,9 +2422,22 @@ impl Database {
         // to prevent race with drop_table rename.
         let tables_guard = self.tables.read().unwrap();
         if tables_guard.contains_key(table_name) {
-            {
+            let changed = {
                 let mut stats_guard = self.statistics.write().unwrap();
+                // Only the cost inputs matter for plan validity, so compare
+                // against the previous stats and treat a first-ever analyze
+                // (no prior entry) as a change too.
+                let changed = stats_guard.get(table_name) != Some(&stats);
                 stats_guard.insert(table_name.to_string(), stats);
+                changed
+            };
+
+            // Advance the statistics epoch only when the numbers actually moved,
+            // so a periodic background ANALYZE that recomputes identical stats
+            // does not needlessly invalidate cached plans.
+            if changed {
+                let mut versions = self.stats_versions.write().unwrap();
+                *versions.entry(table_name.to_string()).or_insert(0) += 1;
             }
 
             let table_path = self.dir_path.join(table_name);

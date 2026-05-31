@@ -1,4 +1,8 @@
-use dtdb_relational::{Column, DataType, Database, IndexType, RelationalError, Schema};
+use dtdb_relational::{
+    Column, DataType, Database, IndexType, RelationalError, Row, Schema, Transaction,
+};
+use dtdb_storage::{DbKey, DbValue};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn create_test_schema() -> Schema {
@@ -108,4 +112,77 @@ fn test_schema_version_failed_ddl_does_not_increment() {
     let res = db.drop_index("users", "non_existent_idx");
     assert!(matches!(res, Err(RelationalError::SchemaMismatch(_))));
     assert_eq!(db.schema_version(), 1);
+}
+
+fn user_row(id: i64, name: &str) -> Row {
+    Row::new(vec![DbValue::Int(id), DbValue::String(name.to_string())])
+}
+
+#[test]
+fn test_stats_version_bumps_only_on_change() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    // Never analyzed -> epoch is 0.
+    assert_eq!(db.stats_version("users"), 0);
+
+    // Insert rows, then analyze. First-ever statistics count as a change, so
+    // the epoch advances 0 -> 1.
+    let tx = Transaction::new(1, db.clone());
+    tx.put("users", DbKey::Int(1), user_row(1, "alice")).unwrap();
+    tx.put("users", DbKey::Int(2), user_row(2, "bob")).unwrap();
+    tx.commit().unwrap();
+
+    let tx = Transaction::new(2, db.clone());
+    db.analyze_table("users", &tx).unwrap();
+    drop(tx);
+    assert_eq!(db.stats_version("users"), 1);
+
+    // Re-analyzing with no intervening writes recomputes identical statistics,
+    // so the epoch must NOT advance -- this is the property that keeps a
+    // periodic background ANALYZE from needlessly invalidating cached plans.
+    let tx = Transaction::new(3, db.clone());
+    db.analyze_table("users", &tx).unwrap();
+    drop(tx);
+    assert_eq!(db.stats_version("users"), 1);
+
+    // New data shifts the statistics, so the epoch advances 1 -> 2.
+    let tx = Transaction::new(4, db.clone());
+    tx.put("users", DbKey::Int(3), user_row(3, "carol")).unwrap();
+    tx.commit().unwrap();
+
+    let tx = Transaction::new(5, db.clone());
+    db.analyze_table("users", &tx).unwrap();
+    drop(tx);
+    assert_eq!(db.stats_version("users"), 2);
+}
+
+#[test]
+fn test_stats_version_reset_on_drop() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    // Scope each transaction so it is dropped (releasing its table-access slot)
+    // before the later drop_table, which spin-waits for active readers.
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", DbKey::Int(1), user_row(1, "alice")).unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let tx = Transaction::new(2, db.clone());
+        db.analyze_table("users", &tx).unwrap();
+    }
+    assert_eq!(db.stats_version("users"), 1);
+
+    // Dropping the table forgets its epoch; a table later reusing the name
+    // starts fresh at 0. (Any plan referencing the old table is separately
+    // invalidated by the schema_version bump from the DDL.)
+    db.drop_table("users").unwrap();
+    assert_eq!(db.stats_version("users"), 0);
+
+    db.create_table("users", create_test_schema()).unwrap();
+    assert_eq!(db.stats_version("users"), 0);
 }
