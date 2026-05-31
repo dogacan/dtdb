@@ -320,15 +320,6 @@ mod imp {
         g.finish();
     }
 
-    /// 1000 INSERTs batched into a single transaction (one commit total).
-    fn bench_insert_txn(c: &mut Criterion) {
-        let mut g = c.benchmark_group("dml/insert_txn");
-        g.throughput(Throughput::Elements(WRITE_ROWS as u64));
-        let inserts: Vec<String> = (0..WRITE_ROWS).map(insert_sql).collect();
-        write_bench(&mut g, |_t| {}, |t| t.exec_txn(&inserts));
-        g.finish();
-    }
-
     /// Full-scan aggregate filtered on the unindexed `k` column.
     fn bench_select_scan(c: &mut Criterion) {
         let mut g = c.benchmark_group("dml/select_scan_aggregate");
@@ -510,7 +501,6 @@ mod imp {
     pub fn run() {
         let mut c = Criterion::default().configure_from_args();
         bench_insert_autocommit(&mut c);
-        bench_insert_txn(&mut c);
         bench_insert_txn_client(&mut c);
         bench_select_scan(&mut c);
         bench_select_point(&mut c);
