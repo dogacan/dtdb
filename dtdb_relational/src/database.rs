@@ -983,6 +983,7 @@ pub struct Database {
     // snapshot -- matching the previous clone-on-read semantics.
     tables: RwLock<HashMap<String, Arc<Table>>>,
     pub options: DatabaseOptions,
+    pub schema_version: std::sync::atomic::AtomicU64,
     transaction_log_path: PathBuf,
     transaction_log: Mutex<Option<FramedLog<TransactionRecord>>>,
     active_transactions: Mutex<HashSet<u64>>,
@@ -1009,6 +1010,12 @@ impl Database {
 
     pub fn dir_path(&self) -> &Path {
         &self.dir_path
+    }
+
+    /// Exposes the current schema version of the database catalog.
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn register_tokenizer(&self, name: &str, tokenizer: Arc<dyn crate::tokenizer::Tokenizer>) {
@@ -1211,6 +1218,7 @@ impl Database {
             dir_path,
             tables: RwLock::new(tables),
             options,
+            schema_version: std::sync::atomic::AtomicU64::new(0),
             transaction_log_path,
             transaction_log,
             active_transactions,
@@ -1383,6 +1391,9 @@ impl Database {
             seqs.insert(name.to_string(), 1);
         }
 
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -1442,6 +1453,9 @@ impl Database {
             let mut access = self.active_table_access.lock().unwrap();
             access.remove(name);
         }
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }
@@ -2133,6 +2147,9 @@ impl Database {
         table.schema.indexes.push(new_index_def);
         table.index_engines.insert(index_name.to_string(), engine);
 
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -2190,6 +2207,9 @@ impl Database {
         if idx_path.exists() {
             fs::remove_dir_all(idx_path)?;
         }
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }
