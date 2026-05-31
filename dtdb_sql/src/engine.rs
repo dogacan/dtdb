@@ -8,12 +8,19 @@ use crate::physical::{
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
-use dtdb_storage::{DbKey, DbValue};
+use dtdb_storage::{DbKey, DbValue, LruCache};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Capacity (in entries) of the per-engine parsed-statement cache. SQL text is
+/// typically a small, fixed set of templates (the user-facing `sql_query!`
+/// macro requires compile-time literal strings), so this comfortably holds a
+/// real application's working set; pathological dynamic SQL is bounded by LRU
+/// eviction. Entries are stored with size 1 so the byte budget is an entry count.
+const PARSE_CACHE_CAPACITY: usize = 1024;
 
 /// Represents the tabular or DDL execution output of a SQL query.
 #[derive(Debug, Clone, PartialEq)]
@@ -174,11 +181,50 @@ impl PreparedStatement {
 /// SqlEngine orchestrates the parser, logical planner, optimizer, and physical execution pipeline.
 pub struct SqlEngine {
     database: Arc<Database>,
+    /// Caches parsed ASTs keyed on the preprocessed SQL text, so re-executing
+    /// the same statement (parameterized via placeholders) parses only once.
+    /// Parsing is context-free (independent of schema), so a text key is always
+    /// valid; planning is intentionally NOT cached here, so each execution still
+    /// resolves against the current schema.
+    parse_cache: Mutex<LruCache<String, Arc<Statement>>>,
 }
 
 impl SqlEngine {
     pub fn new(database: Arc<Database>) -> Self {
-        Self { database }
+        Self {
+            database,
+            parse_cache: Mutex::new(LruCache::new(PARSE_CACHE_CAPACITY)),
+        }
+    }
+
+    /// Returns the parsed AST for `preprocessed`, reusing a cached parse when
+    /// available. On a miss, parses (outside the lock) and caches the result.
+    /// Validates the single-statement constraint exactly as the uncached path.
+    fn cached_parse(&self, preprocessed: String) -> Result<Arc<Statement>, String> {
+        {
+            let mut cache = self.parse_cache.lock().unwrap();
+            if let Some(stmt) = cache.get(&preprocessed) {
+                return Ok(stmt.clone());
+            }
+        }
+        let dialect = GenericDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
+        if statements.is_empty() {
+            return Err("No SQL statements found".to_string());
+        }
+        if statements.len() > 1 {
+            return Err(
+                "Multiple SQL statements in a single execute() call are not allowed. \
+                 Use DuctTapeDbClient::run_in_transaction() or the Transaction RPC to \
+                 execute multiple statements within a single transaction."
+                    .to_string(),
+            );
+        }
+        let stmt = Arc::new(statements.remove(0));
+        let mut cache = self.parse_cache.lock().unwrap();
+        cache.insert(preprocessed, stmt.clone(), 1);
+        Ok(stmt)
     }
 
     /// Parses and preprocesses `sql` once into a reusable [`PreparedStatement`].
@@ -318,28 +364,15 @@ impl SqlEngine {
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
+        // Parse via the cache: re-executing the same (parameterized) statement
+        // reuses the cached AST instead of re-parsing. The single-statement and
+        // empty-input checks live in `cached_parse`, matching the prior path.
         let preprocessed = preprocess_sql(sql);
-        let dialect = GenericDialect {};
-        let mut statements =
-            Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
-        if statements.is_empty() {
-            return Err("No SQL statements found".to_string());
-        }
-
-        // Reject multi-statement inputs. Callers who need to run multiple statements
-        // in a single transaction must use RunInTransaction or the Transaction RPC.
-        // See the doc comment above for the full rationale.
-        if statements.len() > 1 {
-            return Err(
-                "Multiple SQL statements in a single execute() call are not allowed. \
-                 Use DuctTapeDbClient::run_in_transaction() or the Transaction RPC to \
-                 execute multiple statements within a single transaction."
-                    .to_string(),
-            );
-        }
-
-        let statement = statements.remove(0);
-        self.execute_statement(statement, tx, params)
+        let statement = self.cached_parse(preprocessed)?;
+        // Clone the cached AST: `execute_statement` binds parameters into it, so
+        // each execution needs its own owned copy; the cached entry stays
+        // pristine (symbolic placeholders) for the next caller.
+        self.execute_statement((*statement).clone(), tx, params)
     }
 
     /// Binds parameters into an already-parsed statement, then plans,

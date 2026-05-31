@@ -5834,3 +5834,62 @@ fn test_spilling_parity_against_in_memory() {
         "spilling output diverged from the in-memory path"
     );
 }
+
+/// The parse cache keys on SQL text, so re-executing the same parameterized
+/// template reuses one parsed AST. This guards correctness: the cached AST keeps
+/// its symbolic placeholders (binding happens on a per-execution clone), so
+/// repeated executions with different parameters must not leak into each other.
+#[test]
+fn test_sql_parse_cache_param_isolation() {
+    use std::collections::HashMap;
+    let (_temp, db, engine) = setup_engine();
+
+    let tx = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, v STRING)", &tx)
+        .unwrap();
+    tx.commit().unwrap();
+
+    // Insert three rows through the SAME template -> one parse, then cache hits.
+    let insert_tpl = "INSERT INTO t (id, v) VALUES (@id, @v)";
+    let tx = Transaction::new(2, db.clone());
+    for (id, v) in [(1i64, "one"), (2, "two"), (3, "three")] {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), DbValue::Int(id));
+        params.insert("v".to_string(), DbValue::String(v.to_string()));
+        let res = engine
+            .execute_with_params(insert_tpl, &tx, &params)
+            .unwrap();
+        assert_eq!(res, ExecutionResult::Insert { count: 1 });
+    }
+    tx.commit().unwrap();
+
+    // Select via the SAME template with different @id. If the first bind had
+    // mutated the cached AST, later calls would return the wrong row.
+    let select_tpl = "SELECT v FROM t WHERE id = @id";
+    let select_one = |id: i64| -> String {
+        let tx = Transaction::new(100 + id as u64, db.clone());
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), DbValue::Int(id));
+        let res = engine
+            .execute_with_params(select_tpl, &tx, &params)
+            .unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1, "expected exactly one row for id={id}");
+                match &rows[0].values[0] {
+                    DbValue::String(s) => s.clone(),
+                    other => panic!("unexpected value {other:?}"),
+                }
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    };
+
+    // Out-of-order, with a repeat, to exercise hits against a mutated-AST bug.
+    assert_eq!(select_one(3), "three");
+    assert_eq!(select_one(1), "one");
+    assert_eq!(select_one(2), "two");
+    assert_eq!(select_one(3), "three");
+}
