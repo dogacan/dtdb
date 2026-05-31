@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{JoinType, LogicalPlan, SetOpType};
+use crate::logical::{JoinType, LogicalPlan, PlanKey, SetOpType};
 use dtdb_relational::{DataType, Database, Schema};
 use dtdb_storage::DbKey;
 use dtdb_storage::DbValue;
@@ -614,8 +614,8 @@ impl Optimizer {
                 // scan) instead of collapsing to a selectivity of 1.0.
                 s = 1.0 / (effective_row_count(row_count) as f64);
             } else {
-                let is_start_unbounded = is_key_unbounded_min(start);
-                let is_end_unbounded = is_key_unbounded_max(end);
+                let is_start_unbounded = is_plan_key_unbounded_min(start);
+                let is_end_unbounded = is_plan_key_unbounded_max(end);
                 if is_start_unbounded && is_end_unbounded {
                     s = 1.0;
                 } else if is_start_unbounded || is_end_unbounded {
@@ -635,8 +635,8 @@ impl Optimizer {
         index_name: &str,
         schema: &Schema,
         stats_opt: Option<&dtdb_relational::TableStatistics>,
-        start: &DbKey,
-        end: &DbKey,
+        start: &PlanKey,
+        end: &PlanKey,
         query_columns: &HashSet<String>,
     ) -> f64 {
         let row_count = stats_opt.map(|s| s.row_count).unwrap_or(0);
@@ -651,8 +651,8 @@ impl Optimizer {
                 s_idx = 1.0 / (effective_row_count(row_count) as f64);
             }
         } else {
-            let is_start_unbounded = is_key_unbounded_min(start);
-            let is_end_unbounded = is_key_unbounded_max(end);
+            let is_start_unbounded = is_plan_key_unbounded_min(start);
+            let is_end_unbounded = is_plan_key_unbounded_max(end);
             if is_start_unbounded && is_end_unbounded {
                 s_idx = 1.0;
             } else if is_start_unbounded || is_end_unbounded {
@@ -939,21 +939,33 @@ fn is_key_unbounded_max(key: &DbKey) -> bool {
     }
 }
 
-fn get_column_comparison<'a>(
-    left: &'a Expr,
-    right: &'a Expr,
-    col_name: &str,
-) -> Option<&'a DbValue> {
+fn is_plan_key_unbounded_min(key: &PlanKey) -> bool {
+    match key {
+        PlanKey::Value(k) => is_key_unbounded_min(k),
+        PlanKey::Parameter(_) => false,
+    }
+}
+
+fn is_plan_key_unbounded_max(key: &PlanKey) -> bool {
+    match key {
+        PlanKey::Value(k) => is_key_unbounded_max(k),
+        PlanKey::Parameter(_) => false,
+    }
+}
+
+fn get_column_comparison(left: &Expr, right: &Expr, col_name: &str) -> Option<PlanKey> {
     match (left, right) {
         (Expr::Column(name, _), Expr::Literal(lit))
+        | (Expr::Literal(lit), Expr::Column(name, _))
             if dtdb_relational::column_names_match(name, col_name) =>
         {
-            Some(lit)
+            val_to_key(lit).map(PlanKey::Value)
         }
-        (Expr::Literal(lit), Expr::Column(name, _))
+        (Expr::Column(name, _), Expr::Parameter(p))
+        | (Expr::Parameter(p), Expr::Column(name, _))
             if dtdb_relational::column_names_match(name, col_name) =>
         {
-            Some(lit)
+            Some(PlanKey::Parameter(p.clone()))
         }
         _ => None,
     }
@@ -992,7 +1004,7 @@ fn extract_bounds_for_column(
     predicate: &Expr,
     col_name: &str,
     col_type: &DataType,
-) -> Option<(DbKey, DbKey)> {
+) -> Option<(PlanKey, PlanKey)> {
     match predicate {
         Expr::BinaryOp {
             left,
@@ -1003,8 +1015,20 @@ fn extract_bounds_for_column(
             let right_bounds = extract_bounds_for_column(right, col_name, col_type);
             match (left_bounds, right_bounds) {
                 (Some((l_start, l_end)), Some((r_start, r_end))) => {
-                    let start = std::cmp::max(l_start, r_start);
-                    let end = std::cmp::min(l_end, r_end);
+                    let start = match (&l_start, &r_start) {
+                        (PlanKey::Value(lk), PlanKey::Value(rk)) => {
+                            PlanKey::Value(std::cmp::max(lk.clone(), rk.clone()))
+                        }
+                        (PlanKey::Parameter(_), _) => l_start,
+                        (_, PlanKey::Parameter(_)) => r_start,
+                    };
+                    let end = match (&l_end, &r_end) {
+                        (PlanKey::Value(lk), PlanKey::Value(rk)) => {
+                            PlanKey::Value(std::cmp::min(lk.clone(), rk.clone()))
+                        }
+                        (PlanKey::Parameter(_), _) => l_end,
+                        (_, PlanKey::Parameter(_)) => r_end,
+                    };
                     Some((start, end))
                 }
                 (Some(bounds), None) => Some(bounds),
@@ -1016,65 +1040,55 @@ fn extract_bounds_for_column(
             left,
             op: Operator::Eq,
             right,
-        } => {
-            if let Some(lit) = get_column_comparison(left, right, col_name) {
-                let key = val_to_key(lit)?;
-                Some((key.clone(), key))
-            } else {
-                None
-            }
-        }
+        } => get_column_comparison(left, right, col_name).map(|key| (key.clone(), key)),
         Expr::BinaryOp { left, op, right } => {
-            if let Some(lit) = get_column_comparison(left, right, col_name) {
-                let key = val_to_key(lit)?;
+            if let Some(key) = get_column_comparison(left, right, col_name) {
                 match op {
                     Operator::GtEq | Operator::Gt => {
-                        let start = if matches!(op, Operator::Gt) {
-                            match key {
-                                // `WHERE id > i64::MAX` has no solutions. Bail out of
-                                // the range-pushdown entirely so the executor doesn't
-                                // open a scan over [MAX, MAX] and rely on the predicate
-                                // re-evaluation to filter the one returned row.
-                                DbKey::Int(i64::MAX) => return None,
-                                DbKey::Int(v) => DbKey::Int(v.checked_add(1)?),
-                                // s + "\0" is the immediate successor of s in code-point
-                                // lex order ('\0' is the smallest scalar; no string can
-                                // sort strictly between s and s + "\0"). Rust string
-                                // invariants forbid unpaired surrogates, so this holds
-                                // for every valid &str input.
-                                DbKey::String(s) => DbKey::String(s + "\0"),
-                                _ => key,
+                        let start = match key {
+                            PlanKey::Value(k) => {
+                                if matches!(op, Operator::Gt) {
+                                    match k {
+                                        DbKey::Int(i64::MAX) => return None,
+                                        DbKey::Int(v) => {
+                                            PlanKey::Value(DbKey::Int(v.checked_add(1)?))
+                                        }
+                                        DbKey::String(s) => PlanKey::Value(DbKey::String(s + "\0")),
+                                        _ => PlanKey::Value(k),
+                                    }
+                                } else {
+                                    PlanKey::Value(k)
+                                }
                             }
-                        } else {
-                            key
+                            PlanKey::Parameter(_) => key,
                         };
                         let end = match col_type {
-                            DataType::Int => DbKey::Int(i64::MAX),
-                            _ => DbKey::String("\u{10ffff}".to_string()),
+                            DataType::Int => PlanKey::Value(DbKey::Int(i64::MAX)),
+                            _ => PlanKey::Value(DbKey::String("\u{10ffff}".to_string())),
                         };
                         Some((start, end))
                     }
                     Operator::LtEq | Operator::Lt => {
                         let start = match col_type {
-                            DataType::Int => DbKey::Int(i64::MIN),
-                            _ => DbKey::String("".to_string()),
+                            DataType::Int => PlanKey::Value(DbKey::Int(i64::MIN)),
+                            _ => PlanKey::Value(DbKey::String("".to_string())),
                         };
-                        let end = if matches!(op, Operator::Lt) {
-                            match key {
-                                // Symmetric: `WHERE id < i64::MIN` is empty.
-                                DbKey::Int(i64::MIN) => return None,
-                                DbKey::Int(v) => DbKey::Int(v.checked_sub(1)?),
-                                // For `name < "foo"` we want the largest string strictly
-                                // less than "foo". There's no clean immediate predecessor
-                                // in Unicode lex order, so we leave the bound at the
-                                // literal value and rely on the executor to skip the
-                                // matching row (range bounds are inclusive on the engine
-                                // side but the SQL predicate gets re-checked).
-                                DbKey::String(s) => DbKey::String(s),
-                                _ => key,
+                        let end = match key {
+                            PlanKey::Value(k) => {
+                                if matches!(op, Operator::Lt) {
+                                    match k {
+                                        DbKey::Int(i64::MIN) => return None,
+                                        DbKey::Int(v) => {
+                                            PlanKey::Value(DbKey::Int(v.checked_sub(1)?))
+                                        }
+                                        DbKey::String(s) => PlanKey::Value(DbKey::String(s)),
+                                        _ => PlanKey::Value(k),
+                                    }
+                                } else {
+                                    PlanKey::Value(k)
+                                }
                             }
-                        } else {
-                            key
+                            PlanKey::Parameter(_) => key,
                         };
                         Some((start, end))
                     }
@@ -1090,7 +1104,7 @@ fn extract_bounds_for_column(
 }
 
 /// Helper to examine an expression tree and extract range constraints for the primary key.
-fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(DbKey, DbKey)> {
+fn extract_key_range(predicate: &Expr, schema: &Schema) -> Option<(PlanKey, PlanKey)> {
     let pk_idx = schema.primary_key_index()?;
     let pk_col = &schema.columns[pk_idx];
     extract_bounds_for_column(predicate, &pk_col.name, &pk_col.data_type)
@@ -1391,8 +1405,8 @@ mod tests {
         let bounds = extract_bounds_for_column(&predicate_bool_gt_2, "val", &DataType::Bool);
         assert!(bounds.is_some());
         let (start, end) = bounds.unwrap();
-        assert_eq!(start, DbKey::Int(6));
-        assert_eq!(end, DbKey::String("\u{10ffff}".to_string()));
+        assert_eq!(start, PlanKey::Value(DbKey::Int(6)));
+        assert_eq!(end, PlanKey::Value(DbKey::String("\u{10ffff}".to_string())));
 
         // WHERE val < 5 for boolean col_type (testing fallback arm _ => key in matches!(op, Operator::Lt))
         let predicate_bool_lt = Expr::BinaryOp {
@@ -1403,8 +1417,8 @@ mod tests {
         let bounds = extract_bounds_for_column(&predicate_bool_lt, "val", &DataType::Bool);
         assert!(bounds.is_some());
         let (start, end) = bounds.unwrap();
-        assert_eq!(start, DbKey::String("".to_string()));
-        assert_eq!(end, DbKey::Int(4));
+        assert_eq!(start, PlanKey::Value(DbKey::String("".to_string())));
+        assert_eq!(end, PlanKey::Value(DbKey::Int(4)));
 
         // And operators
         let predicate_and = Expr::BinaryOp {
@@ -1421,7 +1435,13 @@ mod tests {
             }),
         };
         let bounds = extract_bounds_for_column(&predicate_and, "id", &col_type_int);
-        assert_eq!(bounds, Some((DbKey::Int(5), DbKey::Int(10))));
+        assert_eq!(
+            bounds,
+            Some((
+                PlanKey::Value(DbKey::Int(5)),
+                PlanKey::Value(DbKey::Int(10))
+            ))
+        );
     }
 
     #[test]
@@ -1530,7 +1550,10 @@ mod tests {
         let scan_with_range = LogicalPlan::Scan {
             table_name: "t".to_string(),
             schema: schema.clone(),
-            range: Some((DbKey::Int(1), DbKey::Int(10))),
+            range: Some((
+                PlanKey::Value(DbKey::Int(1)),
+                PlanKey::Value(DbKey::Int(10)),
+            )),
         };
         assert!(
             opt.try_promote_to_index_scan(scan_with_range, "val")

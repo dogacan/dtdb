@@ -10,6 +10,13 @@ pub enum JoinType {
     Cross,
 }
 
+/// PlanKey represents a parameterizable key range boundary in LogicalPlan scans.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum PlanKey {
+    Value(dtdb_storage::DbKey),
+    Parameter(String),
+}
+
 /// AggregateExpr represents aggregate functions (COUNT, SUM, MIN, MAX, AVG).
 ///
 /// `distinct` records whether the call used the `DISTINCT` quantifier
@@ -32,14 +39,14 @@ pub enum LogicalPlan {
         table_name: String,
         schema: Schema,
         // Optional key range bounds (start_key, end_key) pushed down by the optimizer.
-        range: Option<(dtdb_storage::DbKey, dtdb_storage::DbKey)>,
+        range: Option<(PlanKey, PlanKey)>,
     },
     IndexScan {
         table_name: String,
         index_name: String,
         schema: Schema,
         // Optional key range bounds (start_key, end_key) on the indexed columns pushed down by the optimizer.
-        range: Option<(dtdb_storage::DbKey, dtdb_storage::DbKey)>,
+        range: Option<(PlanKey, PlanKey)>,
     },
     FullTextScan {
         table_name: String,
@@ -107,9 +114,34 @@ impl LogicalPlan {
         params: &std::collections::HashMap<String, dtdb_storage::DbValue>,
     ) -> Result<(), String> {
         match self {
-            LogicalPlan::Scan { .. }
-            | LogicalPlan::IndexScan { .. }
-            | LogicalPlan::FullTextScan { .. } => Ok(()),
+            LogicalPlan::Scan { range, .. } | LogicalPlan::IndexScan { range, .. } => {
+                if let Some((start, end)) = range {
+                    let subst = |key: &mut PlanKey| -> Result<(), String> {
+                        if let PlanKey::Parameter(name) = key {
+                            let val = params
+                                .get(name)
+                                .ok_or_else(|| format!("Unbound parameter: {name}"))?;
+                            let concrete = match val {
+                                dtdb_storage::DbValue::Int(v) => dtdb_storage::DbKey::Int(*v),
+                                dtdb_storage::DbValue::String(s) => {
+                                    dtdb_storage::DbKey::String(s.clone())
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "Unsupported key parameter type for {name}"
+                                    ));
+                                }
+                            };
+                            *key = PlanKey::Value(concrete);
+                        }
+                        Ok(())
+                    };
+                    subst(start)?;
+                    subst(end)?;
+                }
+                Ok(())
+            }
+            LogicalPlan::FullTextScan { .. } => Ok(()),
             LogicalPlan::Filter { source, predicate } => {
                 source.substitute_params(params)?;
                 predicate.substitute_params(params)

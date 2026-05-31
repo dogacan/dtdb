@@ -915,7 +915,7 @@ fn test_pk_equality_pushdown_without_statistics() {
     let rendered = dtdb_sql::format_logical_plan(&plan);
 
     assert!(
-        rendered.contains("range=[Int(7), Int(7)]"),
+        rendered.contains("range=[Value(Int(7)), Value(Int(7))]"),
         "PK equality on an un-analyzed table should push down a point range.\nPlan:\n{rendered}"
     );
     assert!(
@@ -952,5 +952,21 @@ fn test_placeholder_survives_planning_as_parameter() {
     assert!(
         format!("{plan2:?}").contains(r#"Parameter("id")"#),
         "'@id' should plan to Expr::Parameter"
+    );
+}
+
+#[test]
+fn test_parameter_range_pushdown() {
+    let (_tmp, db) = setup_db();
+    let plan = optimize_plan(db, "SELECT val FROM t1 WHERE id = :id").unwrap();
+    let rendered = dtdb_sql::format_logical_plan(&plan);
+
+    assert!(
+        rendered.contains("range=[Parameter(\"id\"), Parameter(\"id\")]"),
+        "PK equality on a parameter should push down a parameter range.\nPlan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("range=all"),
+        "Parameter range pushdown must not fall back to a full scan.\nPlan:\n{rendered}"
     );
 }

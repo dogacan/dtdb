@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{JoinType, LogicalPlan, format_logical_plan};
+use crate::logical::{JoinType, LogicalPlan, PlanKey, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
@@ -100,7 +100,7 @@ fn match_point_get(plan: &LogicalPlan) -> Option<PointGetPlan<'_>> {
         LogicalPlan::Scan {
             table_name,
             schema,
-            range: Some((start, end)),
+            range: Some((PlanKey::Value(start), PlanKey::Value(end))),
         } if start == end => Some(PointGetPlan {
             projection,
             filter,
@@ -269,7 +269,24 @@ impl SqlEngine {
         // placeholders in INSERT ... VALUES, which the planner materializes to
         // values), fall back to caching the AST and binding on each execution.
         let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-            Ok(planned) => PreparedPlan::Planned(Box::new(planned)),
+            Ok(planned) => {
+                let optimized = match planned {
+                    SqlStatement::Query(q) => {
+                        SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
+                    }
+                    SqlStatement::InsertSelect {
+                        table_name,
+                        columns,
+                        query,
+                    } => SqlStatement::InsertSelect {
+                        table_name,
+                        columns,
+                        query: Optimizer::new(self.database.clone()).optimize(query),
+                    },
+                    other => other,
+                };
+                PreparedPlan::Planned(Box::new(optimized))
+            }
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
@@ -308,7 +325,24 @@ impl SqlEngine {
             .ok_or_else(|| "No SQL statements found".to_string())?;
         Ok(Some(
             match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-                Ok(planned) => PreparedPlan::Planned(Box::new(planned)),
+                Ok(planned) => {
+                    let optimized = match planned {
+                        SqlStatement::Query(q) => {
+                            SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
+                        }
+                        SqlStatement::InsertSelect {
+                            table_name,
+                            columns,
+                            query,
+                        } => SqlStatement::InsertSelect {
+                            table_name,
+                            columns,
+                            query: Optimizer::new(self.database.clone()).optimize(query),
+                        },
+                        other => other,
+                    };
+                    PreparedPlan::Planned(Box::new(optimized))
+                }
                 Err(_) => PreparedPlan::Ast(Box::new(statement)),
             },
         ))
@@ -475,7 +509,22 @@ impl SqlEngine {
     ) -> Result<ExecutionResult, String> {
         crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
-        self.execute_planned(planned_stmt, tx)
+        let optimized = match planned_stmt {
+            SqlStatement::Query(q) => {
+                SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
+            }
+            SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query,
+            } => SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query: Optimizer::new(self.database.clone()).optimize(query),
+            },
+            other => other,
+        };
+        self.execute_planned(optimized, tx)
     }
 
     /// Streaming counterpart to `execute_statement`.
@@ -487,7 +536,22 @@ impl SqlEngine {
     ) -> Result<ExecutionStreamingResult, String> {
         crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
-        self.execute_planned_streaming(planned_stmt, tx)
+        let optimized = match planned_stmt {
+            SqlStatement::Query(q) => {
+                SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
+            }
+            SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query,
+            } => SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query: Optimizer::new(self.database.clone()).optimize(query),
+            },
+            other => other,
+        };
+        self.execute_planned_streaming(optimized, tx)
     }
 
     /// Optimizes, compiles, and executes an already-planned statement in streaming mode.
@@ -497,10 +561,7 @@ impl SqlEngine {
         tx: &Transaction,
     ) -> Result<ExecutionStreamingResult, String> {
         match planned_stmt {
-            SqlStatement::Query(logical_plan) => {
-                // 1. Optimize the Logical Plan
-                let optimized_plan = Optimizer::new(self.database.clone()).optimize(logical_plan);
-
+            SqlStatement::Query(optimized_plan) => {
                 // 1a. Fast path: primary-key point lookups skip the Volcano
                 // operator tree entirely (see `execute_point_get`).
                 if let Some(result) = self.execute_point_get(&optimized_plan, tx)? {
@@ -644,7 +705,7 @@ impl SqlEngine {
             SqlStatement::InsertSelect {
                 table_name,
                 columns,
-                query,
+                query: optimized_plan,
             } => {
                 let table = self
                     .database
@@ -653,9 +714,6 @@ impl SqlEngine {
 
                 let schema = table.schema.clone();
                 let mut insert_count = 0;
-
-                // 1. Optimize the Logical Plan
-                let optimized_plan = Optimizer::new(self.database.clone()).optimize(query);
 
                 // Collect referenced columns
                 let mut cols = HashSet::new();
@@ -831,10 +889,7 @@ impl SqlEngine {
                     count: update_count,
                 })
             }
-            SqlStatement::Query(logical_plan) => {
-                // 1. Optimize the Logical Plan
-                let optimized_plan = Optimizer::new(self.database.clone()).optimize(logical_plan);
-
+            SqlStatement::Query(optimized_plan) => {
                 // 1a. Fast path: primary-key point lookups skip the Volcano
                 // operator tree entirely (see `execute_point_get`).
                 if let Some(result) = self.execute_point_get(&optimized_plan, tx)? {
@@ -1042,7 +1097,10 @@ impl SqlEngine {
             } => {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
-                    Some(r) => r,
+                    Some((PlanKey::Value(s), PlanKey::Value(e))) => (s, e),
+                    Some(_) => {
+                        return Err("IndexScan range contains unresolved parameters".to_string());
+                    }
                     None => {
                         let idx_def = schema
                             .indexes
@@ -1101,7 +1159,8 @@ impl SqlEngine {
             } => {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
-                    Some(r) => r,
+                    Some((PlanKey::Value(s), PlanKey::Value(e))) => (s, e),
+                    Some(_) => return Err("Scan range contains unresolved parameters".to_string()),
                     None => schema.primary_key_bounds().map_err(|e| e.to_string())?,
                 };
 

@@ -1515,10 +1515,9 @@ fn test_sql_secondary_indexing() {
             DbValue::String(s) => s,
             _ => panic!("Expected string plan representation"),
         };
-        assert!(
-            plan_str
-                .contains("- IndexScan: table=students, index=idx_score, range=[Int(85), Int(85)]")
-        );
+        assert!(plan_str.contains(
+            "- IndexScan: table=students, index=idx_score, range=[Value(Int(85)), Value(Int(85))]"
+        ));
         assert!(plan_str.contains("- PhysicalIndexScan"));
     } else {
         panic!("Expected ExecutionResult::Select");
@@ -1609,10 +1608,9 @@ fn test_sql_secondary_indexing() {
             DbValue::String(s) => s,
             _ => panic!("Expected string plan representation"),
         };
-        assert!(
-            plan_str
-                .contains("- IndexScan: table=students, index=idx_score, range=[Int(85), Int(90)]")
-        );
+        assert!(plan_str.contains(
+            "- IndexScan: table=students, index=idx_score, range=[Value(Int(85)), Value(Int(90))]"
+        ));
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -2868,7 +2866,8 @@ fn test_sql_optimizer_predicate_pushdown_through_joins() {
         // The filter for users.id = 2 should be pushed below the join, selecting a range on table=users Scan.
         // It should scan users with range=[Int(2), Int(2)].
         assert!(
-            plan_text.contains("Scan: table=users, range=[Int(2), Int(2)]")
+            plan_text.contains("Scan: table=users, range=[Value(Int(2)), Value(Int(2))]")
+                || plan_text.contains("Scan: table=users, range=[Int(2), Int(2)]")
                 || plan_text.contains("Scan: table=users, range=[2, 2]")
         );
     } else {
