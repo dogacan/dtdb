@@ -178,6 +178,14 @@ enum PreparedPlan {
 pub struct PreparedStatement {
     plan: PreparedPlan,
     sql: String,
+    /// Catalog version this statement's cached [`PreparedPlan::Planned`] was
+    /// built against. A cached logical plan resolves table and column
+    /// references against the schema at `prepare()` time, so DDL run afterwards
+    /// (which bumps [`Database::schema_version`]) can leave it stale.
+    /// `execute_prepared` compares this against the live version and re-plans on
+    /// a mismatch. Unused by the [`PreparedPlan::Ast`] fallback, which already
+    /// re-plans against the live catalog on every execution.
+    catalog_version: u64,
 }
 
 impl PreparedStatement {
@@ -265,10 +273,45 @@ impl SqlEngine {
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
+        // Record the catalog version the plan was built against so later DDL can
+        // be detected and the plan re-built (see `PreparedStatement::catalog_version`).
         Ok(PreparedStatement {
             plan,
             sql: sql.to_string(),
+            catalog_version: self.database.schema_version(),
         })
+    }
+
+    /// Re-plans `prepared` from its original SQL when the catalog has changed
+    /// since it was prepared, returning a plan to use for the current execution.
+    ///
+    /// Returns `None` when the cached plan is still valid (the common case), so
+    /// the caller uses `prepared.plan` directly and avoids re-parsing. A stale
+    /// [`PreparedPlan::Planned`] is rebuilt for this call only; the cached plan
+    /// itself is not refreshed (`prepared` is shared and immutable), so the
+    /// next execution will re-plan again until the statement is re-prepared.
+    fn refreshed_plan(&self, prepared: &PreparedStatement) -> Result<Option<PreparedPlan>, String> {
+        // The Ast fallback already re-plans against the live catalog on every
+        // execution, so only a cached Planned variant can go stale.
+        if !matches!(prepared.plan, PreparedPlan::Planned(_))
+            || prepared.catalog_version == self.database.schema_version()
+        {
+            return Ok(None);
+        }
+
+        let preprocessed = preprocess_sql(&prepared.sql);
+        let dialect = GenericDialect {};
+        let statement = Parser::parse_sql(&dialect, &preprocessed)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "No SQL statements found".to_string())?;
+        Ok(Some(
+            match LogicalPlanner::new(self.database.clone()).plan(&statement) {
+                Ok(planned) => PreparedPlan::Planned(Box::new(planned)),
+                Err(_) => PreparedPlan::Ast(Box::new(statement)),
+            },
+        ))
     }
 
     /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
@@ -281,7 +324,8 @@ impl SqlEngine {
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
-        match &prepared.plan {
+        let refreshed = self.refreshed_plan(prepared)?;
+        match refreshed.as_ref().unwrap_or(&prepared.plan) {
             PreparedPlan::Planned(planned) => {
                 let mut planned = (**planned).clone();
                 substitute_statement_params(&mut planned, params)?;
@@ -300,7 +344,8 @@ impl SqlEngine {
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionStreamingResult, String> {
-        match &prepared.plan {
+        let refreshed = self.refreshed_plan(prepared)?;
+        match refreshed.as_ref().unwrap_or(&prepared.plan) {
             PreparedPlan::Planned(planned) => {
                 let mut planned = (**planned).clone();
                 substitute_statement_params(&mut planned, params)?;

@@ -5055,6 +5055,77 @@ fn test_prepared_statement_reuse() {
 }
 
 #[test]
+fn test_prepared_statement_replanned_after_ddl() {
+    let (_temp, db, engine) = setup_engine();
+
+    // Each statement runs in its own scoped transaction. The transaction must
+    // be dropped (not just committed) before the later DROP TABLE, since DROP
+    // spin-waits for active readers and the reader slot is released on Drop.
+    let run = |sql: &str, id: u64| {
+        let tx = Transaction::new(id, db.clone());
+        engine.execute(sql, &tx).unwrap();
+        tx.commit().unwrap();
+    };
+
+    // Create a two-column table and prepare a `SELECT *` point lookup. The
+    // planner expands `*` against the schema at prepare() time, so the cached
+    // logical plan projects exactly [id, v].
+    run("CREATE TABLE kv (id INT PRIMARY KEY, v VARCHAR)", 1);
+    let stmt = engine.prepare("SELECT * FROM kv WHERE id = :id").unwrap();
+    run("INSERT INTO kv (id, v) VALUES (1, 'a')", 2);
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), DbValue::Int(1));
+
+    // Against the original schema the prepared plan returns two columns.
+    {
+        let tx = Transaction::new(3, db.clone());
+        let res = engine.execute_prepared(&stmt, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { schema, rows } => {
+                assert_eq!(schema.columns.len(), 2);
+                assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // DDL: drop and recreate the table with a third column. Each statement
+    // bumps the catalog version, so the cached `SELECT *` plan is now stale.
+    run("DROP TABLE kv", 4);
+    run("CREATE TABLE kv (id INT PRIMARY KEY, v VARCHAR, w INT)", 5);
+    run("INSERT INTO kv (id, v, w) VALUES (1, 'a', 42)", 6);
+
+    // Re-executing the same prepared statement must reflect the NEW schema
+    // (three columns). A stale plan would still expand `*` to two columns.
+    {
+        let tx = Transaction::new(7, db.clone());
+        let res = engine.execute_prepared(&stmt, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { schema, rows } => {
+                assert_eq!(
+                    schema.columns.len(),
+                    3,
+                    "stale plan would still project the old two columns"
+                );
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].values,
+                    vec![
+                        DbValue::Int(1),
+                        DbValue::String("a".to_string()),
+                        DbValue::Int(42)
+                    ]
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+}
+
+#[test]
 fn test_prepared_statement_insert_and_errors() {
     let (_temp, db, engine) = setup_engine();
 
