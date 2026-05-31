@@ -69,7 +69,7 @@ struct PointGetPlan<'a> {
     /// the filter/projection expressions are bound and evaluated.
     scan_schema: &'a Schema,
     /// The exact primary-key value to fetch.
-    key: &'a DbKey,
+    key: DbKey,
 }
 
 /// Recognizes an optimized plan that is a single-column primary-key point
@@ -82,7 +82,10 @@ struct PointGetPlan<'a> {
 /// any other shape (range scans, full scans, secondary-index/`IndexScan`
 /// lookups, joins, aggregates, composite keys, …), in which case callers fall
 /// back to the general Volcano path.
-fn match_point_get(plan: &LogicalPlan) -> Option<PointGetPlan<'_>> {
+fn match_point_get<'a>(
+    plan: &'a LogicalPlan,
+    params: &std::collections::HashMap<String, DbValue>,
+) -> Option<PointGetPlan<'a>> {
     let (projection, after_proj) = match plan {
         LogicalPlan::Projection {
             source,
@@ -100,54 +103,36 @@ fn match_point_get(plan: &LogicalPlan) -> Option<PointGetPlan<'_>> {
         LogicalPlan::Scan {
             table_name,
             schema,
-            range: Some((PlanKey::Value(start), PlanKey::Value(end))),
-        } if start == end => Some(PointGetPlan {
-            projection,
-            filter,
-            table_name,
-            scan_schema: schema,
-            key: start,
-        }),
-        _ => None,
-    }
-}
-
-/// Substitutes bound parameter values into a planned statement, turning its
-/// symbolic `Expr::Parameter` nodes into concrete literals before execution.
-fn substitute_statement_params(
-    planned: &mut SqlStatement,
-    params: &std::collections::HashMap<String, DbValue>,
-) -> Result<(), String> {
-    match planned {
-        SqlStatement::Query(plan) | SqlStatement::Explain(plan) => plan.substitute_params(params),
-        SqlStatement::InsertSelect { query, .. } => query.substitute_params(params),
-        SqlStatement::Delete { filter, .. } => {
-            if let Some(f) = filter {
-                f.substitute_params(params)?;
-            }
-            Ok(())
-        }
-        SqlStatement::Update {
-            assignments,
-            filter,
-            ..
+            range: Some((start, end)),
         } => {
-            for (_, e) in assignments.iter_mut() {
-                e.substitute_params(params)?;
+            let resolve = |key: &PlanKey| -> Option<DbKey> {
+                match key {
+                    PlanKey::Value(v) => Some(v.clone()),
+                    PlanKey::Parameter(name) => {
+                        let val = params.get(name)?;
+                        match val {
+                            DbValue::Int(v) => Some(DbKey::Int(*v)),
+                            DbValue::String(s) => Some(DbKey::String(s.clone())),
+                            _ => None,
+                        }
+                    }
+                }
+            };
+            let start_key = resolve(start)?;
+            let end_key = resolve(end)?;
+            if start_key == end_key {
+                Some(PointGetPlan {
+                    projection,
+                    filter,
+                    table_name,
+                    scan_schema: schema,
+                    key: start_key,
+                })
+            } else {
+                None
             }
-            if let Some(f) = filter {
-                f.substitute_params(params)?;
-            }
-            Ok(())
         }
-        // Insert holds concrete values (parameters can't survive planning into
-        // it); DDL and Analyze carry no expressions.
-        SqlStatement::Insert { .. }
-        | SqlStatement::CreateTable { .. }
-        | SqlStatement::DropTable { .. }
-        | SqlStatement::CreateIndex { .. }
-        | SqlStatement::DropIndex { .. }
-        | SqlStatement::Analyze { .. } => Ok(()),
+        _ => None,
     }
 }
 
@@ -351,7 +336,7 @@ impl SqlEngine {
     /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
     /// binding `params`. Reuses the cached parse, and — when the plan was
     /// cacheable — the cached logical plan, substituting the bound values into
-    /// it before optimization and execution.
+    /// it during physical compilation.
     pub fn execute_prepared(
         &self,
         prepared: &PreparedStatement,
@@ -360,11 +345,7 @@ impl SqlEngine {
     ) -> Result<ExecutionResult, String> {
         let refreshed = self.refreshed_plan(prepared)?;
         match refreshed.as_ref().unwrap_or(&prepared.plan) {
-            PreparedPlan::Planned(planned) => {
-                let mut planned = (**planned).clone();
-                substitute_statement_params(&mut planned, params)?;
-                self.execute_planned(planned, tx)
-            }
+            PreparedPlan::Planned(planned) => self.execute_planned(planned, tx, params),
             PreparedPlan::Ast(statement) => {
                 self.execute_statement((**statement).clone(), tx, params)
             }
@@ -380,11 +361,7 @@ impl SqlEngine {
     ) -> Result<ExecutionStreamingResult, String> {
         let refreshed = self.refreshed_plan(prepared)?;
         match refreshed.as_ref().unwrap_or(&prepared.plan) {
-            PreparedPlan::Planned(planned) => {
-                let mut planned = (**planned).clone();
-                substitute_statement_params(&mut planned, params)?;
-                self.execute_planned_streaming(planned, tx)
-            }
+            PreparedPlan::Planned(planned) => self.execute_planned_streaming(planned, tx, params),
             PreparedPlan::Ast(statement) => {
                 self.execute_statement_streaming((**statement).clone(), tx, params)
             }
@@ -524,7 +501,7 @@ impl SqlEngine {
             },
             other => other,
         };
-        self.execute_planned(optimized, tx)
+        self.execute_planned(&optimized, tx, params)
     }
 
     /// Streaming counterpart to `execute_statement`.
@@ -551,20 +528,21 @@ impl SqlEngine {
             },
             other => other,
         };
-        self.execute_planned_streaming(optimized, tx)
+        self.execute_planned_streaming(&optimized, tx, params)
     }
 
     /// Optimizes, compiles, and executes an already-planned statement in streaming mode.
     fn execute_planned_streaming(
         &self,
-        planned_stmt: SqlStatement,
+        planned_stmt: &SqlStatement,
         tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionStreamingResult, String> {
         match planned_stmt {
             SqlStatement::Query(optimized_plan) => {
                 // 1a. Fast path: primary-key point lookups skip the Volcano
                 // operator tree entirely (see `execute_point_get`).
-                if let Some(result) = self.execute_point_get(&optimized_plan, tx)? {
+                if let Some(result) = self.execute_point_get(optimized_plan, tx, params)? {
                     return Ok(ExecutionStreamingResult::Complete(result));
                 }
 
@@ -574,7 +552,8 @@ impl SqlEngine {
                 let cols_vec: Vec<String> = cols.into_iter().collect();
 
                 // 2. Compile to Volcano Physical Plan
-                let physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+                let physical_op =
+                    self.compile_physical(optimized_plan, tx, Some(&cols_vec), params)?;
 
                 Ok(ExecutionStreamingResult::Streaming {
                     schema: physical_op.schema().clone(),
@@ -582,11 +561,12 @@ impl SqlEngine {
                 })
             }
             SqlStatement::Explain(logical_plan) => {
-                let result = self.execute_planned(SqlStatement::Explain(logical_plan), tx)?;
+                let result =
+                    self.execute_planned(&SqlStatement::Explain(logical_plan.clone()), tx, params)?;
                 Ok(ExecutionStreamingResult::Complete(result))
             }
             other => {
-                let result = self.execute_planned(other, tx)?;
+                let result = self.execute_planned(other, tx, params)?;
                 Ok(ExecutionStreamingResult::Complete(result))
             }
         }
@@ -598,18 +578,19 @@ impl SqlEngine {
     /// already substituted.
     fn execute_planned(
         &self,
-        planned_stmt: SqlStatement,
+        planned_stmt: &SqlStatement,
         tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
         match planned_stmt {
             SqlStatement::CreateTable { name, schema } => {
                 self.database
-                    .create_table(&name, schema)
+                    .create_table(name, schema.clone())
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::CreateTable)
             }
             SqlStatement::DropTable { name } => {
-                self.database.drop_table(&name).map_err(|e| e.to_string())?;
+                self.database.drop_table(name).map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::DropTable)
             }
             SqlStatement::CreateIndex {
@@ -620,7 +601,13 @@ impl SqlEngine {
                 tokenizer,
             } => {
                 self.database
-                    .create_index(&table_name, &index_name, columns, index_type, tokenizer)
+                    .create_index(
+                        table_name,
+                        index_name,
+                        columns.clone(),
+                        *index_type,
+                        tokenizer.clone(),
+                    )
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::CreateIndex)
             }
@@ -629,7 +616,7 @@ impl SqlEngine {
                 index_name,
             } => {
                 self.database
-                    .drop_index(&table_name, &index_name)
+                    .drop_index(table_name, index_name)
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::DropIndex)
             }
@@ -640,7 +627,7 @@ impl SqlEngine {
             } => {
                 let table = self
                     .database
-                    .get_table(&table_name)
+                    .get_table(table_name)
                     .map_err(|e| e.to_string())?;
 
                 let schema = table.schema.clone();
@@ -667,12 +654,12 @@ impl SqlEngine {
                             if matches!(aligned_vals[col_idx], DbValue::Null) {
                                 let next_val = self
                                     .database
-                                    .next_sequence_value(&table_name)
+                                    .next_sequence_value(table_name)
                                     .map_err(|e| e.to_string())?;
                                 aligned_vals[col_idx] = DbValue::Int(next_val);
                             } else if let DbValue::Int(explicit_val) = aligned_vals[col_idx] {
                                 self.database
-                                    .update_sequence_value(&table_name, explicit_val)
+                                    .update_sequence_value(table_name, explicit_val)
                                     .map_err(|e| e.to_string())?;
                             }
                         }
@@ -686,14 +673,14 @@ impl SqlEngine {
                         .map_err(|e| e.to_string())?;
 
                     if tx
-                        .get(&table_name, &pk_key)
+                        .get(table_name, &pk_key)
                         .map_err(|e| e.to_string())?
                         .is_some()
                     {
                         return Err("Duplicate primary key".to_string());
                     }
 
-                    tx.put(&table_name, pk_key, full_row)
+                    tx.put(table_name, pk_key, full_row)
                         .map_err(|e| e.to_string())?;
                     insert_count += 1;
                 }
@@ -709,7 +696,7 @@ impl SqlEngine {
             } => {
                 let table = self
                     .database
-                    .get_table(&table_name)
+                    .get_table(table_name)
                     .map_err(|e| e.to_string())?;
 
                 let schema = table.schema.clone();
@@ -721,7 +708,8 @@ impl SqlEngine {
                 let cols_vec: Vec<String> = cols.into_iter().collect();
 
                 // 2. Compile to Volcano Physical Plan
-                let mut physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+                let mut physical_op =
+                    self.compile_physical(optimized_plan, tx, Some(&cols_vec), params)?;
 
                 // 3. Validate columns count match
                 let subquery_schema = physical_op.schema();
@@ -753,12 +741,12 @@ impl SqlEngine {
                             if matches!(aligned_vals[col_idx], DbValue::Null) {
                                 let next_val = self
                                     .database
-                                    .next_sequence_value(&table_name)
+                                    .next_sequence_value(table_name)
                                     .map_err(|e| e.to_string())?;
                                 aligned_vals[col_idx] = DbValue::Int(next_val);
                             } else if let DbValue::Int(explicit_val) = aligned_vals[col_idx] {
                                 self.database
-                                    .update_sequence_value(&table_name, explicit_val)
+                                    .update_sequence_value(table_name, explicit_val)
                                     .map_err(|e| e.to_string())?;
                             }
                         }
@@ -770,14 +758,14 @@ impl SqlEngine {
                         .map_err(|e| e.to_string())?;
 
                     if tx
-                        .get(&table_name, &pk_key)
+                        .get(table_name, &pk_key)
                         .map_err(|e| e.to_string())?
                         .is_some()
                     {
                         return Err("Duplicate primary key".to_string());
                     }
 
-                    tx.put(&table_name, pk_key, full_row)
+                    tx.put(table_name, pk_key, full_row)
                         .map_err(|e| e.to_string())?;
                     insert_count += 1;
                 }
@@ -789,7 +777,7 @@ impl SqlEngine {
             SqlStatement::Delete { table_name, filter } => {
                 let table = self
                     .database
-                    .get_table(&table_name)
+                    .get_table(table_name)
                     .map_err(|e| e.to_string())?;
 
                 let scan_plan = LogicalPlan::Scan {
@@ -801,13 +789,13 @@ impl SqlEngine {
                 let plan = match filter {
                     Some(pred) => LogicalPlan::Filter {
                         source: Box::new(scan_plan),
-                        predicate: pred,
+                        predicate: pred.clone(),
                     },
                     None => scan_plan,
                 };
 
                 let optimized_plan = Optimizer::new(self.database.clone()).optimize(plan);
-                let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
+                let mut physical_op = self.compile_physical(&optimized_plan, tx, None, params)?;
 
                 let mut delete_count = 0;
                 while let Some(row) = physical_op.next()? {
@@ -815,7 +803,7 @@ impl SqlEngine {
                         .schema
                         .extract_primary_key(&row)
                         .map_err(|e| e.to_string())?;
-                    tx.delete(&table_name, pk_key).map_err(|e| e.to_string())?;
+                    tx.delete(table_name, pk_key).map_err(|e| e.to_string())?;
                     delete_count += 1;
                 }
 
@@ -830,7 +818,7 @@ impl SqlEngine {
             } => {
                 let table = self
                     .database
-                    .get_table(&table_name)
+                    .get_table(table_name)
                     .map_err(|e| e.to_string())?;
 
                 let scan_plan = LogicalPlan::Scan {
@@ -842,18 +830,26 @@ impl SqlEngine {
                 let plan = match filter {
                     Some(pred) => LogicalPlan::Filter {
                         source: Box::new(scan_plan),
-                        predicate: pred,
+                        predicate: pred.clone(),
                     },
                     None => scan_plan,
                 };
 
                 let optimized_plan = Optimizer::new(self.database.clone()).optimize(plan);
-                let mut physical_op = self.compile_physical(optimized_plan, tx, None)?;
+                let mut physical_op = self.compile_physical(&optimized_plan, tx, None, params)?;
+
+                // Clone and substitute parameter bindings in assignments once.
+                let mut bound_assignments = Vec::with_capacity(assignments.len());
+                for (col_name, expr) in assignments {
+                    let mut bound_expr = expr.clone();
+                    bound_expr.substitute_params(params)?;
+                    bound_assignments.push((col_name, bound_expr));
+                }
 
                 let mut update_count = 0;
                 while let Some(row) = physical_op.next()? {
                     let mut updated_values = row.values.clone();
-                    for (col_name, expr) in &assignments {
+                    for (col_name, expr) in &bound_assignments {
                         let col_idx = table
                             .schema
                             .column_index(col_name)
@@ -874,12 +870,12 @@ impl SqlEngine {
                         .map_err(|e| e.to_string())?;
 
                     if old_pk_key != new_pk_key {
-                        tx.delete(&table_name, old_pk_key)
+                        tx.delete(table_name, old_pk_key)
                             .map_err(|e| e.to_string())?;
-                        tx.put(&table_name, new_pk_key, updated_row)
+                        tx.put(table_name, new_pk_key, updated_row)
                             .map_err(|e| e.to_string())?;
                     } else {
-                        tx.put(&table_name, new_pk_key, updated_row)
+                        tx.put(table_name, new_pk_key, updated_row)
                             .map_err(|e| e.to_string())?;
                     }
                     update_count += 1;
@@ -892,7 +888,7 @@ impl SqlEngine {
             SqlStatement::Query(optimized_plan) => {
                 // 1a. Fast path: primary-key point lookups skip the Volcano
                 // operator tree entirely (see `execute_point_get`).
-                if let Some(result) = self.execute_point_get(&optimized_plan, tx)? {
+                if let Some(result) = self.execute_point_get(optimized_plan, tx, params)? {
                     return Ok(result);
                 }
 
@@ -902,7 +898,8 @@ impl SqlEngine {
                 let cols_vec: Vec<String> = cols.into_iter().collect();
 
                 // 2. Compile to Volcano Physical Plan
-                let mut physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+                let mut physical_op =
+                    self.compile_physical(optimized_plan, tx, Some(&cols_vec), params)?;
 
                 // 3. Consume Volcano Iterator streaming rows
                 let mut results = Vec::new();
@@ -921,13 +918,13 @@ impl SqlEngine {
                     Optimizer::new(self.database.clone()).optimize(logical_plan.clone());
 
                 // 2. Format logical plans as strings
-                let logical_str = format_logical_plan(&logical_plan);
+                let logical_str = format_logical_plan(logical_plan);
                 let opt_logical_str = format_logical_plan(&optimized_plan);
 
                 // 3. Describe the physical plan. Point lookups bypass the
                 // Volcano tree (see `execute_point_get`), so report that here
                 // rather than compiling operators that would never run.
-                let physical_str = if let Some(pg) = match_point_get(&optimized_plan) {
+                let physical_str = if let Some(pg) = match_point_get(&optimized_plan, params) {
                     format!(
                         "- PhysicalPointGet: table={}, key={:?}{}\n",
                         pg.table_name,
@@ -944,7 +941,8 @@ impl SqlEngine {
                     optimized_plan.collect_columns(&mut cols);
                     let cols_vec: Vec<String> = cols.into_iter().collect();
 
-                    let physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+                    let physical_op =
+                        self.compile_physical(&optimized_plan, tx, Some(&cols_vec), params)?;
                     let mut s = String::new();
                     physical_op.explain(0, &mut s);
                     s
@@ -974,7 +972,7 @@ impl SqlEngine {
             }
             SqlStatement::Analyze { table_name } => {
                 self.database
-                    .analyze_table(&table_name, tx)
+                    .analyze_table(table_name, tx)
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::Analyze)
             }
@@ -1011,8 +1009,9 @@ impl SqlEngine {
         &self,
         plan: &LogicalPlan,
         tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<Option<ExecutionResult>, String> {
-        let Some(pg) = match_point_get(plan) else {
+        let Some(pg) = match_point_get(plan, params) else {
             return Ok(None);
         };
 
@@ -1032,7 +1031,7 @@ impl SqlEngine {
         let needed_cols: Vec<String> = needed.into_iter().collect();
 
         let row = tx
-            .get_projected(pg.table_name, pg.key, Some(&needed_cols))
+            .get_projected(pg.table_name, &pg.key, Some(&needed_cols))
             .map_err(|e| e.to_string())?;
 
         let output_schema = match &pg.projection {
@@ -1047,6 +1046,7 @@ impl SqlEngine {
             let passes = match pg.filter {
                 Some(pred) => {
                     let mut pred = pred.clone();
+                    pred.substitute_params(params)?;
                     pred.bind_columns(pg.scan_schema)
                         .map_err(|e| e.to_string())?;
                     match pred.eval(&row, pg.scan_schema)? {
@@ -1063,6 +1063,7 @@ impl SqlEngine {
                         let mut vals = Vec::with_capacity(expressions.len());
                         for e in expressions.iter() {
                             let mut e = (*e).clone();
+                            e.substitute_params(params)?;
                             e.bind_columns(pg.scan_schema)
                                 .map_err(|er| er.to_string())?;
                             vals.push(e.eval(&row, pg.scan_schema)?);
@@ -1084,9 +1085,10 @@ impl SqlEngine {
     /// Compiles a logical plan node into a Volcano Physical Operator tree.
     fn compile_physical(
         &self,
-        plan: LogicalPlan,
+        plan: &LogicalPlan,
         tx: &Transaction,
         columns: Option<&[String]>,
+        params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<Box<dyn PhysicalOperator>, String> {
         match plan {
             LogicalPlan::IndexScan {
@@ -1097,15 +1099,32 @@ impl SqlEngine {
             } => {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
-                    Some((PlanKey::Value(s), PlanKey::Value(e))) => (s, e),
-                    Some(_) => {
-                        return Err("IndexScan range contains unresolved parameters".to_string());
+                    Some((start_key, end_key)) => {
+                        let resolve = |key: &PlanKey| -> Result<DbKey, String> {
+                            match key {
+                                PlanKey::Value(v) => Ok(v.clone()),
+                                PlanKey::Parameter(name) => {
+                                    let val = params
+                                        .get(name)
+                                        .ok_or_else(|| format!("Unbound parameter: {}", name))?;
+                                    match val {
+                                        DbValue::Int(v) => Ok(DbKey::Int(*v)),
+                                        DbValue::String(s) => Ok(DbKey::String(s.clone())),
+                                        _ => Err(format!(
+                                            "Unsupported key parameter type for {}",
+                                            name
+                                        )),
+                                    }
+                                }
+                            }
+                        };
+                        (resolve(start_key)?, resolve(end_key)?)
                     }
                     None => {
                         let idx_def = schema
                             .indexes
                             .iter()
-                            .find(|idx| idx.name == index_name)
+                            .find(|idx| idx.name == *index_name)
                             .ok_or_else(|| {
                                 format!(
                                     "Index '{}' not found in schema during compilation",
@@ -1135,10 +1154,10 @@ impl SqlEngine {
                 };
 
                 let rows = tx
-                    .index_scan(&table_name, &index_name, &start, &end, columns)
+                    .index_scan(table_name, index_name, &start, &end, columns)
                     .map_err(|e| e.to_string())?;
 
-                Ok(Box::new(PhysicalIndexScan::new(schema, rows)))
+                Ok(Box::new(PhysicalIndexScan::new(schema.clone(), rows)))
             }
             LogicalPlan::FullTextScan {
                 table_name,
@@ -1147,10 +1166,14 @@ impl SqlEngine {
                 query_str,
             } => {
                 let rows = tx
-                    .fulltext_scan(&table_name, &index_name, &query_str, columns)
+                    .fulltext_scan(table_name, index_name, query_str, columns)
                     .map_err(|e| e.to_string())?;
 
-                Ok(Box::new(PhysicalFullTextScan::new(schema, query_str, rows)))
+                Ok(Box::new(PhysicalFullTextScan::new(
+                    schema.clone(),
+                    query_str.clone(),
+                    rows,
+                )))
             }
             LogicalPlan::Scan {
                 table_name,
@@ -1159,13 +1182,32 @@ impl SqlEngine {
             } => {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
-                    Some((PlanKey::Value(s), PlanKey::Value(e))) => (s, e),
-                    Some(_) => return Err("Scan range contains unresolved parameters".to_string()),
+                    Some((start_key, end_key)) => {
+                        let resolve = |key: &PlanKey| -> Result<DbKey, String> {
+                            match key {
+                                PlanKey::Value(v) => Ok(v.clone()),
+                                PlanKey::Parameter(name) => {
+                                    let val = params
+                                        .get(name)
+                                        .ok_or_else(|| format!("Unbound parameter: {}", name))?;
+                                    match val {
+                                        DbValue::Int(v) => Ok(DbKey::Int(*v)),
+                                        DbValue::String(s) => Ok(DbKey::String(s.clone())),
+                                        _ => Err(format!(
+                                            "Unsupported key parameter type for {}",
+                                            name
+                                        )),
+                                    }
+                                }
+                            }
+                        };
+                        (resolve(start_key)?, resolve(end_key)?)
+                    }
                     None => schema.primary_key_bounds().map_err(|e| e.to_string())?,
                 };
 
                 let iter = tx
-                    .scan_iter(&table_name, &start, &end, columns)
+                    .scan_iter(table_name, &start, &end, columns)
                     .map_err(|e| e.to_string())?;
 
                 struct RelationalIteratorAdapter {
@@ -1185,18 +1227,17 @@ impl SqlEngine {
                 }
 
                 Ok(Box::new(PhysicalSeqScan::from_iter(
-                    schema,
+                    schema.clone(),
                     Box::new(RelationalIteratorAdapter { iter }),
                 )))
             }
-            LogicalPlan::Filter {
-                source,
-                mut predicate,
-            } => {
+            LogicalPlan::Filter { source, predicate } => {
+                let mut predicate = predicate.clone();
+                predicate.substitute_params(params)?;
                 let mut predicate_cols = HashSet::new();
                 predicate.collect_columns(&mut predicate_cols);
                 let child_cols = parent_cols_union(columns, &predicate_cols);
-                let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
+                let src_op = self.compile_physical(source, tx, child_cols.as_deref(), params)?;
                 predicate
                     .bind_columns(src_op.schema())
                     .map_err(|e| e.to_string())?;
@@ -1204,16 +1245,20 @@ impl SqlEngine {
             }
             LogicalPlan::Projection {
                 source,
-                mut expressions,
+                expressions,
                 field_names,
                 ..
             } => {
+                let mut expressions = expressions.clone();
+                for expr in &mut expressions {
+                    expr.substitute_params(params)?;
+                }
                 let mut child_needed = HashSet::new();
                 for expr in &expressions {
                     expr.collect_columns(&mut child_needed);
                 }
                 let child_cols: Vec<String> = child_needed.into_iter().collect();
-                let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
+                let src_op = self.compile_physical(source, tx, Some(&child_cols), params)?;
                 for expr in &mut expressions {
                     expr.bind_columns(src_op.schema())
                         .map_err(|e| e.to_string())?;
@@ -1240,16 +1285,20 @@ impl SqlEngine {
                 limit,
                 offset,
             } => {
-                let src_op = self.compile_physical(*source, tx, columns)?;
-                Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
+                let src_op = self.compile_physical(source, tx, columns, params)?;
+                Ok(Box::new(PhysicalLimit::new(src_op, *limit, *offset)))
             }
-            LogicalPlan::Sort { source, mut keys } => {
+            LogicalPlan::Sort { source, keys } => {
+                let mut keys = keys.clone();
+                for (expr, _) in &mut keys {
+                    expr.substitute_params(params)?;
+                }
                 let mut key_cols = HashSet::new();
                 for (expr, _) in &keys {
                     expr.collect_columns(&mut key_cols);
                 }
                 let child_cols = parent_cols_union(columns, &key_cols);
-                let src_op = self.compile_physical(*source, tx, child_cols.as_deref())?;
+                let src_op = self.compile_physical(source, tx, child_cols.as_deref(), params)?;
                 for (expr, _) in &mut keys {
                     expr.bind_columns(src_op.schema())
                         .map_err(|e| e.to_string())?;
@@ -1268,6 +1317,9 @@ impl SqlEngine {
                 join_type,
                 ..
             } => {
+                let mut condition = condition.clone();
+                condition.substitute_params(params)?;
+
                 let left_schema = left.schema();
                 let right_schema = right.schema();
 
@@ -1288,12 +1340,12 @@ impl SqlEngine {
                         }
                     }
 
-                    let l_op = self.compile_physical(*left, tx, Some(&left_cols))?;
-                    let r_op = self.compile_physical(*right, tx, Some(&right_cols))?;
+                    let l_op = self.compile_physical(left, tx, Some(&left_cols), params)?;
+                    let r_op = self.compile_physical(right, tx, Some(&right_cols), params)?;
                     (l_op, r_op)
                 } else {
-                    let l_op = self.compile_physical(*left, tx, None)?;
-                    let r_op = self.compile_physical(*right, tx, None)?;
+                    let l_op = self.compile_physical(left, tx, None, params)?;
+                    let r_op = self.compile_physical(right, tx, None, params)?;
                     (l_op, r_op)
                 };
 
@@ -1309,11 +1361,11 @@ impl SqlEngine {
                         range: None,
                     },
                     condition.clone(),
-                    join_type,
+                    *join_type,
                 )
                 .schema();
 
-                if join_type == JoinType::Cross {
+                if *join_type == JoinType::Cross {
                     Ok(Box::new(PhysicalCrossJoin::new(
                         left_op,
                         right_op,
@@ -1326,7 +1378,7 @@ impl SqlEngine {
                             left: l,
                             op: Operator::Eq,
                             right: r,
-                        } => ((*l).clone(), (*r).clone()),
+                        } => ((**l).clone(), (**r).clone()),
                         other => {
                             return Err(format!(
                                 "Only equality join conditions supported, got {:?}",
@@ -1372,9 +1424,9 @@ impl SqlEngine {
                     Ok(Box::new(PhysicalSortMergeJoin::new(
                         left_op,
                         right_op,
-                        *left_on,
-                        *right_on,
-                        join_type,
+                        left_on,
+                        right_on,
+                        *join_type,
                         joined_schema,
                         self.temp_dir(),
                         self.memory_budget(),
@@ -1383,12 +1435,28 @@ impl SqlEngine {
             }
             LogicalPlan::Aggregate {
                 source,
-                mut group_by,
-                mut aggrs,
+                group_by,
+                aggrs,
                 field_names,
                 ..
             } => {
-                let use_sorted_agg = is_plan_sorted_by(&source, &group_by);
+                let mut group_by = group_by.clone();
+                for expr in &mut group_by {
+                    expr.substitute_params(params)?;
+                }
+                let mut aggrs = aggrs.clone();
+                for aggr in &mut aggrs {
+                    match aggr {
+                        crate::logical::AggregateExpr::Count { expr, .. }
+                        | crate::logical::AggregateExpr::Sum { expr, .. }
+                        | crate::logical::AggregateExpr::Min { expr, .. }
+                        | crate::logical::AggregateExpr::Max { expr, .. }
+                        | crate::logical::AggregateExpr::Avg { expr, .. } => {
+                            expr.substitute_params(params)?;
+                        }
+                    }
+                }
+                let use_sorted_agg = is_plan_sorted_by(source, &group_by);
                 let mut child_needed = HashSet::new();
                 for expr in &group_by {
                     expr.collect_columns(&mut child_needed);
@@ -1405,7 +1473,7 @@ impl SqlEngine {
                     }
                 }
                 let child_cols: Vec<String> = child_needed.into_iter().collect();
-                let src_op = self.compile_physical(*source, tx, Some(&child_cols))?;
+                let src_op = self.compile_physical(source, tx, Some(&child_cols), params)?;
                 for expr in &mut group_by {
                     expr.bind_columns(src_op.schema())
                         .map_err(|e| e.to_string())?;
@@ -1458,21 +1526,21 @@ impl SqlEngine {
                 op,
                 all,
             } => {
-                let left_op = self.compile_physical(*left, tx, columns)?;
-                let right_op = self.compile_physical(*right, tx, columns)?;
+                let left_op = self.compile_physical(left, tx, columns, params)?;
+                let right_op = self.compile_physical(right, tx, columns, params)?;
                 let schema = left_op.schema().clone();
                 Ok(Box::new(PhysicalSetOp::new(
                     left_op,
                     right_op,
-                    op,
-                    all,
+                    *op,
+                    *all,
                     schema,
                     self.temp_dir(),
                     self.memory_budget(),
                 )))
             }
             LogicalPlan::Distinct { source } => {
-                let src_op = self.compile_physical(*source, tx, columns)?;
+                let src_op = self.compile_physical(source, tx, columns, params)?;
                 Ok(Box::new(PhysicalDistinct::new(
                     src_op,
                     self.temp_dir(),
