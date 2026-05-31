@@ -1451,6 +1451,10 @@ impl Database {
         }
 
         // Wait until all transactions currently accessing this table have finished.
+        // TODO: bound this spin-wait with a timeout that returns an error (and
+        // names the offending table) instead of spinning forever. A stuck or
+        // leaked reader currently hangs the DDL indefinitely with no diagnostic.
+        // Same pattern in `create_index` and `drop_index`.
         loop {
             let has_active_readers = {
                 let access = self.active_table_access.lock().unwrap();

@@ -61,6 +61,17 @@ impl Drop for Transaction {
     }
 }
 
+// TODO: release this transaction's `active_table_access` slot in `commit()` and
+// `rollback()`, not just here in `Drop`. A committed transaction is logically
+// done, but its reader slot lives until the value is physically dropped -- so a
+// committed `tx` left alive (e.g. shadowed by `let tx = ...`) blocks a
+// subsequent `drop_table`/`create_index`/`drop_index`, whose wait loop spins on
+// that slot. Releasing on commit/rollback (idempotent with this `Drop`) makes
+// the wait depend on the logical end of the transaction rather than its scope.
+// Low priority: real clients go through `run_in_transaction`, which owns and
+// drops the transaction promptly; the hazard is mainly in tests that use
+// `Transaction::new` directly.
+
 impl Transaction {
     /// Creates a new transaction.
     pub fn new(tx_id: u64, database: Arc<Database>) -> Self {
