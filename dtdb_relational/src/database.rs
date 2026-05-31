@@ -976,7 +976,12 @@ fn engine_wal_sync_interval(db_option: Option<u64>) -> Option<u64> {
 /// Database represents a catalog of Tables stored in a base directory.
 pub struct Database {
     dir_path: PathBuf,
-    tables: RwLock<HashMap<String, Table>>,
+    // Tables are stored behind `Arc` so `get_table` is a cheap refcount bump
+    // instead of a deep `Schema` clone on every call (it is called multiple
+    // times per query). DDL that mutates a table (create/drop index) uses
+    // `Arc::make_mut` for copy-on-write, so in-flight holders keep their
+    // snapshot -- matching the previous clone-on-read semantics.
+    tables: RwLock<HashMap<String, Arc<Table>>>,
     pub options: DatabaseOptions,
     transaction_log_path: PathBuf,
     transaction_log: Mutex<Option<FramedLog<TransactionRecord>>>,
@@ -1182,12 +1187,12 @@ impl Database {
 
                     tables.insert(
                         name.clone(),
-                        Table {
+                        Arc::new(Table {
                             name,
                             schema,
                             engines,
                             index_engines,
-                        },
+                        }),
                     );
                 }
             }
@@ -1365,12 +1370,12 @@ impl Database {
 
         tables_guard.insert(
             name.to_string(),
-            Table {
+            Arc::new(Table {
                 name: name.to_string(),
                 schema,
                 engines,
                 index_engines,
-            },
+            }),
         );
 
         if has_auto_inc {
@@ -1488,7 +1493,7 @@ impl Database {
     }
 
     /// Fetches a cloneable table handle from the database.
-    pub fn get_table(&self, name: &str) -> Result<Table> {
+    pub fn get_table(&self, name: &str) -> Result<Arc<Table>> {
         let tables_guard = self.tables.read().unwrap();
         tables_guard
             .get(name)
@@ -1934,9 +1939,12 @@ impl Database {
         let mut tables_guard = self.tables.write().unwrap();
 
         // 1. Check table existence
-        let table = tables_guard
+        let table_arc = tables_guard
             .get_mut(table_name)
             .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        // Copy-on-write: clone the Table only if another holder (e.g. an
+        // in-flight transaction's cache) still references this Arc.
+        let table = Arc::make_mut(table_arc);
 
         // 2. Check for duplicate index name
         if table
@@ -2132,9 +2140,11 @@ impl Database {
     pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
         let mut tables_guard = self.tables.write().unwrap();
 
-        let table = tables_guard
+        let table_arc = tables_guard
             .get_mut(table_name)
             .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        // Copy-on-write (see create_index).
+        let table = Arc::make_mut(table_arc);
 
         // 1. Verify index exists
         let idx_pos = table

@@ -52,7 +52,7 @@ pub struct Transaction {
     // read lock — so a commit that runs concurrently with a DDL write-locking
     // the catalog can still complete and release its active_table_access slot,
     // breaking the deadlock between DDL spin-wait and commit re-resolution.
-    cached_tables: Mutex<HashMap<String, Table>>,
+    cached_tables: Mutex<HashMap<String, Arc<Table>>>,
 }
 
 impl Drop for Transaction {
@@ -94,7 +94,7 @@ impl Transaction {
         }
     }
 
-    fn get_table(&self, table_name: &str) -> Result<Table> {
+    fn get_table(&self, table_name: &str) -> Result<Arc<Table>> {
         {
             let cache = self.cached_tables.lock().unwrap();
             if let Some(t) = cache.get(table_name) {

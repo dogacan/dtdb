@@ -1122,7 +1122,7 @@ impl LogicalPlanner {
 
                 let mut scan_schema = dtdb_relational::Schema::new_with_options(
                     qualified_cols,
-                    table.schema.locality_group_options,
+                    table.schema.locality_group_options.clone(),
                 );
                 scan_schema.indexes = table.schema.indexes.clone();
 

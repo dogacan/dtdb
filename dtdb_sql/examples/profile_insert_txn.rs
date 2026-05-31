@@ -4,9 +4,10 @@
 //! dtdb is ~10x slower than SQLite here, and with the fsync amortized over the
 //! whole batch this is per-INSERT *CPU* cost, not durability. We decompose one
 //! `engine.execute("INSERT ...")` into: SQL preprocess+parse, logical planning,
-//! the `get_table` schema clone (paid more than once per insert), the
-//! duplicate-primary-key `get` (a point lookup before every write), and the
-//! write-buffer `put`. The single commit is measured separately and amortized.
+//! the `get_table` lookup (now a cheap Arc clone; called multiple times per
+//! insert), the duplicate-primary-key `get` (a point lookup before every
+//! write), and the write-buffer `put`. The commit is measured separately and
+//! amortized.
 //!
 //! Run:
 //!   cargo run -p dtdb_sql --release --example profile_insert_txn
@@ -179,7 +180,7 @@ fn main() {
 
     println!("\n  Components within 'write machinery' (measured separately):");
     println!(
-        "    get_table (Table/Schema clone)  {:>7.0} ns   (called ~3x per insert)",
+        "    get_table (Arc clone)           {:>7.0} ns   (called ~3x per insert)",
         t_get_table
     );
     println!("    dup-PK get (point lookup miss)  {:>7.0} ns", t_get_miss);
