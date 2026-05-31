@@ -34,10 +34,8 @@ fn main() {
 mod imp {
     use criterion::measurement::WallTime;
     use criterion::{BatchSize, BenchmarkGroup, Criterion, Throughput, black_box};
-    use dtdb_relational::{Database, Transaction};
-    use dtdb_sql::{ExecutionResult, SqlEngine};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use dtdb_api::client::DuctTapeDbClient;
+    use futures_util::StreamExt;
     use tempfile::TempDir;
 
     /// Rows inserted per iteration of the INSERT benches.
@@ -93,89 +91,138 @@ mod imp {
 
     struct DtdbTarget {
         _tmp: TempDir,
-        db: Arc<Database>,
-        engine: SqlEngine,
-        next_tx: AtomicU64,
+        client: std::sync::Mutex<DuctTapeDbClient>,
+        rt: tokio::runtime::Runtime,
     }
 
     impl DtdbTarget {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let db = Arc::new(Database::open(tmp.path()).unwrap());
-            let engine = SqlEngine::new(db.clone());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
+            rt.block_on(async {
+                client
+                    .create_db("bench", dtdb_storage::CompressionType::Lz4)
+                    .await
+                    .unwrap();
+            });
             Self {
                 _tmp: tmp,
-                db,
-                engine,
-                next_tx: AtomicU64::new(1),
+                client: std::sync::Mutex::new(client),
+                rt,
             }
-        }
-
-        fn begin(&self) -> Transaction {
-            Transaction::new(
-                self.next_tx.fetch_add(1, Ordering::Relaxed),
-                self.db.clone(),
-            )
         }
     }
 
     impl SqlTarget for DtdbTarget {
         fn create_bench_table(&self) {
-            let tx = self.begin();
-            self.engine
-                .execute(
-                    "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)",
-                    &tx,
-                )
-                .unwrap();
-            tx.commit().unwrap();
+            self.rt.block_on(async {
+                let mut client = self.client.lock().unwrap().clone();
+                let mut stream = client
+                    .execute_query(
+                        "bench",
+                        dtdb_api::SqlQuery::new(
+                            "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)".to_string(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                while let Some(r) = stream.next().await {
+                    r.unwrap();
+                }
+            });
         }
 
         fn exec(&self, sql: &str) {
-            let tx = self.begin();
-            self.engine.execute(sql, &tx).unwrap();
-            tx.commit().unwrap();
+            self.rt.block_on(async {
+                let mut client = self.client.lock().unwrap().clone();
+                let mut stream = client
+                    .execute_query("bench", dtdb_api::SqlQuery::new(sql.to_string()))
+                    .await
+                    .unwrap();
+                while let Some(r) = stream.next().await {
+                    r.unwrap();
+                }
+            });
         }
 
         fn exec_txn(&self, stmts: &[String]) {
-            let tx = self.begin();
-            for s in stmts {
-                self.engine.execute(s, &tx).unwrap();
-            }
-            tx.commit().unwrap();
+            self.rt.block_on(async {
+                let mut client = self.client.lock().unwrap().clone();
+                client
+                    .run_in_transaction("bench", |tx| async move {
+                        for s in stmts {
+                            tx.execute_query(dtdb_api::SqlQuery::new(s.to_string()))
+                                .await?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
         }
 
         fn query_rows(&self, sql: &str) -> usize {
-            let tx = self.begin();
-            let res = self.engine.execute(sql, &tx).unwrap();
-            tx.commit().unwrap();
-            match res {
-                ExecutionResult::Select { rows, .. } => rows.len(),
-                ExecutionResult::Insert { count }
-                | ExecutionResult::Update { count }
-                | ExecutionResult::Delete { count } => count,
-                _ => 0,
-            }
+            self.rt.block_on(async {
+                let mut client = self.client.lock().unwrap().clone();
+                let mut stream = client
+                    .execute_query("bench", dtdb_api::SqlQuery::new(sql.to_string()))
+                    .await
+                    .unwrap();
+                let mut count = 0;
+                while let Some(r) = stream.next().await {
+                    let resp = r.unwrap();
+                    if let Some(payload) = resp.payload {
+                        match payload {
+                            dtdb_api::proto::execute_query_response::Payload::Row(_) => {
+                                count += 1;
+                            }
+                            dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg)
+                                if msg.starts_with("Inserted ")
+                                    || msg.starts_with("Updated ")
+                                    || msg.starts_with("Deleted ") =>
+                            {
+                                if let Some(num_str) = msg.split_whitespace().nth(1)
+                                    && let Ok(c) = num_str.parse::<usize>()
+                                {
+                                    count = c;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                count
+            })
         }
 
         fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize) {
             std::thread::scope(|s| {
                 for thread_idx in 0..num_threads {
+                    let mut client = self.client.lock().unwrap().clone();
                     s.spawn(move || {
-                        let engine = SqlEngine::new(self.db.clone());
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
                         for i in 0..txns_per_thread {
                             let key = thread_idx * txns_per_thread + i;
                             let sql = format!(
                                 "INSERT INTO bench (id, k, v) VALUES ({key}, {}, 'val_{key:08}')",
                                 (key * 31) % 100_000
                             );
-                            let tx = Transaction::new(
-                                self.next_tx
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                                self.db.clone(),
-                            );
-                            engine.execute(&sql, &tx).unwrap();
-                            tx.commit().unwrap();
+                            rt.block_on(async {
+                                let mut stream = client
+                                    .execute_query("bench", dtdb_api::SqlQuery::new(sql))
+                                    .await
+                                    .unwrap();
+                                while let Some(r) = stream.next().await {
+                                    r.unwrap();
+                                }
+                            });
                         }
                     });
                 }
