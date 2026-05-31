@@ -32,8 +32,7 @@ fn main() {
 
 #[cfg(feature = "compare-sqlite")]
 mod imp {
-    use criterion::measurement::WallTime;
-    use criterion::{BatchSize, BenchmarkGroup, Criterion, Throughput, black_box};
+    use criterion::{BatchSize, Criterion, Throughput};
     use dtdb_api::client::DuctTapeDbClient;
     use futures_util::StreamExt;
     use tempfile::TempDir;
@@ -49,376 +48,491 @@ mod imp {
 
     // ----- shared workload (identical SQL for both engines) -------------------
 
-    /// `INSERT` for row `i`. `k` is a non-monotonic integer (so range filters on
-    /// it are not trivially served by the primary key) and `v` is a short text.
-    fn insert_sql(i: usize) -> String {
-        format!(
-            "INSERT INTO bench (id, k, v) VALUES ({i}, {}, 'val_{i:08}')",
-            (i * 31) % 100_000
-        )
-    }
-
     /// Point lookup / update keys, strided across the dataset of size `n`.
     fn point_ids(n: usize) -> Vec<usize> {
         (0..POINTS).map(|j| (j * 97) % n).collect()
     }
 
-    // ----- engine abstraction -------------------------------------------------
-
-    /// A SQL engine under test. All methods take `&self`; mutation happens
-    /// through interior mutability so the benches can share one handle.
-    trait SqlTarget {
-        /// Creates the standard `bench(id, k, v)` table (DDL, untimed).
-        fn create_bench_table(&self);
-        /// Runs a single statement in its own (auto-committed) transaction.
-        fn exec(&self, sql: &str);
-        /// Runs `stmts` atomically as one transaction (one commit).
-        fn exec_txn(&self, stmts: &[String]);
-        /// Runs a query and returns the number of rows produced.
-        fn query_rows(&self, sql: &str) -> usize;
-
-        /// Inserts `n` rows in a single transaction (untimed setup helper).
-        fn populate(&self, n: usize) {
-            let stmts: Vec<String> = (0..n).map(insert_sql).collect();
-            self.exec_txn(&stmts);
-        }
-
-        /// Spawns concurrent threads, each executing write transactions.
-        fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize);
-    }
-
-    // ----- dtdb target --------------------------------------------------------
-
-    struct DtdbTarget {
-        _tmp: TempDir,
-        client: std::sync::Mutex<DuctTapeDbClient>,
-        rt: tokio::runtime::Runtime,
-    }
-
-    impl DtdbTarget {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
-            rt.block_on(async {
-                client
-                    .create_db("bench", dtdb_storage::CompressionType::Lz4)
-                    .await
-                    .unwrap();
-            });
-            Self {
-                _tmp: tmp,
-                client: std::sync::Mutex::new(client),
-                rt,
-            }
-        }
-    }
-
-    impl SqlTarget for DtdbTarget {
-        fn create_bench_table(&self) {
-            self.rt.block_on(async {
-                let mut client = self.client.lock().unwrap().clone();
-                let mut stream = client
-                    .execute_query(
-                        "bench",
-                        dtdb_api::SqlQuery::new(
-                            "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)".to_string(),
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                while let Some(r) = stream.next().await {
-                    r.unwrap();
-                }
-            });
-        }
-
-        fn exec(&self, sql: &str) {
-            self.rt.block_on(async {
-                let mut client = self.client.lock().unwrap().clone();
-                let mut stream = client
-                    .execute_query("bench", dtdb_api::SqlQuery::new(sql.to_string()))
-                    .await
-                    .unwrap();
-                while let Some(r) = stream.next().await {
-                    r.unwrap();
-                }
-            });
-        }
-
-        fn exec_txn(&self, stmts: &[String]) {
-            self.rt.block_on(async {
-                let mut client = self.client.lock().unwrap().clone();
-                client
-                    .run_in_transaction("bench", |tx| async move {
-                        for s in stmts {
-                            tx.execute_query(dtdb_api::SqlQuery::new(s.to_string()))
-                                .await?;
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
-            });
-        }
-
-        fn query_rows(&self, sql: &str) -> usize {
-            self.rt.block_on(async {
-                let mut client = self.client.lock().unwrap().clone();
-                let mut stream = client
-                    .execute_query("bench", dtdb_api::SqlQuery::new(sql.to_string()))
-                    .await
-                    .unwrap();
-                let mut count = 0;
-                while let Some(r) = stream.next().await {
-                    let resp = r.unwrap();
-                    if let Some(payload) = resp.payload {
-                        match payload {
-                            dtdb_api::proto::execute_query_response::Payload::Row(_) => {
-                                count += 1;
-                            }
-                            dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg)
-                                if msg.starts_with("Inserted ")
-                                    || msg.starts_with("Updated ")
-                                    || msg.starts_with("Deleted ") =>
-                            {
-                                if let Some(num_str) = msg.split_whitespace().nth(1)
-                                    && let Ok(c) = num_str.parse::<usize>()
-                                {
-                                    count = c;
-                                }
-                            }
-                            _ => {}
-                        }
+    fn populate_dtdb(client: &mut DuctTapeDbClient, n: usize, rt: &tokio::runtime::Runtime) {
+        use dtdb_api::sql_query;
+        rt.block_on(async {
+            client
+                .run_in_transaction("bench", |tx| async move {
+                    for i in 0..n {
+                        tx.execute_query(
+                            sql_query!("INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)")
+                                .bind("id", i as i64)
+                                .bind("k", ((i * 31) % 100_000) as i64)
+                                .bind("v", format!("val_{i:08}")),
+                        )
+                        .await?;
                     }
-                }
-                count
-            })
-        }
-
-        fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize) {
-            std::thread::scope(|s| {
-                for thread_idx in 0..num_threads {
-                    let mut client = self.client.lock().unwrap().clone();
-                    s.spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        for i in 0..txns_per_thread {
-                            let key = thread_idx * txns_per_thread + i;
-                            let sql = format!(
-                                "INSERT INTO bench (id, k, v) VALUES ({key}, {}, 'val_{key:08}')",
-                                (key * 31) % 100_000
-                            );
-                            rt.block_on(async {
-                                let mut stream = client
-                                    .execute_query("bench", dtdb_api::SqlQuery::new(sql))
-                                    .await
-                                    .unwrap();
-                                while let Some(r) = stream.next().await {
-                                    r.unwrap();
-                                }
-                            });
-                        }
-                    });
-                }
-            });
-        }
-    }
-
-    // ----- SQLite target ------------------------------------------------------
-
-    struct SqliteTarget {
-        _tmp: TempDir,
-        conn: rusqlite::Connection,
-    }
-
-    impl SqliteTarget {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let conn = rusqlite::Connection::open(tmp.path().join("bench.sqlite")).unwrap();
-            // Match dtdb's per-commit, power-loss durability.
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+                    Ok(())
+                })
+                .await
                 .unwrap();
-            Self { _tmp: tmp, conn }
-        }
+        });
     }
 
-    impl SqlTarget for SqliteTarget {
-        fn create_bench_table(&self) {
-            self.conn
-                .execute_batch("CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);")
+    fn populate_sqlite(conn: &mut rusqlite::Connection, n: usize) {
+        let txn = conn.transaction().unwrap();
+        {
+            let mut stmt = txn
+                .prepare("INSERT INTO bench (id, k, v) VALUES (?1, ?2, ?3)")
                 .unwrap();
-        }
-
-        fn exec(&self, sql: &str) {
-            self.conn.execute(sql, []).unwrap();
-        }
-
-        fn exec_txn(&self, stmts: &[String]) {
-            // `unchecked_transaction` takes `&self`, letting the trait stay
-            // `&self`-only; it begins/commits a real deferred transaction.
-            let tx = self.conn.unchecked_transaction().unwrap();
-            for s in stmts {
-                tx.execute(s, []).unwrap();
+            for i in 0..n {
+                stmt.execute(rusqlite::params![
+                    i as i64,
+                    ((i * 31) % 100_000) as i64,
+                    format!("val_{i:08}")
+                ])
+                .unwrap();
             }
-            tx.commit().unwrap();
         }
-
-        fn query_rows(&self, sql: &str) -> usize {
-            let mut stmt = self.conn.prepare(sql).unwrap();
-            let mut rows = stmt.query([]).unwrap();
-            let mut n = 0;
-            while rows.next().unwrap().is_some() {
-                n += 1;
-            }
-            n
-        }
-
-        fn run_concurrent_inserts(&self, num_threads: usize, txns_per_thread: usize) {
-            let db_path = self._tmp.path().join("bench.sqlite");
-            std::thread::scope(|s| {
-                for thread_idx in 0..num_threads {
-                    let db_path = db_path.clone();
-                    s.spawn(move || {
-                        let conn = rusqlite::Connection::open(db_path).unwrap();
-                        conn.busy_timeout(std::time::Duration::from_secs(30))
-                            .unwrap();
-                        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-                            .unwrap();
-                        for i in 0..txns_per_thread {
-                            let key = thread_idx * txns_per_thread + i;
-                            let sql = format!(
-                                "INSERT INTO bench (id, k, v) VALUES ({key}, {}, 'val_{key:08}')",
-                                (key * 31) % 100_000
-                            );
-                            conn.execute(&sql, []).unwrap();
-                        }
-                    });
-                }
-            });
-        }
-    }
-
-    // ----- bench helpers ------------------------------------------------------
-
-    fn make_dtdb() -> Box<dyn SqlTarget> {
-        Box::new(DtdbTarget::new())
-    }
-    fn make_sqlite() -> Box<dyn SqlTarget> {
-        Box::new(SqliteTarget::new())
-    }
-    type TargetFactory = fn() -> Box<dyn SqlTarget>;
-    const TARGETS: &[(&str, TargetFactory)] = &[("dtdb", make_dtdb), ("sqlite", make_sqlite)];
-
-    /// A write bench: fresh engine per iteration (built + prepared in the
-    /// untimed setup), then `routine` is timed against it.
-    fn write_bench(
-        group: &mut BenchmarkGroup<WallTime>,
-        prepare: impl Fn(&dyn SqlTarget),
-        routine: impl Fn(&dyn SqlTarget),
-    ) {
-        for (name, make) in TARGETS {
-            group.bench_function(*name, |b| {
-                b.iter_batched(
-                    || {
-                        let t = make();
-                        t.create_bench_table();
-                        prepare(t.as_ref());
-                        t
-                    },
-                    |t| routine(t.as_ref()),
-                    BatchSize::SmallInput,
-                );
-            });
-        }
-    }
-
-    /// A read bench: each engine is built and populated once, then `routine` is
-    /// timed repeatedly against the shared handle.
-    fn read_bench(group: &mut BenchmarkGroup<WallTime>, routine: impl Fn(&dyn SqlTarget)) {
-        for (name, make) in TARGETS {
-            let target = make();
-            target.create_bench_table();
-            target.populate(READ_ROWS);
-            group.bench_function(*name, |b| b.iter(|| routine(target.as_ref())));
-        }
+        txn.commit().unwrap();
     }
 
     // ----- the benches --------------------------------------------------------
 
     /// 1000 INSERTs, each in its own auto-committed transaction (one fsync each).
     fn bench_insert_autocommit(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
         let mut g = c.benchmark_group("dml/insert_autocommit");
         g.throughput(Throughput::Elements(WRITE_ROWS as u64));
-        write_bench(
-            &mut g,
-            |_t| {},
-            |t| {
-                for i in 0..WRITE_ROWS {
-                    t.exec(&insert_sql(i));
-                }
-            },
-        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
+                    rt.block_on(async {
+                        client
+                            .create_db("bench", CompressionType::Lz4)
+                            .await
+                            .unwrap();
+                        let mut stream = client
+                            .execute_query(
+                                "bench",
+                                sql_query!(
+                                    "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            r.unwrap();
+                        }
+                    });
+                    (tmp, client)
+                },
+                |(tmp, mut client)| {
+                    rt.block_on(async {
+                        for i in 0..WRITE_ROWS {
+                            let mut stream = client
+                                .execute_query(
+                                    "bench",
+                                    sql_query!("INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)")
+                                        .bind("id", i as i64)
+                                        .bind("k", ((i * 31) % 100_000) as i64)
+                                        .bind("v", format!("val_{i:08}")),
+                                )
+                                .await
+                                .unwrap();
+                            while let Some(r) = stream.next().await {
+                                r.unwrap();
+                            }
+                        }
+                    });
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("sqlite_prepared", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let conn = rusqlite::Connection::open(tmp.path().join("bench.sqlite")).unwrap();
+                    conn.execute_batch(
+                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                         CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+                    )
+                    .unwrap();
+                    (tmp, conn)
+                },
+                |(tmp, conn)| {
+                    let mut stmt = conn
+                        .prepare("INSERT INTO bench (id, k, v) VALUES (?1, ?2, ?3)")
+                        .unwrap();
+                    for i in 0..WRITE_ROWS {
+                        stmt.execute(rusqlite::params![
+                            i as i64,
+                            ((i * 31) % 100_000) as i64,
+                            format!("val_{i:08}")
+                        ])
+                        .unwrap();
+                    }
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
         g.finish();
     }
 
     /// Full-scan aggregate filtered on the unindexed `k` column.
     fn bench_select_scan(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
         let mut g = c.benchmark_group("dml/select_scan_aggregate");
         g.throughput(Throughput::Elements(READ_ROWS as u64));
-        let sql = "SELECT COUNT(*), SUM(k) FROM bench WHERE k BETWEEN 0 AND 50000";
-        read_bench(&mut g, |t| {
-            black_box(t.query_rows(sql));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Setup dtdb once
+        let dtdb_tmp = TempDir::new().unwrap();
+        let mut dtdb_client = DuctTapeDbClient::in_process(dtdb_tmp.path()).unwrap();
+        rt.block_on(async {
+            dtdb_client
+                .create_db("bench", CompressionType::Lz4)
+                .await
+                .unwrap();
+            let mut stream = dtdb_client
+                .execute_query(
+                    "bench",
+                    sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"),
+                )
+                .await
+                .unwrap();
+            while let Some(r) = stream.next().await {
+                r.unwrap();
+            }
         });
+        populate_dtdb(&mut dtdb_client, READ_ROWS, &rt);
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let mut stream = dtdb_client
+                        .execute_query(
+                            "bench",
+                            sql_query!(
+                                "SELECT COUNT(*), SUM(k) FROM bench WHERE k BETWEEN @lo AND @hi"
+                            )
+                            .bind("lo", 0i64)
+                            .bind("hi", 50000i64),
+                        )
+                        .await
+                        .unwrap();
+                    while let Some(r) = stream.next().await {
+                        let _resp = r.unwrap();
+                    }
+                });
+            });
+        });
+
+        // Setup sqlite once
+        let sqlite_tmp = TempDir::new().unwrap();
+        let mut sqlite_conn =
+            rusqlite::Connection::open(sqlite_tmp.path().join("bench.sqlite")).unwrap();
+        sqlite_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                 CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+            )
+            .unwrap();
+        populate_sqlite(&mut sqlite_conn, READ_ROWS);
+
+        g.bench_function("sqlite_prepared", |b| {
+            let mut stmt = sqlite_conn
+                .prepare("SELECT COUNT(*), SUM(k) FROM bench WHERE k BETWEEN ?1 AND ?2")
+                .unwrap();
+            b.iter(|| {
+                let mut rows = stmt.query(rusqlite::params![0i64, 50000i64]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            });
+        });
+
         g.finish();
     }
 
     /// 200 point lookups by primary key.
     fn bench_select_point(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
         let mut g = c.benchmark_group("dml/select_point_pk");
         g.throughput(Throughput::Elements(POINTS as u64));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
         let ids = point_ids(READ_ROWS);
-        read_bench(&mut g, |t| {
-            for &id in &ids {
-                black_box(t.query_rows(&format!("SELECT k, v FROM bench WHERE id = {id}")));
+
+        // Setup dtdb once
+        let dtdb_tmp = TempDir::new().unwrap();
+        let mut dtdb_client = DuctTapeDbClient::in_process(dtdb_tmp.path()).unwrap();
+        rt.block_on(async {
+            dtdb_client
+                .create_db("bench", CompressionType::Lz4)
+                .await
+                .unwrap();
+            let mut stream = dtdb_client
+                .execute_query(
+                    "bench",
+                    sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"),
+                )
+                .await
+                .unwrap();
+            while let Some(r) = stream.next().await {
+                r.unwrap();
             }
         });
+        populate_dtdb(&mut dtdb_client, READ_ROWS, &rt);
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    for &id in &ids {
+                        let mut stream = dtdb_client
+                            .execute_query(
+                                "bench",
+                                sql_query!("SELECT k, v FROM bench WHERE id = @id")
+                                    .bind("id", id as i64),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            let _resp = r.unwrap();
+                        }
+                    }
+                });
+            });
+        });
+
+        // Setup sqlite once
+        let sqlite_tmp = TempDir::new().unwrap();
+        let mut sqlite_conn =
+            rusqlite::Connection::open(sqlite_tmp.path().join("bench.sqlite")).unwrap();
+        sqlite_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                 CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+            )
+            .unwrap();
+        populate_sqlite(&mut sqlite_conn, READ_ROWS);
+
+        g.bench_function("sqlite_prepared", |b| {
+            let mut stmt = sqlite_conn
+                .prepare("SELECT k, v FROM bench WHERE id = ?1")
+                .unwrap();
+            b.iter(|| {
+                for &id in &ids {
+                    let mut rows = stmt.query(rusqlite::params![id as i64]).unwrap();
+                    while rows.next().unwrap().is_some() {}
+                }
+            });
+        });
+
         g.finish();
     }
 
     /// 200 point UPDATEs by primary key, each auto-committed.
     fn bench_update_point(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
         let mut g = c.benchmark_group("dml/update_point_pk");
         g.throughput(Throughput::Elements(POINTS as u64));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
         let ids = point_ids(MUTATE_ROWS);
-        write_bench(
-            &mut g,
-            |t| t.populate(MUTATE_ROWS),
-            |t| {
-                for &id in &ids {
-                    t.exec(&format!("UPDATE bench SET k = k + 1 WHERE id = {id}"));
-                }
-            },
-        );
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
+                    rt.block_on(async {
+                        client
+                            .create_db("bench", CompressionType::Lz4)
+                            .await
+                            .unwrap();
+                        let mut stream = client
+                            .execute_query(
+                                "bench",
+                                sql_query!(
+                                    "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            r.unwrap();
+                        }
+                    });
+                    populate_dtdb(&mut client, MUTATE_ROWS, &rt);
+                    (tmp, client)
+                },
+                |(tmp, mut client)| {
+                    rt.block_on(async {
+                        for &id in &ids {
+                            let mut stream = client
+                                .execute_query(
+                                    "bench",
+                                    sql_query!("UPDATE bench SET k = k + 1 WHERE id = @id")
+                                        .bind("id", id as i64),
+                                )
+                                .await
+                                .unwrap();
+                            while let Some(r) = stream.next().await {
+                                r.unwrap();
+                            }
+                        }
+                    });
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("sqlite_prepared", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut conn =
+                        rusqlite::Connection::open(tmp.path().join("bench.sqlite")).unwrap();
+                    conn.execute_batch(
+                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                         CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+                    )
+                    .unwrap();
+                    populate_sqlite(&mut conn, MUTATE_ROWS);
+                    (tmp, conn)
+                },
+                |(tmp, conn)| {
+                    let mut stmt = conn
+                        .prepare("UPDATE bench SET k = k + 1 WHERE id = ?1")
+                        .unwrap();
+                    for &id in &ids {
+                        stmt.execute(rusqlite::params![id as i64]).unwrap();
+                    }
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
         g.finish();
     }
 
     /// Range DELETE over a contiguous primary-key band (~half the table).
     fn bench_delete_range(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
         let mut g = c.benchmark_group("dml/delete_range");
         let lo = MUTATE_ROWS / 4;
         let hi = 3 * MUTATE_ROWS / 4;
         g.throughput(Throughput::Elements((hi - lo + 1) as u64));
-        write_bench(
-            &mut g,
-            |t| t.populate(MUTATE_ROWS),
-            move |t| t.exec(&format!("DELETE FROM bench WHERE id BETWEEN {lo} AND {hi}")),
-        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
+                    rt.block_on(async {
+                        client
+                            .create_db("bench", CompressionType::Lz4)
+                            .await
+                            .unwrap();
+                        let mut stream = client
+                            .execute_query(
+                                "bench",
+                                sql_query!(
+                                    "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            r.unwrap();
+                        }
+                    });
+                    populate_dtdb(&mut client, MUTATE_ROWS, &rt);
+                    (tmp, client)
+                },
+                |(tmp, mut client)| {
+                    rt.block_on(async {
+                        let mut stream = client
+                            .execute_query(
+                                "bench",
+                                sql_query!("DELETE FROM bench WHERE id BETWEEN @lo AND @hi")
+                                    .bind("lo", lo as i64)
+                                    .bind("hi", hi as i64),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            r.unwrap();
+                        }
+                    });
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("sqlite_prepared", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut conn =
+                        rusqlite::Connection::open(tmp.path().join("bench.sqlite")).unwrap();
+                    conn.execute_batch(
+                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                         CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+                    )
+                    .unwrap();
+                    populate_sqlite(&mut conn, MUTATE_ROWS);
+                    (tmp, conn)
+                },
+                |(tmp, conn)| {
+                    let mut stmt = conn
+                        .prepare("DELETE FROM bench WHERE id BETWEEN ?1 AND ?2")
+                        .unwrap();
+                    stmt.execute(rusqlite::params![lo as i64, hi as i64])
+                        .unwrap();
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
         g.finish();
     }
 
@@ -533,15 +647,125 @@ mod imp {
 
     /// Concurrent transactions inserting disjoint keys.
     fn bench_concurrent_inserts(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
         let mut g = c.benchmark_group("dml/concurrent_inserts");
         let num_threads = 4;
         let txns_per_thread = 100;
         g.throughput(Throughput::Elements((num_threads * txns_per_thread) as u64));
-        write_bench(
-            &mut g,
-            |_t| {},
-            move |t| t.run_concurrent_inserts(num_threads, txns_per_thread),
-        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
+                    rt.block_on(async {
+                        client.create_db("bench", CompressionType::Lz4).await.unwrap();
+                        let mut stream = client
+                            .execute_query(
+                                "bench",
+                                sql_query!(
+                                    "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            r.unwrap();
+                        }
+                    });
+                    (tmp, client)
+                },
+                |(tmp, client)| {
+                    std::thread::scope(|s| {
+                        for thread_idx in 0..num_threads {
+                            let mut client_clone = client.clone();
+                            s.spawn(move || {
+                                let rt_thread = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .unwrap();
+                                for i in 0..txns_per_thread {
+                                    let key = thread_idx * txns_per_thread + i;
+                                    rt_thread.block_on(async {
+                                        let mut stream = client_clone
+                                            .execute_query(
+                                                "bench",
+                                                sql_query!(
+                                                    "INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)"
+                                                )
+                                                .bind("id", key as i64)
+                                                .bind("k", ((key * 31) % 100_000) as i64)
+                                                .bind("v", format!("val_{key:08}")),
+                                            )
+                                            .await
+                                            .unwrap();
+                                        while let Some(r) = stream.next().await {
+                                            r.unwrap();
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("sqlite_prepared", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let conn = rusqlite::Connection::open(tmp.path().join("bench.sqlite")).unwrap();
+                    conn.execute_batch(
+                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                         CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+                    )
+                    .unwrap();
+                    (tmp, conn)
+                },
+                |(tmp, _conn)| {
+                    let db_path = tmp.path().join("bench.sqlite");
+                    std::thread::scope(|s| {
+                        for thread_idx in 0..num_threads {
+                            let db_path = db_path.clone();
+                            s.spawn(move || {
+                                let conn = rusqlite::Connection::open(db_path).unwrap();
+                                conn.busy_timeout(std::time::Duration::from_secs(30))
+                                    .unwrap();
+                                conn.execute_batch(
+                                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
+                                )
+                                .unwrap();
+                                let mut stmt = conn
+                                    .prepare("INSERT INTO bench (id, k, v) VALUES (?1, ?2, ?3)")
+                                    .unwrap();
+                                for i in 0..txns_per_thread {
+                                    let key = thread_idx * txns_per_thread + i;
+                                    stmt.execute(rusqlite::params![
+                                        key as i64,
+                                        ((key * 31) % 100_000) as i64,
+                                        format!("val_{key:08}")
+                                    ])
+                                    .unwrap();
+                                }
+                            });
+                        }
+                    });
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
         g.finish();
     }
 
