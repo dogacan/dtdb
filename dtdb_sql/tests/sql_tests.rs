@@ -5963,3 +5963,64 @@ fn test_sql_parse_cache_param_isolation() {
     assert_eq!(select_one(2), "two");
     assert_eq!(select_one(3), "three");
 }
+
+#[test]
+fn test_plan_cache_registry() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx_ddl = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE kv (id INT PRIMARY KEY, v VARCHAR)", &tx_ddl)
+        .unwrap();
+    tx_ddl.commit().unwrap();
+
+    // Cache starts empty
+    assert_eq!(engine.plan_cache_len(), 0);
+
+    // Preparing a query inserts it into the plan cache registry
+    let _stmt1 = engine.prepare("SELECT v FROM kv WHERE id = :id").unwrap();
+    assert_eq!(engine.plan_cache_len(), 1);
+
+    // Re-preparing the exact same statement hits the cache (cache length stays 1)
+    let stmt2 = engine.prepare("SELECT v FROM kv WHERE id = :id").unwrap();
+    assert_eq!(engine.plan_cache_len(), 1);
+
+    // Check that we can execute it successfully
+    let tx = Transaction::new(2, db.clone());
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), DbValue::Int(1));
+    let _ = engine.execute_prepared(&stmt2, &tx, &params).unwrap();
+    tx.commit().unwrap();
+
+    // Preparing a different query increases cache length to 2
+    let _stmt3 = engine.prepare("SELECT * FROM kv").unwrap();
+    assert_eq!(engine.plan_cache_len(), 2);
+
+    // Perform a DDL command to bump catalog/schema version
+    let tx_ddl2 = Transaction::new(3, db.clone());
+    engine
+        .execute("CREATE TABLE kv2 (id INT PRIMARY KEY)", &tx_ddl2)
+        .unwrap();
+    tx_ddl2.commit().unwrap();
+
+    // Stale plans are replaced when prepared again. Length should still be 2 after preparation
+    // since it overwrites the stale cache entries.
+    let stmt4 = engine.prepare("SELECT v FROM kv WHERE id = :id").unwrap();
+    assert_eq!(engine.plan_cache_len(), 2);
+    // Make sure it runs under the new schema
+    let tx_new = Transaction::new(4, db.clone());
+    let mut params = std::collections::HashMap::new();
+    params.insert("id".to_string(), DbValue::Int(1));
+    let _res = engine.execute_prepared(&stmt4, &tx_new, &params).unwrap();
+    tx_new.commit().unwrap();
+
+    // Eviction test: fill the plan cache beyond capacity (1024)
+    // We can prepare 1025 unique queries. Since each unique query is distinct,
+    // it will eventually evict the oldest.
+    for i in 0..1025 {
+        let sql = format!("SELECT v FROM kv WHERE id = :id OR id = {}", i);
+        let _ = engine.prepare(&sql).unwrap();
+    }
+    // Check that the plan cache does not exceed 1024
+    assert_eq!(engine.plan_cache_len(), 1024);
+}

@@ -13,7 +13,7 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Capacity (in entries) of the per-engine parsed-statement cache. SQL text is
 /// typically a small, fixed set of templates (the user-facing `sql_query!`
@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 /// real application's working set; pathological dynamic SQL is bounded by LRU
 /// eviction. Entries are stored with size 1 so the byte budget is an entry count.
 const PARSE_CACHE_CAPACITY: usize = 1024;
+const PLAN_CACHE_CAPACITY: usize = 1024;
 
 /// Represents the tabular or DDL execution output of a SQL query.
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +190,9 @@ pub struct SqlEngine {
     /// valid; planning is intentionally NOT cached here, so each execution still
     /// resolves against the current schema.
     parse_cache: Mutex<LruCache<String, Arc<Statement>>>,
+    /// Caches pre-optimized logical plans keyed on the preprocessed SQL text,
+    /// so re-preparing or executing the same statement template bypasses planning/optimization.
+    plan_cache: RwLock<LruCache<String, (PreparedPlan, u64)>>,
 }
 
 impl SqlEngine {
@@ -196,7 +200,18 @@ impl SqlEngine {
         Self {
             database,
             parse_cache: Mutex::new(LruCache::new(PARSE_CACHE_CAPACITY)),
+            plan_cache: RwLock::new(LruCache::new(PLAN_CACHE_CAPACITY)),
         }
+    }
+
+    /// Returns the number of cached plans in the registry.
+    pub fn plan_cache_len(&self) -> usize {
+        self.plan_cache.read().unwrap().len()
+    }
+
+    /// Returns true if the plan cache is empty.
+    pub fn plan_cache_is_empty(&self) -> bool {
+        self.plan_cache.read().unwrap().is_empty()
     }
 
     /// Returns the parsed AST for `preprocessed`, reusing a cached parse when
@@ -236,6 +251,23 @@ impl SqlEngine {
     /// between executions, then supply them to [`execute_prepared`](Self::execute_prepared).
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, String> {
         let preprocessed = preprocess_sql(sql);
+        let schema_version = self.database.schema_version();
+
+        // 1. Check if the pre-optimized plan is in the cache and matches the current schema version.
+        {
+            let mut cache = self.plan_cache.write().unwrap();
+            if let Some((plan, catalog_version)) = cache
+                .get(&preprocessed)
+                .filter(|(_, cv)| *cv == schema_version)
+            {
+                return Ok(PreparedStatement {
+                    plan: plan.clone(),
+                    sql: sql.to_string(),
+                    catalog_version: *catalog_version,
+                });
+            }
+        }
+
         let dialect = GenericDialect {};
         let mut statements =
             Parser::parse_sql(&dialect, &preprocessed).map_err(|e| e.to_string())?;
@@ -275,12 +307,16 @@ impl SqlEngine {
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
-        // Record the catalog version the plan was built against so later DDL can
-        // be detected and the plan re-built (see `PreparedStatement::catalog_version`).
+        // Cache the newly planned statement in the registry.
+        {
+            let mut cache = self.plan_cache.write().unwrap();
+            cache.insert(preprocessed, (plan.clone(), schema_version), 1);
+        }
+
         Ok(PreparedStatement {
             plan,
             sql: sql.to_string(),
-            catalog_version: self.database.schema_version(),
+            catalog_version: schema_version,
         })
     }
 
@@ -302,35 +338,55 @@ impl SqlEngine {
         }
 
         let preprocessed = preprocess_sql(&prepared.sql);
+        let schema_version = self.database.schema_version();
+
+        // 1. Check if another thread has already cached the fresh plan
+        {
+            let mut cache = self.plan_cache.write().unwrap();
+            if let Some((plan, _)) = cache
+                .get(&preprocessed)
+                .filter(|(_, cv)| *cv == schema_version)
+            {
+                return Ok(Some(plan.clone()));
+            }
+        }
+
         let dialect = GenericDialect {};
         let statement = Parser::parse_sql(&dialect, &preprocessed)
             .map_err(|e| e.to_string())?
             .into_iter()
             .next()
             .ok_or_else(|| "No SQL statements found".to_string())?;
-        Ok(Some(
-            match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-                Ok(planned) => {
-                    let optimized = match planned {
-                        SqlStatement::Query(q) => {
-                            SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
-                        }
-                        SqlStatement::InsertSelect {
-                            table_name,
-                            columns,
-                            query,
-                        } => SqlStatement::InsertSelect {
-                            table_name,
-                            columns,
-                            query: Optimizer::new(self.database.clone()).optimize(query),
-                        },
-                        other => other,
-                    };
-                    PreparedPlan::Planned(Box::new(optimized))
-                }
-                Err(_) => PreparedPlan::Ast(Box::new(statement)),
-            },
-        ))
+
+        let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
+            Ok(planned) => {
+                let optimized = match planned {
+                    SqlStatement::Query(q) => {
+                        SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
+                    }
+                    SqlStatement::InsertSelect {
+                        table_name,
+                        columns,
+                        query,
+                    } => SqlStatement::InsertSelect {
+                        table_name,
+                        columns,
+                        query: Optimizer::new(self.database.clone()).optimize(query),
+                    },
+                    other => other,
+                };
+                PreparedPlan::Planned(Box::new(optimized))
+            }
+            Err(_) => PreparedPlan::Ast(Box::new(statement)),
+        };
+
+        // Cache the newly refreshed plan in the registry.
+        {
+            let mut cache = self.plan_cache.write().unwrap();
+            cache.insert(preprocessed, (plan.clone(), schema_version), 1);
+        }
+
+        Ok(Some(plan))
     }
 
     /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
