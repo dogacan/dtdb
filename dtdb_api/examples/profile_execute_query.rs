@@ -2,10 +2,11 @@
 //! `TransactionClient::execute_query` adds on top of the SQL engine.
 //!
 //! The benchmark found that routing parameterized INSERTs through the client
-//! interface showed no gain from the parse cache. This sizes why, by measuring
-//! each thing the in-process wrapper does per call:
-//!   - `SqlEngine::is_ddl(text)` -- which RE-PARSES the SQL (uncached!) just to
-//!     reject DDL inside a transaction;
+//! interface showed no gain from the parse cache, because `is_ddl` re-parsed
+//! every statement uncached. After pointing `is_ddl` at the shared cache too,
+//! this sizes what the in-process wrapper does per call:
+//!   - `SqlEngine::is_ddl(text)` -- the DDL guard before executing (now a cache
+//!     hit, so it no longer re-parses);
 //!   - building the `SqlQuery` via `sql_query!` + `.bind()`;
 //!   - rebuilding the `params` HashMap from the bindings;
 //!   - the actual engine work, `execute_with_params` (parse-cached).
@@ -64,7 +65,8 @@ fn main() {
     }
 
     // 1. is_ddl: the wrapper calls this per statement to reject DDL inside a
-    //    transaction. It re-parses the SQL with sqlparser (NOT via the cache).
+    //    transaction. It now parses through the shared cache, so after the first
+    //    call it is a cache hit + a variant check rather than a full re-parse.
     let t_is_ddl = bench(20_000, |_| {
         black_box(engine.is_ddl(TMPL));
     });
@@ -123,22 +125,20 @@ fn main() {
     };
 
     println!("\nPer-statement client `execute_query` cost (in-process, INSERT)\n");
-    row("is_ddl (RE-PARSE, uncached)", t_is_ddl);
+    row("is_ddl (DDL guard, cached)", t_is_ddl);
     row("build SqlQuery (sql_query! + bind)", t_build_query);
     row("rebuild params HashMap", t_build_params);
     row("execute_with_params (engine, cached)", t_execute_cached);
     println!("  {:-<52}", "");
     println!("  {:<34} {:>9.0} ns  (100.0%)", "approx total", total);
     println!(
-        "\n  wrapper overhead = {:.2} us/call  ({:.0}% of the total), of which is_ddl\n  \
-         alone is {:.2} us -- a full redundant parse that negates the parse cache.",
+        "\n  wrapper overhead = {:.2} us/call  ({:.0}% of the total); is_ddl is now\n  \
+         {:.2} us (a cache hit), down from a full ~3.5 us re-parse before it shared\n  \
+         the cache. The engine itself (cached) is {:.2} us/call.\n",
         wrapper / 1000.0,
         pct(wrapper),
         t_is_ddl / 1000.0,
-    );
-    println!(
-        "  the engine itself (cached) is only {:.2} us/call.\n",
-        t_execute_cached / 1000.0
+        t_execute_cached / 1000.0,
     );
 
     let _ = std::fs::remove_dir_all(&dir);

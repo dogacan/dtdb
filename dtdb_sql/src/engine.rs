@@ -300,14 +300,17 @@ impl SqlEngine {
     }
 
     /// Checks if the SQL string contains a DDL statement (CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX).
+    ///
+    /// Parses through the shared cache so a statement that is then executed via
+    /// `execute_with_params` is parsed only once (the client wrapper calls this
+    /// immediately before executing). Multi-statement/empty input fails
+    /// `cached_parse` and is treated as non-DDL, matching the downstream
+    /// rejection of such inputs.
     pub fn is_ddl(&self, sql: &str) -> bool {
         let preprocessed = preprocess_sql(sql);
-        let dialect = GenericDialect {};
-        if let Ok(statements) = Parser::parse_sql(&dialect, &preprocessed)
-            && !statements.is_empty()
-        {
+        if let Ok(statement) = self.cached_parse(preprocessed) {
             return matches!(
-                statements[0],
+                &*statement,
                 sqlparser::ast::Statement::CreateTable(_)
                     | sqlparser::ast::Statement::Drop { .. }
                     | sqlparser::ast::Statement::CreateIndex(_)
