@@ -1,3 +1,4 @@
+#![allow(clippy::result_large_err)]
 use futures_util::StreamExt;
 use std::path::Path;
 use tempfile::TempDir;
@@ -6,7 +7,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Status;
 use tonic::transport::Server;
 
-use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::client::RemoteClient;
 use dtdb_api::proto::duct_tape_db_service_client::DuctTapeDbServiceClient;
 use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
 use dtdb_api::proto::execute_query_response::Payload as EqPayload;
@@ -40,63 +41,68 @@ async fn start_test_server(data_path: &Path) -> (u16, tokio::task::JoinHandle<()
     (port, server_handle)
 }
 
-#[tokio::test]
-async fn test_in_process_transaction_commit() {
+#[test]
+fn test_in_process_transaction_commit() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().to_path_buf();
 
-    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    let client = dtdb_api::in_process::InProcessClient::open(&data_path).unwrap();
     client
         .create_db("test_db", CompressionType::Uncompressed)
-        .await
         .unwrap();
 
     // Create table first
     {
-        let mut stream = client
+        let results = client
             .execute_query(
                 "test_db",
                 dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
-            .await
             .unwrap();
-        while let Some(res) = stream.next().await {
+        for res in results {
             res.unwrap();
         }
     }
 
     // Run transaction
-    let tx_res = client
-        .run_in_transaction("test_db", |tx| async move {
-            tx.execute_query(dtdb_api::sql_query!(
-                "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
-            ))
-            .await?;
-            tx.execute_query(dtdb_api::sql_query!(
-                "INSERT INTO Users (id, name) VALUES (2, 'Bob');"
-            ))
-            .await?;
-            Ok("success_value")
-        })
-        .await;
+    let tx_res = client.run_in_transaction("test_db", |tx| {
+        let res1 = tx.execute_query(dtdb_api::sql_query!(
+            "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
+        ))?;
+        for res in res1 {
+            res.unwrap();
+        }
+        let res2 = tx.execute_query(dtdb_api::sql_query!(
+            "INSERT INTO Users (id, name) VALUES (2, 'Bob');"
+        ))?;
+        for res in res2 {
+            res.unwrap();
+        }
+        Ok("success_value")
+    });
 
     assert_eq!(tx_res.unwrap(), "success_value");
 
     // Verify both rows exist
-    let mut stream = client
+    let results = client
         .execute_query(
             "test_db",
             dtdb_api::sql_query!("SELECT id, name FROM Users ORDER BY id ASC;"),
         )
-        .await
         .unwrap();
 
     let mut rows = Vec::new();
-    while let Some(res) = stream.next().await {
-        let resp = res.unwrap();
-        if let Some(EqPayload::Row(row)) = resp.payload {
-            rows.push(row.values);
-        }
+    for res in results {
+        let row = res.unwrap();
+        let id_val = match row.get_by_index(0).unwrap() {
+            dtdb_storage::DbValue::Int(v) => v.to_string(),
+            _ => panic!("Expected int"),
+        };
+        let name_val = match row.get_by_index(1).unwrap() {
+            dtdb_storage::DbValue::String(s) => s.clone(),
+            _ => panic!("Expected string"),
+        };
+        rows.push(vec![id_val, name_val]);
     }
 
     assert_eq!(rows.len(), 2);
@@ -104,60 +110,55 @@ async fn test_in_process_transaction_commit() {
     assert_eq!(rows[1], vec!["2", "Bob"]);
 }
 
-#[tokio::test]
-async fn test_in_process_transaction_rollback() {
+#[test]
+fn test_in_process_transaction_rollback() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().to_path_buf();
 
-    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    let client = dtdb_api::in_process::InProcessClient::open(&data_path).unwrap();
     client
         .create_db("test_db", CompressionType::Uncompressed)
-        .await
         .unwrap();
 
     // Create table first
     {
-        let mut stream = client
+        let results = client
             .execute_query(
                 "test_db",
                 dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
-            .await
             .unwrap();
-        while let Some(res) = stream.next().await {
+        for res in results {
             res.unwrap();
         }
     }
 
     // Run transaction and return error to trigger rollback
-    let tx_res: Result<(), Status> = client
-        .run_in_transaction("test_db", |tx| async move {
-            tx.execute_query(dtdb_api::sql_query!(
-                "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
-            ))
-            .await?;
-            Err(Status::aborted("abort transaction"))
-        })
-        .await;
+    let tx_res: Result<(), Status> = client.run_in_transaction("test_db", |tx| {
+        let res = tx.execute_query(dtdb_api::sql_query!(
+            "INSERT INTO Users (id, name) VALUES (1, 'Alice');"
+        ))?;
+        for r in res {
+            r.unwrap();
+        }
+        Err(Status::aborted("abort transaction"))
+    });
 
     assert!(tx_res.is_err());
     assert_eq!(tx_res.unwrap_err().code(), tonic::Code::Aborted);
 
     // Verify table is empty
-    let mut stream = client
+    let results = client
         .execute_query(
             "test_db",
             dtdb_api::sql_query!("SELECT id, name FROM Users;"),
         )
-        .await
         .unwrap();
 
     let mut rows = Vec::new();
-    while let Some(res) = stream.next().await {
-        let resp = res.unwrap();
-        if let Some(EqPayload::Row(row)) = resp.payload {
-            rows.push(row.values);
-        }
+    for res in results {
+        let row = res.unwrap();
+        rows.push(row.values);
     }
 
     assert_eq!(rows.len(), 0);
@@ -171,7 +172,7 @@ async fn test_grpc_transaction_commit() {
     let (port, server_handle) = start_test_server(&data_path).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     client
         .create_db("test_db", CompressionType::Uncompressed)
@@ -241,7 +242,7 @@ async fn test_grpc_transaction_rollback() {
     let (port, server_handle) = start_test_server(&data_path).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     client
         .create_db("test_db", CompressionType::Uncompressed)
@@ -297,15 +298,14 @@ async fn test_grpc_transaction_rollback() {
     server_handle.abort();
 }
 
-#[tokio::test]
-async fn test_multi_statement_rejection() {
+#[test]
+fn test_multi_statement_rejection() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().to_path_buf();
 
-    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    let client = dtdb_api::in_process::InProcessClient::open(&data_path).unwrap();
     client
         .create_db("test_db", CompressionType::Uncompressed)
-        .await
         .unwrap();
 
     // Rejects multi-statement ExecuteQuery
@@ -316,7 +316,6 @@ async fn test_multi_statement_rejection() {
                 "CREATE TABLE Users (id int PRIMARY KEY); INSERT INTO Users (id) VALUES (1);"
             ),
         )
-        .await
         .err()
         .unwrap();
 
@@ -338,9 +337,7 @@ async fn test_grpc_protocol_misuse() {
 
     // Create the database first
     {
-        let mut client = DuctTapeDbClient::connect(client_addr.clone())
-            .await
-            .unwrap();
+        let mut client = RemoteClient::connect(client_addr.clone()).await.unwrap();
         client
             .create_db("test_db", CompressionType::Uncompressed)
             .await
@@ -641,9 +638,7 @@ async fn test_grpc_transaction_disconnect_rollback() {
     let (port, server_handle) = start_test_server(&data_path).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr.clone())
-        .await
-        .unwrap();
+    let mut client = RemoteClient::connect(client_addr.clone()).await.unwrap();
 
     client
         .create_db("test_disconnect_db", CompressionType::Uncompressed)
@@ -740,7 +735,7 @@ async fn test_grpc_ddl_transaction_rejection() {
     let (port, server_handle) = start_test_server(&data_path).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     client
         .create_db("test_db", CompressionType::Uncompressed)
@@ -764,22 +759,17 @@ async fn test_grpc_ddl_transaction_rejection() {
     assert!(err_msg.contains("DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions."));
 
     // 2. In-process transaction rejection of DDL
-    let mut ip_client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    let ip_client = dtdb_api::in_process::InProcessClient::open(&data_path).unwrap();
     ip_client
         .create_db("test_db_ip", CompressionType::Uncompressed)
-        .await
         .unwrap();
 
-    let ip_tx_res = ip_client
-        .run_in_transaction("test_db_ip", |tx| async move {
-            let _ = tx
-                .execute_query(dtdb_api::sql_query!(
-                    "CREATE TABLE Dummy (id int PRIMARY KEY);"
-                ))
-                .await?;
-            Ok(())
-        })
-        .await;
+    let ip_tx_res = ip_client.run_in_transaction("test_db_ip", |tx| {
+        let _ = tx.execute_query(dtdb_api::sql_query!(
+            "CREATE TABLE Dummy (id int PRIMARY KEY);"
+        ))?;
+        Ok(())
+    });
 
     assert!(ip_tx_res.is_err());
     let ip_err_msg = ip_tx_res.unwrap_err().message().to_string();
@@ -810,7 +800,7 @@ async fn test_grpc_transaction_with_isolation_options() {
     let (port, server_handle) = start_test_server(&data_path).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     client
         .create_db("test_db", CompressionType::Uncompressed)

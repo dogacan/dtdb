@@ -22,19 +22,19 @@ use crate::proto::{
     Header, Row, TransactionRequest, TransactionResponse,
 };
 
-pub struct DuctTapeDbServiceImpl {
+pub(crate) struct DbState {
+    pub(crate) database: Arc<Database>,
+    pub(crate) sql_engine: Arc<SqlEngine>,
+}
+
+pub struct DatabaseCatalog {
     data_dir: PathBuf,
-    databases: Arc<RwLock<HashMap<String, DbState>>>,
-    next_tx_id: Arc<AtomicU64>,
+    databases: RwLock<HashMap<String, DbState>>,
+    next_tx_id: AtomicU64,
     executor: Arc<dyn dtdb_storage::Executor>,
 }
 
-struct DbState {
-    database: Arc<Database>,
-    sql_engine: Arc<SqlEngine>,
-}
-
-impl DuctTapeDbServiceImpl {
+impl DatabaseCatalog {
     pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, String> {
         Self::new_with_executor(data_dir, dtdb_storage::default_executor())
     }
@@ -46,18 +46,18 @@ impl DuctTapeDbServiceImpl {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
-        let databases = Arc::new(RwLock::new(HashMap::new()));
-        let service = Self {
+        let databases = RwLock::new(HashMap::new());
+        let catalog = Self {
             data_dir: data_dir.clone(),
             databases,
-            next_tx_id: Arc::new(AtomicU64::new(1)),
+            next_tx_id: AtomicU64::new(1),
             executor,
         };
 
         // Scan and restore databases
-        service.restore_databases()?;
+        catalog.restore_databases()?;
 
-        Ok(service)
+        Ok(catalog)
     }
 
     fn restore_databases(&self) -> Result<(), String> {
@@ -92,16 +92,180 @@ impl DuctTapeDbServiceImpl {
         Ok(())
     }
 
-    /// Returns the database and SQL engine for the given database name, if it exists.
     pub fn get_db_and_engine(&self, db_name: &str) -> Option<(Arc<Database>, Arc<SqlEngine>)> {
         let dbs = self.databases.read().unwrap();
         dbs.get(db_name)
             .map(|state| (state.database.clone(), state.sql_engine.clone()))
     }
 
-    /// Allocates the next unique transaction ID.
     pub fn next_tx_id(&self) -> u64 {
         self.next_tx_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn create_db(
+        &self,
+        name: &str,
+        options: DatabaseOptions,
+    ) -> Result<CreateDbResponse, Status> {
+        let db_name = name.trim();
+        if db_name.is_empty() {
+            return Err(Status::invalid_argument("Database name cannot be empty"));
+        }
+
+        let mut dbs = self.databases.write().unwrap();
+        if dbs.contains_key(db_name) {
+            return Ok(CreateDbResponse {
+                success: false,
+                message: format!("Database '{}' already exists", db_name),
+            });
+        }
+
+        let db_path = self.data_dir.join(db_name);
+        let database = Arc::new(
+            Database::open_with_options_and_executor(
+                &db_path,
+                options.clone(),
+                self.executor.clone(),
+            )
+            .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?,
+        );
+        database.start_background_analyze_if_needed(&database);
+        database.start_background_flush_if_needed(&database);
+        let sql_engine = Arc::new(SqlEngine::new(database.clone()));
+
+        dbs.insert(
+            db_name.to_string(),
+            DbState {
+                database,
+                sql_engine,
+            },
+        );
+
+        Ok(CreateDbResponse {
+            success: true,
+            message: format!("Database '{}' created with options: {:?}", db_name, options),
+        })
+    }
+
+    pub fn drop_db(&self, name: &str) -> Result<DropDbResponse, Status> {
+        let db_name = name.trim();
+        if db_name.is_empty() {
+            return Err(Status::invalid_argument("Database name cannot be empty"));
+        }
+
+        let state = {
+            let mut dbs = self.databases.write().unwrap();
+            if let Some(true) = dbs
+                .get(db_name)
+                .map(|s| s.database.has_active_transactions())
+            {
+                return Ok(DropDbResponse {
+                    success: false,
+                    message: format!(
+                        "Cannot drop database '{}' because it has active transactions",
+                        db_name
+                    ),
+                });
+            }
+            dbs.remove(db_name)
+        };
+
+        if let Some(db_state) = state {
+            drop(db_state);
+
+            let db_path = self.data_dir.join(db_name);
+            if db_path.exists()
+                && let Err(e) = fs::remove_dir_all(&db_path)
+            {
+                return Ok(DropDbResponse {
+                    success: false,
+                    message: format!(
+                        "Database removed from catalog but failed to delete files: {}",
+                        e
+                    ),
+                });
+            }
+
+            Ok(DropDbResponse {
+                success: true,
+                message: format!("Database '{}' dropped successfully", db_name),
+            })
+        } else {
+            Ok(DropDbResponse {
+                success: false,
+                message: format!("Database '{}' not found", db_name),
+            })
+        }
+    }
+
+    pub fn flush_db(&self, name: &str) -> Result<FlushDbResponse, Status> {
+        let db_name = name.trim();
+        if db_name.is_empty() {
+            return Err(Status::invalid_argument("Database name cannot be empty"));
+        }
+
+        let database = {
+            let dbs = self.databases.read().unwrap();
+            if let Some(state) = dbs.get(db_name) {
+                state.database.clone()
+            } else {
+                return Err(Status::not_found(format!(
+                    "Database '{}' not found",
+                    db_name
+                )));
+            }
+        };
+
+        let tables = database.list_tables();
+        let mut flushed_tables = Vec::new();
+        for table_name in tables {
+            if let Ok(table) = database.get_table(&table_name) {
+                if let Err(e) = table.flush_memtable() {
+                    return Err(Status::internal(format!(
+                        "Failed to flush table {}: {}",
+                        table_name, e
+                    )));
+                }
+                flushed_tables.push(table_name);
+            }
+        }
+
+        Ok(FlushDbResponse {
+            success: true,
+            message: format!(
+                "Flushed {} table(s) in database '{}': {:?}",
+                flushed_tables.len(),
+                db_name,
+                flushed_tables
+            ),
+        })
+    }
+}
+
+pub struct DuctTapeDbServiceImpl {
+    pub(crate) catalog: Arc<DatabaseCatalog>,
+}
+
+impl DuctTapeDbServiceImpl {
+    pub fn new(data_dir: impl AsRef<Path>) -> Result<Self, String> {
+        let catalog = Arc::new(DatabaseCatalog::new(data_dir)?);
+        Ok(Self { catalog })
+    }
+
+    pub fn new_with_executor(
+        data_dir: impl AsRef<Path>,
+        executor: Arc<dyn dtdb_storage::Executor>,
+    ) -> Result<Self, String> {
+        let catalog = Arc::new(DatabaseCatalog::new_with_executor(data_dir, executor)?);
+        Ok(Self { catalog })
+    }
+
+    pub fn get_db_and_engine(&self, db_name: &str) -> Option<(Arc<Database>, Arc<SqlEngine>)> {
+        self.catalog.get_db_and_engine(db_name)
+    }
+
+    pub fn next_tx_id(&self) -> u64 {
+        self.catalog.next_tx_id()
     }
 }
 
@@ -218,19 +382,6 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let req = request.into_inner();
         let db_name = req.db_name.trim();
 
-        if db_name.is_empty() {
-            return Err(Status::invalid_argument("Database name cannot be empty"));
-        }
-
-        let mut dbs = self.databases.write().unwrap();
-        if dbs.contains_key(db_name) {
-            return Ok(Response::new(CreateDbResponse {
-                success: false,
-                message: format!("Database '{}' already exists", db_name),
-            }));
-        }
-
-        let db_path = self.data_dir.join(db_name);
         let compression = match req.compression() {
             CompressionOption::CompressionLz4 => CompressionType::Lz4,
             CompressionOption::CompressionUncompressed => CompressionType::Uncompressed,
@@ -255,30 +406,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             fsync_method: FsyncMethod::default(),
         };
 
-        let database = Arc::new(
-            Database::open_with_options_and_executor(
-                &db_path,
-                options.clone(),
-                self.executor.clone(),
-            )
-            .map_err(|e| Status::internal(format!("Failed to create database: {}", e)))?,
-        );
-        database.start_background_analyze_if_needed(&database);
-        database.start_background_flush_if_needed(&database);
-        let sql_engine = Arc::new(SqlEngine::new(database.clone()));
-
-        dbs.insert(
-            db_name.to_string(),
-            DbState {
-                database,
-                sql_engine,
-            },
-        );
-
-        Ok(Response::new(CreateDbResponse {
-            success: true,
-            message: format!("Database '{}' created with options: {:?}", db_name, options),
-        }))
+        let resp = self.catalog.create_db(db_name, options)?;
+        Ok(Response::new(resp))
     }
 
     async fn drop_db(
@@ -287,56 +416,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
     ) -> Result<Response<DropDbResponse>, Status> {
         let req = request.into_inner();
         let db_name = req.db_name.trim();
-
-        if db_name.is_empty() {
-            return Err(Status::invalid_argument("Database name cannot be empty"));
-        }
-
-        let state = {
-            let mut dbs = self.databases.write().unwrap();
-            if let Some(true) = dbs
-                .get(db_name)
-                .map(|s| s.database.has_active_transactions())
-            {
-                return Ok(Response::new(DropDbResponse {
-                    success: false,
-                    message: format!(
-                        "Cannot drop database '{}' because it has active transactions",
-                        db_name
-                    ),
-                }));
-            }
-            dbs.remove(db_name)
-        };
-
-        if let Some(db_state) = state {
-            // Drop database references to release file locks
-            drop(db_state);
-
-            // Clean up directory from disk
-            let db_path = self.data_dir.join(db_name);
-            if db_path.exists()
-                && let Err(e) = fs::remove_dir_all(&db_path)
-            {
-                return Ok(Response::new(DropDbResponse {
-                    success: false,
-                    message: format!(
-                        "Database removed from catalog but failed to delete files: {}",
-                        e
-                    ),
-                }));
-            }
-
-            Ok(Response::new(DropDbResponse {
-                success: true,
-                message: format!("Database '{}' dropped successfully", db_name),
-            }))
-        } else {
-            Ok(Response::new(DropDbResponse {
-                success: false,
-                message: format!("Database '{}' not found", db_name),
-            }))
-        }
+        let resp = self.catalog.drop_db(db_name)?;
+        Ok(Response::new(resp))
     }
 
     async fn flush_db(
@@ -346,48 +427,13 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let req = request.into_inner();
         let db_name = req.db_name.trim();
 
-        if db_name.is_empty() {
-            return Err(Status::invalid_argument("Database name cannot be empty"));
-        }
+        let catalog = self.catalog.clone();
+        let db_name_owned = db_name.to_string();
+        let resp = tokio::task::spawn_blocking(move || catalog.flush_db(&db_name_owned))
+            .await
+            .map_err(|e| Status::internal(format!("Worker panicked: {}", e)))??;
 
-        let database = {
-            let dbs = self.databases.read().unwrap();
-            if let Some(state) = dbs.get(db_name) {
-                state.database.clone()
-            } else {
-                return Err(Status::not_found(format!(
-                    "Database '{}' not found",
-                    db_name
-                )));
-            }
-        };
-
-        let flushed_tables = tokio::task::spawn_blocking(move || {
-            let tables = database.list_tables();
-            let mut flushed_tables = Vec::new();
-            for table_name in tables {
-                if let Ok(table) = database.get_table(&table_name) {
-                    if let Err(e) = table.flush_memtable() {
-                        return Err(format!("Failed to flush table {}: {}", table_name, e));
-                    }
-                    flushed_tables.push(table_name);
-                }
-            }
-            Ok(flushed_tables)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Worker panicked: {}", e)))?
-        .map_err(Status::internal)?;
-
-        Ok(Response::new(FlushDbResponse {
-            success: true,
-            message: format!(
-                "Flushed {} table(s) in database '{}': {:?}",
-                flushed_tables.len(),
-                db_name,
-                flushed_tables
-            ),
-        }))
+        Ok(Response::new(resp))
     }
 
     async fn execute_query(
@@ -399,20 +445,12 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let sql_query = req.sql_query.trim();
         let params = proto_params_to_db_params(req.parameters)?;
 
-        // 1. Get db state
-        let (database, sql_engine) = {
-            let dbs = self.databases.read().unwrap();
-            if let Some(state) = dbs.get(db_name) {
-                (state.database.clone(), state.sql_engine.clone())
-            } else {
-                return Err(Status::not_found(format!(
-                    "Database '{}' not found",
-                    db_name
-                )));
-            }
-        };
+        let (database, sql_engine) = self
+            .catalog
+            .get_db_and_engine(db_name)
+            .ok_or_else(|| Status::not_found(format!("Database '{}' not found", db_name)))?;
 
-        let tx_id = self.next_tx_id.fetch_add(1, Ordering::SeqCst);
+        let tx_id = self.catalog.next_tx_id();
         let tx = Transaction::new(tx_id, database.clone());
 
         // Create channel for streaming
@@ -424,12 +462,58 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         // other in-flight RPC sharing this Tokio worker thread.
         let sql_query_owned = sql_query.to_string();
         let exec_result = tokio::task::spawn_blocking(move || {
-            let exec = sql_engine.execute_with_params(&sql_query_owned, &tx, &params);
+            let exec = sql_engine.execute_streaming(&sql_query_owned, &tx, &params);
             match exec {
-                Ok(result) => match tx.commit() {
-                    Ok(()) => Ok(result),
+                Ok(dtdb_sql::ExecutionStreamingResult::Complete(result)) => match tx.commit() {
+                    Ok(()) => Ok(crate::server::execution_result_to_responses(result)),
                     Err(e) => Err((true, e.to_string())),
                 },
+                Ok(dtdb_sql::ExecutionStreamingResult::Streaming {
+                    schema,
+                    mut operator,
+                }) => {
+                    let mut responses = Vec::new();
+                    let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
+                    responses.push(ExecuteQueryResponse {
+                        payload: Some(crate::proto::execute_query_response::Payload::Header(
+                            Header { column_names },
+                        )),
+                    });
+                    loop {
+                        match operator.next() {
+                            Ok(Some(row)) => {
+                                let values = row
+                                    .values
+                                    .iter()
+                                    .map(|val| match val {
+                                        DbValue::Int(v) => v.to_string(),
+                                        DbValue::Float(v) => v.to_string(),
+                                        DbValue::String(s) => s.clone(),
+                                        DbValue::Bytes(b) => format!("{:?}", b),
+                                        DbValue::Bool(b) => b.to_string(),
+                                        DbValue::Null => "NULL".to_string(),
+                                    })
+                                    .collect();
+                                responses.push(ExecuteQueryResponse {
+                                    payload: Some(
+                                        crate::proto::execute_query_response::Payload::Row(Row {
+                                            values,
+                                        }),
+                                    ),
+                                });
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                let _ = tx.rollback();
+                                return Err((false, e));
+                            }
+                        }
+                    }
+                    match tx.commit() {
+                        Ok(()) => Ok(responses),
+                        Err(e) => Err((true, e.to_string())),
+                    }
+                }
                 Err(e) => {
                     let _ = tx.rollback();
                     Err((false, e))
@@ -440,8 +524,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         .map_err(|e| Status::internal(format!("Worker panicked: {}", e)))?;
 
         match exec_result {
-            Ok(result) => {
-                let responses = execution_result_to_responses(result);
+            Ok(responses) => {
                 tokio::spawn(async move {
                     for resp in responses {
                         if tx_chan.send(Ok(resp)).await.is_err() {
@@ -464,16 +547,6 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
     }
 
     /// Bidirectional streaming RPC for multi-statement transactions.
-    ///
-    /// This implements a state machine with the following valid transitions:
-    ///
-    ///   [Idle] --Start--> [Active] --Execute--> [Active]
-    ///                       |                      |
-    ///                       +--Commit/Rollback--> [Done]
-    ///
-    /// Invalid transitions (e.g. double Start, Execute before Start) return
-    /// error messages on the response stream. If the client disconnects at
-    /// any point before committing, the transaction is automatically rolled back.
     async fn transaction(
         &self,
         request: Request<tonic::Streaming<TransactionRequest>>,
@@ -481,9 +554,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
         let mut in_stream = request.into_inner();
         let (tx_chan, rx_chan) = mpsc::channel::<Result<TransactionResponse, Status>>(128);
 
-        // Clone Arc-wrapped fields so they can be moved into the spawned task.
-        let databases = self.databases.clone();
-        let next_tx_id = self.next_tx_id.clone();
+        // Clone catalog so it can be moved into the spawned task.
+        let catalog = self.catalog.clone();
 
         tokio::spawn(async move {
             // Transaction state machine.
@@ -566,11 +638,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         }
 
                         let db_name = start.db_name.trim();
-                        let lookup = {
-                            let dbs = databases.read().unwrap();
-                            dbs.get(db_name)
-                                .map(|state| (state.database.clone(), state.sql_engine.clone()))
-                        };
+                        let lookup = catalog.get_db_and_engine(db_name);
                         let (database, sql_engine) = match lookup {
                             Some(pair) => pair,
                             None => {
@@ -603,7 +671,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             }
                         };
 
-                        let tx_id = next_tx_id.fetch_add(1, Ordering::SeqCst);
+                        let tx_id = catalog.next_tx_id();
                         let tx = Transaction::new_with_isolation(tx_id, database, isolation_level);
                         tx_state = Some((tx, sql_engine));
 
@@ -630,10 +698,9 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                             })).await;
                             continue;
                         }
-                        let sql_engine_ref = &tx_state.as_ref().expect("checked").1;
 
                         let sql_query = exec.sql_query.trim();
-                        if sql_engine_ref.is_ddl(sql_query) {
+                        if tx_state.as_ref().unwrap().1.is_ddl(sql_query) {
                             let _ = tx_chan.send(Ok(TransactionResponse {
                                 payload: Some(crate::proto::transaction_response::Payload::ErrorMessage(
                                     "DDL statements (CREATE TABLE, DROP TABLE) are not supported inside explicit multi-statement transactions.".to_string(),
@@ -669,8 +736,51 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         let (tx, sql_engine) = tx_state.take().expect("checked");
                         let sql_query_owned = sql_query.to_string();
                         let blocking_result = tokio::task::spawn_blocking(move || {
-                            let r = sql_engine.execute_with_params(&sql_query_owned, &tx, &params);
-                            (tx, sql_engine, r)
+                            let r = sql_engine.execute_streaming(&sql_query_owned, &tx, &params);
+                            match r {
+                                Ok(dtdb_sql::ExecutionStreamingResult::Complete(result)) => {
+                                    let responses = crate::server::execution_result_to_responses(result);
+                                    (tx, sql_engine, Ok(responses))
+                                }
+                                Ok(dtdb_sql::ExecutionStreamingResult::Streaming { schema, mut operator }) => {
+                                    let mut responses = Vec::new();
+                                    let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
+                                    responses.push(ExecuteQueryResponse {
+                                        payload: Some(crate::proto::execute_query_response::Payload::Header(
+                                            Header { column_names },
+                                        )),
+                                    });
+                                    loop {
+                                        match operator.next() {
+                                            Ok(Some(row)) => {
+                                                let values = row
+                                                    .values
+                                                    .iter()
+                                                    .map(|val| match val {
+                                                        DbValue::Int(v) => v.to_string(),
+                                                        DbValue::Float(v) => v.to_string(),
+                                                        DbValue::String(s) => s.clone(),
+                                                        DbValue::Bytes(b) => format!("{:?}", b),
+                                                        DbValue::Bool(b) => b.to_string(),
+                                                        DbValue::Null => "NULL".to_string(),
+                                                    })
+                                                    .collect();
+                                                responses.push(ExecuteQueryResponse {
+                                                    payload: Some(crate::proto::execute_query_response::Payload::Row(Row {
+                                                        values,
+                                                    })),
+                                                });
+                                            }
+                                            Ok(None) => break,
+                                            Err(e) => {
+                                                return (tx, sql_engine, Err(e));
+                                            }
+                                        }
+                                    }
+                                    (tx, sql_engine, Ok(responses))
+                                }
+                                Err(e) => (tx, sql_engine, Err(e)),
+                            }
                         })
                         .await;
                         let (tx, sql_engine, exec_result) = match blocking_result {
@@ -686,8 +796,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         };
                         tx_state = Some((tx, sql_engine));
                         match exec_result {
-                            Ok(result) => {
-                                let responses = execution_result_to_responses(result);
+                            Ok(responses) => {
                                 for resp in responses {
                                     let tx_resp = TransactionResponse {
                                         payload: Some(crate::proto::transaction_response::Payload::QueryResult(resp)),

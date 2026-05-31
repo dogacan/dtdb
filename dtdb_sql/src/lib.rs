@@ -7,7 +7,7 @@ pub mod physical;
 pub mod planner;
 pub mod spill;
 
-pub use engine::{ExecutionResult, PreparedStatement, SqlEngine};
+pub use engine::{ExecutionResult, ExecutionStreamingResult, PreparedStatement, SqlEngine};
 pub use expr::{Expr, Operator};
 pub use logical::{AggregateExpr, LogicalPlan, format_logical_plan};
 pub use optimizer::Optimizer;

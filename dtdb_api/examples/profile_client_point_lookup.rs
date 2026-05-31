@@ -3,12 +3,13 @@
 //! Run:
 //!   cargo run -p dtdb_api --release --example profile_client_point_lookup
 
-use dtdb_api::client::DuctTapeDbClient;
+#![allow(clippy::result_large_err)]
+
+use dtdb_api::in_process::InProcessClient;
 use dtdb_api::sql_query;
 use dtdb_relational::{Database, Transaction};
 use dtdb_sql::SqlEngine;
 use dtdb_storage::{CompressionType, DbValue};
-use futures_util::StreamExt;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,48 +34,38 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let mut client = DuctTapeDbClient::in_process(&dir).unwrap();
+    let client = InProcessClient::open(&dir).unwrap();
 
     // Set up schema and population
-    rt.block_on(async {
-        client
-            .create_db("bench", CompressionType::Lz4)
-            .await
-            .unwrap();
+    client.create_db("bench", CompressionType::Lz4).unwrap();
 
-        let mut stream = client
-            .execute_query(
-                "bench",
-                sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"),
-            )
-            .await
-            .unwrap();
-        while let Some(r) = stream.next().await {
-            r.unwrap();
-        }
+    let results = client
+        .execute_query(
+            "bench",
+            sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"),
+        )
+        .unwrap();
+    for r in results {
+        r.unwrap();
+    }
 
-        // Populate in one transaction
-        client
-            .run_in_transaction("bench", |tx| async move {
-                for i in 0..ROWS {
-                    tx.execute_query(
-                        sql_query!("INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)")
-                            .bind("id", i as i64)
-                            .bind("k", ((i * 31) % 100_000) as i64)
-                            .bind("v", format!("val_{i:08}")),
-                    )
-                    .await?;
+    // Populate in one transaction
+    client
+        .run_in_transaction("bench", |tx| {
+            for i in 0..ROWS {
+                let q = sql_query!("INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)")
+                    .bind("id", i as i64)
+                    .bind("k", ((i * 31) % 100_000) as i64)
+                    .bind("v", format!("val_{i:08}"));
+                let res = tx.execute_query(q)?;
+                // Consume the write result
+                for row_res in res {
+                    row_res?;
                 }
-                Ok(())
-            })
-            .await
-            .unwrap();
-    });
+            }
+            Ok(())
+        })
+        .unwrap();
 
     // We can extract the underlying service/engine to measure raw execution
     // Let's create a raw SqlEngine on the same DB directory to compare
@@ -96,42 +87,34 @@ fn main() {
         black_box(res);
     });
 
-    // --- 2. Client API (Non-cached literal SQL, which the benchmark runs) ---
-    let mut client2 = client.clone();
+    // --- 2. InProcessClient (Non-cached literal SQL) ---
     let t_client_literal = bench(ITERS, |i| {
-        rt.block_on(async {
-            let mut stream = client2
-                .execute_query("bench", dtdb_api::SqlQuery::new(sql_for(i)))
-                .await
-                .unwrap();
-            let mut rows = 0;
-            while let Some(r) = stream.next().await {
-                let _resp = r.unwrap();
-                rows += 1;
-            }
-            black_box(rows);
-        });
+        let results = client
+            .execute_query("bench", dtdb_api::SqlQuery::new(sql_for(i)))
+            .unwrap();
+        let mut rows = 0;
+        for r in results {
+            let _row = r.unwrap();
+            rows += 1;
+        }
+        black_box(rows);
     });
 
-    // --- 3. Client API (Cached template query with parameters) ---
-    let mut client3 = client.clone();
+    // --- 3. InProcessClient (Cached template query with parameters) ---
     let t_client_parameterized = bench(ITERS, |i| {
-        rt.block_on(async {
-            let mut stream = client3
-                .execute_query(
-                    "bench",
-                    sql_query!("SELECT k, v FROM bench WHERE id = @id")
-                        .bind("id", ((i * 97) % ROWS) as i64),
-                )
-                .await
-                .unwrap();
-            let mut rows = 0;
-            while let Some(r) = stream.next().await {
-                let _resp = r.unwrap();
-                rows += 1;
-            }
-            black_box(rows);
-        });
+        let results = client
+            .execute_query(
+                "bench",
+                sql_query!("SELECT k, v FROM bench WHERE id = @id")
+                    .bind("id", ((i * 97) % ROWS) as i64),
+            )
+            .unwrap();
+        let mut rows = 0;
+        for r in results {
+            let _row = r.unwrap();
+            rows += 1;
+        }
+        black_box(rows);
     });
 
     // --- 4. Breakdown of Client Wrapper Steps ---
@@ -162,26 +145,26 @@ fn main() {
         black_box(params);
     });
 
-    // 4e. Engine work (execute_with_params, cached)
+    // 4e. Engine work (execute_streaming, cached)
     let engine_tx = Transaction::new(50_000, db.clone());
     // WARMUP cache
     let mut warmup_params = std::collections::HashMap::new();
     warmup_params.insert("id".to_string(), DbValue::Int(0));
     engine
-        .execute_with_params(template, &engine_tx, &warmup_params)
+        .execute_streaming(template, &engine_tx, &warmup_params)
         .unwrap();
 
     let t_engine_cached = bench(ITERS, |i| {
         let mut params = std::collections::HashMap::new();
         params.insert("id".to_string(), DbValue::Int(((i * 97) % ROWS) as i64));
         let res = engine
-            .execute_with_params(template, &engine_tx, &params)
+            .execute_streaming(template, &engine_tx, &params)
             .unwrap();
         black_box(res);
     });
     engine_tx.commit().unwrap();
 
-    println!("\nPoint Lookup Profiling (SELECT k, v FROM bench WHERE id = ?)\n");
+    println!("\nIn-Process Client Point Lookup Profiling (SELECT k, v FROM bench WHERE id = ?)\n");
     println!("  {:^55}", "--- Overall Comparison ---");
     println!(
         "  {:<38} {:>9.2} us/query",
@@ -190,12 +173,12 @@ fn main() {
     );
     println!(
         "  {:<38} {:>9.2} us/query",
-        "Client API (literal SQL, benchmarked)",
+        "InProcessClient (literal SQL, sync)",
         t_client_literal / 1000.0
     );
     println!(
         "  {:<38} {:>9.2} us/query",
-        "Client API (parameterized, cached)",
+        "InProcessClient (parameterized, sync)",
         t_client_parameterized / 1000.0
     );
     println!("  {:-<55}", "");
@@ -223,7 +206,7 @@ fn main() {
     );
     println!(
         "  {:<38} {:>9.2} us/call",
-        "execute_with_params (engine, cached)",
+        "execute_streaming (engine, cached)",
         t_engine_cached / 1000.0
     );
 
@@ -231,7 +214,10 @@ fn main() {
     let unaccounted_cached =
         (t_client_parameterized - t_engine_cached - t_is_ddl_hit - t_build_query - t_build_params)
             .max(0.0);
-    println!("\n  {:^55}", "--- Async & Communication Overhead ---");
+    println!(
+        "\n  {:^55}",
+        "--- Wrapper API Overhead (Excluding Engine) ---"
+    );
     println!(
         "  {:<38} {:>9.2} us/call",
         "API overhead for Literal SQL",
@@ -242,10 +228,8 @@ fn main() {
         "API overhead for Parameterized SQL",
         unaccounted_cached / 1000.0
     );
-    println!("\n  * API overhead includes: tokio block_on runtime entry/exit, spawn_blocking,");
-    println!(
-        "    mpsc channel stream creation, and consuming response payloads over the stream.\n"
-    );
+    println!("\n  * API overhead includes: InProcessQueryResult / RowIterator creation,");
+    println!("    and transaction boundary commit/rollback hooks (no Tokio, no channels).\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

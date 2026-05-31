@@ -1,4 +1,4 @@
-use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::client::RemoteClient;
 use dtdb_relational::DatabaseOptions;
 use dtdb_storage::CompressionType;
 use futures_util::StreamExt;
@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_addr
     );
 
-    let mut client = match DuctTapeDbClient::connect(server_addr).await {
+    let mut client = match RemoteClient::connect(server_addr).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to connect to server: {}", e);

@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::client::RemoteClient;
 use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
 use dtdb_api::server::DuctTapeDbServiceImpl;
 use dtdb_relational::DatabaseOptions;
@@ -48,7 +48,7 @@ async fn test_wal_size_based_flush() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     // Create a database with a very small WAL size limit (100 bytes)
     let options = DatabaseOptions {
@@ -138,7 +138,7 @@ async fn test_periodic_time_based_flush() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     // Create a database with a 3s periodic flush interval. The interval is kept
     // comfortably longer than the test's setup + insert so the "not flushed
@@ -249,7 +249,7 @@ async fn test_manual_rpc_flush() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     // Create database with no periodic flush
     let options = DatabaseOptions {

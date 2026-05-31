@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::client::RemoteClient;
 use dtdb_api::proto::duct_tape_db_service_server::DuctTapeDbServiceServer;
 use dtdb_api::server::DuctTapeDbServiceImpl;
 use dtdb_storage::CompressionType;
@@ -35,7 +35,7 @@ async fn test_grpc_client_server_integration() {
 
     // 2. Connect client
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     // 3. Test CreateDb with Lz4
     let create_lz4_resp = client
@@ -183,7 +183,7 @@ async fn test_grpc_server_side_parameters() {
 
     // 2. Connect client
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     // 3. Create database
     client
@@ -391,7 +391,7 @@ async fn test_grpc_security() {
     // 3. Connect client with WRONG token
     let client_addr = format!("https://127.0.0.1:{}", port);
     let mut client_wrong_token =
-        DuctTapeDbClient::connect_with_token(client_addr.clone(), Some("wrong_token".to_string()))
+        RemoteClient::connect_with_token(client_addr.clone(), Some("wrong_token".to_string()))
             .await
             .unwrap();
 
@@ -402,7 +402,7 @@ async fn test_grpc_security() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
     // 4. Connect client with MISSING token
-    let mut client_missing_token = DuctTapeDbClient::connect_with_token(client_addr.clone(), None)
+    let mut client_missing_token = RemoteClient::connect_with_token(client_addr.clone(), None)
         .await
         .unwrap();
 
@@ -414,7 +414,7 @@ async fn test_grpc_security() {
 
     // 5. Connect client with CORRECT token
     let mut client_correct =
-        DuctTapeDbClient::connect_with_token(client_addr, Some("secret_token".to_string()))
+        RemoteClient::connect_with_token(client_addr, Some("secret_token".to_string()))
             .await
             .unwrap();
 
@@ -468,7 +468,7 @@ async fn test_drop_db_active_transactions() {
 
     // 2. Connect client
     let client_addr = format!("http://127.0.0.1:{}", port);
-    let mut client = DuctTapeDbClient::connect(client_addr).await.unwrap();
+    let mut client = RemoteClient::connect(client_addr).await.unwrap();
 
     // 3. Create database and table
     client

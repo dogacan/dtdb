@@ -1,10 +1,10 @@
-#![allow(clippy::boxed_local)]
+#![allow(clippy::boxed_local, clippy::result_large_err)]
 
-use dtdb_api::client::DuctTapeDbClient;
 use dtdb_api::proto::execute_query_response::Payload;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tonic::Status;
 
 /// Returns the process-wide Tokio runtime shared by every `CxxClient`.
 ///
@@ -135,9 +135,14 @@ fn convert_cxx_query(cxx_query: ffi::CxxSqlQuery) -> dtdb_api::SqlQuery {
     query
 }
 
+pub enum ClientEnum {
+    InProcess(dtdb_api::in_process::InProcessClient),
+    Remote(dtdb_api::remote::RemoteClient),
+}
+
 pub struct CxxClient {
     runtime: Arc<Runtime>,
-    client: DuctTapeDbClient,
+    client: ClientEnum,
 }
 
 enum TxRequest {
@@ -157,29 +162,79 @@ pub struct CxxTransaction {
     req_tx: tokio::sync::mpsc::Sender<TxRequest>,
 }
 
+fn handle_in_process_query_result(
+    res: dtdb_api::in_process::InProcessQueryResult,
+) -> ffi::QueryResult {
+    let mut headers = Vec::new();
+    if let Some(schema) = res.schema() {
+        headers = schema.columns.iter().map(|col| col.name.clone()).collect();
+    }
+
+    let mut rows = Vec::new();
+    if let Some(msg) = res.info_message() {
+        headers = vec!["Info".to_string()];
+        rows.push(msg);
+    } else {
+        for row_res in res {
+            match row_res {
+                Ok(row) => {
+                    let row_vals = row
+                        .values
+                        .iter()
+                        .map(|val| match val {
+                            dtdb_storage::DbValue::Int(v) => v.to_string(),
+                            dtdb_storage::DbValue::Float(v) => v.to_string(),
+                            dtdb_storage::DbValue::String(s) => s.clone(),
+                            dtdb_storage::DbValue::Bytes(b) => format!("{:?}", b),
+                            dtdb_storage::DbValue::Bool(b) => b.to_string(),
+                            dtdb_storage::DbValue::Null => "NULL".to_string(),
+                        })
+                        .collect::<Vec<_>>();
+                    rows.extend(row_vals);
+                }
+                Err(e) => {
+                    return ffi::QueryResult {
+                        success: false,
+                        error_message: e.message().to_string(),
+                        headers: Vec::new(),
+                        rows: Vec::new(),
+                    };
+                }
+            }
+        }
+    }
+
+    ffi::QueryResult {
+        success: true,
+        error_message: String::new(),
+        headers,
+        rows,
+    }
+}
+
 // --- Factory implementations ---
 
 pub fn new_in_process_client(data_dir: &str) -> Result<Box<CxxClient>, String> {
     let rt = global_runtime()?;
-    let client = {
-        let _guard = rt.enter();
-        DuctTapeDbClient::in_process(data_dir).map_err(|e| e.to_string())?
-    };
+    let client =
+        dtdb_api::in_process::InProcessClient::open(data_dir).map_err(|e| e.to_string())?;
     Ok(Box::new(CxxClient {
         runtime: rt,
-        client,
+        client: ClientEnum::InProcess(client),
     }))
 }
 
 pub fn new_remote_client(server_address: &str) -> Result<Box<CxxClient>, String> {
     let rt = global_runtime()?;
     let client = rt
-        .block_on(async { DuctTapeDbClient::connect(server_address.to_string()).await })
+        .block_on(async {
+            dtdb_api::remote::RemoteClient::connect(server_address.to_string()).await
+        })
         .map_err(|e| e.to_string())?;
 
     Ok(Box::new(CxxClient {
         runtime: rt,
-        client,
+        client: ClientEnum::Remote(client),
     }))
 }
 
@@ -187,25 +242,45 @@ pub fn new_remote_client(server_address: &str) -> Result<Box<CxxClient>, String>
 
 impl CxxClient {
     pub fn create_db(&self, db_name: &str) -> Result<(), String> {
-        let mut client = self.client.clone();
-        self.runtime.block_on(async {
-            client
-                .create_db(db_name, dtdb_storage::CompressionType::Lz4)
-                .await
-                .map_err(|e| e.message().to_string())
-        })?;
-        Ok(())
+        match &self.client {
+            ClientEnum::InProcess(client) => {
+                client
+                    .create_db(db_name, dtdb_storage::CompressionType::Lz4)
+                    .map_err(|e| e.message().to_string())?;
+                Ok(())
+            }
+            ClientEnum::Remote(client) => {
+                let mut client = client.clone();
+                self.runtime.block_on(async {
+                    client
+                        .create_db(db_name, dtdb_storage::CompressionType::Lz4)
+                        .await
+                        .map_err(|e| e.message().to_string())
+                })?;
+                Ok(())
+            }
+        }
     }
 
     pub fn drop_db(&self, db_name: &str) -> Result<(), String> {
-        let mut client = self.client.clone();
-        self.runtime.block_on(async {
-            client
-                .drop_db(db_name)
-                .await
-                .map_err(|e| e.message().to_string())
-        })?;
-        Ok(())
+        match &self.client {
+            ClientEnum::InProcess(client) => {
+                client
+                    .drop_db(db_name)
+                    .map_err(|e| e.message().to_string())?;
+                Ok(())
+            }
+            ClientEnum::Remote(client) => {
+                let mut client = client.clone();
+                self.runtime.block_on(async {
+                    client
+                        .drop_db(db_name)
+                        .await
+                        .map_err(|e| e.message().to_string())
+                })?;
+                Ok(())
+            }
+        }
     }
 
     pub fn execute_query(
@@ -213,126 +288,170 @@ impl CxxClient {
         db_name: &str,
         query: ffi::CxxSqlQuery,
     ) -> Result<ffi::QueryResult, String> {
-        let mut client = self.client.clone();
         let rust_query = convert_cxx_query(query);
-        self.runtime.block_on(async {
-            let mut stream = client
-                .execute_query(db_name, rust_query)
-                .await
-                .map_err(|e| e.message().to_string())?;
-
-            let mut headers = Vec::new();
-            let mut rows = Vec::new();
-
-            while let Some(resp_result) = stream.next().await {
-                let resp = resp_result.map_err(|e| e.message().to_string())?;
-                match resp.payload {
-                    Some(Payload::Header(h)) => {
-                        headers = h.column_names;
-                    }
-                    Some(Payload::Row(r)) => {
-                        rows.extend(r.values);
-                    }
-                    Some(Payload::InfoMessage(msg)) => {
-                        if headers.is_empty() {
-                            headers = vec!["Info".to_string()];
-                        }
-                        rows.push(msg);
-                    }
-                    None => {}
-                }
+        match &self.client {
+            ClientEnum::InProcess(client) => {
+                let result = client
+                    .execute_query(db_name, rust_query)
+                    .map_err(|e| e.message().to_string())?;
+                Ok(handle_in_process_query_result(result))
             }
+            ClientEnum::Remote(client) => {
+                let mut client = client.clone();
+                self.runtime.block_on(async {
+                    let mut stream = client
+                        .execute_query(db_name, rust_query)
+                        .await
+                        .map_err(|e| e.message().to_string())?;
 
-            Ok(ffi::QueryResult {
-                success: true,
-                error_message: String::new(),
-                headers,
-                rows,
-            })
-        })
+                    let mut headers = Vec::new();
+                    let mut rows = Vec::new();
+
+                    while let Some(resp_result) = stream.next().await {
+                        let resp = resp_result.map_err(|e| e.message().to_string())?;
+                        match resp.payload {
+                            Some(Payload::Header(h)) => {
+                                headers = h.column_names;
+                            }
+                            Some(Payload::Row(r)) => {
+                                rows.extend(r.values);
+                            }
+                            Some(Payload::InfoMessage(msg)) => {
+                                if headers.is_empty() {
+                                    headers = vec!["Info".to_string()];
+                                }
+                                rows.push(msg);
+                            }
+                            None => {}
+                        }
+                    }
+
+                    Ok(ffi::QueryResult {
+                        success: true,
+                        error_message: String::new(),
+                        headers,
+                        rows,
+                    })
+                })
+            }
+        }
     }
 
     // --- Stateful Transaction setup ---
 
     pub fn start_transaction(&self, db_name: &str) -> Result<Box<CxxTransaction>, String> {
-        let mut client = self.client.clone();
         let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<TxRequest>(32);
         let db_name = db_name.to_string();
 
-        // Holds the responder for whichever terminal request (Commit or
-        // Rollback) was sent. The spawned task fills this in before exiting
-        // the inner closure so it can signal the caller after
-        // run_in_transaction completes.
         type TerminalSender =
             std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>;
         let terminal_sender: Arc<TerminalSender> = Arc::new(std::sync::Mutex::new(None));
         let terminal_sender_clone = terminal_sender.clone();
 
-        // Spawn a transaction execution loop inside DuctTapeDbClient's closure-based transaction runner
-        self.runtime.spawn(async move {
-            let res = client
-                .run_in_transaction(&db_name, |tx_client| async move {
-                    while let Some(req) = req_rx.recv().await {
-                        match req {
-                            TxRequest::Execute { query, resp_tx } => {
-                                let responses_result = tx_client.execute_query(query).await;
-                                let mapped = match responses_result {
-                                    Ok(responses) => {
-                                        let mut headers = Vec::new();
-                                        let mut rows = Vec::new();
-                                        for resp in responses {
-                                            match resp.payload {
-                                                Some(Payload::Header(h)) => {
-                                                    headers = h.column_names;
-                                                }
-                                                Some(Payload::Row(r)) => {
-                                                    rows.extend(r.values);
-                                                }
-                                                Some(Payload::InfoMessage(msg)) => {
-                                                    if headers.is_empty() {
-                                                        headers = vec!["Info".to_string()];
-                                                    }
-                                                    rows.push(msg);
-                                                }
-                                                None => {}
-                                            }
-                                        }
-                                        Ok(ffi::QueryResult {
-                                            success: true,
-                                            error_message: String::new(),
-                                            headers,
-                                            rows,
-                                        })
-                                    }
-                                    Err(status) => Err(status.message().to_string()),
-                                };
-                                let _ = resp_tx.send(mapped);
-                            }
-                            TxRequest::Commit { resp_tx } => {
-                                *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
-                                return Ok(()); // Returns Ok to commit
-                            }
-                            TxRequest::Rollback { resp_tx } => {
-                                *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
-                                return Err(tonic::Status::aborted("Rollback requested"));
+        match &self.client {
+            ClientEnum::InProcess(client) => {
+                let client = client.clone();
+                self.runtime.spawn_blocking(move || {
+                    let res = client.run_in_transaction(&db_name, |tx_client| {
+                        while let Some(req) = req_rx.blocking_recv() {
+                            match req {
+                                TxRequest::Execute { query, resp_tx } => {
+                                    let result = tx_client.execute_query(query);
+                                    let mapped = match result {
+                                        Ok(res) => Ok(handle_in_process_query_result(res)),
+                                        Err(status) => Err(status.message().to_string()),
+                                    };
+                                    let _ = resp_tx.send(mapped);
+                                }
+                                TxRequest::Commit { resp_tx } => {
+                                    *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                    return Ok(());
+                                }
+                                TxRequest::Rollback { resp_tx } => {
+                                    *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                    return Err(Status::aborted("Rollback requested"));
+                                }
                             }
                         }
-                    }
-                    Err(tonic::Status::aborted("Transaction handle dropped"))
-                })
-                .await;
+                        Err(Status::aborted("Transaction handle dropped"))
+                    });
 
-            // Notify whichever caller (commit_tx or rollback_tx) is waiting
-            // for the terminal outcome of the transaction.
-            let mut guard = terminal_sender.lock().unwrap();
-            if let Some(resp_tx) = guard.take() {
-                let mapped = match res {
-                    Ok(_) => Ok(()),
-                    Err(status) => Err(status.message().to_string()),
-                };
-                let _ = resp_tx.send(mapped);
+                    let mut guard = terminal_sender.lock().unwrap();
+                    if let Some(resp_tx) = guard.take() {
+                        let mapped = match res {
+                            Ok(_) => Ok(()),
+                            Err(status) => Err(status.message().to_string()),
+                        };
+                        let _ = resp_tx.send(mapped);
+                    }
+                });
             }
-        });
+            ClientEnum::Remote(client) => {
+                let mut client = client.clone();
+                self.runtime.spawn(async move {
+                    let res = client
+                        .run_in_transaction(&db_name, |tx_client| async move {
+                            while let Some(req) = req_rx.recv().await {
+                                match req {
+                                    TxRequest::Execute { query, resp_tx } => {
+                                        let responses_result = tx_client.execute_query(query).await;
+                                        let mapped = match responses_result {
+                                            Ok(responses) => {
+                                                let mut headers = Vec::new();
+                                                let mut rows = Vec::new();
+                                                for resp in responses {
+                                                    match resp.payload {
+                                                        Some(Payload::Header(h)) => {
+                                                            headers = h.column_names;
+                                                        }
+                                                        Some(Payload::Row(r)) => {
+                                                            rows.extend(r.values);
+                                                        }
+                                                        Some(Payload::InfoMessage(msg)) => {
+                                                            if headers.is_empty() {
+                                                                headers = vec!["Info".to_string()];
+                                                            }
+                                                            rows.push(msg);
+                                                        }
+                                                        None => {}
+                                                    }
+                                                }
+                                                Ok(ffi::QueryResult {
+                                                    success: true,
+                                                    error_message: String::new(),
+                                                    headers,
+                                                    rows,
+                                                })
+                                            }
+                                            Err(status) => Err(status.message().to_string()),
+                                        };
+                                        let _ = resp_tx.send(mapped);
+                                    }
+                                    TxRequest::Commit { resp_tx } => {
+                                        *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                        return Ok(());
+                                    }
+                                    TxRequest::Rollback { resp_tx } => {
+                                        *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                        return Err(tonic::Status::aborted("Rollback requested"));
+                                    }
+                                }
+                            }
+                            Err(tonic::Status::aborted("Transaction handle dropped"))
+                        })
+                        .await;
+
+                    let mut guard = terminal_sender.lock().unwrap();
+                    if let Some(resp_tx) = guard.take() {
+                        let mapped = match res {
+                            Ok(_) => Ok(()),
+                            Err(status) => Err(status.message().to_string()),
+                        };
+                        let _ = resp_tx.send(mapped);
+                    }
+                });
+            }
+        }
 
         Ok(Box::new(CxxTransaction { req_tx }))
     }

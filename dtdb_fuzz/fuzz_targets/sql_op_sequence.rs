@@ -1,5 +1,5 @@
 //! Property target: random SQL operation sequences against the in-process
-//! `DuctTapeDbClient`, asserting durability across a flush + reopen.
+//! `InProcessClient`, asserting durability across a flush + reopen.
 //!
 //! Strategy:
 //!   - Fixed schema `T (id INT PRIMARY KEY, v INT)`.
@@ -11,10 +11,10 @@
 //!     directory, then `SELECT id, v FROM T` and assert the returned rows
 //!     match the model.
 
-use dtdb_api::client::DuctTapeDbClient;
-use dtdb_api::proto::execute_query_response::Payload;
+#![allow(clippy::result_large_err)]
+
+use dtdb_api::in_process::InProcessClient;
 use dtdb_storage::CompressionType;
-use futures_util::StreamExt;
 use proptest::prelude::*;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -36,28 +36,25 @@ fn op_strategy() -> impl Strategy<Value = SqlOp> {
     ]
 }
 
-async fn drain(client: &mut DuctTapeDbClient, sql: &str) -> Result<Vec<Payload>, tonic::Status> {
+fn drain(client: &InProcessClient, sql: &str) -> Result<Vec<dtdb_relational::Row>, tonic::Status> {
     // We bypass the sql_query! macro since the macro requires a string
     // literal and we need to build SQL from generated data.
     let q = dtdb_api::SqlQuery::new(sql.to_string());
-    let mut stream = client.execute_query("fuzz", q).await?;
+    let results = client.execute_query("fuzz", q)?;
     let mut out = Vec::new();
-    while let Some(res) = stream.next().await {
-        let resp = res?;
-        if let Some(p) = resp.payload {
-            out.push(p);
-        }
+    for row_res in results {
+        out.push(row_res?);
     }
     Ok(out)
 }
 
-async fn apply_op(client: &mut DuctTapeDbClient, model: &mut HashMap<i64, i64>, op: &SqlOp) {
+fn apply_op(client: &InProcessClient, model: &mut HashMap<i64, i64>, op: &SqlOp) {
     let sql = match op {
         SqlOp::Insert { id, v } => format!("INSERT INTO T (id, v) VALUES ({id}, {v});"),
         SqlOp::Update { id, v } => format!("UPDATE T SET v = {v} WHERE id = {id};"),
         SqlOp::Delete { id } => format!("DELETE FROM T WHERE id = {id};"),
     };
-    if drain(client, &sql).await.is_err() {
+    if drain(client, &sql).is_err() {
         // Conflicting writes / constraint failures are expected and must
         // leave the model unchanged.
         return;
@@ -78,61 +75,52 @@ async fn apply_op(client: &mut DuctTapeDbClient, model: &mut HashMap<i64, i64>, 
     }
 }
 
-async fn select_all(client: &mut DuctTapeDbClient) -> HashMap<i64, i64> {
-    let payloads = drain(client, "SELECT id, v FROM T;")
-        .await
-        .expect("select after reopen must succeed");
+fn select_all(client: &InProcessClient) -> HashMap<i64, i64> {
+    let rows = drain(client, "SELECT id, v FROM T;").expect("select after reopen must succeed");
     let mut out = HashMap::new();
-    for p in payloads {
-        if let Payload::Row(row) = p {
-            let id: i64 = row.values[0].parse().expect("id parse");
-            let v: i64 = row.values[1].parse().expect("v parse");
-            out.insert(id, v);
-        }
+    for row in rows {
+        let id = match row.values[0] {
+            dtdb_storage::DbValue::Int(v) => v,
+            ref other => panic!("Expected Int id, got {:?}", other),
+        };
+        let v = match row.values[1] {
+            dtdb_storage::DbValue::Int(v) => v,
+            ref other => panic!("Expected Int v, got {:?}", other),
+        };
+        out.insert(id, v);
     }
     out
 }
 
-async fn run_async(ops: Vec<SqlOp>) {
+fn run_test(ops: Vec<SqlOp>) {
     let dir = TempDir::new().expect("tempdir");
     let mut model: HashMap<i64, i64> = HashMap::new();
 
     {
-        let mut client = DuctTapeDbClient::in_process(dir.path()).expect("open client");
+        let client = InProcessClient::open(dir.path()).expect("open client");
         client
             .create_db("fuzz", CompressionType::Uncompressed)
-            .await
             .expect("create_db");
-        drain(&mut client, "CREATE TABLE T (id int PRIMARY KEY, v int);")
-            .await
-            .expect("create table");
+        drain(&client, "CREATE TABLE T (id int PRIMARY KEY, v int);").expect("create table");
 
         for op in &ops {
-            apply_op(&mut client, &mut model, op).await;
+            apply_op(&client, &mut model, op);
         }
 
-        let before_reopen = select_all(&mut client).await;
+        let before_reopen = select_all(&client);
         assert_eq!(before_reopen, model, "pre-flush state diverges from model");
 
-        client.flush_db("fuzz").await.expect("flush");
+        client.flush_db("fuzz").expect("flush");
         drop(client);
     }
 
     // Reopen against the same directory and re-verify.
-    let mut client = DuctTapeDbClient::in_process(dir.path()).expect("reopen client");
-    let after_reopen = select_all(&mut client).await;
+    let client = InProcessClient::open(dir.path()).expect("reopen client");
+    let after_reopen = select_all(&client);
     assert_eq!(
         after_reopen, model,
         "post-reopen state diverges from model (durability bug)"
     );
-}
-
-fn run_blocking(ops: Vec<SqlOp>) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio rt");
-    rt.block_on(run_async(ops));
 }
 
 proptest! {
@@ -150,6 +138,6 @@ proptest! {
     #[test]
     #[ignore = "fuzz target — run with `cargo test -p dtdb_fuzz -- --ignored` or scripts/run_fuzz.sh"]
     fn sql_random_op_sequence(ops in prop::collection::vec(op_strategy(), 1..30)) {
-        run_blocking(ops);
+        run_test(ops);
     }
 }

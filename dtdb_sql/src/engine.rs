@@ -36,6 +36,15 @@ pub enum ExecutionResult {
     Analyze,
 }
 
+/// Represents either a completed output or a streaming physical operator for a SQL query.
+pub enum ExecutionStreamingResult {
+    Complete(ExecutionResult),
+    Streaming {
+        schema: Schema,
+        operator: Box<dyn PhysicalOperator>,
+    },
+}
+
 fn is_plan_sorted_by(plan: &LogicalPlan, group_by: &[Expr]) -> bool {
     if group_by.len() != 1 {
         return false;
@@ -284,6 +293,25 @@ impl SqlEngine {
         }
     }
 
+    /// Executes a previously [`prepare`](Self::prepare)d statement within `tx` in streaming mode.
+    pub fn execute_prepared_streaming(
+        &self,
+        prepared: &PreparedStatement,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<ExecutionStreamingResult, String> {
+        match &prepared.plan {
+            PreparedPlan::Planned(planned) => {
+                let mut planned = (**planned).clone();
+                substitute_statement_params(&mut planned, params)?;
+                self.execute_planned_streaming(planned, tx)
+            }
+            PreparedPlan::Ast(statement) => {
+                self.execute_statement_streaming((**statement).clone(), tx, params)
+            }
+        }
+    }
+
     /// Returns the temp directory for spill files, creating it if needed.
     fn temp_dir(&self) -> std::path::PathBuf {
         let dir = self.database.dir_path().join("_tmp");
@@ -378,6 +406,18 @@ impl SqlEngine {
         self.execute_statement((*statement).clone(), tx, params)
     }
 
+    /// Parses, plans, optimizes, and executes a single SQL statement with parameters inside the transaction in streaming mode.
+    pub fn execute_streaming(
+        &self,
+        sql: &str,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<ExecutionStreamingResult, String> {
+        let preprocessed = preprocess_sql(sql);
+        let statement = self.cached_parse(preprocessed)?;
+        self.execute_statement_streaming((*statement).clone(), tx, params)
+    }
+
     /// Binds parameters into an already-parsed statement, then plans,
     /// optimizes, and executes it. Shared by `execute_with_params` (which
     /// parses fresh each call) and `execute_prepared` (which reuses a cached
@@ -391,6 +431,59 @@ impl SqlEngine {
         crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
         self.execute_planned(planned_stmt, tx)
+    }
+
+    /// Streaming counterpart to `execute_statement`.
+    fn execute_statement_streaming(
+        &self,
+        mut statement: Statement,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<ExecutionStreamingResult, String> {
+        crate::parameters::bind_statement(&mut statement, params)?;
+        let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
+        self.execute_planned_streaming(planned_stmt, tx)
+    }
+
+    /// Optimizes, compiles, and executes an already-planned statement in streaming mode.
+    fn execute_planned_streaming(
+        &self,
+        planned_stmt: SqlStatement,
+        tx: &Transaction,
+    ) -> Result<ExecutionStreamingResult, String> {
+        match planned_stmt {
+            SqlStatement::Query(logical_plan) => {
+                // 1. Optimize the Logical Plan
+                let optimized_plan = Optimizer::new(self.database.clone()).optimize(logical_plan);
+
+                // 1a. Fast path: primary-key point lookups skip the Volcano
+                // operator tree entirely (see `execute_point_get`).
+                if let Some(result) = self.execute_point_get(&optimized_plan, tx)? {
+                    return Ok(ExecutionStreamingResult::Complete(result));
+                }
+
+                // Collect referenced columns
+                let mut cols = HashSet::new();
+                optimized_plan.collect_columns(&mut cols);
+                let cols_vec: Vec<String> = cols.into_iter().collect();
+
+                // 2. Compile to Volcano Physical Plan
+                let physical_op = self.compile_physical(optimized_plan, tx, Some(&cols_vec))?;
+
+                Ok(ExecutionStreamingResult::Streaming {
+                    schema: physical_op.schema().clone(),
+                    operator: physical_op,
+                })
+            }
+            SqlStatement::Explain(logical_plan) => {
+                let result = self.execute_planned(SqlStatement::Explain(logical_plan), tx)?;
+                Ok(ExecutionStreamingResult::Complete(result))
+            }
+            other => {
+                let result = self.execute_planned(other, tx)?;
+                Ok(ExecutionStreamingResult::Complete(result))
+            }
+        }
     }
 
     /// Optimizes, compiles, and executes an already-planned statement. Shared by

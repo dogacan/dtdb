@@ -1,24 +1,20 @@
-use futures_util::StreamExt;
 use std::fs;
 use tempfile::TempDir;
 
-use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::in_process::InProcessClient;
 use dtdb_relational::DatabaseOptions;
 use dtdb_storage::CompressionType;
 
-#[tokio::test]
-async fn test_in_process_client_integration() {
+#[test]
+fn test_in_process_client_integration() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().to_path_buf();
 
     // 1. Create client
-    let mut client = DuctTapeDbClient::in_process(&data_path).unwrap();
+    let client = InProcessClient::open(&data_path).unwrap();
 
     // 2. Test CreateDb with Lz4
-    let create_lz4_resp = client
-        .create_db("db_lz4", CompressionType::Lz4)
-        .await
-        .unwrap();
+    let create_lz4_resp = client.create_db("db_lz4", CompressionType::Lz4).unwrap();
     assert!(create_lz4_resp.success);
     assert!(create_lz4_resp.message.contains("Lz4"));
 
@@ -49,10 +45,7 @@ async fn test_in_process_client_integration() {
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
     };
-    let create_opt_resp = client
-        .create_db_with_options("db_opt", options)
-        .await
-        .unwrap();
+    let create_opt_resp = client.create_db_with_options("db_opt", options).unwrap();
     assert!(create_opt_resp.success);
 
     // Check directory layout & db_options.bin
@@ -67,89 +60,76 @@ async fn test_in_process_client_integration() {
     // 4. Test ExecuteQuery on db_lz4
     // Create Table
     {
-        let mut stream = client
+        let results = client
             .execute_query(
                 "db_lz4",
                 dtdb_api::sql_query!("CREATE TABLE Users (id int PRIMARY KEY, name varchar(255));"),
             )
-            .await
             .unwrap();
 
         let mut payloads = Vec::new();
-        while let Some(res) = stream.next().await {
+        for res in results {
             payloads.push(res.unwrap());
         }
-        assert_eq!(payloads.len(), 1);
-        let payload = payloads[0].payload.as_ref().unwrap();
-        match payload {
-            dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg) => {
-                assert!(msg.contains("Table created"));
-            }
-            _ => panic!("Expected info message"),
-        }
+        // Since CREATE TABLE is not a query returning rows, it runs immediately and returns
+        // InProcessQueryResult::Complete(ExecutionResult::CreateTable), which yields no rows.
+        assert_eq!(payloads.len(), 0);
     }
 
     // Insert rows
     {
-        let mut stream = client
+        let results = client
             .execute_query(
                 "db_lz4",
                 dtdb_api::sql_query!("INSERT INTO Users (id, name) VALUES (42, 'Bob');"),
             )
-            .await
             .unwrap();
         let mut payloads = Vec::new();
-        while let Some(res) = stream.next().await {
+        for res in results {
             payloads.push(res.unwrap());
         }
-        assert_eq!(payloads.len(), 1);
-        match payloads[0].payload.as_ref().unwrap() {
-            dtdb_api::proto::execute_query_response::Payload::InfoMessage(msg) => {
-                assert!(msg.contains("Inserted 1 row"));
-            }
-            _ => panic!("Expected info message"),
-        }
+        // INSERT runs immediately and returns Complete, yielding no rows.
+        assert_eq!(payloads.len(), 0);
     }
 
     // Select rows
     {
-        let mut stream = client
+        let results = client
             .execute_query(
                 "db_lz4",
                 dtdb_api::sql_query!("SELECT id, name FROM Users;"),
             )
-            .await
             .unwrap();
-        let mut payloads = Vec::new();
-        while let Some(res) = stream.next().await {
-            payloads.push(res.unwrap());
-        }
-        assert_eq!(payloads.len(), 2); // Header + Row
 
-        // Header validation
-        match payloads[0].payload.as_ref().unwrap() {
-            dtdb_api::proto::execute_query_response::Payload::Header(header) => {
-                assert_eq!(header.column_names, vec!["id", "name"]);
-            }
-            _ => panic!("Expected header payload"),
+        let col_names: Vec<&str> = results
+            .schema()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(col_names, vec!["id", "name"]);
+
+        let mut rows = Vec::new();
+        for res in results {
+            rows.push(res.unwrap());
         }
+        assert_eq!(rows.len(), 1);
 
         // Row validation
-        match payloads[1].payload.as_ref().unwrap() {
-            dtdb_api::proto::execute_query_response::Payload::Row(row) => {
-                assert_eq!(row.values, vec!["42", "Bob"]);
-            }
-            _ => panic!("Expected row payload"),
-        }
+        let id_val = rows[0].get_by_index(0).unwrap();
+        let name_val = rows[0].get_by_index(1).unwrap();
+        assert_eq!(id_val, &dtdb_storage::DbValue::Int(42));
+        assert_eq!(name_val, &dtdb_storage::DbValue::String("Bob".to_string()));
     }
 
     // 5. Test Flush Db
-    let flush_resp = client.flush_db("db_lz4").await.unwrap();
+    let flush_resp = client.flush_db("db_lz4").unwrap();
     assert!(flush_resp.success);
     assert!(flush_resp.message.contains("Flushed"));
 
     // 6. Test DropDb
-    let drop_resp = client.drop_db("db_lz4").await.unwrap();
+    let drop_resp = client.drop_db("db_lz4").unwrap();
     assert!(drop_resp.success);
     assert!(!db_lz4_path.exists());
 }
