@@ -384,6 +384,115 @@ mod imp {
         g.finish();
     }
 
+    /// 1000 INSERTs in one transaction, driven through the realistic *client*
+    /// interface on both sides: dtdb via the in-process `DuctTapeDbClient` +
+    /// `run_in_transaction` + the parameterized `sql_query!` macro (so the
+    /// engine's parse cache sees one template and parses once), and SQLite via a
+    /// reused prepared statement. This is the apples-to-apples "parameterized
+    /// bulk insert" pattern a real application would use, in contrast to
+    /// `insert_txn` above which re-parses a distinct literal string per row.
+    fn bench_insert_txn_client(c: &mut Criterion) {
+        use dtdb_api::client::DuctTapeDbClient;
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+        use futures_util::StreamExt;
+
+        let mut g = c.benchmark_group("dml/insert_txn_client");
+        g.throughput(Throughput::Elements(WRITE_ROWS as u64));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut client = DuctTapeDbClient::in_process(tmp.path()).unwrap();
+                    rt.block_on(async {
+                        client
+                            .create_db("bench", CompressionType::Lz4)
+                            .await
+                            .unwrap();
+                        let mut stream = client
+                            .execute_query(
+                                "bench",
+                                sql_query!(
+                                    "CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        while let Some(r) = stream.next().await {
+                            r.unwrap();
+                        }
+                    });
+                    (tmp, client)
+                },
+                |(tmp, mut client)| {
+                    rt.block_on(async {
+                        client
+                            .run_in_transaction("bench", |tx| async move {
+                                for i in 0..WRITE_ROWS {
+                                    tx.execute_query(
+                                        sql_query!(
+                                            "INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)"
+                                        )
+                                        .bind("id", i as i64)
+                                        .bind("k", ((i * 31) % 100_000) as i64)
+                                        .bind("v", format!("val_{i:08}")),
+                                    )
+                                    .await?;
+                                }
+                                Ok(())
+                            })
+                            .await
+                            .unwrap();
+                    });
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("sqlite_prepared", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let conn = rusqlite::Connection::open(tmp.path().join("bench.sqlite")).unwrap();
+                    conn.execute_batch(
+                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                         CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+                    )
+                    .unwrap();
+                    (tmp, conn)
+                },
+                |(tmp, mut conn)| {
+                    let txn = conn.transaction().unwrap();
+                    {
+                        let mut stmt = txn
+                            .prepare("INSERT INTO bench (id, k, v) VALUES (?1, ?2, ?3)")
+                            .unwrap();
+                        for i in 0..WRITE_ROWS {
+                            stmt.execute(rusqlite::params![
+                                i as i64,
+                                ((i * 31) % 100_000) as i64,
+                                format!("val_{i:08}")
+                            ])
+                            .unwrap();
+                        }
+                    }
+                    txn.commit().unwrap();
+                    drop(tmp);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.finish();
+    }
+
     /// Concurrent transactions inserting disjoint keys.
     fn bench_concurrent_inserts(c: &mut Criterion) {
         let mut g = c.benchmark_group("dml/concurrent_inserts");
@@ -402,6 +511,7 @@ mod imp {
         let mut c = Criterion::default().configure_from_args();
         bench_insert_autocommit(&mut c);
         bench_insert_txn(&mut c);
+        bench_insert_txn_client(&mut c);
         bench_select_scan(&mut c);
         bench_select_point(&mut c);
         bench_update_point(&mut c);

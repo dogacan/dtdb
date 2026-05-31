@@ -154,6 +154,31 @@ fn main() {
     let t_prepared = prep_start.elapsed().as_nanos() as f64 / N as f64;
     ptx.commit().unwrap();
 
+    // --- Parse-cache path: execute_with_params with a FIXED template (so the
+    // engine's parse cache hits after the first call), pre-built params. This is
+    // what the typed client interface drives, minus the client wrapper. Shows
+    // the cache benefit in isolation. ---
+    let tmpl = "INSERT INTO bench (id, k, v) VALUES (@id, @k, @v)";
+    let cache_params: Vec<HashMap<String, DbValue>> =
+        (400_000_000..400_000_000 + N).map(build_params).collect();
+    {
+        let wtx = Transaction::new(7, db.clone());
+        for p in cache_params.iter().take(WARMUP) {
+            engine.execute_with_params(tmpl, &wtx, p).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+    // Re-bind the warmup ids would duplicate; use a disjoint measured range.
+    let cache_params2: Vec<HashMap<String, DbValue>> =
+        (500_000_000..500_000_000 + N).map(build_params).collect();
+    let ctx = Transaction::new(8, db.clone());
+    let cache_start = Instant::now();
+    for p in &cache_params2 {
+        engine.execute_with_params(tmpl, &ctx, p).unwrap();
+    }
+    let t_cached = cache_start.elapsed().as_nanos() as f64 / N as f64;
+    ctx.commit().unwrap();
+
     // Derived.
     let plan = t_parse_plan - t_parse;
     let pipeline = t_parse_plan; // preprocess+parse+plan
@@ -202,6 +227,11 @@ fn main() {
         "  prepared (parse+plan once) = {:.2} us/row   ({:.2}x faster than literal)",
         t_prepared / 1000.0,
         t_full_insert / t_prepared
+    );
+    println!(
+        "  parse-cache (fixed template via execute_with_params) = {:.2} us/row   ({:.2}x faster)",
+        t_cached / 1000.0,
+        t_full_insert / t_cached
     );
     println!(
         "  -> reusing the parse/plan removes ~{:.2} us/row; the residual {:.2} us is\n     \

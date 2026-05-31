@@ -14,8 +14,16 @@ dtdb_sql = { workspace = true }
 # CI `cargo bench --no-run` smoke test — free of any C toolchain dependency.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
+# Pulled in (with rusqlite) only for the comparison bench: the client-interface
+# INSERT case drives dtdb through the in-process `DuctTapeDbClient` +
+# `run_in_transaction` + `sql_query!`, which needs the API crate and an async
+# runtime. Gated behind `compare-sqlite` so the default build stays lean.
+dtdb_api = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"], optional = true }
+futures-util = { workspace = true, optional = true }
+
 [features]
-compare-sqlite = ["dep:rusqlite"]
+compare-sqlite = ["dep:rusqlite", "dep:dtdb_api", "dep:tokio", "dep:futures-util"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

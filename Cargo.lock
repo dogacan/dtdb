@@ -527,11 +527,14 @@ name = "dtdb_benchmark"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "dtdb_api",
  "dtdb_relational",
  "dtdb_sql",
  "dtdb_storage",
+ "futures-util",
  "rusqlite",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
