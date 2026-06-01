@@ -1,4 +1,6 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
 use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine};
 use tempfile::TempDir;
 
@@ -120,6 +122,44 @@ fn benchmark_storage(c: &mut Criterion) {
                 });
             });
         }
+        group.finish();
+    }
+
+    // --- SCAN ITERATOR PULL-PATH BENCHMARK ---
+    // Drives the `scan_iter().next()` Volcano pull path directly, served entirely
+    // from the memtable (no flush/compaction). This isolates the per-row snapshot
+    // and traversal cost that ADR 0004's `Arc` payloads target — distinct from the
+    // `Range Scans` group above, which goes through `filtered_scan` and
+    // materializes the whole result into a `Vec`. Reported per yielded row via
+    // `Throughput::Elements`, so the headline number is ns/row.
+    {
+        let mut group = c.benchmark_group("Scan Iterator (memtable)");
+
+        let temp_dir = TempDir::new().unwrap();
+        // A memtable large enough that the entire dataset stays in memory: the
+        // scan never touches an SSTable, so we measure the in-memory snapshot +
+        // merge path that the change optimizes.
+        let mut options = create_options(0, CompressionType::Lz4);
+        options.memtable_size_limit = 64 * 1024 * 1024;
+        let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
+        for i in 0..num_keys {
+            engine.put(make_key(i), make_value(i)).unwrap();
+        }
+
+        let start = make_key(0);
+        let end = make_key(num_keys);
+        group.throughput(Throughput::Elements(num_keys as u64));
+        group.bench_function("full_scan", |b| {
+            b.iter(|| {
+                let mut it = engine.scan_iter(&start, &end).unwrap();
+                let mut rows = 0usize;
+                while let Some(pair) = it.next().unwrap() {
+                    black_box(&pair);
+                    rows += 1;
+                }
+                black_box(rows);
+            });
+        });
         group.finish();
     }
 }
