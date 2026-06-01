@@ -945,3 +945,535 @@ fn proto_params_to_db_params(
     }
     Ok(params)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::duct_tape_db_service_client::DuctTapeDbServiceClient;
+    use crate::proto::{
+        CommitTransaction, CreateDbRequest, DropDbRequest, ExecuteQueryRequest, ExecuteTxQuery,
+        FlushDbRequest, IsolationLevel, ParamValue, QueryParam, RollbackTransaction,
+        StartTransaction, param_value::Val, transaction_request, transaction_response,
+    };
+    use dtdb_relational::DataType;
+    use dtdb_storage::DbValue;
+    use futures_util::StreamExt;
+    use std::path::Path;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::Request;
+
+    async fn start_test_server(data_path: &Path) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_addr = format!("http://127.0.0.1:{}", addr.port());
+
+        let service = DuctTapeDbServiceImpl::new(data_path).unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::proto::duct_tape_db_service_server::DuctTapeDbServiceServer::new(
+                        service,
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (client_addr, server_handle)
+    }
+
+    #[tokio::test]
+    async fn test_new_with_executor_and_catalog() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executor = dtdb_storage::default_executor();
+        let service = DuctTapeDbServiceImpl::new_with_executor(temp_dir.path(), executor).unwrap();
+        assert_eq!(service.next_tx_id(), 1);
+        assert_eq!(service.catalog.next_tx_id(), 2);
+    }
+
+    #[test]
+    fn test_execution_result_to_responses_mapping() {
+        use dtdb_relational::{Column, Schema};
+        use dtdb_sql::ExecutionResult;
+
+        let map_res = |res| execution_result_to_responses(res);
+
+        // Analyze
+        let r = map_res(ExecutionResult::Analyze);
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("analyzed"))
+        );
+
+        // CreateTable
+        let r = map_res(ExecutionResult::CreateTable);
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("created"))
+        );
+
+        // DropTable
+        let r = map_res(ExecutionResult::DropTable);
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("dropped"))
+        );
+
+        // CreateIndex
+        let r = map_res(ExecutionResult::CreateIndex);
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("Index created"))
+        );
+
+        // DropIndex
+        let r = map_res(ExecutionResult::DropIndex);
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("Index dropped"))
+        );
+
+        // AlterTable
+        let r = map_res(ExecutionResult::AlterTable);
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("altered"))
+        );
+
+        // Insert
+        let r = map_res(ExecutionResult::Insert { count: 3 });
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("Inserted 3"))
+        );
+
+        // Delete
+        let r = map_res(ExecutionResult::Delete { count: 2 });
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("Deleted 2"))
+        );
+
+        // Update
+        let r = map_res(ExecutionResult::Update { count: 5 });
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::InfoMessage(ref m)) if m.contains("Updated 5"))
+        );
+
+        // Select
+        let schema = Schema::new(vec![Column {
+            id: 1,
+            name: "col1".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        }]);
+        let rows = vec![
+            dtdb_relational::Row::new(vec![DbValue::Int(10)]),
+            dtdb_relational::Row::new(vec![DbValue::Float(1.5)]),
+            dtdb_relational::Row::new(vec![DbValue::Bytes(vec![0xAA, 0xBB])]),
+            dtdb_relational::Row::new(vec![DbValue::Bool(true)]),
+            dtdb_relational::Row::new(vec![DbValue::Null]),
+        ];
+        let r = map_res(ExecutionResult::Select { schema, rows });
+        // Response 0: Header
+        assert!(
+            matches!(r[0].payload, Some(crate::proto::execute_query_response::Payload::Header(ref h)) if h.column_names[0] == "col1")
+        );
+        // Response 1: Int Row
+        assert!(
+            matches!(r[1].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "10")
+        );
+        // Response 2: Float Row
+        assert!(
+            matches!(r[2].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "1.5")
+        );
+        // Response 3: Bytes Row
+        assert!(
+            matches!(r[3].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0].contains("170"))
+        );
+        // Response 4: Bool Row
+        assert!(
+            matches!(r[4].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "true")
+        );
+        // Response 5: Null Row
+        assert!(
+            matches!(r[5].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "NULL")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_operations_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let service = DuctTapeDbServiceImpl::new(temp_dir.path()).unwrap();
+
+        let test_options = dtdb_relational::DatabaseOptions {
+            compression: dtdb_storage::CompressionType::Uncompressed,
+            memtable_size_limit: 1024,
+            block_size_limit: 4096,
+            wal_size_limit: 1024,
+            flush_interval_ms: None,
+            l0_compaction_threshold: None,
+            sstable_target_size: None,
+            base_level_size_limit: None,
+            level_size_multiplier: None,
+            max_level: None,
+            block_cache_capacity: None,
+            analyze_frequency_ms: None,
+            wal_sync_interval_ms: None,
+            memory_budget: None,
+            fsync_method: dtdb_storage::FsyncMethod::default(),
+        };
+
+        // 1. Create DB invalid name
+        let req = Request::new(CreateDbRequest {
+            db_name: "   ".to_string(),
+            ..Default::default()
+        });
+        let err = service.create_db(req).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // 2. Drop DB invalid name & not found
+        let req = Request::new(DropDbRequest {
+            db_name: "   ".to_string(),
+        });
+        let err = service.drop_db(req).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let req = Request::new(DropDbRequest {
+            db_name: "nonexistent".to_string(),
+        });
+        let res = service.drop_db(req).await.unwrap();
+        assert!(!res.into_inner().success); // Success false but no error code
+
+        // 3. Flush DB invalid name & not found
+        let req = Request::new(FlushDbRequest {
+            db_name: "   ".to_string(),
+        });
+        let err = service.flush_db(req).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let req = Request::new(FlushDbRequest {
+            db_name: "nonexistent".to_string(),
+        });
+        let err = service.flush_db(req).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // Create database and drop database success file delete failure:
+        // Not easily simulated unless we make a read-only directory or mock fs.
+        // But we can test regular drop success.
+        service
+            .catalog
+            .create_db("to_drop", test_options.clone())
+            .unwrap();
+        let res_drop = service
+            .drop_db(Request::new(DropDbRequest {
+                db_name: "to_drop".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(res_drop.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let service = DuctTapeDbServiceImpl::new(temp_dir.path()).unwrap();
+
+        let test_options = dtdb_relational::DatabaseOptions {
+            compression: dtdb_storage::CompressionType::Uncompressed,
+            memtable_size_limit: 1024,
+            block_size_limit: 4096,
+            wal_size_limit: 1024,
+            flush_interval_ms: None,
+            l0_compaction_threshold: None,
+            sstable_target_size: None,
+            base_level_size_limit: None,
+            level_size_multiplier: None,
+            max_level: None,
+            block_cache_capacity: None,
+            analyze_frequency_ms: None,
+            wal_sync_interval_ms: None,
+            memory_budget: None,
+            fsync_method: dtdb_storage::FsyncMethod::default(),
+        };
+
+        // 1. DB not found
+        let req = Request::new(ExecuteQueryRequest {
+            db_name: "nonexistent".to_string(),
+            sql_query: "SELECT 1".to_string(),
+            parameters: vec![],
+        });
+        let err = service.execute_query(req).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // 2. Database exists but SQL is malformed
+        service.catalog.create_db("test_db", test_options).unwrap();
+
+        let req = Request::new(ExecuteQueryRequest {
+            db_name: "test_db".to_string(),
+            sql_query: "SELECT INVALID SYNTAX".to_string(),
+            parameters: vec![],
+        });
+        let err = service.execute_query(req).await.err().unwrap();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_transaction_errors_and_isolation_mapping() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (client_addr, server_handle) = start_test_server(temp_dir.path()).await;
+
+        let mut client = DuctTapeDbServiceClient::connect(client_addr.clone())
+            .await
+            .unwrap();
+
+        // 1. Send ExecuteTxQuery before StartTransaction
+        let (tx, rx) = mpsc::channel(1);
+        let stream = ReceiverStream::new(rx);
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Execute(ExecuteTxQuery {
+                sql_query: "SELECT 1".to_string(),
+                parameters: vec![],
+            })),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut res_stream = client.transaction(stream).await.unwrap().into_inner();
+        let res = res_stream.next().await.unwrap().unwrap();
+        assert!(
+            matches!(res.payload, Some(transaction_response::Payload::ErrorMessage(ref msg)) if msg.contains("Protocol error"))
+        );
+
+        // 2. Duplicate StartTransaction
+        let (tx, rx) = mpsc::channel(3);
+        let stream = ReceiverStream::new(rx);
+
+        // Setup database first
+        let mut client_pre = DuctTapeDbServiceClient::connect(client_addr.clone())
+            .await
+            .unwrap();
+        client_pre
+            .create_db(Request::new(CreateDbRequest {
+                db_name: "test_db".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: Some(IsolationLevel::ReadUncommitted as i32),
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: Some(IsolationLevel::RepeatableRead as i32),
+            })),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut res_stream = client.transaction(stream).await.unwrap().into_inner();
+        let out1 = res_stream.next().await.unwrap().unwrap();
+        let out2 = res_stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            out1.payload,
+            Some(transaction_response::Payload::QueryFinished(true))
+        ));
+        assert!(
+            matches!(out2.payload, Some(transaction_response::Payload::ErrorMessage(ref msg)) if msg.contains("already received"))
+        );
+
+        // 3. Start transaction database not found
+        let (tx, rx) = mpsc::channel(1);
+        let stream = ReceiverStream::new(rx);
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Start(StartTransaction {
+                db_name: "nonexistent".to_string(),
+                isolation_level: Some(IsolationLevel::RepeatableRead as i32),
+            })),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut res_stream = client.transaction(stream).await.unwrap().into_inner();
+        let out = res_stream.next().await.unwrap().unwrap();
+        assert!(
+            matches!(out.payload, Some(transaction_response::Payload::ErrorMessage(ref msg)) if msg.contains("not found"))
+        );
+
+        // 4. DDL statements inside transaction
+        let (tx, rx) = mpsc::channel(2);
+        let stream = ReceiverStream::new(rx);
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Execute(ExecuteTxQuery {
+                sql_query: "CREATE TABLE t (id INT)".to_string(),
+                parameters: vec![],
+            })),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut res_stream = client.transaction(stream).await.unwrap().into_inner();
+        let out1 = res_stream.next().await.unwrap().unwrap();
+        let out2 = res_stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            out1.payload,
+            Some(transaction_response::Payload::QueryFinished(true))
+        ));
+        assert!(
+            matches!(out2.payload, Some(transaction_response::Payload::ErrorMessage(ref msg)) if msg.contains("DDL statements"))
+        );
+
+        // 5. Commit/Rollback protocols
+        let (tx, rx) = mpsc::channel(3);
+        let stream = ReceiverStream::new(rx);
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Commit(CommitTransaction {})),
+        })
+        .await
+        .unwrap();
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Commit(CommitTransaction {})),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut res_stream = client.transaction(stream).await.unwrap().into_inner();
+        let out1 = res_stream.next().await.unwrap().unwrap();
+        let out2 = res_stream.next().await.unwrap().unwrap();
+        let out3 = res_stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            out1.payload,
+            Some(transaction_response::Payload::QueryFinished(true))
+        ));
+        assert!(
+            matches!(out2.payload, Some(transaction_response::Payload::CommitResult(ref c)) if c.success)
+        );
+        assert!(
+            matches!(out3.payload, Some(transaction_response::Payload::ErrorMessage(ref msg)) if msg.contains("completed"))
+        );
+
+        // 6. Test Rollback protocol explicitly
+        let (tx, rx) = mpsc::channel(2);
+        let stream = ReceiverStream::new(rx);
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Start(StartTransaction {
+                db_name: "test_db".to_string(),
+                isolation_level: None,
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(crate::proto::TransactionRequest {
+            command: Some(transaction_request::Command::Rollback(
+                RollbackTransaction {},
+            )),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut res_stream = client.transaction(stream).await.unwrap().into_inner();
+        let out1 = res_stream.next().await.unwrap().unwrap();
+        let out2 = res_stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            out1.payload,
+            Some(transaction_response::Payload::QueryFinished(true))
+        ));
+        assert!(
+            matches!(out2.payload, Some(transaction_response::Payload::CommitResult(ref c)) if c.success && c.message.contains("rolled back"))
+        );
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn test_proto_params_to_db_params_all_variants() {
+        let proto = vec![
+            QueryParam {
+                name: "p1".to_string(),
+                value: Some(ParamValue {
+                    val: Some(Val::IntVal(10)),
+                }),
+            },
+            QueryParam {
+                name: "p2".to_string(),
+                value: Some(ParamValue {
+                    val: Some(Val::FloatVal(1.5)),
+                }),
+            },
+            QueryParam {
+                name: "p3".to_string(),
+                value: Some(ParamValue {
+                    val: Some(Val::BoolVal(true)),
+                }),
+            },
+            QueryParam {
+                name: "p4".to_string(),
+                value: Some(ParamValue {
+                    val: Some(Val::StringVal("hello".to_string())),
+                }),
+            },
+            QueryParam {
+                name: "p5".to_string(),
+                value: Some(ParamValue {
+                    val: Some(Val::BytesVal(vec![1, 2])),
+                }),
+            },
+            QueryParam {
+                name: "p6".to_string(),
+                value: Some(ParamValue {
+                    val: Some(Val::NullVal(true)),
+                }),
+            },
+            QueryParam {
+                name: "p7".to_string(),
+                value: Some(ParamValue { val: None }),
+            },
+            QueryParam {
+                name: "p8".to_string(),
+                value: None,
+            },
+        ];
+
+        let out = proto_params_to_db_params(proto).unwrap();
+        assert_eq!(out.get("p1").unwrap(), &DbValue::Int(10));
+        assert_eq!(out.get("p2").unwrap(), &DbValue::Float(1.5));
+        assert_eq!(out.get("p3").unwrap(), &DbValue::Bool(true));
+        assert_eq!(
+            out.get("p4").unwrap(),
+            &DbValue::String("hello".to_string())
+        );
+        assert_eq!(out.get("p5").unwrap(), &DbValue::Bytes(vec![1, 2]));
+        assert_eq!(out.get("p6").unwrap(), &DbValue::Null);
+        assert_eq!(out.get("p7").unwrap(), &DbValue::Null);
+        assert_eq!(out.get("p8").unwrap(), &DbValue::Null);
+    }
+}
