@@ -104,6 +104,9 @@ fn display_result(res: ExecutionResult) {
         ExecutionResult::DropIndex => {
             println!("Index dropped successfully.");
         }
+        ExecutionResult::AlterTable => {
+            println!("Table altered successfully.");
+        }
         ExecutionResult::Insert { count } => {
             println!("Inserted {} row(s).", count);
         }

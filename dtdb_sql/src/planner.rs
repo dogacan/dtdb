@@ -50,9 +50,21 @@ pub enum SqlStatement {
         table_name: String,
         index_name: String,
     },
+    AlterTable {
+        table_name: String,
+        op: AlterOp,
+    },
     Analyze {
         table_name: String,
     },
+}
+
+/// A single `ALTER TABLE` alteration. Phase 1 supports the lazy, metadata-only
+/// operations; `DROP COLUMN` and `ALTER COLUMN` are deferred (see ADR 0003).
+#[derive(Debug, Clone)]
+pub enum AlterOp {
+    AddColumn(Column),
+    RenameColumn { old_name: String, new_name: String },
 }
 
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
@@ -416,6 +428,36 @@ impl LogicalPlanner {
                     index_type,
                     tokenizer,
                 })
+            }
+            Statement::AlterTable(alter) => {
+                let table_name = alter.name.to_string();
+                // Phase 1 takes a single alteration per statement. Multiple
+                // comma-separated operations are not atomic in our model yet, so
+                // reject them rather than apply a partial prefix.
+                if alter.operations.len() != 1 {
+                    return Err(
+                        "ALTER TABLE supports exactly one operation per statement".to_string()
+                    );
+                }
+                let op = match &alter.operations[0] {
+                    sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
+                        AlterOp::AddColumn(column_def_to_column(column_def)?)
+                    }
+                    sqlparser::ast::AlterTableOperation::RenameColumn {
+                        old_column_name,
+                        new_column_name,
+                    } => AlterOp::RenameColumn {
+                        old_name: old_column_name.value.clone(),
+                        new_name: new_column_name.value.clone(),
+                    },
+                    other => {
+                        return Err(format!(
+                            "Unsupported ALTER TABLE operation: {} (only ADD COLUMN and RENAME COLUMN are supported)",
+                            other
+                        ));
+                    }
+                };
+                Ok(SqlStatement::AlterTable { table_name, op })
             }
             Statement::Insert(sqlparser::ast::Insert {
                 table,
@@ -1441,6 +1483,69 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
         SqlExpr::Nested(inner) => has_aggregate_function(inner),
         _ => false,
     }
+}
+
+/// Translates a single sqlparser `ColumnDef` into a relational [`Column`].
+///
+/// Used by `ALTER TABLE ADD COLUMN`, where there is no table-level primary-key
+/// constraint or locality-group map to consult — only the column's own inline
+/// options. (CREATE TABLE has its own loop because it also folds in those
+/// table-level inputs.) The returned column's `id` is a placeholder (0); the
+/// catalog assigns the real stable id in `Database::alter_table_add_column`.
+fn column_def_to_column(col: &sqlparser::ast::ColumnDef) -> Result<Column, String> {
+    let data_type = match &col.data_type {
+        SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => DataType::Int,
+        SqlDataType::Custom(name, _)
+            if {
+                let n = name.to_string().to_uppercase();
+                n == "SERIAL" || n == "BIGSERIAL"
+            } =>
+        {
+            DataType::Int
+        }
+        SqlDataType::Custom(name, _) if name.to_string().to_uppercase() == "BOOL" => DataType::Bool,
+        SqlDataType::Float(_) | SqlDataType::Double(_) | SqlDataType::Real => DataType::Float,
+        SqlDataType::Boolean | SqlDataType::Bool => DataType::Bool,
+        SqlDataType::Text
+        | SqlDataType::Varchar(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::String(_) => DataType::String,
+        SqlDataType::Bytea | SqlDataType::Blob(_) => DataType::Bytes,
+        other => return Err(format!("Unsupported SQL data type: {:?}", other)),
+    };
+
+    let is_primary_key = col
+        .options
+        .iter()
+        .any(|opt| matches!(opt.option, ColumnOption::PrimaryKey(_)));
+    // A column added via ALTER cannot become a primary key: it would change the
+    // table's key, which the lazy/positional scheme does not support.
+    if is_primary_key {
+        return Err("ALTER TABLE ADD COLUMN cannot add a PRIMARY KEY column".to_string());
+    }
+
+    let is_nullable = !col
+        .options
+        .iter()
+        .any(|opt| matches!(opt.option, ColumnOption::NotNull));
+
+    let mut default_value = None;
+    for opt in &col.options {
+        if let ColumnOption::Default(ref default_expr) = opt.option {
+            default_value = Some(eval_default_expr(default_expr)?);
+        }
+    }
+
+    Ok(Column {
+        id: 0,
+        name: col.name.value.clone(),
+        data_type,
+        is_primary_key: false,
+        is_nullable,
+        locality_group: None,
+        default_value,
+        is_auto_increment: false,
+    })
 }
 
 fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {

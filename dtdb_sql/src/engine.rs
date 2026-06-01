@@ -29,6 +29,7 @@ pub enum ExecutionResult {
     DropTable,
     CreateIndex,
     DropIndex,
+    AlterTable,
     Insert { count: usize },
     Delete { count: usize },
     Update { count: usize },
@@ -147,6 +148,7 @@ fn substitute_statement_params(
         | SqlStatement::DropTable { .. }
         | SqlStatement::CreateIndex { .. }
         | SqlStatement::DropIndex { .. }
+        | SqlStatement::AlterTable { .. }
         | SqlStatement::Analyze { .. } => Ok(()),
     }
 }
@@ -387,6 +389,7 @@ impl SqlEngine {
                 sqlparser::ast::Statement::CreateTable(_)
                     | sqlparser::ast::Statement::Drop { .. }
                     | sqlparser::ast::Statement::CreateIndex(_)
+                    | sqlparser::ast::Statement::AlterTable(_)
             );
         }
         false
@@ -571,6 +574,21 @@ impl SqlEngine {
                     .drop_index(&table_name, &index_name)
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::DropIndex)
+            }
+            SqlStatement::AlterTable { table_name, op } => {
+                match op {
+                    crate::planner::AlterOp::AddColumn(column) => {
+                        self.database
+                            .alter_table_add_column(&table_name, column)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    crate::planner::AlterOp::RenameColumn { old_name, new_name } => {
+                        self.database
+                            .alter_table_rename_column(&table_name, &old_name, &new_name)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(ExecutionResult::AlterTable)
             }
             SqlStatement::Insert {
                 table_name,

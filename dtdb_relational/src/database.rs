@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use crate::schema::{IndexDefinition, IndexType, Schema};
+use crate::schema::{Column, IndexDefinition, IndexType, Schema};
 use crate::transaction::Transaction;
 use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, Executor, FramedLog, FsyncMethod, LogFormat,
@@ -1500,6 +1500,166 @@ impl Database {
         self.schema_version
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    /// Spin-waits until no transaction is actively accessing `table_name`.
+    ///
+    /// This is the "stop the world" quiesce shared by every catalog mutation:
+    /// the caller holds the `tables` write lock (so no *new* transaction can
+    /// resolve the table), and this drains the transactions already reading it
+    /// before the schema is swapped. Mirrors the inline loops in `create_index`
+    /// / `drop_index` / `drop_table`.
+    ///
+    /// TODO: bound this with a timeout that returns an error naming the
+    /// offending table instead of spinning forever; a leaked reader currently
+    /// hangs the DDL with no diagnostic (tracked for all quiesce sites).
+    fn wait_for_table_quiescent(&self, table_name: &str) {
+        loop {
+            let has_active_readers = {
+                let access = self.active_table_access.lock().unwrap();
+                access
+                    .get(table_name)
+                    .is_some_and(|readers| !readers.is_empty())
+            };
+            if !has_active_readers {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Adds a column to an existing table (lazy `ALTER TABLE ADD COLUMN`).
+    ///
+    /// Metadata-only and O(1) in the table size: existing rows are left on disk
+    /// untouched and reconciled to the new column's `default_value` (or NULL) on
+    /// read (see [`Schema::reconcile_row`] and ADR 0003). The new column is
+    /// always appended, preserving the Phase 1 invariant that a stored row is a
+    /// prefix of the live schema.
+    ///
+    /// The column's `id` is assigned here from the schema's monotonic
+    /// `next_column_id`; any id on the passed-in `Column` is ignored.
+    pub fn alter_table_add_column(&self, table_name: &str, mut column: Column) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+        let table_arc = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        // Copy-on-write so in-flight transactions keep their old schema snapshot.
+        let table = Arc::make_mut(table_arc);
+
+        // 1. Reject a duplicate column name.
+        if table.schema.column_index(&column.name).is_some() {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Column '{}' already exists in table '{}'",
+                column.name, table_name
+            )));
+        }
+
+        // 2. A new NOT NULL column needs a value for the rows that predate it.
+        //    Allow it only when it has a default, or the table is empty (no rows
+        //    to violate the constraint). Checked while quiesced below; here we
+        //    only need the cheap default check up front.
+        if !column.is_nullable && column.default_value.is_none() {
+            let (start, end) = table.schema.primary_key_bounds()?;
+            let is_empty = table.filtered_scan(&start, &end, None)?.is_empty();
+            if !is_empty {
+                return Err(RelationalError::SchemaMismatch(format!(
+                    "Cannot add NOT NULL column '{}' without a default to non-empty table '{}'",
+                    column.name, table_name
+                )));
+            }
+        }
+
+        // 3. A new column may not join a non-default locality group: that group's
+        //    engine would not exist for the existing rows. (Adding columns only
+        //    to the default group keeps the prefix invariant and needs no new
+        //    storage engine.) Reject explicit non-default groups for now.
+        if let Some(group) = &column.locality_group
+            && !group.is_empty()
+        {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "ALTER TABLE ADD COLUMN into locality group '{}' is not supported",
+                group
+            )));
+        }
+
+        // 4. Assign the stable id and stage the new schema.
+        column.id = table.schema.next_column_id;
+        let mut new_schema = table.schema.clone();
+        new_schema.columns.push(column);
+        new_schema.next_column_id += 1;
+        // `Schema::clone` copies the populated `relative_indices` cache; adding a
+        // column changes the group->index mapping, so drop it to be rebuilt lazily.
+        new_schema.relative_indices = std::sync::OnceLock::new();
+
+        // 5. Quiesce, then atomically swap schema.bin and publish. No row data is
+        //    written, so the single atomic rename is the entire durability story.
+        self.wait_for_table_quiescent(table_name);
+        let schema_path = self.dir_path.join(table_name).join("schema.bin");
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+        table.schema = new_schema;
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Renames a column of an existing table (`ALTER TABLE RENAME COLUMN`).
+    ///
+    /// Pure metadata: no row bytes are touched (positions are unchanged). Any
+    /// index column reference or locality-group key naming the old column is
+    /// updated in lockstep so the rename is internally consistent.
+    pub fn alter_table_rename_column(
+        &self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+        let table_arc = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        let table = Arc::make_mut(table_arc);
+
+        // 1. Old column must exist; new name must not collide. A no-op rename
+        //    (old == new) is accepted and changes nothing.
+        if table.schema.column_index(old_name).is_none() {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Column '{}' does not exist in table '{}'",
+                old_name, table_name
+            )));
+        }
+        if old_name != new_name && table.schema.column_index(new_name).is_some() {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Column '{}' already exists in table '{}'",
+                new_name, table_name
+            )));
+        }
+
+        // 2. Stage the rename across the column, any index that references it,
+        //    and locality-group membership (keyed by column name elsewhere).
+        let mut new_schema = table.schema.clone();
+        for col in &mut new_schema.columns {
+            if col.name == old_name {
+                col.name = new_name.to_string();
+            }
+        }
+        for idx in &mut new_schema.indexes {
+            for col in &mut idx.columns {
+                if col == old_name {
+                    *col = new_name.to_string();
+                }
+            }
+        }
+
+        // 3. Quiesce, atomically swap schema.bin, publish.
+        self.wait_for_table_quiescent(table_name);
+        let schema_path = self.dir_path.join(table_name).join("schema.bin");
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+        table.schema = new_schema;
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 

@@ -123,6 +123,41 @@ Removes a secondary index from a table.
     DROP INDEX idx_score;
     ```
 
+#### `ALTER TABLE`
+Alters an existing table's columns. Currently supports adding a column and
+renaming a column; one operation per statement.
+*   **Syntax**:
+    ```sql
+    ALTER TABLE <table_name> ADD COLUMN <column_name> <type> [NOT NULL] [DEFAULT <const>];
+    ALTER TABLE <table_name> RENAME COLUMN <old_name> TO <new_name>;
+    ```
+*   **Notes**:
+    *   `ADD COLUMN` is **lazy and metadata-only**: existing rows are not
+        rewritten. Rows stored before the column was added are reconciled on
+        read, returning the column's `DEFAULT` (or `NULL` if none). A column
+        added this way is always appended to the end of the schema.
+    *   A new `NOT NULL` column requires a `DEFAULT`, unless the table is empty
+        (there are no existing rows to violate the constraint).
+    *   A column added via `ALTER TABLE` cannot be a `PRIMARY KEY`, cannot join a
+        non-default locality group, and cannot duplicate an existing column name.
+    *   `RENAME COLUMN` is pure metadata; it also updates any secondary index
+        that references the renamed column.
+    *   `DROP COLUMN` and `ALTER COLUMN` (type changes) are **not yet supported**.
+*   **Transaction Restriction**:
+    *   `ALTER TABLE` is a DDL statement and is **not allowed** inside explicit
+        multi-statement transactions. It must be run as a single auto-committed
+        statement.
+*   **Concurrency & Serialization**:
+    *   Acquires an exclusive write lock on the database catalog and waits for
+        all active transactions accessing the target table to finish before
+        swapping the schema. Because no row data is rewritten, this "stop the
+        world" window is O(1) in the table size.
+*   **Example**:
+    ```sql
+    ALTER TABLE employees ADD COLUMN active BOOL DEFAULT true;
+    ALTER TABLE employees RENAME COLUMN name TO full_name;
+    ```
+
 ---
 
 ### Data Manipulation Language (DML) & Queries

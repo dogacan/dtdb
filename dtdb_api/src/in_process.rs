@@ -232,6 +232,7 @@ impl InProcessQueryResult {
                 ExecutionResult::DropTable => Some("Table dropped successfully.".to_string()),
                 ExecutionResult::CreateIndex => Some("Index created successfully.".to_string()),
                 ExecutionResult::DropIndex => Some("Index dropped successfully.".to_string()),
+                ExecutionResult::AlterTable => Some("Table altered successfully.".to_string()),
                 ExecutionResult::Insert { count } => Some(format!("Inserted {} row(s).", count)),
                 ExecutionResult::Delete { count } => Some(format!("Deleted {} row(s).", count)),
                 ExecutionResult::Update { count } => Some(format!("Updated {} row(s).", count)),

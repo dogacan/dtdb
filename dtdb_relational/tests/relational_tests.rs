@@ -1028,3 +1028,274 @@ fn test_create_index_persists_schema_only_after_index_data() {
         );
     }
 }
+
+// ----- ALTER TABLE Database API (ADR 0003, Phase 1) -----
+
+/// `alter_table_add_column` is metadata-only: existing rows reconcile to the new
+/// column's default on read, and a row written afterward carries it natively.
+#[test]
+fn test_database_alter_add_column_with_default() {
+    use dtdb_relational::Column;
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Add `verified BOOL DEFAULT true`. The id must be assigned from the
+    // schema's high-water mark (3 -> the new column gets id 3), not left at 0.
+    db.alter_table_add_column(
+        "users",
+        Column {
+            id: 0,
+            name: "verified".to_string(),
+            data_type: DataType::Bool,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: Some(DbValue::Bool(true)),
+            is_auto_increment: false,
+        },
+    )
+    .unwrap();
+
+    let table = db.get_table("users").unwrap();
+    assert_eq!(table.schema.columns.len(), 4);
+    assert_eq!(table.schema.columns[3].id, 3);
+    assert_eq!(table.schema.next_column_id, 4);
+
+    // Old row reconciles to the default.
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(got.values.last(), Some(&DbValue::Bool(true)));
+}
+
+/// Adding a duplicate column name, or a NOT NULL column without a default to a
+/// non-empty table, is rejected with a SchemaMismatch error.
+#[test]
+fn test_database_alter_add_column_validation() {
+    use dtdb_relational::Column;
+    let mk = |name: &str, nullable: bool, default: Option<DbValue>| Column {
+        id: 0,
+        name: name.to_string(),
+        data_type: DataType::Int,
+        is_primary_key: false,
+        is_nullable: nullable,
+        locality_group: None,
+        default_value: default,
+        is_auto_increment: false,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Duplicate name ("name" already exists).
+    let dup = db.alter_table_add_column("users", mk("name", true, None));
+    assert!(matches!(dup, Err(RelationalError::SchemaMismatch(_))));
+
+    // NOT NULL without default on a non-empty table.
+    let nn = db.alter_table_add_column("users", mk("c", false, None));
+    assert!(matches!(nn, Err(RelationalError::SchemaMismatch(_))));
+
+    // NOT NULL *with* default is fine.
+    db.alter_table_add_column("users", mk("c", false, Some(DbValue::Int(0))))
+        .unwrap();
+
+    // Neither failed ALTER should have advanced the column count beyond the one
+    // successful add.
+    assert_eq!(db.get_table("users").unwrap().schema.columns.len(), 4);
+}
+
+/// `alter_table_rename_column` renames the column and rewrites any index
+/// reference to it; the data is untouched.
+#[test]
+fn test_database_alter_rename_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    db.create_index(
+        "users",
+        "idx_name",
+        vec!["name".to_string()],
+        dtdb_relational::IndexType::BTree,
+        None,
+    )
+    .unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    db.alter_table_rename_column("users", "name", "full_name")
+        .unwrap();
+
+    let table = db.get_table("users").unwrap();
+    assert!(table.schema.column_index("full_name").is_some());
+    assert!(table.schema.column_index("name").is_none());
+    // The index that referenced `name` now references `full_name`.
+    assert_eq!(
+        table.schema.indexes[0].columns,
+        vec!["full_name".to_string()]
+    );
+
+    // Renaming a missing column, or onto an existing name, is rejected.
+    assert!(matches!(
+        db.alter_table_rename_column("users", "nope", "x"),
+        Err(RelationalError::SchemaMismatch(_))
+    ));
+    assert!(matches!(
+        db.alter_table_rename_column("users", "full_name", "id"),
+        Err(RelationalError::SchemaMismatch(_))
+    ));
+}
+
+/// An ADD COLUMN survives a reopen: the swapped schema.bin is durable, and old
+/// rows still reconcile after the database is reopened from disk.
+#[test]
+fn test_database_alter_add_column_survives_reopen() {
+    use dtdb_relational::Column;
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+        {
+            let tx = Transaction::new(1, db.clone());
+            tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+            tx.commit().unwrap();
+        }
+        db.alter_table_add_column(
+            "users",
+            Column {
+                id: 0,
+                name: "verified".to_string(),
+                data_type: DataType::Bool,
+                is_primary_key: false,
+                is_nullable: true,
+                locality_group: None,
+                default_value: Some(DbValue::Bool(true)),
+                is_auto_increment: false,
+            },
+        )
+        .unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // Reopen and confirm the added column and its default-reconciliation persist.
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+    assert_eq!(table.schema.columns.len(), 4);
+    assert_eq!(table.schema.next_column_id, 4);
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(got.values.last(), Some(&DbValue::Bool(true)));
+}
+
+/// ADD COLUMN on a *multi-locality-group* table exercises the scan merge path
+/// (not the single-group fast path) and the `relative_indices` cache reset:
+/// after the new default-group column is appended, an old row read through the
+/// merge must reconcile to the new column's default at the correct position.
+#[test]
+fn test_database_alter_add_column_multi_group() {
+    use dtdb_relational::Column;
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    // id in the default group; name/score in their own groups.
+    let schema = Schema::new(vec![
+        Column {
+            id: 0,
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 0,
+            name: "name".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_name".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 0,
+            name: "score".to_string(),
+            data_type: DataType::Float,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_score".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ]);
+    db.create_table("users", schema).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Force the read path (and thus the relative_indices cache) to populate
+    // before the ALTER, so the cache-reset path is actually exercised.
+    let _ = db.get_table("users").unwrap().get(&k_int(1), None).unwrap();
+
+    // Append a default-group column with a default value.
+    db.alter_table_add_column(
+        "users",
+        Column {
+            id: 0,
+            name: "active".to_string(),
+            data_type: DataType::Bool,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: Some(DbValue::Bool(true)),
+            is_auto_increment: false,
+        },
+    )
+    .unwrap();
+
+    // The old row reconciles to the default in the new (4th) position, with the
+    // group-resident columns still correctly merged into their positions.
+    let table = db.get_table("users").unwrap();
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(
+        got.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Float(95.5),
+            DbValue::Bool(true),
+        ]
+    );
+
+    // A non-default-group column is rejected.
+    let bad = db.alter_table_add_column(
+        "users",
+        Column {
+            id: 0,
+            name: "extra".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_name".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+    );
+    assert!(matches!(bad, Err(RelationalError::SchemaMismatch(_))));
+}
