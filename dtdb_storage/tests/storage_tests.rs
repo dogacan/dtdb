@@ -13,7 +13,7 @@ fn k_int(val: i64) -> DbKey {
 }
 
 fn k_str(val: &str) -> DbKey {
-    DbKey::String(val.to_string())
+    DbKey::string(val)
 }
 
 fn v_int(val: i64) -> DbValue {
@@ -21,7 +21,7 @@ fn v_int(val: i64) -> DbValue {
 }
 
 fn v_str(val: &str) -> DbValue {
-    DbValue::String(val.to_string())
+    DbValue::string(val)
 }
 
 #[test]

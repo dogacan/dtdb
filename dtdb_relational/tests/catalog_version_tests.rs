@@ -117,7 +117,7 @@ fn test_schema_version_failed_ddl_does_not_increment() {
 }
 
 fn user_row(id: i64, name: &str) -> Row {
-    Row::new(vec![DbValue::Int(id), DbValue::String(name.to_string())])
+    Row::new(vec![DbValue::Int(id), DbValue::string(name.to_string())])
 }
 
 #[test]

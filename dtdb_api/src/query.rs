@@ -66,7 +66,7 @@ impl SqlQuery {
                             DbValue::Bytes(b) => {
                                 // Format bytes as hex literal x'0102ff'
                                 let mut s = String::from("x'");
-                                for byte in b {
+                                for byte in b.iter() {
                                     s.push_str(&format!("{:02x}", byte));
                                 }
                                 s.push('\'');

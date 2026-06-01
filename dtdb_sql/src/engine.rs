@@ -1046,7 +1046,7 @@ impl SqlEngine {
                     physical_str.trim_end()
                 );
 
-                let rows = vec![Row::new(vec![DbValue::String(plan_info)])];
+                let rows = vec![Row::new(vec![DbValue::string(plan_info)])];
 
                 Ok(ExecutionResult::Select { schema, rows })
             }
@@ -1226,8 +1226,8 @@ impl SqlEngine {
                             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
                             DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
                             _ => (
-                                DbKey::String("".to_string()),
-                                DbKey::String("\u{10ffff}".to_string()),
+                                DbKey::string(""),
+                                DbKey::string("\u{10ffff}"),
                             ),
                         }
                     }

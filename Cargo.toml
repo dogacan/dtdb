@@ -25,7 +25,10 @@ dtdb_sql = { path = "dtdb_sql" }
 dtdb_api = { path = "dtdb_api" }
 
 # Shared external dependencies
-serde = { version = "1.0", features = ["derive"] }
+# `rc` enables Serialize/Deserialize for Arc<T>, which DbKey/DbValue payloads
+# rely on (Arc<str>, Arc<[u8]>, Arc<Vec<DbKey>>). Without it the derives on
+# those enums won't compile. Note: deserialization does not dedup Arcs.
+serde = { version = "1.0", features = ["derive", "rc"] }
 bincode = "1.3"
 thiserror = "1.0"
 tempfile = "3.27.0"

@@ -410,8 +410,8 @@ impl Transaction {
         let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
 
         // Construct composite key scan bounds for the index engine
-        let start_bound = DbKey::Composite(vec![start_val.clone(), min_pk]);
-        let end_bound = DbKey::Composite(vec![end_val.clone(), max_pk]);
+        let start_bound = DbKey::composite(vec![start_val.clone(), min_pk]);
+        let end_bound = DbKey::composite(vec![end_val.clone(), max_pk]);
 
         // Track the scan range for the index
         if self.isolation_level == IsolationLevel::SnapshotIsolation {
@@ -431,8 +431,8 @@ impl Transaction {
         // 2. Fetch rows by primary key from transaction/main table in batch
         let mut pks = Vec::new();
         for (idx_key, _) in index_entries {
-            if let DbKey::Composite(mut parts) = idx_key
-                && let Some(pk) = parts.pop()
+            if let DbKey::Composite(parts) = idx_key
+                && let Some(pk) = parts.last().cloned()
             {
                 pks.push(pk);
             }
@@ -470,10 +470,10 @@ impl Transaction {
                             let tokenizer_name = idx_def.tokenizer.as_deref().unwrap_or("simple");
                             if let Some(tokenizer) = crate::tokenizer::get_tokenizer(tokenizer_name)
                             {
-                                let tokens = tokenizer.tokenize(s.as_str());
+                                let tokens = tokenizer.tokenize(s);
                                 let mut match_found = false;
                                 if let DbKey::String(query_token) = start_val
-                                    && tokens.contains(query_token)
+                                    && tokens.iter().any(|t| t.as_str() == &**query_token)
                                 {
                                     match_found = true;
                                 }
@@ -652,8 +652,8 @@ impl Transaction {
         match query {
             crate::fts_parser::FullTextQuery::Token(tok) => {
                 let start_bound =
-                    DbKey::Composite(vec![DbKey::String(tok.clone()), min_pk.clone()]);
-                let end_bound = DbKey::Composite(vec![DbKey::String(tok.clone()), max_pk.clone()]);
+                    DbKey::composite(vec![DbKey::string(tok.clone()), min_pk.clone()]);
+                let end_bound = DbKey::composite(vec![DbKey::string(tok.clone()), max_pk.clone()]);
 
                 if self.isolation_level == IsolationLevel::SnapshotIsolation {
                     let mut scan_ranges = self.scan_ranges.lock().unwrap();
@@ -667,8 +667,8 @@ impl Transaction {
                     index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
                 let mut pks = HashSet::new();
                 for (idx_key, _) in index_entries {
-                    if let DbKey::Composite(mut parts) = idx_key
-                        && let Some(pk) = parts.pop()
+                    if let DbKey::Composite(parts) = idx_key
+                        && let Some(pk) = parts.last().cloned()
                     {
                         pks.insert(pk);
                     }
@@ -718,12 +718,12 @@ impl Transaction {
                     return Ok(HashSet::new());
                 }
                 if phrase_tokens.len() == 1 {
-                    let start_bound = DbKey::Composite(vec![
-                        DbKey::String(phrase_tokens[0].clone()),
+                    let start_bound = DbKey::composite(vec![
+                        DbKey::string(phrase_tokens[0].clone()),
                         min_pk.clone(),
                     ]);
-                    let end_bound = DbKey::Composite(vec![
-                        DbKey::String(phrase_tokens[0].clone()),
+                    let end_bound = DbKey::composite(vec![
+                        DbKey::string(phrase_tokens[0].clone()),
                         max_pk.clone(),
                     ]);
 
@@ -739,8 +739,8 @@ impl Transaction {
                         index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
                     let mut pks = HashSet::new();
                     for (idx_key, _) in index_entries {
-                        if let DbKey::Composite(mut parts) = idx_key
-                            && let Some(pk) = parts.pop()
+                        if let DbKey::Composite(parts) = idx_key
+                            && let Some(pk) = parts.last().cloned()
                         {
                             pks.insert(pk);
                         }
@@ -751,9 +751,9 @@ impl Transaction {
                 let mut token_pos_maps: Vec<HashMap<DbKey, Vec<u32>>> = Vec::new();
                 for tok in phrase_tokens {
                     let start_bound =
-                        DbKey::Composite(vec![DbKey::String(tok.clone()), min_pk.clone()]);
+                        DbKey::composite(vec![DbKey::string(tok.clone()), min_pk.clone()]);
                     let end_bound =
-                        DbKey::Composite(vec![DbKey::String(tok.clone()), max_pk.clone()]);
+                        DbKey::composite(vec![DbKey::string(tok.clone()), max_pk.clone()]);
 
                     if self.isolation_level == IsolationLevel::SnapshotIsolation {
                         let mut scan_ranges = self.scan_ranges.lock().unwrap();
@@ -767,8 +767,8 @@ impl Transaction {
                         index_engine.filtered_scan(&start_bound, &end_bound, |_, _| true)?;
                     let mut pos_map = HashMap::new();
                     for (idx_key, val) in index_entries {
-                        if let DbKey::Composite(mut parts) = idx_key
-                            && let Some(pk) = parts.pop()
+                        if let DbKey::Composite(parts) = idx_key
+                            && let Some(pk) = parts.last().cloned()
                             && let DbValue::Bytes(bytes) = val
                             && let Ok(positions) = bincode::deserialize::<Vec<u32>>(&bytes)
                         {
@@ -827,7 +827,7 @@ impl Transaction {
         match query {
             crate::fts_parser::FullTextQuery::Token(tok) => {
                 if let Some(DbValue::String(s)) = row.get_by_index(col_idx) {
-                    let tokens = tokenizer.tokenize(s.as_str());
+                    let tokens = tokenizer.tokenize(s);
                     tokens.contains(tok)
                 } else {
                     false
@@ -843,7 +843,7 @@ impl Transaction {
             }
             crate::fts_parser::FullTextQuery::Phrase(phrase_tokens) => {
                 if let Some(DbValue::String(s)) = row.get_by_index(col_idx) {
-                    let tokens = tokenizer.tokenize(s.as_str());
+                    let tokens = tokenizer.tokenize(s);
                     if phrase_tokens.is_empty() {
                         return true;
                     }
@@ -880,7 +880,7 @@ impl Transaction {
                         let bytes = row.to_bytes()?;
                         let mutation = crate::database::RelationalMutation::Put {
                             key: key.clone(),
-                            value: DbValue::Bytes(bytes),
+                            value: DbValue::bytes(bytes),
                         };
                         entries.push(mutation.clone());
                         write_entries.push(crate::database::TableWriteEntry {

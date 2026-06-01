@@ -129,7 +129,7 @@ impl Table {
                     tokens.sort();
                     tokens.dedup();
                     for token in tokens {
-                        let idx_key = DbKey::Composite(vec![DbKey::String(token), pk_key.clone()]);
+                        let idx_key = DbKey::composite(vec![DbKey::string(token), pk_key.clone()]);
                         keys.push(idx_key);
                     }
                 }
@@ -152,7 +152,7 @@ impl Table {
             }
             if col_keys.len() == idx.columns.len() {
                 col_keys.push(pk_key.clone());
-                keys.push(DbKey::Composite(col_keys));
+                keys.push(DbKey::composite(col_keys));
             }
         }
         Ok(keys)
@@ -239,8 +239,8 @@ impl Table {
                                             tokens.sort();
                                             tokens.dedup();
                                             for token in tokens {
-                                                let idx_key = DbKey::Composite(vec![
-                                                    DbKey::String(token),
+                                                let idx_key = DbKey::composite(vec![
+                                                    DbKey::string(token),
                                                     key.clone(),
                                                 ]);
                                                 index_batches
@@ -270,7 +270,7 @@ impl Table {
                                         old_keys.push(key.clone());
                                         index_batches.get_mut(&idx.name).unwrap().push(
                                             WalEntry::Delete {
-                                                key: DbKey::Composite(old_keys),
+                                                key: DbKey::composite(old_keys),
                                             },
                                         );
                                     }
@@ -302,8 +302,8 @@ impl Table {
                                                 .push(pos as u32);
                                         }
                                         for (token, positions) in token_positions {
-                                            let idx_key = DbKey::Composite(vec![
-                                                DbKey::String(token),
+                                            let idx_key = DbKey::composite(vec![
+                                                DbKey::string(token),
                                                 key.clone(),
                                             ]);
                                             let value_bytes =
@@ -311,7 +311,7 @@ impl Table {
                                             index_batches.get_mut(&idx.name).unwrap().push(
                                                 WalEntry::Put {
                                                     key: idx_key,
-                                                    value: DbValue::Bytes(value_bytes),
+                                                    value: DbValue::bytes(value_bytes),
                                                 },
                                             );
                                         }
@@ -339,7 +339,7 @@ impl Table {
                                         .get_mut(&idx.name)
                                         .unwrap()
                                         .push(WalEntry::Put {
-                                            key: DbKey::Composite(new_keys),
+                                            key: DbKey::composite(new_keys),
                                             value: DbValue::Null,
                                         });
                                 }
@@ -351,11 +351,11 @@ impl Table {
                         let (_, batch) = group_batches.iter_mut().next().unwrap();
                         let sub_bytes = match &value {
                             DbValue::Bytes(b) => b.clone(),
-                            _ => full_row_opt.as_ref().unwrap().to_bytes()?,
+                            _ => full_row_opt.as_ref().unwrap().to_bytes()?.into(),
                         };
                         batch.push(WalEntry::Put {
                             key: key.clone(),
-                            value: DbValue::Bytes(sub_bytes),
+                            value: DbValue::bytes(sub_bytes),
                         });
                     } else {
                         let full_row = full_row_opt.as_ref().unwrap();
@@ -364,7 +364,7 @@ impl Table {
                             let sub_bytes = sub_row.to_bytes()?;
                             batch.push(WalEntry::Put {
                                 key: key.clone(),
-                                value: DbValue::Bytes(sub_bytes),
+                                value: DbValue::bytes(sub_bytes),
                             });
                         }
                     }
@@ -389,8 +389,8 @@ impl Table {
                                             tokens.sort();
                                             tokens.dedup();
                                             for token in tokens {
-                                                let idx_key = DbKey::Composite(vec![
-                                                    DbKey::String(token),
+                                                let idx_key = DbKey::composite(vec![
+                                                    DbKey::string(token),
                                                     key.clone(),
                                                 ]);
                                                 index_batches
@@ -420,7 +420,7 @@ impl Table {
                                         old_keys.push(key.clone());
                                         index_batches.get_mut(&idx.name).unwrap().push(
                                             WalEntry::Delete {
-                                                key: DbKey::Composite(old_keys),
+                                                key: DbKey::composite(old_keys),
                                             },
                                         );
                                     }
@@ -2415,11 +2415,11 @@ impl Database {
                         token_positions.entry(token).or_default().push(pos as u32);
                     }
                     for (token, positions) in token_positions {
-                        let idx_key = DbKey::Composite(vec![DbKey::String(token), pk_key.clone()]);
+                        let idx_key = DbKey::composite(vec![DbKey::string(token), pk_key.clone()]);
                         let value_bytes = bincode::serialize(&positions).unwrap();
                         index_entries.push(WalEntry::Put {
                             key: idx_key,
-                            value: DbValue::Bytes(value_bytes),
+                            value: DbValue::bytes(value_bytes),
                         });
                     }
                 }
@@ -2450,7 +2450,7 @@ impl Database {
                 if keys.len() == columns.len() {
                     keys.push(pk_key);
                     index_entries.push(WalEntry::Put {
-                        key: DbKey::Composite(keys),
+                        key: DbKey::composite(keys),
                         value: DbValue::Null,
                     });
                 }
@@ -2660,8 +2660,8 @@ impl Database {
                         }
                         crate::schema::DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
                         _ => (
-                            DbKey::String("".to_string()),
-                            DbKey::String("\u{10ffff}".to_string()),
+                            DbKey::string(""),
+                            DbKey::string("\u{10ffff}"),
                         ),
                     };
                     min_idx_keys.push(min_val);
@@ -2669,8 +2669,8 @@ impl Database {
                 }
                 min_idx_keys.push(min_pk.clone());
                 max_idx_keys.push(max_pk.clone());
-                let start_bound = DbKey::Composite(min_idx_keys);
-                let end_bound = DbKey::Composite(max_idx_keys);
+                let start_bound = DbKey::composite(min_idx_keys);
+                let end_bound = DbKey::composite(max_idx_keys);
 
                 let mut scan_iter = index_engine.scan_iter(&start_bound, &end_bound)?;
                 let mut entry_count = 0;
@@ -2808,7 +2808,7 @@ impl dtdb_storage::ValueRewriter for RelationalValueRewriter {
             let new_bytes = new_row
                 .to_bytes()
                 .map_err(|e| dtdb_storage::StorageError::Corruption(e.to_string()))?;
-            Ok(DbValue::Bytes(new_bytes))
+            Ok(DbValue::bytes(new_bytes))
         } else {
             Ok(value.clone())
         }

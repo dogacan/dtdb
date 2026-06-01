@@ -356,7 +356,7 @@ pub(crate) fn execution_result_to_responses(
                     .map(|val| match val {
                         DbValue::Int(v) => v.to_string(),
                         DbValue::Float(v) => v.to_string(),
-                        DbValue::String(s) => s.clone(),
+                        DbValue::String(s) => s.to_string(),
                         DbValue::Bytes(b) => format!("{:?}", b),
                         DbValue::Bool(b) => b.to_string(),
                         DbValue::Null => "NULL".to_string(),
@@ -495,7 +495,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                     .map(|val| match val {
                                         DbValue::Int(v) => v.to_string(),
                                         DbValue::Float(v) => v.to_string(),
-                                        DbValue::String(s) => s.clone(),
+                                        DbValue::String(s) => s.to_string(),
                                         DbValue::Bytes(b) => format!("{:?}", b),
                                         DbValue::Bool(b) => b.to_string(),
                                         DbValue::Null => "NULL".to_string(),
@@ -766,7 +766,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                                     .map(|val| match val {
                                                         DbValue::Int(v) => v.to_string(),
                                                         DbValue::Float(v) => v.to_string(),
-                                                        DbValue::String(s) => s.clone(),
+                                                        DbValue::String(s) => s.to_string(),
                                                         DbValue::Bytes(b) => format!("{:?}", b),
                                                         DbValue::Bool(b) => b.to_string(),
                                                         DbValue::Null => "NULL".to_string(),
@@ -934,8 +934,8 @@ fn proto_params_to_db_params(
                 Some(crate::proto::param_value::Val::IntVal(i)) => DbValue::Int(i),
                 Some(crate::proto::param_value::Val::FloatVal(f)) => DbValue::Float(f),
                 Some(crate::proto::param_value::Val::BoolVal(b)) => DbValue::Bool(b),
-                Some(crate::proto::param_value::Val::StringVal(s)) => DbValue::String(s),
-                Some(crate::proto::param_value::Val::BytesVal(b)) => DbValue::Bytes(b),
+                Some(crate::proto::param_value::Val::StringVal(s)) => DbValue::string(s),
+                Some(crate::proto::param_value::Val::BytesVal(b)) => DbValue::bytes(b),
                 Some(crate::proto::param_value::Val::NullVal(_)) => DbValue::Null,
                 None => DbValue::Null,
             },
@@ -1070,7 +1070,7 @@ mod tests {
         let rows = vec![
             dtdb_relational::Row::new(vec![DbValue::Int(10)]),
             dtdb_relational::Row::new(vec![DbValue::Float(1.5)]),
-            dtdb_relational::Row::new(vec![DbValue::Bytes(vec![0xAA, 0xBB])]),
+            dtdb_relational::Row::new(vec![DbValue::bytes(vec![0xAA, 0xBB])]),
             dtdb_relational::Row::new(vec![DbValue::Bool(true)]),
             dtdb_relational::Row::new(vec![DbValue::Null]),
         ];
@@ -1469,9 +1469,9 @@ mod tests {
         assert_eq!(out.get("p3").unwrap(), &DbValue::Bool(true));
         assert_eq!(
             out.get("p4").unwrap(),
-            &DbValue::String("hello".to_string())
+            &DbValue::string("hello")
         );
-        assert_eq!(out.get("p5").unwrap(), &DbValue::Bytes(vec![1, 2]));
+        assert_eq!(out.get("p5").unwrap(), &DbValue::bytes(vec![1, 2]));
         assert_eq!(out.get("p6").unwrap(), &DbValue::Null);
         assert_eq!(out.get("p7").unwrap(), &DbValue::Null);
         assert_eq!(out.get("p8").unwrap(), &DbValue::Null);

@@ -110,19 +110,19 @@ fn convert_cxx_param(p: &ffi::QueryParam) -> dtdb_storage::DbValue {
         ffi::ParamKind::Null => DbValue::Null,
         ffi::ParamKind::Int => match p.value.parse::<i64>() {
             Ok(i) => DbValue::Int(i),
-            Err(_) => DbValue::String(p.value.clone()),
+            Err(_) => DbValue::string(p.value.clone()),
         },
         ffi::ParamKind::Float => match p.value.parse::<f64>() {
             Ok(f) => DbValue::Float(f),
-            Err(_) => DbValue::String(p.value.clone()),
+            Err(_) => DbValue::string(p.value.clone()),
         },
         ffi::ParamKind::Bool => DbValue::Bool(matches!(p.value.as_str(), "1" | "true" | "TRUE")),
         ffi::ParamKind::Bytes => match decode_hex(&p.value) {
-            Some(bytes) => DbValue::Bytes(bytes),
-            None => DbValue::String(p.value.clone()),
+            Some(bytes) => DbValue::bytes(bytes),
+            None => DbValue::string(p.value.clone()),
         },
-        ffi::ParamKind::Text => DbValue::String(p.value.clone()),
-        _ => DbValue::String(p.value.clone()),
+        ffi::ParamKind::Text => DbValue::string(p.value.clone()),
+        _ => DbValue::string(p.value.clone()),
     }
 }
 
@@ -184,7 +184,7 @@ fn handle_in_process_query_result(
                         .map(|val| match val {
                             dtdb_storage::DbValue::Int(v) => v.to_string(),
                             dtdb_storage::DbValue::Float(v) => v.to_string(),
-                            dtdb_storage::DbValue::String(s) => s.clone(),
+                            dtdb_storage::DbValue::String(s) => s.to_string(),
                             dtdb_storage::DbValue::Bytes(b) => format!("{:?}", b),
                             dtdb_storage::DbValue::Bool(b) => b.to_string(),
                             dtdb_storage::DbValue::Null => "NULL".to_string(),
