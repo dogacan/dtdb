@@ -16,6 +16,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
         "t1",
         dtdb_relational::Schema::new(vec![
             Column {
+                id: 0,
                 name: "id".to_string(),
                 data_type: DataType::Int,
                 is_primary_key: true,
@@ -25,6 +26,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
                 is_auto_increment: false,
             },
             Column {
+                id: 0,
                 name: "val".to_string(),
                 data_type: DataType::Int,
                 is_primary_key: false,
@@ -50,6 +52,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
         "t2",
         dtdb_relational::Schema::new(vec![
             Column {
+                id: 0,
                 name: "id".to_string(),
                 data_type: DataType::Int,
                 is_primary_key: true,
@@ -59,6 +62,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
                 is_auto_increment: false,
             },
             Column {
+                id: 0,
                 name: "a".to_string(),
                 data_type: DataType::Int,
                 is_primary_key: false,
@@ -75,6 +79,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
     db.create_table(
         "t_str",
         dtdb_relational::Schema::new(vec![Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: true,
@@ -828,6 +833,7 @@ fn test_additional_optimizer_edge_cases() {
     // 6. Optimizer stats_opt is None check (lines 604-606 & 679-681)
     let schema_fake = dtdb_relational::Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -837,6 +843,7 @@ fn test_additional_optimizer_edge_cases() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "val".to_string(),
             data_type: DataType::Int,
             is_primary_key: false,
@@ -871,6 +878,7 @@ fn test_additional_optimizer_edge_cases() {
         tokenizer: None,
     });
     schema_fts.columns.push(Column {
+        id: 0,
         name: "val_str".to_string(),
         data_type: DataType::String,
         is_primary_key: false,

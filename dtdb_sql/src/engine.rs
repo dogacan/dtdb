@@ -897,6 +897,8 @@ impl SqlEngine {
 
                 // 4. Wrap the result in a select output with "Query Plan" schema column
                 let schema = Schema::new(vec![dtdb_relational::Column {
+                    // Ephemeral EXPLAIN output column; id is unused (not persisted).
+                    id: 0,
                     name: "Query Plan".to_string(),
                     data_type: DataType::String,
                     is_primary_key: false,

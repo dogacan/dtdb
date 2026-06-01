@@ -8,6 +8,7 @@ use tempfile::TempDir;
 fn create_user_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -17,6 +18,7 @@ fn create_user_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -624,6 +626,7 @@ fn test_occ_si_race() {
 fn create_user_index_schema() -> Schema {
     let mut s = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -633,6 +636,7 @@ fn create_user_index_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "age".to_string(),
             data_type: DataType::Int,
             is_primary_key: false,
@@ -706,6 +710,7 @@ fn test_occ_phantom_read_index_scan() {
 fn create_user_fts_schema() -> Schema {
     let mut s = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -715,6 +720,7 @@ fn create_user_fts_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "bio".to_string(),
             data_type: DataType::String,
             is_primary_key: false,

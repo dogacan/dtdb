@@ -12,6 +12,7 @@ use tempfile::TempDir;
 fn create_test_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -21,6 +22,7 @@ fn create_test_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -30,6 +32,7 @@ fn create_test_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
@@ -374,6 +377,7 @@ fn test_drop_table_stranded_cleanup_on_startup() {
 fn auto_inc_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -383,6 +387,7 @@ fn auto_inc_schema() -> Schema {
             is_auto_increment: true,
         },
         Column {
+            id: 0,
             name: "val".to_string(),
             data_type: DataType::Int,
             is_primary_key: false,
@@ -462,6 +467,7 @@ fn test_locality_group_pruning_verification() {
     // 3. "lg_score" for score
     let schema = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -471,6 +477,7 @@ fn test_locality_group_pruning_verification() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -480,6 +487,7 @@ fn test_locality_group_pruning_verification() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
@@ -615,6 +623,120 @@ fn test_scan_iter_single_group_fast_path() {
     assert!(empty.is_empty());
 }
 
+/// A four-column schema (the 3-column `create_test_schema` plus a `verified`
+/// bool column with a default), modeling the result of a lazy
+/// `ALTER TABLE ADD COLUMN verified BOOL DEFAULT true`. `default_value` is what
+/// the read path substitutes for rows that predate the column (ADR 0003).
+fn create_test_schema_with_added_column(default: Option<DbValue>) -> Schema {
+    let mut schema = create_test_schema();
+    schema.columns.push(Column {
+        id: schema.next_column_id,
+        name: "verified".to_string(),
+        data_type: DataType::Bool,
+        is_primary_key: false,
+        is_nullable: true,
+        locality_group: None,
+        default_value: default,
+        is_auto_increment: false,
+    });
+    schema.next_column_id += 1;
+    schema
+}
+
+/// End-to-end check of lazy `ADD COLUMN` reconciliation through the real scan
+/// path. We reproduce exactly the on-disk state a metadata-only ADD produces:
+/// rows are written under the original N-column schema, then `schema.bin` is
+/// replaced with an (N+1)-column schema and the database reopened. The added
+/// column's bytes are absent from every stored row, so the scan must pad them
+/// with the column's default. This is the single-locality-group fast path.
+#[test]
+fn test_add_column_reconciles_old_rows_on_scan_single_group() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // 1. Original 3-column table; insert rows that predate the new column.
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.put("users", k_int(2), r_user(2, "Bob", 80.25)).unwrap();
+        tx.commit().unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // 2. Simulate the lazy ALTER's atomic schema swap: overwrite schema.bin with
+    //    the 4-column schema (added `verified BOOL DEFAULT true`). No row bytes
+    //    are touched -- exactly what a metadata-only ADD does.
+    let schema_path = temp_dir.path().join("users").join("schema.bin");
+    create_test_schema_with_added_column(Some(DbValue::Bool(true)))
+        .save_to_file(&schema_path, dtdb_storage::FsyncMethod::Fullfsync)
+        .unwrap();
+
+    // 3. Reopen and scan. Old rows must come back full width with the default.
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+    let rows = drain_scan(
+        table
+            .scan_iter(&k_int(i64::MIN), &k_int(i64::MAX), None)
+            .unwrap(),
+    );
+    let mut alice = r_user(1, "Alice", 95.5).values;
+    alice.push(DbValue::Bool(true));
+    let mut bob = r_user(2, "Bob", 80.25).values;
+    bob.push(DbValue::Bool(true));
+    assert_eq!(
+        rows,
+        vec![(k_int(1), Row::new(alice)), (k_int(2), Row::new(bob))]
+    );
+
+    // A point get goes through the merge path; it must reconcile identically.
+    let got = table.get(&k_int(2), None).unwrap().unwrap();
+    assert_eq!(
+        got.values,
+        vec![
+            DbValue::Int(2),
+            DbValue::String("Bob".to_string()),
+            DbValue::Float(80.25),
+            DbValue::Bool(true),
+        ]
+    );
+
+    // A row inserted *after* the ALTER carries the new column explicitly; mixing
+    // it with reconciled old rows must yield consistent full-width rows.
+    let tx = Transaction::new(2, db.clone());
+    let mut carol = r_user(3, "Carol", 70.0).values;
+    carol.push(DbValue::Bool(false));
+    tx.put("users", k_int(3), Row::new(carol)).unwrap();
+    tx.commit().unwrap();
+    let table = db.get_table("users").unwrap();
+    let after = table.get(&k_int(3), None).unwrap().unwrap();
+    assert_eq!(after.values.last(), Some(&DbValue::Bool(false)));
+}
+
+/// Same lazy-ADD reconciliation, but the column has no default, so old rows must
+/// pad to NULL rather than a value.
+#[test]
+fn test_add_column_without_default_pads_null() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+        db.checkpoint().unwrap();
+    }
+    let schema_path = temp_dir.path().join("users").join("schema.bin");
+    create_test_schema_with_added_column(None)
+        .save_to_file(&schema_path, dtdb_storage::FsyncMethod::Fullfsync)
+        .unwrap();
+
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(got.values.last(), Some(&DbValue::Null));
+}
+
 /// Guards the *other* side of the gate: a genuinely multi-locality-group table
 /// must keep using the merge path. A full scan (all groups) has to reassemble
 /// each row from its per-group sub-rows; the fast path would be wrong here, so
@@ -626,6 +748,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
 
     let schema = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -635,6 +758,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -644,6 +768,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,

@@ -317,6 +317,7 @@ fn main() {
     // (inherent) vs the merge glue on top.
     let mg_schema = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -326,6 +327,7 @@ fn main() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "k".to_string(),
             data_type: DataType::Int,
             is_primary_key: false,
@@ -335,6 +337,7 @@ fn main() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "v".to_string(),
             data_type: DataType::String,
             is_primary_key: false,

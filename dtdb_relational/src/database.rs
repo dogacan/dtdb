@@ -835,7 +835,11 @@ impl TableScanIterator {
                 self.group_peeks[0] = iter.next()?;
             }
             let row = match value {
-                DbValue::Bytes(bytes) => Row::from_bytes(&bytes)?,
+                // Reconcile to the current schema width: a row stored before a
+                // later `ALTER TABLE ADD COLUMN` decodes short, and `reconcile_row`
+                // pads the missing trailing columns with their defaults so no
+                // short row escapes the scan (see ADR 0003).
+                DbValue::Bytes(bytes) => self.schema.reconcile_row(Row::from_bytes(&bytes)?),
                 // Mirror the general path: a non-Bytes value yields a row of
                 // all-NULLs (a missing/None group contributes only NULLs).
                 _ => Row::new(vec![DbValue::Null; self.schema.columns.len()]),
@@ -879,7 +883,10 @@ impl TableScanIterator {
 
         // Index-keyed merge: copy each column from its slot's sub-row at the
         // precomputed relative index. No group-name hashing, no per-row map.
-        let mut full_values = vec![DbValue::Null; self.schema.columns.len()];
+        // Seed with per-column defaults (not bare NULL) so a column added by a
+        // later `ALTER TABLE` that an old sub-row predates -- its relative index
+        // is past that sub-row's end -- reconciles to its default (see ADR 0003).
+        let mut full_values = self.schema.default_row_values();
         for (col_idx, (slot, rel_idx)) in self.column_mapping.iter().enumerate() {
             if let Some(slot) = slot
                 && let Some(sub_row) = &self.row_parts[*slot]

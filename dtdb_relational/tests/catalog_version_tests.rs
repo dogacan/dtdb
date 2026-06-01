@@ -8,6 +8,7 @@ use tempfile::TempDir;
 fn create_test_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -17,6 +18,7 @@ fn create_test_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -130,7 +132,8 @@ fn test_stats_version_bumps_only_on_change() {
     // Insert rows, then analyze. First-ever statistics count as a change, so
     // the epoch advances 0 -> 1.
     let tx = Transaction::new(1, db.clone());
-    tx.put("users", DbKey::Int(1), user_row(1, "alice")).unwrap();
+    tx.put("users", DbKey::Int(1), user_row(1, "alice"))
+        .unwrap();
     tx.put("users", DbKey::Int(2), user_row(2, "bob")).unwrap();
     tx.commit().unwrap();
 
@@ -149,7 +152,8 @@ fn test_stats_version_bumps_only_on_change() {
 
     // New data shifts the statistics, so the epoch advances 1 -> 2.
     let tx = Transaction::new(4, db.clone());
-    tx.put("users", DbKey::Int(3), user_row(3, "carol")).unwrap();
+    tx.put("users", DbKey::Int(3), user_row(3, "carol"))
+        .unwrap();
     tx.commit().unwrap();
 
     let tx = Transaction::new(5, db.clone());
@@ -168,7 +172,8 @@ fn test_stats_version_reset_on_drop() {
     // before the later drop_table, which spin-waits for active readers.
     {
         let tx = Transaction::new(1, db.clone());
-        tx.put("users", DbKey::Int(1), user_row(1, "alice")).unwrap();
+        tx.put("users", DbKey::Int(1), user_row(1, "alice"))
+            .unwrap();
         tx.commit().unwrap();
     }
     {

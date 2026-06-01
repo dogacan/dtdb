@@ -320,6 +320,10 @@ impl LogicalPlanner {
                     }
 
                     cols.push(Column {
+                        // Real catalog column, but the id here is a placeholder:
+                        // these columns are handed to `Schema::new`, which is the
+                        // chokepoint that renumbers them 0..n (see ADR 0003).
+                        id: 0,
                         name: col.name.value.clone(),
                         data_type: dt,
                         is_primary_key: is_pk,
