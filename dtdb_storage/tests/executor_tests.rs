@@ -208,16 +208,27 @@ fn periodic_fires_and_is_cancelled_on_handle_drop() {
         )
     };
 
-    // Let it fire a few times.
-    std::thread::sleep(Duration::from_millis(150));
-    let observed = ticks.load(Ordering::SeqCst);
-    assert!(observed >= 2, "expected several ticks, got {observed}");
+    // Poll until the periodic task has fired repeatedly. A 20ms period needs only
+    // ~40ms in the happy path, but a starved scheduler can stretch that out, so we
+    // wait up to a few seconds rather than asserting after one fixed sleep.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ticks.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected several ticks within 5s, got {}",
+            ticks.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
-    // Dropping the handle stops further ticks.
+    // Dropping the handle stops further ticks. Let any tick that was already
+    // in flight settle, then confirm the count holds steady across a window that
+    // spans several periods — if cancellation were broken, ticks would keep
+    // climbing here.
     drop(handle);
-    std::thread::sleep(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(100));
     let after_cancel = ticks.load(Ordering::SeqCst);
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
         ticks.load(Ordering::SeqCst),
         after_cancel,
