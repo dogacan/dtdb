@@ -751,10 +751,7 @@ fn test_occ_phantom_read_fts_scan() {
         tx.put(
             "users",
             k_int(1),
-            Row::new(vec![
-                DbValue::Int(1),
-                DbValue::string("hello world"),
-            ]),
+            Row::new(vec![DbValue::Int(1), DbValue::string("hello world")]),
         )
         .unwrap();
         tx.commit().unwrap();
@@ -770,10 +767,7 @@ fn test_occ_phantom_read_fts_scan() {
     tx2.put(
         "users",
         k_int(2),
-        Row::new(vec![
-            DbValue::Int(2),
-            DbValue::string("rust is fast"),
-        ]),
+        Row::new(vec![DbValue::Int(2), DbValue::string("rust is fast")]),
     )
     .unwrap();
     tx2.commit().unwrap();

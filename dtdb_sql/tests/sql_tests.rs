@@ -310,10 +310,7 @@ fn test_sql_like_wildcard() {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values[1], DbValue::string("abc-123"));
         assert_eq!(rows[1].values[1], DbValue::string("abc-789"));
-        assert_eq!(
-            rows[2].values[1],
-            DbValue::string("xyz-abc-999")
-        );
+        assert_eq!(rows[2].values[1], DbValue::string("xyz-abc-999"));
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -741,10 +738,7 @@ fn test_sql_update() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values[0],
-            DbValue::string("AliceUpdated")
-        );
+        assert_eq!(rows[0].values[0], DbValue::string("AliceUpdated"));
         assert_eq!(rows[0].values[1], DbValue::Float(95.5));
     } else {
         panic!("Expected Select");
@@ -1046,10 +1040,7 @@ fn test_sql_case_and_functions() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
-        assert_eq!(
-            rows[0].values[1],
-            DbValue::string("Electronics")
-        );
+        assert_eq!(rows[0].values[1], DbValue::string("Electronics"));
         assert_eq!(rows[1].values[1], DbValue::string("")); // Mouse category is empty "" -> NOT Null -> no fallback
         assert_eq!(rows[2].values[1], DbValue::string("Furniture"));
     } else {
@@ -1817,10 +1808,7 @@ fn test_sql_pass1_scalar_features() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], DbValue::string("CHARLIE"));
         assert_eq!(rows[0].values[1], DbValue::string("furniture"));
-        assert_eq!(
-            rows[0].values[2],
-            DbValue::string("Charlie-Furniture")
-        );
+        assert_eq!(rows[0].values[2], DbValue::string("Charlie-Furniture"));
         assert_eq!(rows[0].values[3], DbValue::Float(3.2));
         assert_eq!(rows[0].values[4], DbValue::Float(-3.0));
     } else {
@@ -1864,18 +1852,9 @@ fn test_sql_pass2_table_and_join_features() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            rows[0].values,
-            vec![DbValue::string("A"), DbValue::Int(10)]
-        );
-        assert_eq!(
-            rows[1].values,
-            vec![DbValue::string("A"), DbValue::Int(20)]
-        );
-        assert_eq!(
-            rows[2].values,
-            vec![DbValue::string("B"), DbValue::Int(30)]
-        );
+        assert_eq!(rows[0].values, vec![DbValue::string("A"), DbValue::Int(10)]);
+        assert_eq!(rows[1].values, vec![DbValue::string("A"), DbValue::Int(20)]);
+        assert_eq!(rows[2].values, vec![DbValue::string("B"), DbValue::Int(30)]);
     } else {
         panic!("Expected Select");
     }
@@ -1909,10 +1888,7 @@ fn test_sql_pass2_table_and_join_features() {
         // SUM over an INT column now finalizes as Int (matching the schema
         // declared by the logical planner). It previously returned Float
         // unconditionally.
-        assert_eq!(
-            rows[0].values,
-            vec![DbValue::string("A"), DbValue::Int(30)]
-        );
+        assert_eq!(rows[0].values, vec![DbValue::string("A"), DbValue::Int(30)]);
     } else {
         panic!("Expected Select");
     }
@@ -1925,14 +1901,8 @@ fn test_sql_pass2_table_and_join_features() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].values,
-            vec![DbValue::string("A"), DbValue::Int(2)]
-        );
-        assert_eq!(
-            rows[1].values,
-            vec![DbValue::string("B"), DbValue::Int(1)]
-        );
+        assert_eq!(rows[0].values, vec![DbValue::string("A"), DbValue::Int(2)]);
+        assert_eq!(rows[1].values, vec![DbValue::string("B"), DbValue::Int(1)]);
     } else {
         panic!("Expected Select");
     }
@@ -2029,27 +1999,15 @@ fn test_sql_pass3_schema_and_constraints() {
             assert_eq!(rows.len(), 3);
             assert_eq!(
                 rows[0].values,
-                vec![
-                    DbValue::Int(1),
-                    DbValue::Int(10),
-                    DbValue::string("admin")
-                ]
+                vec![DbValue::Int(1), DbValue::Int(10), DbValue::string("admin")]
             );
             assert_eq!(
                 rows[1].values,
-                vec![
-                    DbValue::Int(1),
-                    DbValue::Int(20),
-                    DbValue::string("user")
-                ]
+                vec![DbValue::Int(1), DbValue::Int(20), DbValue::string("user")]
             );
             assert_eq!(
                 rows[2].values,
-                vec![
-                    DbValue::Int(2),
-                    DbValue::Int(10),
-                    DbValue::string("admin")
-                ]
+                vec![DbValue::Int(2), DbValue::Int(10), DbValue::string("admin")]
             );
         } else {
             panic!("Expected Select");
@@ -2110,11 +2068,7 @@ fn test_sql_pass3_schema_and_constraints() {
             );
             assert_eq!(
                 rows[1].values,
-                vec![
-                    DbValue::Int(2),
-                    DbValue::string("Bob"),
-                    DbValue::Int(42)
-                ]
+                vec![DbValue::Int(2), DbValue::string("Bob"), DbValue::Int(42)]
             );
         } else {
             panic!("Expected Select");
@@ -2975,10 +2929,7 @@ fn test_sql_optimizer_join_order_reordering() {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values,
-            vec![
-                DbValue::string("one"),
-                DbValue::string("one")
-            ]
+            vec![DbValue::string("one"), DbValue::string("one")]
         );
     } else {
         panic!("Expected Select result");
@@ -3019,31 +2970,19 @@ fn test_sql_cross_join_lazy_and_correctness() {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows[0].values,
-            vec![
-                DbValue::string("a"),
-                DbValue::string("x")
-            ]
+            vec![DbValue::string("a"), DbValue::string("x")]
         );
         assert_eq!(
             rows[1].values,
-            vec![
-                DbValue::string("a"),
-                DbValue::string("y")
-            ]
+            vec![DbValue::string("a"), DbValue::string("y")]
         );
         assert_eq!(
             rows[2].values,
-            vec![
-                DbValue::string("b"),
-                DbValue::string("x")
-            ]
+            vec![DbValue::string("b"), DbValue::string("x")]
         );
         assert_eq!(
             rows[3].values,
-            vec![
-                DbValue::string("b"),
-                DbValue::string("y")
-            ]
+            vec![DbValue::string("b"), DbValue::string("y")]
         );
     } else {
         panic!("Expected Select result");
@@ -4328,10 +4267,7 @@ fn test_sql_sorted_aggregate() {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0].values,
-            vec![
-                DbValue::string("Engineering"),
-                DbValue::Float(110.0)
-            ]
+            vec![DbValue::string("Engineering"), DbValue::Float(110.0)]
         );
         assert_eq!(
             rows[1].values,
@@ -5112,11 +5048,7 @@ fn test_prepared_statement_replanned_after_ddl() {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].values,
-                    vec![
-                        DbValue::Int(1),
-                        DbValue::string("a"),
-                        DbValue::Int(42)
-                    ]
+                    vec![DbValue::Int(1), DbValue::string("a"), DbValue::Int(42)]
                 );
             }
             _ => panic!("expected Select"),

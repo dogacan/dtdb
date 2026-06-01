@@ -559,7 +559,9 @@ impl Expr {
                             if start_rust >= chars.len() {
                                 Ok(DbValue::string(""))
                             } else {
-                                Ok(DbValue::string(chars[start_rust..].iter().collect::<String>()))
+                                Ok(DbValue::string(
+                                    chars[start_rust..].iter().collect::<String>(),
+                                ))
                             }
                         } else {
                             let len_val = args[2].eval(row, schema)?;
@@ -591,9 +593,7 @@ impl Expr {
                                 let active_end = end_idx.clamp(0, n) as usize;
                                 if active_start < active_end && active_start < chars.len() {
                                     Ok(DbValue::string(
-                                        chars[active_start..active_end]
-                                            .iter()
-                                            .collect::<String>(),
+                                        chars[active_start..active_end].iter().collect::<String>(),
                                     ))
                                 } else {
                                     Ok(DbValue::string(""))
@@ -1412,11 +1412,7 @@ mod tests {
             DbValue::string("abc")
         );
         assert_eq!(
-            eval(&func(
-                "CONCAT",
-                vec![DbValue::string("a"), DbValue::Int(2)]
-            ))
-            .unwrap(),
+            eval(&func("CONCAT", vec![DbValue::string("a"), DbValue::Int(2)])).unwrap(),
             DbValue::string("a2")
         );
         // case-insensitive name.

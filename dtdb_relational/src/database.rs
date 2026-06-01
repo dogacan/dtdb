@@ -2659,10 +2659,7 @@ impl Database {
                             (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX))
                         }
                         crate::schema::DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
-                        _ => (
-                            DbKey::string(""),
-                            DbKey::string("\u{10ffff}"),
-                        ),
+                        _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
                     };
                     min_idx_keys.push(min_val);
                     max_idx_keys.push(max_val);
