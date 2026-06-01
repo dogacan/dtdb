@@ -363,3 +363,162 @@ fn merge_chunk<P: Serialize + DeserializeOwned>(
         remaining: count as usize,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtdb_storage::DbValue;
+    use std::rc::Rc;
+
+    #[test]
+    fn test_type_rank_and_total_compare() {
+        // Null (0) < Bool (1) < Int (2) < Float (3) < String (4) < Bytes (5)
+        assert_eq!(type_rank(&DbValue::Null), 0);
+        assert_eq!(type_rank(&DbValue::Bool(true)), 1);
+        assert_eq!(type_rank(&DbValue::Int(42)), 2);
+        assert_eq!(type_rank(&DbValue::Float(1.5)), 3);
+        assert_eq!(type_rank(&DbValue::String("hello".to_string())), 4);
+        assert_eq!(type_rank(&DbValue::Bytes(vec![1])), 5);
+
+        // Different variant comparison
+        assert_eq!(
+            total_compare(&DbValue::Null, &DbValue::Bool(false)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Int(10), &DbValue::Float(1.0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::String("a".to_string()), &DbValue::Bytes(vec![])),
+            Ordering::Less
+        );
+
+        // Same variant comparison - Null
+        assert_eq!(
+            total_compare(&DbValue::Null, &DbValue::Null),
+            Ordering::Equal
+        );
+
+        // Same variant comparison - Bool
+        assert_eq!(
+            total_compare(&DbValue::Bool(false), &DbValue::Bool(true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Bool(true), &DbValue::Bool(true)),
+            Ordering::Equal
+        );
+
+        // Same variant comparison - Int
+        assert_eq!(
+            total_compare(&DbValue::Int(5), &DbValue::Int(10)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Int(5), &DbValue::Int(5)),
+            Ordering::Equal
+        );
+
+        // Same variant comparison - Float
+        assert_eq!(
+            total_compare(&DbValue::Float(1.0), &DbValue::Float(2.0)),
+            Ordering::Less
+        );
+        // NaN behavior
+        assert_eq!(
+            total_compare(&DbValue::Float(f64::NAN), &DbValue::Float(f64::NAN)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            total_compare(&DbValue::Float(1.0), &DbValue::Float(f64::NAN)),
+            Ordering::Less
+        );
+
+        // Same variant comparison - String
+        assert_eq!(
+            total_compare(
+                &DbValue::String("abc".to_string()),
+                &DbValue::String("def".to_string())
+            ),
+            Ordering::Less
+        );
+
+        // Same variant comparison - Bytes
+        assert_eq!(
+            total_compare(&DbValue::Bytes(vec![1, 2]), &DbValue::Bytes(vec![1, 3])),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Bytes(vec![1, 2]), &DbValue::Bytes(vec![1, 2])),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_estimate_value_size() {
+        let size_int = estimate_value_size(&DbValue::Int(42));
+        assert!(size_int > 0);
+
+        let size_str = estimate_value_size(&DbValue::String("hello".to_string()));
+        let size_bytes = estimate_value_size(&DbValue::Bytes(vec![1, 2, 3]));
+        assert_eq!(size_str, std::mem::size_of::<DbValue>() + 5);
+        assert_eq!(size_bytes, std::mem::size_of::<DbValue>() + 3);
+
+        let row_size = estimate_row_size(&[DbValue::Int(1)], &[DbValue::String("a".to_string())]);
+        assert!(row_size > 0);
+    }
+
+    #[test]
+    fn test_heap_entry_eq() {
+        let directions = Rc::new(vec![true]);
+        let e1 = HeapEntry {
+            sort_keys: vec![DbValue::Int(10)],
+            payload: "p1",
+            run_index: 0,
+            directions: Rc::clone(&directions),
+        };
+        let e2 = HeapEntry {
+            sort_keys: vec![DbValue::Int(10)],
+            payload: "p2",
+            run_index: 1,
+            directions: Rc::clone(&directions),
+        };
+        let e3 = HeapEntry {
+            sort_keys: vec![DbValue::Int(20)],
+            payload: "p1",
+            run_index: 0,
+            directions: Rc::clone(&directions),
+        };
+
+        assert!(e1 == e2);
+        assert!(e1 != e3);
+    }
+
+    #[test]
+    fn test_cascade_merge_lone_run() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Create 65 runs to exceed MAX_FANIN (64), forcing a cascading merge.
+        // This will result in one chunk of 64 runs being merged, and a second chunk of 1 run.
+        // The second chunk is a lone run and hits the `1 => next_runs.push(...)` branch.
+        let mut runs = Vec::new();
+        for i in 0..65 {
+            let buffer = vec![(vec![DbValue::Int(i as i64)], i as i64)];
+            let run = write_run(temp_dir.path(), "test_cascade", &buffer).unwrap();
+            runs.push(run);
+        }
+
+        let mut merger = KWayMerge::new(runs, vec![true], temp_dir.path(), "test_cascade").unwrap();
+
+        let mut results = Vec::new();
+        while let Some((keys, payload)) = merger.next().unwrap() {
+            results.push((keys, payload));
+        }
+
+        assert_eq!(results.len(), 65);
+        for (i, (keys, payload)) in results.iter().enumerate() {
+            assert_eq!(keys[0], DbValue::Int(i as i64));
+            assert_eq!(*payload, i as i64);
+        }
+    }
+}

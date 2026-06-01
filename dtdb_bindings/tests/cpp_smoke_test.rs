@@ -15,9 +15,13 @@ fn ensure_static_lib(profile_dir: &Path, workspace_root: &Path) {
     // Detect target triple
     let parent = profile_dir.parent().unwrap();
     if parent.file_name().map(|n| n.to_str()) != Some(Some("target")) {
-        // Parent directory is target triple folder
+        // Parent directory is target triple folder or custom target-dir
         if let Some(target_triple) = parent.file_name().and_then(|n| n.to_str()) {
-            cmd.arg("--target").arg(target_triple);
+            if target_triple == "llvm-cov-target" {
+                cmd.arg("--target-dir").arg(parent);
+            } else {
+                cmd.arg("--target").arg(target_triple);
+            }
         }
     }
 

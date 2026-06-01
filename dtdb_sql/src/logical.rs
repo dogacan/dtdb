@@ -627,3 +627,368 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
         Expr::Parameter(_) => DataType::Null,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtdb_relational::{Column, DataType, Schema};
+    use dtdb_storage::{DbKey, DbValue};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_substitute_params_scan_and_index_scan() {
+        let mut plan = LogicalPlan::Scan {
+            table_name: "users".to_string(),
+            schema: Schema::new(vec![]),
+            range: Some((
+                PlanKey::Parameter("p1".to_string()),
+                PlanKey::Parameter("p2".to_string()),
+            )),
+        };
+
+        let mut params = HashMap::new();
+        params.insert("p1".to_string(), DbValue::Int(42));
+        params.insert("p2".to_string(), DbValue::String("hello".to_string()));
+
+        plan.substitute_params(&params).unwrap();
+
+        if let LogicalPlan::Scan { range, .. } = plan {
+            let (start, end) = range.unwrap();
+            assert_eq!(start, PlanKey::Value(DbKey::Int(42)));
+            assert_eq!(end, PlanKey::Value(DbKey::String("hello".to_string())));
+        } else {
+            panic!("Expected Scan");
+        }
+
+        // Test IndexScan range substitution too
+        let mut idx_plan = LogicalPlan::IndexScan {
+            table_name: "users".to_string(),
+            index_name: "idx_name".to_string(),
+            schema: Schema::new(vec![]),
+            range: Some((
+                PlanKey::Parameter("p1".to_string()),
+                PlanKey::Parameter("p2".to_string()),
+            )),
+        };
+
+        idx_plan.substitute_params(&params).unwrap();
+
+        if let LogicalPlan::IndexScan { range, .. } = idx_plan {
+            let (start, end) = range.unwrap();
+            assert_eq!(start, PlanKey::Value(DbKey::Int(42)));
+            assert_eq!(end, PlanKey::Value(DbKey::String("hello".to_string())));
+        } else {
+            panic!("Expected IndexScan");
+        }
+    }
+
+    #[test]
+    fn test_substitute_params_unbound_and_invalid_type() {
+        let mut plan = LogicalPlan::Scan {
+            table_name: "users".to_string(),
+            schema: Schema::new(vec![]),
+            range: Some((
+                PlanKey::Parameter("p1".to_string()),
+                PlanKey::Parameter("p2".to_string()),
+            )),
+        };
+
+        let mut params = HashMap::new();
+        params.insert("p1".to_string(), DbValue::Int(42));
+        // p2 is unbound
+        let res = plan.substitute_params(&params);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Unbound parameter"));
+
+        // p2 bound to unsupported type
+        params.insert("p2".to_string(), DbValue::Bool(true));
+        let res = plan.substitute_params(&params);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Unsupported key parameter type"));
+    }
+
+    #[test]
+    fn test_substitute_params_recursion() {
+        let child = LogicalPlan::Scan {
+            table_name: "users".to_string(),
+            schema: Schema::new(vec![]),
+            range: Some((
+                PlanKey::Parameter("p1".to_string()),
+                PlanKey::Parameter("p2".to_string()),
+            )),
+        };
+
+        let mut plan = LogicalPlan::Filter {
+            source: Box::new(child),
+            predicate: Expr::Parameter("p3".to_string()),
+        };
+
+        let mut params = HashMap::new();
+        params.insert("p1".to_string(), DbValue::Int(42));
+        params.insert("p2".to_string(), DbValue::String("hello".to_string()));
+        params.insert("p3".to_string(), DbValue::Bool(true));
+
+        plan.substitute_params(&params).unwrap();
+
+        if let LogicalPlan::Filter { source, predicate } = plan {
+            assert_eq!(predicate, Expr::Literal(DbValue::Bool(true)));
+            if let LogicalPlan::Scan { range, .. } = *source {
+                let (start, end) = range.unwrap();
+                assert_eq!(start, PlanKey::Value(DbKey::Int(42)));
+                assert_eq!(end, PlanKey::Value(DbKey::String("hello".to_string())));
+            } else {
+                panic!("Expected child Scan");
+            }
+        } else {
+            panic!("Expected Filter");
+        }
+    }
+
+    #[test]
+    fn test_substitute_params_other_operators() {
+        let child = LogicalPlan::Scan {
+            table_name: "users".to_string(),
+            schema: Schema::new(vec![]),
+            range: None,
+        };
+
+        // Projection
+        let mut proj = LogicalPlan::Projection {
+            source: Box::new(child.clone()),
+            expressions: vec![Expr::Parameter("p".to_string())],
+            field_names: vec!["f".to_string()],
+            schema: Schema::new(vec![]),
+        };
+        // Join
+        let mut join = LogicalPlan::Join {
+            left: Box::new(child.clone()),
+            right: Box::new(child.clone()),
+            condition: Expr::Parameter("p".to_string()),
+            join_type: JoinType::Inner,
+            schema: Schema::new(vec![]),
+        };
+        // Aggregate
+        let mut agg = LogicalPlan::Aggregate {
+            source: Box::new(child.clone()),
+            group_by: vec![Expr::Parameter("p".to_string())],
+            aggrs: vec![AggregateExpr::Count {
+                expr: Expr::Parameter("p".to_string()),
+                distinct: false,
+            }],
+            field_names: vec!["f1".to_string(), "f2".to_string()],
+            schema: Schema::new(vec![]),
+        };
+        // Sort
+        let mut sort = LogicalPlan::Sort {
+            source: Box::new(child.clone()),
+            keys: vec![(Expr::Parameter("p".to_string()), true)],
+        };
+        // Limit
+        let mut limit = LogicalPlan::Limit {
+            source: Box::new(child.clone()),
+            limit: Some(10),
+            offset: 0,
+        };
+        // Distinct
+        let mut distinct = LogicalPlan::Distinct {
+            source: Box::new(child.clone()),
+        };
+        // SetOp
+        let mut setop = LogicalPlan::SetOp {
+            left: Box::new(child.clone()),
+            right: Box::new(child.clone()),
+            op: SetOpType::Union,
+            all: true,
+        };
+
+        let mut params = HashMap::new();
+        params.insert("p".to_string(), DbValue::Int(1));
+
+        proj.substitute_params(&params).unwrap();
+        join.substitute_params(&params).unwrap();
+        agg.substitute_params(&params).unwrap();
+        sort.substitute_params(&params).unwrap();
+        limit.substitute_params(&params).unwrap();
+        distinct.substitute_params(&params).unwrap();
+        setop.substitute_params(&params).unwrap();
+
+        // Check substitution took place
+        if let LogicalPlan::Projection { expressions, .. } = proj {
+            assert_eq!(expressions[0], Expr::Literal(DbValue::Int(1)));
+        } else {
+            panic!();
+        }
+
+        if let LogicalPlan::Join { condition, .. } = join {
+            assert_eq!(condition, Expr::Literal(DbValue::Int(1)));
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_new_aggregate_fallbacks() {
+        let cols = vec![Column {
+            id: 1,
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        }];
+        let schema = Schema::new(cols);
+        let scan = LogicalPlan::Scan {
+            table_name: "t".to_string(),
+            schema: schema.clone(),
+            range: None,
+        };
+
+        // Group-by column not in schema and group-by expression not Expr::Column
+        let agg = LogicalPlan::new_aggregate(
+            scan.clone(),
+            vec![
+                Expr::Column("nonexistent".to_string(), None),
+                Expr::Literal(DbValue::Int(1)),
+            ],
+            vec![
+                AggregateExpr::Sum {
+                    expr: Expr::Column("nonexistent".to_string(), None),
+                    distinct: false,
+                },
+                AggregateExpr::Min {
+                    expr: Expr::Literal(DbValue::Int(1)),
+                    distinct: false,
+                },
+            ],
+            vec![
+                "g1".to_string(),
+                "g2".to_string(),
+                "agg1".to_string(),
+                "agg2".to_string(),
+            ],
+        );
+
+        let agg_schema = agg.schema();
+        assert_eq!(agg_schema.columns[0].data_type, DataType::String);
+        assert_eq!(agg_schema.columns[1].data_type, DataType::String);
+        assert_eq!(agg_schema.columns[2].data_type, DataType::Float);
+        assert_eq!(agg_schema.columns[3].data_type, DataType::Float);
+    }
+
+    #[test]
+    fn test_infer_expr_type_variants() {
+        let schema = Schema::new(vec![]);
+        // DbValue Float, Bytes, Bool, Null
+        assert_eq!(
+            infer_expr_type(&Expr::Literal(DbValue::Float(1.0)), &schema),
+            DataType::Float
+        );
+        assert_eq!(
+            infer_expr_type(&Expr::Literal(DbValue::Bytes(vec![])), &schema),
+            DataType::Bytes
+        );
+        assert_eq!(
+            infer_expr_type(&Expr::Literal(DbValue::Bool(true)), &schema),
+            DataType::Bool
+        );
+        assert_eq!(
+            infer_expr_type(&Expr::Literal(DbValue::Null), &schema),
+            DataType::Null
+        );
+
+        // Case
+        let case_expr_fallback = Expr::Case {
+            operand: None,
+            conditions: vec![],
+            results: vec![],
+            else_result: None,
+        };
+        assert_eq!(infer_expr_type(&case_expr_fallback, &schema), DataType::Int);
+
+        let case_expr_else = Expr::Case {
+            operand: None,
+            conditions: vec![],
+            results: vec![],
+            else_result: Some(Box::new(Expr::Literal(DbValue::Float(1.0)))),
+        };
+        assert_eq!(infer_expr_type(&case_expr_else, &schema), DataType::Float);
+
+        // Function Coalesce fallback
+        let coalesce_fallback = Expr::Function {
+            name: "COALESCE".to_string(),
+            args: vec![],
+        };
+        assert_eq!(infer_expr_type(&coalesce_fallback, &schema), DataType::Int);
+
+        // Operators & Param
+        assert_eq!(
+            infer_expr_type(
+                &Expr::Not(Box::new(Expr::Literal(DbValue::Int(1)))),
+                &schema
+            ),
+            DataType::Int
+        );
+        assert_eq!(
+            infer_expr_type(
+                &Expr::IsNull(Box::new(Expr::Literal(DbValue::Int(1)))),
+                &schema
+            ),
+            DataType::Int
+        );
+        assert_eq!(
+            infer_expr_type(
+                &Expr::InList {
+                    expr: Box::new(Expr::Literal(DbValue::Int(1))),
+                    list: vec![]
+                },
+                &schema
+            ),
+            DataType::Int
+        );
+        assert_eq!(
+            infer_expr_type(
+                &Expr::Match {
+                    column: "c".to_string(),
+                    index: None,
+                    query_str: "q".to_string()
+                },
+                &schema
+            ),
+            DataType::Bool
+        );
+        assert_eq!(
+            infer_expr_type(&Expr::Parameter("p".to_string()), &schema),
+            DataType::Null
+        );
+    }
+
+    #[test]
+    fn test_format_logical_plan_setop_and_limit() {
+        let child = LogicalPlan::Scan {
+            table_name: "t".to_string(),
+            schema: Schema::new(vec![]),
+            range: None,
+        };
+        let setop = LogicalPlan::SetOp {
+            left: Box::new(child.clone()),
+            right: Box::new(child.clone()),
+            op: SetOpType::Except,
+            all: false,
+        };
+        let formatted = format_logical_plan(&setop);
+        assert!(formatted.contains("SetOp: op=Except, all=false"));
+        assert!(formatted.contains("left:"));
+        assert!(formatted.contains("right:"));
+
+        let limit = LogicalPlan::Limit {
+            source: Box::new(child),
+            limit: None,
+            offset: 5,
+        };
+        let formatted_limit = format_logical_plan(&limit);
+        assert!(formatted_limit.contains("Limit: count=none, offset=5"));
+        assert_eq!(limit.schema().columns.len(), 0);
+    }
+}
