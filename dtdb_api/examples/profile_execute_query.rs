@@ -42,7 +42,7 @@ fn build_params(i: usize) -> HashMap<String, DbValue> {
     let mut m = HashMap::new();
     m.insert("id".to_string(), DbValue::Int(i as i64));
     m.insert("k".to_string(), DbValue::Int(((i * 31) % 100_000) as i64));
-    m.insert("v".to_string(), DbValue::String(format!("val_{i:08}")));
+    m.insert("v".to_string(), DbValue::string(format!("val_{i:08}")));
     m
 }
 

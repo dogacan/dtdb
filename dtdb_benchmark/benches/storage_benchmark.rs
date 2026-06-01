@@ -26,11 +26,11 @@ const WRITE_OPS: usize = 1_000;
 fn make_key(i: usize) -> DbKey {
     // Zero-padded so lexicographic string order matches numeric order, which
     // keeps range bounds intuitive.
-    DbKey::String(format!("key_{i:08}"))
+    DbKey::string(format!("key_{i:08}"))
 }
 
 fn make_value(i: usize) -> DbValue {
-    DbValue::Bytes(vec![(i % 256) as u8; VALUE_SIZE])
+    DbValue::bytes(vec![(i % 256) as u8; VALUE_SIZE])
 }
 
 /// Engine options tuned for benchmarking.

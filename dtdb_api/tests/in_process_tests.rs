@@ -120,7 +120,7 @@ fn test_in_process_client_integration() {
         let id_val = rows[0].get_by_index(0).unwrap();
         let name_val = rows[0].get_by_index(1).unwrap();
         assert_eq!(id_val, &dtdb_storage::DbValue::Int(42));
-        assert_eq!(name_val, &dtdb_storage::DbValue::String("Bob".to_string()));
+        assert_eq!(name_val, &dtdb_storage::DbValue::string("Bob"));
     }
 
     // 5. Test Flush Db

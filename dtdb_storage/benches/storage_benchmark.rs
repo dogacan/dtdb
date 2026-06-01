@@ -3,12 +3,12 @@ use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine
 use tempfile::TempDir;
 
 fn make_key(i: usize) -> DbKey {
-    DbKey::String(format!("key_{:06}", i))
+    DbKey::string(format!("key_{:06}", i))
 }
 
 fn make_value(i: usize) -> DbValue {
     // ~200 bytes value
-    DbValue::Bytes(vec![(i % 256) as u8; 200])
+    DbValue::bytes(vec![(i % 256) as u8; 200])
 }
 
 fn create_options(cache_capacity: usize, compression: CompressionType) -> EngineOptions {

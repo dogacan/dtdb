@@ -59,7 +59,7 @@ fn test_sql_ddl_and_crud() {
             rows[0].values,
             vec![
                 DbValue::Int(1),
-                DbValue::String("Alice".to_string()),
+                DbValue::string("Alice"),
                 DbValue::Float(95.5)
             ]
         );
@@ -67,7 +67,7 @@ fn test_sql_ddl_and_crud() {
             rows[1].values,
             vec![
                 DbValue::Int(2),
-                DbValue::String("Bob".to_string()),
+                DbValue::string("Bob"),
                 DbValue::Float(80.0)
             ]
         );
@@ -75,7 +75,7 @@ fn test_sql_ddl_and_crud() {
             rows[2].values,
             vec![
                 DbValue::Int(3),
-                DbValue::String("Charlie".to_string()),
+                DbValue::string("Charlie"),
                 DbValue::Float(85.0)
             ]
         );
@@ -93,7 +93,7 @@ fn test_sql_ddl_and_crud() {
     if let ExecutionResult::Select { schema, rows } = res {
         assert_eq!(rows.len(), 1);
         assert_eq!(schema.columns[0].name, "name");
-        assert_eq!(rows[0].values, vec![DbValue::String("Alice".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Alice")]);
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -149,17 +149,17 @@ fn test_sql_joins() {
         // Row 0: Alice, 15.75
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("Alice".to_string()), DbValue::Float(15.75)]
+            vec![DbValue::string("Alice"), DbValue::Float(15.75)]
         );
         // Row 1: Alice, 100.5
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("Alice".to_string()), DbValue::Float(100.5)]
+            vec![DbValue::string("Alice"), DbValue::Float(100.5)]
         );
         // Row 2: Bob, 250.0
         assert_eq!(
             rows[2].values,
-            vec![DbValue::String("Bob".to_string()), DbValue::Float(250.0)]
+            vec![DbValue::string("Bob"), DbValue::Float(250.0)]
         );
     } else {
         panic!("Expected ExecutionResult::Select");
@@ -232,7 +232,7 @@ fn test_sql_aggregations() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::String("Engineering".to_string()),
+                DbValue::string("Engineering"),
                 DbValue::Int(2),
                 DbValue::Float(200000.0)
             ]
@@ -241,7 +241,7 @@ fn test_sql_aggregations() {
         assert_eq!(
             rows[1].values,
             vec![
-                DbValue::String("HR".to_string()),
+                DbValue::string("HR"),
                 DbValue::Int(1),
                 DbValue::Float(45000.0)
             ]
@@ -250,7 +250,7 @@ fn test_sql_aggregations() {
         assert_eq!(
             rows[2].values,
             vec![
-                DbValue::String("Sales".to_string()),
+                DbValue::string("Sales"),
                 DbValue::Int(2),
                 DbValue::Float(110000.0)
             ]
@@ -293,8 +293,8 @@ fn test_sql_like_wildcard() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values[1], DbValue::String("abc-123".to_string()));
-        assert_eq!(rows[1].values[1], DbValue::String("abc-789".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::string("abc-123"));
+        assert_eq!(rows[1].values[1], DbValue::string("abc-789"));
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -308,11 +308,11 @@ fn test_sql_like_wildcard() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values[1], DbValue::String("abc-123".to_string()));
-        assert_eq!(rows[1].values[1], DbValue::String("abc-789".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::string("abc-123"));
+        assert_eq!(rows[1].values[1], DbValue::string("abc-789"));
         assert_eq!(
             rows[2].values[1],
-            DbValue::String("xyz-abc-999".to_string())
+            DbValue::string("xyz-abc-999")
         );
     } else {
         panic!("Expected ExecutionResult::Select");
@@ -354,7 +354,7 @@ fn test_sql_transactions() {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::Int(20), DbValue::String("KeepMe".to_string())]
+            vec![DbValue::Int(20), DbValue::string("KeepMe")]
         );
     } else {
         panic!("Expected ExecutionResult::Select");
@@ -395,7 +395,7 @@ fn test_sql_optimizer_pushdown() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::String("twenty".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("twenty")]);
     } else {
         panic!("Expected Select");
     }
@@ -409,8 +409,8 @@ fn test_sql_optimizer_pushdown() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values, vec![DbValue::String("twenty".to_string())]);
-        assert_eq!(rows[1].values, vec![DbValue::String("thirty".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("twenty")]);
+        assert_eq!(rows[1].values, vec![DbValue::string("thirty")]);
     } else {
         panic!("Expected Select");
     }
@@ -435,7 +435,7 @@ fn test_sql_explain() {
                 assert_eq!(schema.columns[0].name, "Query Plan");
                 assert_eq!(rows.len(), 1);
                 match &rows[0].values[0] {
-                    DbValue::String(s) => s.clone(),
+                    DbValue::String(s) => s.to_string(),
                     _ => panic!("Expected string plan text"),
                 }
             }
@@ -499,7 +499,7 @@ fn test_sql_point_get_fast_path() {
         tx.commit().unwrap();
         match res {
             ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
-                DbValue::String(s) => s.clone(),
+                DbValue::String(s) => s.to_string(),
                 _ => unreachable!(),
             },
             _ => unreachable!(),
@@ -509,7 +509,7 @@ fn test_sql_point_get_fast_path() {
     // 1. Point hit: correct projected row, and the fast path is chosen.
     assert_eq!(
         select("SELECT k, v FROM t WHERE id = 7"),
-        vec![vec![DbValue::Int(70), DbValue::String("v7".to_string())]]
+        vec![vec![DbValue::Int(70), DbValue::string("v7")]]
     );
     assert!(plan_for("SELECT k, v FROM t WHERE id = 7").contains("PhysicalPointGet"));
 
@@ -526,7 +526,7 @@ fn test_sql_point_get_fast_path() {
         vec![vec![
             DbValue::Int(3),
             DbValue::Int(30),
-            DbValue::String("v3".to_string())
+            DbValue::string("v3")
         ]]
     );
 
@@ -540,7 +540,7 @@ fn test_sql_point_get_fast_path() {
     //    ...and a residual filter that passes keeps the row.
     assert_eq!(
         select("SELECT v FROM t WHERE id = 5 AND k = 50"),
-        vec![vec![DbValue::String("v5".to_string())]]
+        vec![vec![DbValue::string("v5")]]
     );
 
     // 5. Expression projection over a point lookup evaluates per-row.
@@ -743,7 +743,7 @@ fn test_sql_update() {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values[0],
-            DbValue::String("AliceUpdated".to_string())
+            DbValue::string("AliceUpdated")
         );
         assert_eq!(rows[0].values[1], DbValue::Float(95.5));
     } else {
@@ -767,7 +767,7 @@ fn test_sql_update() {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[0], DbValue::Int(1)); // Alice
         assert_eq!(rows[1].values[0], DbValue::Int(12)); // Bob (2 + 10)
-        assert_eq!(rows[1].values[1], DbValue::String("Bob".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::string("Bob"));
     } else {
         panic!("Expected Select");
     }
@@ -813,13 +813,13 @@ fn test_sql_left_join() {
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 3);
         // Alice: matched
-        assert_eq!(rows[0].values[0], DbValue::String("Alice".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Alice"));
         assert_eq!(rows[0].values[1], DbValue::Float(99.9));
         // Bob: matched
-        assert_eq!(rows[1].values[0], DbValue::String("Bob".to_string()));
+        assert_eq!(rows[1].values[0], DbValue::string("Bob"));
         assert_eq!(rows[1].values[1], DbValue::Float(199.9));
         // Charlie: unmatched (padded with NULL)
-        assert_eq!(rows[2].values[0], DbValue::String("Charlie".to_string()));
+        assert_eq!(rows[2].values[0], DbValue::string("Charlie"));
         assert_eq!(rows[2].values[1], DbValue::Null);
     } else {
         panic!("Expected Select");
@@ -898,10 +898,10 @@ fn test_sql_avg_aggregate() {
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 2);
         // Eng
-        assert_eq!(rows[0].values[0], DbValue::String("Eng".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Eng"));
         assert_eq!(rows[0].values[1], DbValue::Float(200.0)); // (100+300)/2
         // Sales
-        assert_eq!(rows[1].values[0], DbValue::String("Sales".to_string()));
+        assert_eq!(rows[1].values[0], DbValue::string("Sales"));
         assert_eq!(rows[1].values[1], DbValue::Float(100.0)); // (50+150)/2
     } else {
         panic!("Expected Select");
@@ -984,10 +984,10 @@ fn test_sql_case_and_functions() {
     ).unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].values[1], DbValue::String("expensive".to_string()));
-        assert_eq!(rows[1].values[1], DbValue::String("cheap".to_string()));
-        assert_eq!(rows[2].values[1], DbValue::String("cheap".to_string()));
-        assert_eq!(rows[3].values[1], DbValue::String("moderate".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::string("expensive"));
+        assert_eq!(rows[1].values[1], DbValue::string("cheap"));
+        assert_eq!(rows[2].values[1], DbValue::string("cheap"));
+        assert_eq!(rows[3].values[1], DbValue::string("moderate"));
     } else {
         panic!("Expected Select");
     }
@@ -999,10 +999,10 @@ fn test_sql_case_and_functions() {
     ).unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].values[1], DbValue::String("One".to_string()));
-        assert_eq!(rows[1].values[1], DbValue::String("Two".to_string()));
-        assert_eq!(rows[2].values[1], DbValue::String("Other".to_string()));
-        assert_eq!(rows[3].values[1], DbValue::String("Other".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::string("One"));
+        assert_eq!(rows[1].values[1], DbValue::string("Two"));
+        assert_eq!(rows[2].values[1], DbValue::string("Other"));
+        assert_eq!(rows[3].values[1], DbValue::string("Other"));
     } else {
         panic!("Expected Select");
     }
@@ -1029,10 +1029,10 @@ fn test_sql_case_and_functions() {
     ).unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::String("Lap".to_string()));
-        assert_eq!(rows[0].values[1], DbValue::String("top".to_string()));
-        assert_eq!(rows[0].values[2], DbValue::String("to".to_string()));
-        assert_eq!(rows[0].values[3], DbValue::String("L".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Lap"));
+        assert_eq!(rows[0].values[1], DbValue::string("top"));
+        assert_eq!(rows[0].values[2], DbValue::string("to"));
+        assert_eq!(rows[0].values[3], DbValue::string("L"));
     } else {
         panic!("Expected Select");
     }
@@ -1048,10 +1048,10 @@ fn test_sql_case_and_functions() {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows[0].values[1],
-            DbValue::String("Electronics".to_string())
+            DbValue::string("Electronics")
         );
-        assert_eq!(rows[1].values[1], DbValue::String("".to_string())); // Mouse category is empty "" -> NOT Null -> no fallback
-        assert_eq!(rows[2].values[1], DbValue::String("Furniture".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::string("")); // Mouse category is empty "" -> NOT Null -> no fallback
+        assert_eq!(rows[2].values[1], DbValue::string("Furniture"));
     } else {
         panic!("Expected Select");
     }
@@ -1125,17 +1125,17 @@ fn test_sql_explicit_null() {
         assert_eq!(rows.len(), 3);
         // Alice note is NULL
         assert_eq!(rows[0].values[0], DbValue::Int(1));
-        assert_eq!(rows[0].values[1], DbValue::String("Alice".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::string("Alice"));
         assert_eq!(rows[0].values[2], DbValue::Null);
 
         // Bob note is "First Note"
         assert_eq!(rows[1].values[0], DbValue::Int(2));
-        assert_eq!(rows[1].values[1], DbValue::String("Bob".to_string()));
-        assert_eq!(rows[1].values[2], DbValue::String("First Note".to_string()));
+        assert_eq!(rows[1].values[1], DbValue::string("Bob"));
+        assert_eq!(rows[1].values[2], DbValue::string("First Note"));
 
         // Charlie note defaulted to NULL
         assert_eq!(rows[2].values[0], DbValue::Int(3));
-        assert_eq!(rows[2].values[1], DbValue::String("Charlie".to_string()));
+        assert_eq!(rows[2].values[1], DbValue::string("Charlie"));
         assert_eq!(rows[2].values[2], DbValue::Null);
     } else {
         panic!("Expected Select");
@@ -1166,9 +1166,9 @@ fn test_sql_explicit_null() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res3 {
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values[1], DbValue::String("default".to_string()));
-        assert_eq!(rows[1].values[1], DbValue::String("First Note".to_string()));
-        assert_eq!(rows[2].values[1], DbValue::String("default".to_string()));
+        assert_eq!(rows[0].values[1], DbValue::string("default"));
+        assert_eq!(rows[1].values[1], DbValue::string("First Note"));
+        assert_eq!(rows[2].values[1], DbValue::string("default"));
     } else {
         panic!("Expected Select");
     }
@@ -1193,13 +1193,13 @@ fn test_sql_explicit_null() {
     if let ExecutionResult::Select { rows, .. } = res4 {
         assert_eq!(rows.len(), 3);
         // Alice (1): unmatched order -> amount is NULL
-        assert_eq!(rows[0].values[0], DbValue::String("Alice".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Alice"));
         assert_eq!(rows[0].values[1], DbValue::Null);
         // Bob (2): matched order -> amount is 9.99
-        assert_eq!(rows[1].values[0], DbValue::String("Bob".to_string()));
+        assert_eq!(rows[1].values[0], DbValue::string("Bob"));
         assert_eq!(rows[1].values[1], DbValue::Float(9.99));
         // Charlie (3): unmatched order -> amount is NULL
-        assert_eq!(rows[2].values[0], DbValue::String("Charlie".to_string()));
+        assert_eq!(rows[2].values[0], DbValue::string("Charlie"));
         assert_eq!(rows[2].values[1], DbValue::Null);
     } else {
         panic!("Expected Select");
@@ -1268,18 +1268,18 @@ fn test_locality_groups_end_to_end() {
             rows[0].values,
             vec![
                 DbValue::Int(1),
-                DbValue::String("Alice".to_string()),
+                DbValue::string("Alice"),
                 DbValue::Int(100000),
-                DbValue::String("Engineering".to_string())
+                DbValue::string("Engineering")
             ]
         );
         assert_eq!(
             rows[1].values,
             vec![
                 DbValue::Int(2),
-                DbValue::String("Bob".to_string()),
+                DbValue::string("Bob"),
                 DbValue::Int(80000),
-                DbValue::String("HR".to_string())
+                DbValue::string("HR")
             ]
         );
     } else {
@@ -1303,11 +1303,11 @@ fn test_locality_groups_end_to_end() {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("Alice".to_string()), DbValue::Int(110000)]
+            vec![DbValue::string("Alice"), DbValue::Int(110000)]
         );
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("Bob".to_string()), DbValue::Int(80000)]
+            vec![DbValue::string("Bob"), DbValue::Int(80000)]
         );
     } else {
         panic!("Expected Select");
@@ -1529,7 +1529,7 @@ fn test_sql_secondary_indexing() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = select_res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::String("Charlie".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Charlie")]);
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -1562,7 +1562,7 @@ fn test_sql_secondary_indexing() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res_dave {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::String("Dave".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Dave")]);
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -1573,7 +1573,7 @@ fn test_sql_secondary_indexing() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res_bob_new {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::String("Bob".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Bob")]);
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -1624,9 +1624,9 @@ fn test_sql_secondary_indexing() {
     if let ExecutionResult::Select { rows, .. } = range_select {
         // Charlie (85) and Bob (88) and Dave (90)
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values, vec![DbValue::String("Charlie".to_string())]);
-        assert_eq!(rows[1].values, vec![DbValue::String("Bob".to_string())]);
-        assert_eq!(rows[2].values, vec![DbValue::String("Dave".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Charlie")]);
+        assert_eq!(rows[1].values, vec![DbValue::string("Bob")]);
+        assert_eq!(rows[2].values, vec![DbValue::string("Dave")]);
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -1656,9 +1656,9 @@ fn test_sql_secondary_indexing() {
     if let ExecutionResult::Select { rows, .. } = tx7_select {
         // Eve (87) and Bob (88) and Dave (90). Charlie (85) must be deleted.
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values, vec![DbValue::String("Eve".to_string())]);
-        assert_eq!(rows[1].values, vec![DbValue::String("Bob".to_string())]);
-        assert_eq!(rows[2].values, vec![DbValue::String("Dave".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Eve")]);
+        assert_eq!(rows[1].values, vec![DbValue::string("Bob")]);
+        assert_eq!(rows[2].values, vec![DbValue::string("Dave")]);
     } else {
         panic!("Expected ExecutionResult::Select");
     }
@@ -1815,11 +1815,11 @@ fn test_sql_pass1_scalar_features() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::String("CHARLIE".to_string()));
-        assert_eq!(rows[0].values[1], DbValue::String("furniture".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("CHARLIE"));
+        assert_eq!(rows[0].values[1], DbValue::string("furniture"));
         assert_eq!(
             rows[0].values[2],
-            DbValue::String("Charlie-Furniture".to_string())
+            DbValue::string("Charlie-Furniture")
         );
         assert_eq!(rows[0].values[3], DbValue::Float(3.2));
         assert_eq!(rows[0].values[4], DbValue::Float(-3.0));
@@ -1866,15 +1866,15 @@ fn test_sql_pass2_table_and_join_features() {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("A".to_string()), DbValue::Int(10)]
+            vec![DbValue::string("A"), DbValue::Int(10)]
         );
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("A".to_string()), DbValue::Int(20)]
+            vec![DbValue::string("A"), DbValue::Int(20)]
         );
         assert_eq!(
             rows[2].values,
-            vec![DbValue::String("B".to_string()), DbValue::Int(30)]
+            vec![DbValue::string("B"), DbValue::Int(30)]
         );
     } else {
         panic!("Expected Select");
@@ -1911,7 +1911,7 @@ fn test_sql_pass2_table_and_join_features() {
         // unconditionally.
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("A".to_string()), DbValue::Int(30)]
+            vec![DbValue::string("A"), DbValue::Int(30)]
         );
     } else {
         panic!("Expected Select");
@@ -1927,11 +1927,11 @@ fn test_sql_pass2_table_and_join_features() {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("A".to_string()), DbValue::Int(2)]
+            vec![DbValue::string("A"), DbValue::Int(2)]
         );
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("B".to_string()), DbValue::Int(1)]
+            vec![DbValue::string("B"), DbValue::Int(1)]
         );
     } else {
         panic!("Expected Select");
@@ -2032,7 +2032,7 @@ fn test_sql_pass3_schema_and_constraints() {
                 vec![
                     DbValue::Int(1),
                     DbValue::Int(10),
-                    DbValue::String("admin".to_string())
+                    DbValue::string("admin")
                 ]
             );
             assert_eq!(
@@ -2040,7 +2040,7 @@ fn test_sql_pass3_schema_and_constraints() {
                 vec![
                     DbValue::Int(1),
                     DbValue::Int(20),
-                    DbValue::String("user".to_string())
+                    DbValue::string("user")
                 ]
             );
             assert_eq!(
@@ -2048,7 +2048,7 @@ fn test_sql_pass3_schema_and_constraints() {
                 vec![
                     DbValue::Int(2),
                     DbValue::Int(10),
-                    DbValue::String("admin".to_string())
+                    DbValue::string("admin")
                 ]
             );
         } else {
@@ -2104,7 +2104,7 @@ fn test_sql_pass3_schema_and_constraints() {
                 rows[0].values,
                 vec![
                     DbValue::Int(1),
-                    DbValue::String("Unnamed".to_string()),
+                    DbValue::string("Unnamed"),
                     DbValue::Int(42)
                 ]
             );
@@ -2112,7 +2112,7 @@ fn test_sql_pass3_schema_and_constraints() {
                 rows[1].values,
                 vec![
                     DbValue::Int(2),
-                    DbValue::String("Bob".to_string()),
+                    DbValue::string("Bob"),
                     DbValue::Int(42)
                 ]
             );
@@ -2149,11 +2149,11 @@ fn test_sql_pass3_schema_and_constraints() {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(1), DbValue::String("First".to_string())]
+                vec![DbValue::Int(1), DbValue::string("First")]
             );
             assert_eq!(
                 rows[1].values,
-                vec![DbValue::Int(2), DbValue::String("Second".to_string())]
+                vec![DbValue::Int(2), DbValue::string("Second")]
             );
         } else {
             panic!("Expected Select");
@@ -2178,11 +2178,11 @@ fn test_sql_pass3_schema_and_constraints() {
             assert_eq!(rows.len(), 4);
             assert_eq!(
                 rows[2].values,
-                vec![DbValue::Int(10), DbValue::String("Ten".to_string())]
+                vec![DbValue::Int(10), DbValue::string("Ten")]
             );
             assert_eq!(
                 rows[3].values,
-                vec![DbValue::Int(11), DbValue::String("Eleven".to_string())]
+                vec![DbValue::Int(11), DbValue::string("Eleven")]
             );
         } else {
             panic!("Expected Select");
@@ -2245,24 +2245,24 @@ fn test_sql_pass4_dml_and_set_operations() {
                 rows[0].values,
                 vec![
                     DbValue::Int(1),
-                    DbValue::String("Apple".to_string()),
-                    DbValue::String("Cool".to_string())
+                    DbValue::string("Apple"),
+                    DbValue::string("Cool")
                 ]
             );
             assert_eq!(
                 rows[1].values,
                 vec![
                     DbValue::Int(2),
-                    DbValue::String("Banana".to_string()),
-                    DbValue::String("Cool".to_string())
+                    DbValue::string("Banana"),
+                    DbValue::string("Cool")
                 ]
             );
             assert_eq!(
                 rows[2].values,
                 vec![
                     DbValue::Int(3),
-                    DbValue::String("Cherry".to_string()),
-                    DbValue::String("Cool".to_string())
+                    DbValue::string("Cherry"),
+                    DbValue::string("Cool")
                 ]
             );
         } else {
@@ -2353,19 +2353,19 @@ fn test_sql_pass4_dml_and_set_operations() {
             assert_eq!(rows.len(), 4);
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(1), DbValue::String("apple".to_string())]
+                vec![DbValue::Int(1), DbValue::string("apple")]
             );
             assert_eq!(
                 rows[1].values,
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+                vec![DbValue::Int(2), DbValue::string("banana")]
             );
             assert_eq!(
                 rows[2].values,
-                vec![DbValue::Int(3), DbValue::String("cherry".to_string())]
+                vec![DbValue::Int(3), DbValue::string("cherry")]
             );
             assert_eq!(
                 rows[3].values,
-                vec![DbValue::Int(4), DbValue::String("date".to_string())]
+                vec![DbValue::Int(4), DbValue::string("date")]
             );
         } else {
             panic!("Expected Select");
@@ -2381,14 +2381,14 @@ fn test_sql_pass4_dml_and_set_operations() {
         if let ExecutionResult::Select { rows, .. } = res {
             assert_eq!(rows.len(), 8);
             let expected = vec![
-                vec![DbValue::Int(1), DbValue::String("apple".to_string())],
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())],
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())],
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())],
-                vec![DbValue::Int(3), DbValue::String("cherry".to_string())],
-                vec![DbValue::Int(3), DbValue::String("cherry".to_string())],
-                vec![DbValue::Int(3), DbValue::String("cherry".to_string())],
-                vec![DbValue::Int(4), DbValue::String("date".to_string())],
+                vec![DbValue::Int(1), DbValue::string("apple")],
+                vec![DbValue::Int(2), DbValue::string("banana")],
+                vec![DbValue::Int(2), DbValue::string("banana")],
+                vec![DbValue::Int(2), DbValue::string("banana")],
+                vec![DbValue::Int(3), DbValue::string("cherry")],
+                vec![DbValue::Int(3), DbValue::string("cherry")],
+                vec![DbValue::Int(3), DbValue::string("cherry")],
+                vec![DbValue::Int(4), DbValue::string("date")],
             ];
             for (i, val) in expected.into_iter().enumerate() {
                 assert_eq!(rows[i].values, val);
@@ -2408,7 +2408,7 @@ fn test_sql_pass4_dml_and_set_operations() {
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(1), DbValue::String("apple".to_string())]
+                vec![DbValue::Int(1), DbValue::string("apple")]
             );
         } else {
             panic!("Expected Select");
@@ -2427,11 +2427,11 @@ fn test_sql_pass4_dml_and_set_operations() {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(1), DbValue::String("apple".to_string())]
+                vec![DbValue::Int(1), DbValue::string("apple")]
             );
             assert_eq!(
                 rows[1].values,
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+                vec![DbValue::Int(2), DbValue::string("banana")]
             );
         } else {
             panic!("Expected Select");
@@ -2448,11 +2448,11 @@ fn test_sql_pass4_dml_and_set_operations() {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+                vec![DbValue::Int(2), DbValue::string("banana")]
             );
             assert_eq!(
                 rows[1].values,
-                vec![DbValue::Int(3), DbValue::String("cherry".to_string())]
+                vec![DbValue::Int(3), DbValue::string("cherry")]
             );
         } else {
             panic!("Expected Select");
@@ -2471,11 +2471,11 @@ fn test_sql_pass4_dml_and_set_operations() {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(2), DbValue::String("banana".to_string())]
+                vec![DbValue::Int(2), DbValue::string("banana")]
             );
             assert_eq!(
                 rows[1].values,
-                vec![DbValue::Int(3), DbValue::String("cherry".to_string())]
+                vec![DbValue::Int(3), DbValue::string("cherry")]
             );
         } else {
             panic!("Expected Select");
@@ -2887,7 +2887,7 @@ fn test_sql_optimizer_predicate_pushdown_through_joins() {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("Bob".to_string()), DbValue::Float(250.0)]
+            vec![DbValue::string("Bob"), DbValue::Float(250.0)]
         );
     } else {
         panic!("Expected Select result");
@@ -2976,8 +2976,8 @@ fn test_sql_optimizer_join_order_reordering() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::String("one".to_string()),
-                DbValue::String("one".to_string())
+                DbValue::string("one"),
+                DbValue::string("one")
             ]
         );
     } else {
@@ -3020,29 +3020,29 @@ fn test_sql_cross_join_lazy_and_correctness() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::String("a".to_string()),
-                DbValue::String("x".to_string())
+                DbValue::string("a"),
+                DbValue::string("x")
             ]
         );
         assert_eq!(
             rows[1].values,
             vec![
-                DbValue::String("a".to_string()),
-                DbValue::String("y".to_string())
+                DbValue::string("a"),
+                DbValue::string("y")
             ]
         );
         assert_eq!(
             rows[2].values,
             vec![
-                DbValue::String("b".to_string()),
-                DbValue::String("x".to_string())
+                DbValue::string("b"),
+                DbValue::string("x")
             ]
         );
         assert_eq!(
             rows[3].values,
             vec![
-                DbValue::String("b".to_string()),
-                DbValue::String("y".to_string())
+                DbValue::string("b"),
+                DbValue::string("y")
             ]
         );
     } else {
@@ -3854,9 +3854,9 @@ fn test_sql_sort_elimination_and_promotion() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = query_pk {
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values[0], DbValue::String("Apple".to_string()));
-        assert_eq!(rows[1].values[0], DbValue::String("Banana".to_string()));
-        assert_eq!(rows[2].values[0], DbValue::String("Orange".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Apple"));
+        assert_eq!(rows[1].values[0], DbValue::string("Banana"));
+        assert_eq!(rows[2].values[0], DbValue::string("Orange"));
     } else {
         panic!("Expected Select");
     }
@@ -3882,9 +3882,9 @@ fn test_sql_sort_elimination_and_promotion() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = query_idx {
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values[0], DbValue::String("Banana".to_string()));
-        assert_eq!(rows[1].values[0], DbValue::String("Orange".to_string()));
-        assert_eq!(rows[2].values[0], DbValue::String("Apple".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Banana"));
+        assert_eq!(rows[1].values[0], DbValue::string("Orange"));
+        assert_eq!(rows[2].values[0], DbValue::string("Apple"));
     } else {
         panic!("Expected Select");
     }
@@ -3912,9 +3912,9 @@ fn test_sql_sort_elimination_and_promotion() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = query_desc {
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values[0], DbValue::String("Apple".to_string()));
-        assert_eq!(rows[1].values[0], DbValue::String("Orange".to_string()));
-        assert_eq!(rows[2].values[0], DbValue::String("Banana".to_string()));
+        assert_eq!(rows[0].values[0], DbValue::string("Apple"));
+        assert_eq!(rows[1].values[0], DbValue::string("Orange"));
+        assert_eq!(rows[2].values[0], DbValue::string("Banana"));
     } else {
         panic!("Expected Select");
     }
@@ -4329,17 +4329,17 @@ fn test_sql_sorted_aggregate() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::String("Engineering".to_string()),
+                DbValue::string("Engineering"),
                 DbValue::Float(110.0)
             ]
         );
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("HR".to_string()), DbValue::Float(30.0)]
+            vec![DbValue::string("HR"), DbValue::Float(30.0)]
         );
         assert_eq!(
             rows[2].values,
-            vec![DbValue::String("Sales".to_string()), DbValue::Float(30.0)]
+            vec![DbValue::string("Sales"), DbValue::Float(30.0)]
         );
     } else {
         panic!("Expected Select");
@@ -4467,11 +4467,11 @@ fn test_sql_join_order_orientation() {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("Alice".to_string()), DbValue::Int(100)]
+            vec![DbValue::string("Alice"), DbValue::Int(100)]
         );
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("Bob".to_string()), DbValue::Int(200)]
+            vec![DbValue::string("Bob"), DbValue::Int(200)]
         );
     } else {
         panic!("Expected SELECT result");
@@ -4488,11 +4488,11 @@ fn test_sql_join_order_orientation() {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values,
-            vec![DbValue::String("Alice".to_string()), DbValue::Int(100)]
+            vec![DbValue::string("Alice"), DbValue::Int(100)]
         );
         assert_eq!(
             rows[1].values,
-            vec![DbValue::String("Bob".to_string()), DbValue::Int(200)]
+            vec![DbValue::string("Bob"), DbValue::Int(200)]
         );
     } else {
         panic!("Expected SELECT result");
@@ -4687,9 +4687,9 @@ fn test_sql_select_distinct() {
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values, vec![DbValue::String("Alice".to_string())]);
-        assert_eq!(rows[1].values, vec![DbValue::String("Bob".to_string())]);
-        assert_eq!(rows[2].values, vec![DbValue::String("Charlie".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("Alice")]);
+        assert_eq!(rows[1].values, vec![DbValue::string("Bob")]);
+        assert_eq!(rows[2].values, vec![DbValue::string("Charlie")]);
     } else {
         panic!("Expected SELECT");
     }
@@ -4784,7 +4784,7 @@ fn test_sql_count_distinct_grouped() {
         assert_eq!(
             rows[0].values,
             vec![
-                DbValue::String("a".to_string()),
+                DbValue::string("a"),
                 DbValue::Int(3),
                 DbValue::Int(2),
                 DbValue::Int(30),
@@ -4794,7 +4794,7 @@ fn test_sql_count_distinct_grouped() {
         assert_eq!(
             rows[1].values,
             vec![
-                DbValue::String("b".to_string()),
+                DbValue::string("b"),
                 DbValue::Int(3),
                 DbValue::Int(1),
                 DbValue::Int(30),
@@ -4804,7 +4804,7 @@ fn test_sql_count_distinct_grouped() {
         assert_eq!(
             rows[2].values,
             vec![
-                DbValue::String("c".to_string()),
+                DbValue::string("c"),
                 DbValue::Int(1),
                 DbValue::Int(1),
                 DbValue::Int(5),
@@ -4966,7 +4966,7 @@ fn test_sql_server_side_parameters() {
     let tx_insert = Transaction::new(2, db.clone());
     let mut params = std::collections::HashMap::new();
     params.insert("id".to_string(), DbValue::Int(1));
-    params.insert("name".to_string(), DbValue::String("Alice".to_string()));
+    params.insert("name".to_string(), DbValue::string("Alice"));
     params.insert("age".to_string(), DbValue::Int(30));
 
     // Test insert with parameters
@@ -4981,7 +4981,7 @@ fn test_sql_server_side_parameters() {
 
     let tx_query = Transaction::new(3, db.clone());
     let mut q_params = std::collections::HashMap::new();
-    q_params.insert("name".to_string(), DbValue::String("Alice".to_string()));
+    q_params.insert("name".to_string(), DbValue::string("Alice"));
     q_params.insert("min_age".to_string(), DbValue::Int(25));
 
     // Test select with parameters
@@ -5036,7 +5036,7 @@ fn test_prepared_statement_reuse() {
         match res {
             ExecutionResult::Select { rows, .. } => {
                 assert_eq!(rows.len(), 1, "id={i}");
-                assert_eq!(rows[0].values, vec![DbValue::String(format!("v{i}"))]);
+                assert_eq!(rows[0].values, vec![DbValue::string(format!("v{i}"))]);
             }
             _ => panic!("expected Select"),
         }
@@ -5114,7 +5114,7 @@ fn test_prepared_statement_replanned_after_ddl() {
                     rows[0].values,
                     vec![
                         DbValue::Int(1),
-                        DbValue::String("a".to_string()),
+                        DbValue::string("a"),
                         DbValue::Int(42)
                     ]
                 );
@@ -5328,7 +5328,7 @@ fn test_substr_handles_extreme_length() {
         )
         .unwrap();
     if let ExecutionResult::Select { rows, .. } = res {
-        assert_eq!(rows[0].values, vec![DbValue::String("hello".to_string())]);
+        assert_eq!(rows[0].values, vec![DbValue::string("hello")]);
     } else {
         panic!("expected Select");
     }
@@ -5785,7 +5785,7 @@ fn test_spilling_sort_merge_join() {
         let pairs: Vec<(String, String)> = rows
             .into_iter()
             .map(|row| match (&row.values[0], &row.values[1]) {
-                (DbValue::String(a), DbValue::String(b)) => (a.clone(), b.clone()),
+                (DbValue::String(a), DbValue::String(b)) => (a.to_string(), b.to_string()),
                 _ => panic!("Expected strings"),
             })
             .collect();
@@ -5816,7 +5816,7 @@ fn test_spilling_sort_merge_join() {
             .iter()
             .filter(|row| row.values[1] == DbValue::Null)
             .map(|row| match &row.values[0] {
-                DbValue::String(s) => s.clone(),
+                DbValue::String(s) => s.to_string(),
                 _ => panic!("Expected string"),
             })
             .collect();
@@ -5926,7 +5926,7 @@ fn test_sql_parse_cache_param_isolation() {
     for (id, v) in [(1i64, "one"), (2, "two"), (3, "three")] {
         let mut params = HashMap::new();
         params.insert("id".to_string(), DbValue::Int(id));
-        params.insert("v".to_string(), DbValue::String(v.to_string()));
+        params.insert("v".to_string(), DbValue::string(v.to_string()));
         let res = engine
             .execute_with_params(insert_tpl, &tx, &params)
             .unwrap();
@@ -5949,7 +5949,7 @@ fn test_sql_parse_cache_param_isolation() {
             ExecutionResult::Select { rows, .. } => {
                 assert_eq!(rows.len(), 1, "expected exactly one row for id={id}");
                 match &rows[0].values[0] {
-                    DbValue::String(s) => s.clone(),
+                    DbValue::String(s) => s.to_string(),
                     other => panic!("unexpected value {other:?}"),
                 }
             }
@@ -6085,7 +6085,7 @@ fn test_alter_table_add_column_with_default() {
             rows[0].values,
             vec![
                 DbValue::Int(1),
-                DbValue::String("Alice".to_string()),
+                DbValue::string("Alice"),
                 DbValue::Bool(true),
             ]
         );
@@ -6093,7 +6093,7 @@ fn test_alter_table_add_column_with_default() {
             rows[1].values,
             vec![
                 DbValue::Int(2),
-                DbValue::String("Bob".to_string()),
+                DbValue::string("Bob"),
                 DbValue::Bool(false),
             ]
         );
@@ -6218,7 +6218,7 @@ fn test_alter_table_rename_column() {
         if let ExecutionResult::Select { rows, .. } = res {
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(1), DbValue::String("Alice".to_string())]
+                vec![DbValue::Int(1), DbValue::string("Alice")]
             );
         } else {
             panic!("Expected Select");
@@ -6268,7 +6268,7 @@ fn test_alter_table_drop_column() {
         if let ExecutionResult::Select { rows, .. } = res {
             assert_eq!(
                 rows[0].values,
-                vec![DbValue::Int(1), DbValue::String("Alice".to_string())]
+                vec![DbValue::Int(1), DbValue::string("Alice")]
             );
         } else {
             panic!("Expected Select");

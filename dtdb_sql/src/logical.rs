@@ -648,14 +648,14 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("p1".to_string(), DbValue::Int(42));
-        params.insert("p2".to_string(), DbValue::String("hello".to_string()));
+        params.insert("p2".to_string(), DbValue::string("hello"));
 
         plan.substitute_params(&params).unwrap();
 
         if let LogicalPlan::Scan { range, .. } = plan {
             let (start, end) = range.unwrap();
             assert_eq!(start, PlanKey::Value(DbKey::Int(42)));
-            assert_eq!(end, PlanKey::Value(DbKey::String("hello".to_string())));
+            assert_eq!(end, PlanKey::Value(DbKey::string("hello")));
         } else {
             panic!("Expected Scan");
         }
@@ -676,7 +676,7 @@ mod tests {
         if let LogicalPlan::IndexScan { range, .. } = idx_plan {
             let (start, end) = range.unwrap();
             assert_eq!(start, PlanKey::Value(DbKey::Int(42)));
-            assert_eq!(end, PlanKey::Value(DbKey::String("hello".to_string())));
+            assert_eq!(end, PlanKey::Value(DbKey::string("hello")));
         } else {
             panic!("Expected IndexScan");
         }
@@ -725,7 +725,7 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("p1".to_string(), DbValue::Int(42));
-        params.insert("p2".to_string(), DbValue::String("hello".to_string()));
+        params.insert("p2".to_string(), DbValue::string("hello"));
         params.insert("p3".to_string(), DbValue::Bool(true));
 
         plan.substitute_params(&params).unwrap();
@@ -735,7 +735,7 @@ mod tests {
             if let LogicalPlan::Scan { range, .. } = *source {
                 let (start, end) = range.unwrap();
                 assert_eq!(start, PlanKey::Value(DbKey::Int(42)));
-                assert_eq!(end, PlanKey::Value(DbKey::String("hello".to_string())));
+                assert_eq!(end, PlanKey::Value(DbKey::string("hello")));
             } else {
                 panic!("Expected child Scan");
             }
@@ -886,7 +886,7 @@ mod tests {
             DataType::Float
         );
         assert_eq!(
-            infer_expr_type(&Expr::Literal(DbValue::Bytes(vec![])), &schema),
+            infer_expr_type(&Expr::Literal(DbValue::bytes(vec![])), &schema),
             DataType::Bytes
         );
         assert_eq!(

@@ -134,7 +134,7 @@ fn display_result(res: ExecutionResult) {
                     let val_str = match val {
                         DbValue::Int(v) => v.to_string(),
                         DbValue::Float(v) => v.to_string(),
-                        DbValue::String(s) => s.clone(),
+                        DbValue::String(s) => s.to_string(),
                         DbValue::Bytes(b) => format!("{:?}", b),
                         DbValue::Bool(b) => b.to_string(),
                         DbValue::Null => "NULL".to_string(),

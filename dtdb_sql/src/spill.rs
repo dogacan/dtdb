@@ -377,8 +377,8 @@ mod tests {
         assert_eq!(type_rank(&DbValue::Bool(true)), 1);
         assert_eq!(type_rank(&DbValue::Int(42)), 2);
         assert_eq!(type_rank(&DbValue::Float(1.5)), 3);
-        assert_eq!(type_rank(&DbValue::String("hello".to_string())), 4);
-        assert_eq!(type_rank(&DbValue::Bytes(vec![1])), 5);
+        assert_eq!(type_rank(&DbValue::string("hello")), 4);
+        assert_eq!(type_rank(&DbValue::bytes(vec![1])), 5);
 
         // Different variant comparison
         assert_eq!(
@@ -390,7 +390,7 @@ mod tests {
             Ordering::Less
         );
         assert_eq!(
-            total_compare(&DbValue::String("a".to_string()), &DbValue::Bytes(vec![])),
+            total_compare(&DbValue::string("a"), &DbValue::bytes(vec![])),
             Ordering::Less
         );
 
@@ -438,19 +438,19 @@ mod tests {
         // Same variant comparison - String
         assert_eq!(
             total_compare(
-                &DbValue::String("abc".to_string()),
-                &DbValue::String("def".to_string())
+                &DbValue::string("abc"),
+                &DbValue::string("def")
             ),
             Ordering::Less
         );
 
         // Same variant comparison - Bytes
         assert_eq!(
-            total_compare(&DbValue::Bytes(vec![1, 2]), &DbValue::Bytes(vec![1, 3])),
+            total_compare(&DbValue::bytes(vec![1, 2]), &DbValue::bytes(vec![1, 3])),
             Ordering::Less
         );
         assert_eq!(
-            total_compare(&DbValue::Bytes(vec![1, 2]), &DbValue::Bytes(vec![1, 2])),
+            total_compare(&DbValue::bytes(vec![1, 2]), &DbValue::bytes(vec![1, 2])),
             Ordering::Equal
         );
     }
@@ -460,12 +460,12 @@ mod tests {
         let size_int = estimate_value_size(&DbValue::Int(42));
         assert!(size_int > 0);
 
-        let size_str = estimate_value_size(&DbValue::String("hello".to_string()));
-        let size_bytes = estimate_value_size(&DbValue::Bytes(vec![1, 2, 3]));
+        let size_str = estimate_value_size(&DbValue::string("hello"));
+        let size_bytes = estimate_value_size(&DbValue::bytes(vec![1, 2, 3]));
         assert_eq!(size_str, std::mem::size_of::<DbValue>() + 5);
         assert_eq!(size_bytes, std::mem::size_of::<DbValue>() + 3);
 
-        let row_size = estimate_row_size(&[DbValue::Int(1)], &[DbValue::String("a".to_string())]);
+        let row_size = estimate_row_size(&[DbValue::Int(1)], &[DbValue::string("a")]);
         assert!(row_size > 0);
     }
 

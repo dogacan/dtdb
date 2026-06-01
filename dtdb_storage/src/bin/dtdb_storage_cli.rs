@@ -114,8 +114,8 @@ fn main() {
                     // In Rust enum ordering: Int comes before String.
                     let int_start = DbKey::Int(i64::MIN);
                     let int_end = DbKey::Int(i64::MAX);
-                    let str_start = DbKey::String("".to_string());
-                    let str_end = DbKey::String("\u{10ffff}".to_string());
+                    let str_start = DbKey::string("");
+                    let str_end = DbKey::string("\u{10ffff}");
 
                     match engine.filtered_scan(&int_start, &int_end, |_, _| true) {
                         Ok(int_res) => {
@@ -172,7 +172,7 @@ fn parse_key(s: &str) -> DbKey {
     if let Ok(val) = s.parse::<i64>() {
         DbKey::Int(val)
     } else {
-        DbKey::String(s.to_string())
+        DbKey::string(s)
     }
 }
 
@@ -184,9 +184,9 @@ fn parse_value(s: &str) -> DbValue {
         if let Ok(val) = s.parse::<f64>() {
             DbValue::Float(val)
         } else {
-            DbValue::String(s.to_string())
+            DbValue::string(s)
         }
     } else {
-        DbValue::String(s.to_string())
+        DbValue::string(s)
     }
 }

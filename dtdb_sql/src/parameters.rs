@@ -11,11 +11,11 @@ fn db_value_to_sql_expr(val: &DbValue) -> SqlExpr {
         DbValue::Int(i) => SqlExpr::Value(SqlValue::Number(i.to_string(), false).into()),
         DbValue::Float(f) => SqlExpr::Value(SqlValue::Number(f.to_string(), false).into()),
         DbValue::Bool(b) => SqlExpr::Value(SqlValue::Boolean(*b).into()),
-        DbValue::String(s) => SqlExpr::Value(SqlValue::SingleQuotedString(s.clone()).into()),
+        DbValue::String(s) => SqlExpr::Value(SqlValue::SingleQuotedString(s.to_string()).into()),
         DbValue::Null => SqlExpr::Value(SqlValue::Null.into()),
         DbValue::Bytes(bytes) => {
             let mut hex = String::new();
-            for b in bytes {
+            for b in bytes.iter() {
                 hex.push_str(&format!("{:02x}", b));
             }
             SqlExpr::Value(SqlValue::HexStringLiteral(hex).into())
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn binds_at_identifier_parameter() {
-        let p = params(&[("name", DbValue::String("alice".to_string()))]);
+        let p = params(&[("name", DbValue::string("alice"))]);
         let out = bind_and_render("SELECT * FROM t WHERE name = @name", &p).unwrap();
         assert!(out.contains("'alice'"), "got: {out}");
         assert!(!out.contains('@'), "got: {out}");
@@ -367,9 +367,9 @@ mod tests {
             ("i", DbValue::Int(1)),
             ("f", DbValue::Float(2.5)),
             ("b", DbValue::Bool(true)),
-            ("s", DbValue::String("hi".to_string())),
+            ("s", DbValue::string("hi")),
             ("n", DbValue::Null),
-            ("by", DbValue::Bytes(vec![0xde, 0xad])),
+            ("by", DbValue::bytes(vec![0xde, 0xad])),
         ]);
         let out = bind_and_render(
             "SELECT * FROM t WHERE i = :i AND f = :f AND b = :b AND s = :s AND n = :n AND by = :by",
@@ -391,7 +391,7 @@ mod tests {
         let p = params(&[
             ("lo", DbValue::Int(1)),
             ("hi", DbValue::Int(10)),
-            ("pat", DbValue::String("a%".to_string())),
+            ("pat", DbValue::string("a%")),
             ("x", DbValue::Int(5)),
             ("y", DbValue::Int(6)),
             ("z", DbValue::Int(7)),
@@ -410,7 +410,7 @@ mod tests {
     fn binds_in_insert_update_delete() {
         let p = params(&[
             ("v", DbValue::Int(9)),
-            ("w", DbValue::String("x".to_string())),
+            ("w", DbValue::string("x")),
             ("id", DbValue::Int(3)),
         ]);
         let insert = bind_and_render("INSERT INTO t (a) VALUES (:v)", &p).unwrap();

@@ -518,7 +518,7 @@ impl Schema {
                 };
                 keys.push(k);
             }
-            Ok(DbKey::Composite(keys))
+            Ok(DbKey::composite(keys))
         }
     }
 
@@ -535,8 +535,8 @@ impl Schema {
             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
             DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
             _ => (
-                DbKey::String("".to_string()),
-                DbKey::String("\u{10ffff}".to_string()),
+                DbKey::string(""),
+                DbKey::string("\u{10ffff}"),
             ),
         };
 
@@ -552,7 +552,7 @@ impl Schema {
                 mins.push(min_val);
                 maxs.push(max_val);
             }
-            Ok((DbKey::Composite(mins), DbKey::Composite(maxs)))
+            Ok((DbKey::composite(mins), DbKey::composite(maxs)))
         }
     }
 
@@ -738,20 +738,20 @@ mod tests {
         ]);
         let row = Row::new(vec![
             DbValue::Int(1),
-            DbValue::String("hello".to_string()),
-            DbValue::String("alice".to_string()),
+            DbValue::string("hello"),
+            DbValue::string("alice"),
         ]);
 
         // Default group holds id + name; "detail" group holds bio.
         let default_sub = schema.split_row(&row, "");
         assert_eq!(
             default_sub.values,
-            vec![DbValue::Int(1), DbValue::String("alice".to_string())]
+            vec![DbValue::Int(1), DbValue::string("alice")]
         );
         let detail_sub = schema.split_row(&row, "detail");
         assert_eq!(
             detail_sub.values,
-            vec![DbValue::String("hello".to_string())]
+            vec![DbValue::string("hello")]
         );
 
         // Merging the sub-rows back yields the original full row.
@@ -807,8 +807,8 @@ mod tests {
         let row = Row::new(vec![
             DbValue::Int(1),
             DbValue::Float(1.5),
-            DbValue::String("x".to_string()),
-            DbValue::Bytes(vec![1, 2]),
+            DbValue::string("x"),
+            DbValue::bytes(vec![1, 2]),
             DbValue::Bool(true),
         ]);
         assert!(schema.validate_row(&row).is_ok());
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn validate_row_rejects_type_mismatch() {
         let schema = Schema::new(vec![col("id", DataType::Int, true)]);
-        let row = Row::new(vec![DbValue::String("nope".to_string())]);
+        let row = Row::new(vec![DbValue::string("nope")]);
         assert!(schema.validate_row(&row).is_err());
     }
 
@@ -869,10 +869,10 @@ mod tests {
         assert_eq!(schema.extract_primary_key(&row).unwrap(), DbKey::Int(42));
 
         let schema = Schema::new(vec![col("id", DataType::String, true)]);
-        let row = Row::new(vec![DbValue::String("k".to_string())]);
+        let row = Row::new(vec![DbValue::string("k")]);
         assert_eq!(
             schema.extract_primary_key(&row).unwrap(),
-            DbKey::String("k".to_string())
+            DbKey::string("k")
         );
 
         let schema = Schema::new(vec![col("id", DataType::Bool, true)]);
@@ -886,10 +886,10 @@ mod tests {
             col("a", DataType::Int, true),
             col("b", DataType::String, true),
         ]);
-        let row = Row::new(vec![DbValue::Int(1), DbValue::String("x".to_string())]);
+        let row = Row::new(vec![DbValue::Int(1), DbValue::string("x")]);
         assert_eq!(
             schema.extract_primary_key(&row).unwrap(),
-            DbKey::Composite(vec![DbKey::Int(1), DbKey::String("x".to_string())])
+            DbKey::composite(vec![DbKey::Int(1), DbKey::string("x")])
         );
     }
 
@@ -899,7 +899,7 @@ mod tests {
         let schema = Schema::new(vec![col("name", DataType::String, false)]);
         assert!(
             schema
-                .extract_primary_key(&Row::new(vec![DbValue::String("a".to_string())]))
+                .extract_primary_key(&Row::new(vec![DbValue::string("a")]))
                 .is_err()
         );
 
@@ -958,8 +958,8 @@ mod tests {
 
         let schema = Schema::new(vec![col("id", DataType::String, true)]);
         let (lo, hi) = schema.primary_key_bounds().unwrap();
-        assert_eq!(lo, DbKey::String("".to_string()));
-        assert_eq!(hi, DbKey::String("\u{10ffff}".to_string()));
+        assert_eq!(lo, DbKey::string(""));
+        assert_eq!(hi, DbKey::string("\u{10ffff}"));
 
         let composite = Schema::new(vec![
             col("a", DataType::Int, true),
@@ -968,13 +968,13 @@ mod tests {
         let (lo, hi) = composite.primary_key_bounds().unwrap();
         assert_eq!(
             lo,
-            DbKey::Composite(vec![DbKey::Int(i64::MIN), DbKey::String("".to_string())])
+            DbKey::composite(vec![DbKey::Int(i64::MIN), DbKey::string("")])
         );
         assert_eq!(
             hi,
-            DbKey::Composite(vec![
+            DbKey::composite(vec![
                 DbKey::Int(i64::MAX),
-                DbKey::String("\u{10ffff}".to_string())
+                DbKey::string("\u{10ffff}")
             ])
         );
 
@@ -994,7 +994,7 @@ mod tests {
         // Key type does not match column type.
         assert!(
             schema
-                .validate_key(&DbKey::String("5".to_string()), &row)
+                .validate_key(&DbKey::string("5"), &row)
                 .is_err()
         );
         // Key value does not match the row's primary key value.
@@ -1006,7 +1006,7 @@ mod tests {
             no_pk
                 .validate_key(
                     &DbKey::Int(1),
-                    &Row::new(vec![DbValue::String("x".to_string())])
+                    &Row::new(vec![DbValue::string("x")])
                 )
                 .is_err()
         );
@@ -1018,19 +1018,19 @@ mod tests {
             col("a", DataType::Int, true),
             col("b", DataType::String, true),
         ]);
-        let row = Row::new(vec![DbValue::Int(1), DbValue::String("x".to_string())]);
-        let good = DbKey::Composite(vec![DbKey::Int(1), DbKey::String("x".to_string())]);
+        let row = Row::new(vec![DbValue::Int(1), DbValue::string("x")]);
+        let good = DbKey::composite(vec![DbKey::Int(1), DbKey::string("x")]);
         assert!(schema.validate_key(&good, &row).is_ok());
 
         // Wrong number of parts.
-        let short = DbKey::Composite(vec![DbKey::Int(1)]);
+        let short = DbKey::composite(vec![DbKey::Int(1)]);
         assert!(schema.validate_key(&short, &row).is_err());
 
         // Non-composite key for a composite primary key.
         assert!(schema.validate_key(&DbKey::Int(1), &row).is_err());
 
         // Mismatched part value.
-        let bad = DbKey::Composite(vec![DbKey::Int(1), DbKey::String("y".to_string())]);
+        let bad = DbKey::composite(vec![DbKey::Int(1), DbKey::string("y")]);
         assert!(schema.validate_key(&bad, &row).is_err());
     }
 
@@ -1049,16 +1049,16 @@ mod tests {
             col("a", DataType::Int, true),
             col("b", DataType::String, true),
         ]);
-        let good = DbKey::Composite(vec![DbKey::Int(1), DbKey::String("x".to_string())]);
+        let good = DbKey::composite(vec![DbKey::Int(1), DbKey::string("x")]);
         assert!(composite.validate_key_only(&good).is_ok());
         assert!(
             composite
-                .validate_key_only(&DbKey::Composite(vec![DbKey::Int(1)]))
+                .validate_key_only(&DbKey::composite(vec![DbKey::Int(1)]))
                 .is_err()
         );
         assert!(composite.validate_key_only(&DbKey::Int(1)).is_err());
         // Wrong type within composite.
-        let bad = DbKey::Composite(vec![DbKey::Int(1), DbKey::Int(2)]);
+        let bad = DbKey::composite(vec![DbKey::Int(1), DbKey::Int(2)]);
         assert!(composite.validate_key_only(&bad).is_err());
     }
 
@@ -1158,7 +1158,7 @@ mod tests {
     #[test]
     fn reconcile_row_pads_short_rows_with_defaults() {
         let mut c = col("c", DataType::String, false);
-        c.default_value = Some(DbValue::String("dflt".to_string()));
+        c.default_value = Some(DbValue::string("dflt"));
         // Three-column schema: a (no default), b (no default), c (default "dflt").
         let schema = Schema::new(vec![
             col("a", DataType::Int, true),
@@ -1174,7 +1174,7 @@ mod tests {
             vec![
                 DbValue::Int(1),
                 DbValue::Int(2),
-                DbValue::String("dflt".to_string()),
+                DbValue::string("dflt"),
             ]
         );
     }

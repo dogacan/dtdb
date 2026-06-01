@@ -14,7 +14,7 @@ fn v_int(val: i64) -> DbValue {
 }
 
 fn v_str(val: &str) -> DbValue {
-    DbValue::String(val.to_string())
+    DbValue::string(val)
 }
 
 // Helper to count SSTable files in a directory that belong to a specific level

@@ -113,7 +113,7 @@ impl Row {
                         let s = String::from_utf8(cursor[0..str_len].to_vec()).map_err(|e| {
                             dtdb_storage::StorageError::Corruption(format!("Invalid UTF-8: {}", e))
                         })?;
-                        values.push(DbValue::String(s));
+                        values.push(DbValue::string(s));
                     } else {
                         values.push(DbValue::Null);
                     }
@@ -138,7 +138,7 @@ impl Row {
                         ));
                     }
                     if keep {
-                        values.push(DbValue::Bytes(cursor[0..bytes_len].to_vec()));
+                        values.push(DbValue::bytes(cursor[0..bytes_len].to_vec()));
                     } else {
                         values.push(DbValue::Null);
                     }
@@ -199,10 +199,10 @@ mod tests {
     fn test_from_bytes_projected() {
         let row = Row::new(vec![
             DbValue::Int(42),
-            DbValue::String("hello".to_string()),
+            DbValue::string("hello"),
             DbValue::Null,
             DbValue::Bool(true),
-            DbValue::Bytes(vec![1, 2, 3]),
+            DbValue::bytes(vec![1, 2, 3]),
             DbValue::Float(1.5),
         ]);
 
@@ -219,10 +219,10 @@ mod tests {
         // 3. Projection with subset (only keep index 0, 1, 4)
         let row_subset = Row::from_bytes_projected(&bytes, Some(&[0, 1, 4])).unwrap();
         assert_eq!(row_subset.values[0], DbValue::Int(42));
-        assert_eq!(row_subset.values[1], DbValue::String("hello".to_string()));
+        assert_eq!(row_subset.values[1], DbValue::string("hello"));
         assert_eq!(row_subset.values[2], DbValue::Null); // Not kept
         assert_eq!(row_subset.values[3], DbValue::Null); // Not kept
-        assert_eq!(row_subset.values[4], DbValue::Bytes(vec![1, 2, 3]));
+        assert_eq!(row_subset.values[4], DbValue::bytes(vec![1, 2, 3]));
         assert_eq!(row_subset.values[5], DbValue::Null); // Not kept
     }
 }

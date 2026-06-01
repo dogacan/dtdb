@@ -66,7 +66,7 @@ fn poll_until<F: FnMut() -> bool>(timeout: std::time::Duration, mut condition: F
 fn r_user(id: i64, name: &str, score: f64) -> Row {
     Row::new(vec![
         DbValue::Int(id),
-        DbValue::String(name.to_string()),
+        DbValue::string(name.to_string()),
         DbValue::Float(score),
     ])
 }
@@ -112,7 +112,7 @@ fn test_schema_validations() {
     tx.put("users", k_int(1), r_user(1, "alice", 95.5)).unwrap();
 
     // 2. Schema mismatch: column count mismatch (only 2 values instead of 3)
-    let bad_row_cols = Row::new(vec![DbValue::Int(2), DbValue::String("bob".to_string())]);
+    let bad_row_cols = Row::new(vec![DbValue::Int(2), DbValue::string("bob")]);
     assert!(matches!(
         tx.put("users", k_int(2), bad_row_cols),
         Err(RelationalError::SchemaMismatch(_))
@@ -121,8 +121,8 @@ fn test_schema_validations() {
     // 3. Schema mismatch: type mismatch (String instead of Float for score)
     let bad_row_types = Row::new(vec![
         DbValue::Int(2),
-        DbValue::String("bob".to_string()),
-        DbValue::String("bad_float".to_string()),
+        DbValue::string("bob"),
+        DbValue::string("bad_float"),
     ]);
     assert!(matches!(
         tx.put("users", k_int(2), bad_row_types),
@@ -133,7 +133,7 @@ fn test_schema_validations() {
     assert!(matches!(
         tx.put(
             "users",
-            DbKey::String("1".to_string()),
+            DbKey::string("1"),
             r_user(1, "alice", 95.5)
         ),
         Err(RelationalError::SchemaMismatch(_))
@@ -431,7 +431,7 @@ fn test_auto_increment_sequence_reflects_recovered_rows() {
             "t".to_string(),
             vec![RelationalMutation::Put {
                 key: DbKey::Int(100),
-                value: DbValue::Bytes(row100_bytes),
+                value: DbValue::bytes(row100_bytes),
             }],
         )]);
         let prepared = TransactionRecord::Prepared {
@@ -516,7 +516,7 @@ fn test_locality_group_pruning_verification() {
         scan1[0].1.values,
         vec![
             DbValue::Null,
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Null
         ]
     );
@@ -555,7 +555,7 @@ fn test_locality_group_pruning_verification() {
         scan4[0].1.values,
         vec![
             DbValue::Int(1),
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Float(95.5)
         ]
     );
@@ -621,7 +621,7 @@ fn test_scan_iter_single_group_fast_path() {
             k_int(2),
             Row::new(vec![
                 DbValue::Null,
-                DbValue::String("Bob".to_string()),
+                DbValue::string("Bob"),
                 DbValue::Null
             ])
         )]
@@ -704,7 +704,7 @@ fn test_add_column_reconciles_old_rows_on_scan_single_group() {
         got.values,
         vec![
             DbValue::Int(2),
-            DbValue::String("Bob".to_string()),
+            DbValue::string("Bob"),
             DbValue::Float(80.25),
             DbValue::Bool(true),
         ]
@@ -823,7 +823,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
             k_int(1),
             Row::new(vec![
                 DbValue::Null,
-                DbValue::String("Alice".to_string()),
+                DbValue::string("Alice"),
                 DbValue::Null,
             ]),
         )]
@@ -1286,7 +1286,7 @@ fn test_database_alter_add_column_multi_group() {
         got.values,
         vec![
             DbValue::Int(1),
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Float(95.5),
             DbValue::Bool(true),
         ]
@@ -1366,7 +1366,7 @@ fn test_database_alter_drop_column() {
         let tx = Transaction::new(1, db.clone());
         let val = Row::new(vec![
             DbValue::Int(1),
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Float(95.5),
             DbValue::Bool(false),
         ]);
@@ -1388,7 +1388,7 @@ fn test_database_alter_drop_column() {
         got.values,
         vec![
             DbValue::Int(1),
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Bool(false),
         ]
     );
@@ -1400,7 +1400,7 @@ fn test_database_alter_drop_column() {
         rows[0].1.values,
         vec![
             DbValue::Int(1),
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Bool(false),
         ]
     );
@@ -1422,7 +1422,7 @@ fn test_database_alter_drop_column() {
             k_int(2),
             Row::new(vec![
                 DbValue::Int(2),
-                DbValue::String("Bob".to_string()),
+                DbValue::string("Bob"),
                 DbValue::Bool(true),
             ]),
         )
@@ -1451,7 +1451,7 @@ fn test_database_alter_drop_column() {
         got1.values,
         vec![
             DbValue::Int(1),
-            DbValue::String("Alice".to_string()),
+            DbValue::string("Alice"),
             DbValue::Bool(false),
         ]
     );
@@ -1461,7 +1461,7 @@ fn test_database_alter_drop_column() {
         got2.values,
         vec![
             DbValue::Int(2),
-            DbValue::String("Bob".to_string()),
+            DbValue::string("Bob"),
             DbValue::Bool(true),
         ]
     );
@@ -1479,7 +1479,7 @@ fn test_database_alter_drop_column() {
                 row.values,
                 vec![
                     DbValue::Int(1),
-                    DbValue::String("Alice".to_string()),
+                    DbValue::string("Alice"),
                     DbValue::Bool(false),
                 ]
             );

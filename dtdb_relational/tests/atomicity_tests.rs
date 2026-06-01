@@ -91,16 +91,16 @@ fn k_int(val: i64) -> DbKey {
 }
 
 fn k_str(val: &str) -> DbKey {
-    DbKey::String(val.to_string())
+    DbKey::string(val.to_string())
 }
 
 fn r_user(id: i64, name: &str) -> Row {
-    Row::new(vec![DbValue::Int(id), DbValue::String(name.to_string())])
+    Row::new(vec![DbValue::Int(id), DbValue::string(name.to_string())])
 }
 
 fn r_product(sku: &str, price: f64) -> Row {
     Row::new(vec![
-        DbValue::String(sku.to_string()),
+        DbValue::string(sku.to_string()),
         DbValue::Float(price),
     ])
 }
@@ -197,7 +197,7 @@ fn test_crash_recovery_roll_forward() {
         let user_bytes = r_user(42, "Douglas Adams").to_bytes().unwrap();
         let user_entries = vec![RelationalMutation::Put {
             key: k_int(42),
-            value: DbValue::Bytes(user_bytes),
+            value: DbValue::bytes(user_bytes),
         }];
         mutations.insert("users".to_string(), user_entries);
 
@@ -205,7 +205,7 @@ fn test_crash_recovery_roll_forward() {
         let prod_bytes = r_product("TOWEL", 42.0).to_bytes().unwrap();
         let prod_entries = vec![RelationalMutation::Put {
             key: k_str("TOWEL"),
-            value: DbValue::Bytes(prod_bytes),
+            value: DbValue::bytes(prod_bytes),
         }];
         mutations.insert("products".to_string(), prod_entries);
 
@@ -320,7 +320,7 @@ fn test_crash_recovery_secondary_index_maintenance() {
         let main_engine = table.engines.get("").unwrap();
         let new_row_bytes = r_user(1, "Adams").to_bytes().unwrap();
         main_engine
-            .put(k_int(1), DbValue::Bytes(new_row_bytes.clone()))
+            .put(k_int(1), DbValue::bytes(new_row_bytes.clone()))
             .unwrap();
 
         // Write the Prepared record to transactions.log
@@ -330,7 +330,7 @@ fn test_crash_recovery_secondary_index_maintenance() {
             "users".to_string(),
             vec![RelationalMutation::Put {
                 key: k_int(1),
-                value: DbValue::Bytes(new_row_bytes),
+                value: DbValue::bytes(new_row_bytes),
             }],
         );
 
@@ -361,8 +361,8 @@ fn test_crash_recovery_secondary_index_maintenance() {
             .index_scan(
                 "users",
                 "idx_name",
-                &DbKey::String("Douglas".to_string()),
-                &DbKey::String("Douglas".to_string()),
+                &DbKey::string("Douglas"),
+                &DbKey::string("Douglas"),
                 None,
             )
             .unwrap();
@@ -373,8 +373,8 @@ fn test_crash_recovery_secondary_index_maintenance() {
             .index_scan(
                 "users",
                 "idx_name",
-                &DbKey::String("Adams".to_string()),
-                &DbKey::String("Adams".to_string()),
+                &DbKey::string("Adams"),
+                &DbKey::string("Adams"),
                 None,
             )
             .unwrap();

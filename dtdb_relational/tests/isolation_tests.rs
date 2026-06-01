@@ -35,7 +35,7 @@ fn k_int(val: i64) -> DbKey {
 }
 
 fn r_user(id: i64, name: &str) -> Row {
-    Row::new(vec![DbValue::Int(id), DbValue::String(name.to_string())])
+    Row::new(vec![DbValue::Int(id), DbValue::string(name.to_string())])
 }
 
 #[test]
@@ -753,7 +753,7 @@ fn test_occ_phantom_read_fts_scan() {
             k_int(1),
             Row::new(vec![
                 DbValue::Int(1),
-                DbValue::String("hello world".to_string()),
+                DbValue::string("hello world"),
             ]),
         )
         .unwrap();
@@ -772,7 +772,7 @@ fn test_occ_phantom_read_fts_scan() {
         k_int(2),
         Row::new(vec![
             DbValue::Int(2),
-            DbValue::String("rust is fast".to_string()),
+            DbValue::string("rust is fast"),
         ]),
     )
     .unwrap();

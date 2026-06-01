@@ -933,7 +933,7 @@ fn is_key_unbounded_min(key: &DbKey) -> bool {
 fn is_key_unbounded_max(key: &DbKey) -> bool {
     match key {
         DbKey::Int(v) => *v == i64::MAX,
-        DbKey::String(s) => s == "\u{10ffff}",
+        DbKey::String(s) => &**s == "\u{10ffff}",
         DbKey::Bool(b) => *b,
         DbKey::Composite(parts) => parts.first().is_none_or(is_key_unbounded_max),
     }
@@ -1053,7 +1053,7 @@ fn extract_bounds_for_column(
                                         DbKey::Int(v) => {
                                             PlanKey::Value(DbKey::Int(v.checked_add(1)?))
                                         }
-                                        DbKey::String(s) => PlanKey::Value(DbKey::String(s + "\0")),
+                                        DbKey::String(s) => PlanKey::Value(DbKey::string(format!("{s}\0"))),
                                         _ => PlanKey::Value(k),
                                     }
                                 } else {
@@ -1064,14 +1064,14 @@ fn extract_bounds_for_column(
                         };
                         let end = match col_type {
                             DataType::Int => PlanKey::Value(DbKey::Int(i64::MAX)),
-                            _ => PlanKey::Value(DbKey::String("\u{10ffff}".to_string())),
+                            _ => PlanKey::Value(DbKey::string("\u{10ffff}")),
                         };
                         Some((start, end))
                     }
                     Operator::LtEq | Operator::Lt => {
                         let start = match col_type {
                             DataType::Int => PlanKey::Value(DbKey::Int(i64::MIN)),
-                            _ => PlanKey::Value(DbKey::String("".to_string())),
+                            _ => PlanKey::Value(DbKey::string("")),
                         };
                         let end = match key {
                             PlanKey::Value(k) => {
@@ -1220,29 +1220,27 @@ mod tests {
         assert!(is_key_unbounded_max(&DbKey::Int(i64::MAX)));
         assert!(!is_key_unbounded_max(&DbKey::Int(0)));
 
-        assert!(is_key_unbounded_min(&DbKey::String("".to_string())));
-        assert!(!is_key_unbounded_min(&DbKey::String("a".to_string())));
-        assert!(is_key_unbounded_max(&DbKey::String(
-            "\u{10ffff}".to_string()
-        )));
+        assert!(is_key_unbounded_min(&DbKey::string("")));
+        assert!(!is_key_unbounded_min(&DbKey::string("a")));
+        assert!(is_key_unbounded_max(&DbKey::string("\u{10ffff}")));
 
         assert!(is_key_unbounded_min(&DbKey::Bool(false)));
         assert!(!is_key_unbounded_min(&DbKey::Bool(true)));
         assert!(is_key_unbounded_max(&DbKey::Bool(true)));
         assert!(!is_key_unbounded_max(&DbKey::Bool(false)));
 
-        assert!(is_key_unbounded_min(&DbKey::Composite(vec![])));
-        assert!(is_key_unbounded_min(&DbKey::Composite(vec![DbKey::Bool(
+        assert!(is_key_unbounded_min(&DbKey::composite(vec![])));
+        assert!(is_key_unbounded_min(&DbKey::composite(vec![DbKey::Bool(
             false
         )])));
-        assert!(!is_key_unbounded_min(&DbKey::Composite(vec![DbKey::Bool(
+        assert!(!is_key_unbounded_min(&DbKey::composite(vec![DbKey::Bool(
             true
         )])));
-        assert!(is_key_unbounded_max(&DbKey::Composite(vec![])));
-        assert!(is_key_unbounded_max(&DbKey::Composite(vec![DbKey::Bool(
+        assert!(is_key_unbounded_max(&DbKey::composite(vec![])));
+        assert!(is_key_unbounded_max(&DbKey::composite(vec![DbKey::Bool(
             true
         )])));
-        assert!(!is_key_unbounded_max(&DbKey::Composite(vec![DbKey::Bool(
+        assert!(!is_key_unbounded_max(&DbKey::composite(vec![DbKey::Bool(
             false
         )])));
     }
@@ -1407,7 +1405,7 @@ mod tests {
         assert!(bounds.is_some());
         let (start, end) = bounds.unwrap();
         assert_eq!(start, PlanKey::Value(DbKey::Int(6)));
-        assert_eq!(end, PlanKey::Value(DbKey::String("\u{10ffff}".to_string())));
+        assert_eq!(end, PlanKey::Value(DbKey::string("\u{10ffff}")));
 
         // WHERE val < 5 for boolean col_type (testing fallback arm _ => key in matches!(op, Operator::Lt))
         let predicate_bool_lt = Expr::BinaryOp {
@@ -1418,7 +1416,7 @@ mod tests {
         let bounds = extract_bounds_for_column(&predicate_bool_lt, "val", &DataType::Bool);
         assert!(bounds.is_some());
         let (start, end) = bounds.unwrap();
-        assert_eq!(start, PlanKey::Value(DbKey::String("".to_string())));
+        assert_eq!(start, PlanKey::Value(DbKey::string("")));
         assert_eq!(end, PlanKey::Value(DbKey::Int(4)));
 
         // And operators

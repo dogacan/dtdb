@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub mod block_cache;
@@ -63,18 +64,36 @@ pub enum StorageError {
 
 /// DbKey represents strongly typed keys in the database.
 ///
+/// Heap-allocated payloads are wrapped in `Arc` so that snapshotting a key
+/// (e.g. when a scan iterator clones the memtable range) is a refcount bump
+/// rather than a deep buffer copy. `Arc<T>` delegates `Ord`/`PartialOrd`/`Eq`/
+/// `Hash` to the pointee, so ordering and equality semantics are by *value*,
+/// not by pointer — `BTreeMap` correctness is unaffected.
+///
 /// We derive `PartialOrd` and `Ord` so keys can be sorted and stored in `BTreeMap`.
 /// Rust's derived ordering compares variants in the order they are declared:
 /// `Int` comes before `String`. Within a variant, it compares the inner data.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DbKey {
     Int(i64),
-    String(String),
+    String(Arc<str>),
     Bool(bool),
-    Composite(Vec<DbKey>),
+    Composite(Arc<Vec<DbKey>>),
 }
 
 impl DbKey {
+    /// Construct a `String` key from anything convertible into `Arc<str>`
+    /// (`String`, `&str`, `Box<str>`, `Arc<str>`).
+    pub fn string(s: impl Into<Arc<str>>) -> Self {
+        DbKey::String(s.into())
+    }
+
+    /// Construct a `Composite` key from anything convertible into
+    /// `Arc<Vec<DbKey>>` (`Vec<DbKey>`, `Arc<Vec<DbKey>>`).
+    pub fn composite(keys: impl Into<Arc<Vec<DbKey>>>) -> Self {
+        DbKey::Composite(keys.into())
+    }
+
     pub fn byte_size(&self) -> usize {
         match self {
             DbKey::Int(_) => 8,
@@ -93,10 +112,24 @@ impl DbKey {
 pub enum DbValue {
     Int(i64),
     Float(f64),
-    String(String),
-    Bytes(Vec<u8>),
+    String(Arc<str>),
+    Bytes(Arc<[u8]>),
     Bool(bool),
     Null,
+}
+
+impl DbValue {
+    /// Construct a `String` value from anything convertible into `Arc<str>`
+    /// (`String`, `&str`, `Box<str>`, `Arc<str>`).
+    pub fn string(s: impl Into<Arc<str>>) -> Self {
+        DbValue::String(s.into())
+    }
+
+    /// Construct a `Bytes` value from anything convertible into `Arc<[u8]>`
+    /// (`Vec<u8>`, `&[u8]`, `Arc<[u8]>`).
+    pub fn bytes(b: impl Into<Arc<[u8]>>) -> Self {
+        DbValue::Bytes(b.into())
+    }
 }
 
 impl PartialEq for DbValue {
@@ -221,7 +254,7 @@ impl From<f64> for DbValue {
 
 impl From<String> for DbValue {
     fn from(v: String) -> Self {
-        DbValue::String(v)
+        DbValue::string(v)
     }
 }
 
@@ -233,19 +266,19 @@ impl From<bool> for DbValue {
 
 impl<'a> From<&'a str> for DbValue {
     fn from(v: &'a str) -> Self {
-        DbValue::String(v.to_string())
+        DbValue::string(v)
     }
 }
 
 impl From<Vec<u8>> for DbValue {
     fn from(v: Vec<u8>) -> Self {
-        DbValue::Bytes(v)
+        DbValue::bytes(v)
     }
 }
 
 impl<'a> From<&'a [u8]> for DbValue {
     fn from(v: &'a [u8]) -> Self {
-        DbValue::Bytes(v.to_vec())
+        DbValue::bytes(v)
     }
 }
 
@@ -415,10 +448,10 @@ mod tests {
 
     #[test]
     fn test_composite_key_ordering() {
-        let k1 = DbKey::Composite(vec![DbKey::Int(10), DbKey::Int(1)]);
-        let k2 = DbKey::Composite(vec![DbKey::Int(10), DbKey::Int(2)]);
-        let k3 = DbKey::Composite(vec![DbKey::Int(9), DbKey::Int(20)]);
-        let k4 = DbKey::Composite(vec![DbKey::Int(10)]);
+        let k1 = DbKey::composite(vec![DbKey::Int(10), DbKey::Int(1)]);
+        let k2 = DbKey::composite(vec![DbKey::Int(10), DbKey::Int(2)]);
+        let k3 = DbKey::composite(vec![DbKey::Int(9), DbKey::Int(20)]);
+        let k4 = DbKey::composite(vec![DbKey::Int(10)]);
 
         assert!(k1 < k2);
         assert!(k3 < k1);
@@ -427,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_composite_key_byte_size() {
-        let key = DbKey::Composite(vec![DbKey::Int(10), DbKey::String("hello".to_string())]);
+        let key = DbKey::composite(vec![DbKey::Int(10), DbKey::string("hello")]);
         assert_eq!(key.byte_size(), 8 + 5);
     }
 
@@ -443,9 +476,9 @@ mod tests {
     #[test]
     fn test_dbkey_byte_size_all_variants() {
         assert_eq!(DbKey::Int(0).byte_size(), 8);
-        assert_eq!(DbKey::String("abcd".to_string()).byte_size(), 4);
+        assert_eq!(DbKey::string("abcd").byte_size(), 4);
         assert_eq!(DbKey::Bool(true).byte_size(), 1);
-        assert_eq!(DbKey::String(String::new()).byte_size(), 0);
+        assert_eq!(DbKey::string("").byte_size(), 0);
     }
 
     #[test]
@@ -455,8 +488,8 @@ mod tests {
         assert_ne!(DbValue::Int(7), DbValue::Int(8));
         assert_eq!(DbValue::String("x".into()), DbValue::String("x".into()));
         assert_ne!(DbValue::String("x".into()), DbValue::String("y".into()));
-        assert_eq!(DbValue::Bytes(vec![1, 2]), DbValue::Bytes(vec![1, 2]));
-        assert_ne!(DbValue::Bytes(vec![1, 2]), DbValue::Bytes(vec![1, 3]));
+        assert_eq!(DbValue::bytes(vec![1, 2]), DbValue::bytes(vec![1, 2]));
+        assert_ne!(DbValue::bytes(vec![1, 2]), DbValue::bytes(vec![1, 3]));
         assert_eq!(DbValue::Bool(true), DbValue::Bool(true));
         assert_ne!(DbValue::Bool(true), DbValue::Bool(false));
         assert_eq!(DbValue::Null, DbValue::Null);
@@ -487,8 +520,8 @@ mod tests {
             hash_of(&DbValue::String("k".into()))
         );
         assert_eq!(
-            hash_of(&DbValue::Bytes(vec![9, 8])),
-            hash_of(&DbValue::Bytes(vec![9, 8]))
+            hash_of(&DbValue::bytes(vec![9, 8])),
+            hash_of(&DbValue::bytes(vec![9, 8]))
         );
         assert_eq!(hash_of(&DbValue::Bool(true)), hash_of(&DbValue::Bool(true)));
         assert_eq!(hash_of(&DbValue::Null), hash_of(&DbValue::Null));
@@ -513,10 +546,10 @@ mod tests {
         assert_eq!(DbValue::from("slice"), DbValue::String("slice".into()));
         assert_eq!(
             DbValue::from(vec![1u8, 2, 3]),
-            DbValue::Bytes(vec![1, 2, 3])
+            DbValue::bytes(vec![1, 2, 3])
         );
         let bytes: &[u8] = &[7, 8];
-        assert_eq!(DbValue::from(bytes), DbValue::Bytes(vec![7, 8]));
+        assert_eq!(DbValue::from(bytes), DbValue::bytes(vec![7, 8]));
     }
 
     #[test]
@@ -559,5 +592,133 @@ mod tests {
         neg_zero.hash(&mut h4);
 
         assert_eq!(h3.finish(), h4.finish());
+    }
+
+    // ----- Arc-payload invariants (ADR 0004) ---------------------------------
+
+    /// Cloning a `DbValue::String`/`Bytes` must share the underlying buffer via
+    /// the `Arc` refcount rather than deep-copying it. This is the core
+    /// performance invariant of ADR 0004: if a future change reintroduces a
+    /// deep copy on this path (e.g. a stray `to_string()`), `ptr_eq` fails here.
+    #[test]
+    fn test_dbvalue_clone_shares_arc_buffer() {
+        let v = DbValue::string("a reasonably long string payload to copy");
+        let DbValue::String(orig) = &v else {
+            unreachable!()
+        };
+        assert_eq!(Arc::strong_count(orig), 1);
+
+        let cloned = v.clone();
+        let DbValue::String(copy) = &cloned else {
+            unreachable!()
+        };
+        // Same allocation (no deep copy) and the refcount went up.
+        assert!(Arc::ptr_eq(orig, copy));
+        assert_eq!(Arc::strong_count(orig), 2);
+
+        let b = DbValue::bytes(vec![0u8; 256]);
+        let DbValue::Bytes(orig_b) = &b else {
+            unreachable!()
+        };
+        let cloned_b = b.clone();
+        let DbValue::Bytes(copy_b) = &cloned_b else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(orig_b, copy_b));
+    }
+
+    /// The same sharing must hold for keys, including the composite vec, so that
+    /// snapshotting a scan range is a set of refcount bumps.
+    #[test]
+    fn test_dbkey_clone_shares_arc_buffer() {
+        let k = DbKey::composite(vec![DbKey::Int(1), DbKey::string("payload")]);
+        let DbKey::Composite(orig) = &k else {
+            unreachable!()
+        };
+        let cloned = k.clone();
+        let DbKey::Composite(copy) = &cloned else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(orig, copy));
+    }
+
+    /// `Arc<T>` delegates ordering/equality to the pointee, so wrapping the
+    /// payloads in `Arc` must not change key ordering — the entire `BTreeMap`
+    /// store depends on by-value comparison, never pointer comparison.
+    #[test]
+    fn test_arc_keys_order_by_value_not_pointer() {
+        // Distinct allocations with equal contents compare equal.
+        let a = DbKey::string("dup");
+        let b = DbKey::string(String::from("dup"));
+        if let (DbKey::String(sa), DbKey::String(sb)) = (&a, &b) {
+            assert!(!Arc::ptr_eq(sa, sb), "intended distinct allocations");
+        }
+        assert_eq!(a, b);
+
+        // Variant order (Int < String) and within-variant ordering hold.
+        assert!(DbKey::Int(i64::MAX) < DbKey::string(""));
+        assert!(DbKey::string("apple") < DbKey::string("banana"));
+        assert!(
+            DbKey::composite(vec![DbKey::Int(1), DbKey::string("a")])
+                < DbKey::composite(vec![DbKey::Int(1), DbKey::string("b")])
+        );
+
+        // Usable as a BTreeMap key with correct sorted iteration order.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(DbKey::string("c"), 3);
+        map.insert(DbKey::string("a"), 1);
+        map.insert(DbKey::string("b"), 2);
+        let ordered: Vec<i32> = map.values().copied().collect();
+        assert_eq!(ordered, vec![1, 2, 3]);
+    }
+
+    /// ADR 0004 claims the on-disk/wire format is unchanged: `Arc<str>` and
+    /// `Arc<[u8]>` must serialize byte-for-byte identically to `String`/`Vec<u8>`
+    /// (serde `rc` feature), so existing SSTables/WAL stay readable with no
+    /// migration. This test makes that claim enforceable.
+    #[test]
+    fn test_arc_payload_serializes_identically_to_owned() {
+        let arc_str: Arc<str> = Arc::from("héllo, wörld");
+        let owned_str: String = "héllo, wörld".to_string();
+        assert_eq!(
+            bincode::serialize(&arc_str).unwrap(),
+            bincode::serialize(&owned_str).unwrap(),
+        );
+
+        let arc_bytes: Arc<[u8]> = Arc::from(&[0u8, 1, 2, 250, 255][..]);
+        let owned_bytes: Vec<u8> = vec![0, 1, 2, 250, 255];
+        assert_eq!(
+            bincode::serialize(&arc_bytes).unwrap(),
+            bincode::serialize(&owned_bytes).unwrap(),
+        );
+    }
+
+    /// Every `DbKey`/`DbValue` variant must survive a bincode round-trip
+    /// unchanged (confirms the serde `rc` feature is wired up correctly).
+    #[test]
+    fn test_dbkey_dbvalue_bincode_roundtrip() {
+        let keys = [
+            DbKey::Int(-42),
+            DbKey::string("key"),
+            DbKey::Bool(true),
+            DbKey::composite(vec![DbKey::Int(1), DbKey::string("x")]),
+        ];
+        for k in keys {
+            let back: DbKey = bincode::deserialize(&bincode::serialize(&k).unwrap()).unwrap();
+            assert_eq!(k, back);
+        }
+
+        let values = [
+            DbValue::Int(7),
+            DbValue::Float(2.5),
+            DbValue::string("value"),
+            DbValue::bytes(vec![9, 8, 7]),
+            DbValue::Bool(false),
+            DbValue::Null,
+        ];
+        for v in values {
+            let back: DbValue = bincode::deserialize(&bincode::serialize(&v).unwrap()).unwrap();
+            assert_eq!(v, back);
+        }
     }
 }

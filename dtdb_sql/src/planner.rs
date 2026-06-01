@@ -1198,7 +1198,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
     match expr {
         SqlExpr::Identifier(ident) => {
             if ident.quote_style == Some('"') {
-                Ok(Expr::Literal(DbValue::String(ident.value.clone())))
+                Ok(Expr::Literal(DbValue::string(ident.value.clone())))
             } else if let Some(name) = ident.value.strip_prefix('@') {
                 // `@name` is a bind-parameter placeholder, not a column.
                 Ok(Expr::Parameter(name.to_string()))
@@ -1225,7 +1225,7 @@ pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
                         return Err(format!("Invalid numeric literal: {}", num_str));
                     }
                 }
-                SqlValue::SingleQuotedString(s) => DbValue::String(s.clone()),
+                SqlValue::SingleQuotedString(s) => DbValue::string(s.clone()),
                 SqlValue::Boolean(b) => DbValue::Bool(*b),
                 SqlValue::Null => DbValue::Null,
                 // `:name` / `?` bind-parameter placeholder: keep it symbolic in
@@ -1570,7 +1570,7 @@ fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {
                     Err(format!("Invalid numeric literal for default: {}", num_str))
                 }
             }
-            SqlValue::SingleQuotedString(s) => Ok(DbValue::String(s.clone())),
+            SqlValue::SingleQuotedString(s) => Ok(DbValue::string(s.clone())),
             SqlValue::Boolean(b) => Ok(DbValue::Bool(*b)),
             SqlValue::Null => Ok(DbValue::Null),
             other => Err(format!("Unsupported value type for default: {:?}", other)),

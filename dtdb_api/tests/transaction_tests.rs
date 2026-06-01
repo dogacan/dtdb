@@ -99,7 +99,7 @@ fn test_in_process_transaction_commit() {
             _ => panic!("Expected int"),
         };
         let name_val = match row.get_by_index(1).unwrap() {
-            dtdb_storage::DbValue::String(s) => s.clone(),
+            dtdb_storage::DbValue::String(s) => s.to_string(),
             _ => panic!("Expected string"),
         };
         rows.push(vec![id_val, name_val]);

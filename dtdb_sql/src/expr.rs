@@ -557,9 +557,9 @@ impl Expr {
                         if args.len() == 2 {
                             let start_rust = start_idx.max(0) as usize;
                             if start_rust >= chars.len() {
-                                Ok(DbValue::String("".to_string()))
+                                Ok(DbValue::string(""))
                             } else {
-                                Ok(DbValue::String(chars[start_rust..].iter().collect()))
+                                Ok(DbValue::string(chars[start_rust..].iter().collect::<String>()))
                             }
                         } else {
                             let len_val = args[2].eval(row, schema)?;
@@ -578,7 +578,7 @@ impl Expr {
                                 ));
                             }
                             if length == 0 {
-                                Ok(DbValue::String("".to_string()))
+                                Ok(DbValue::string(""))
                             } else {
                                 // Saturating add: SUBSTR(s, 1, i64::MAX) used to panic
                                 // (debug) or wrap to a negative value (release). We
@@ -590,11 +590,13 @@ impl Expr {
                                 let active_start = start_idx.max(0) as usize;
                                 let active_end = end_idx.clamp(0, n) as usize;
                                 if active_start < active_end && active_start < chars.len() {
-                                    Ok(DbValue::String(
-                                        chars[active_start..active_end].iter().collect(),
+                                    Ok(DbValue::string(
+                                        chars[active_start..active_end]
+                                            .iter()
+                                            .collect::<String>(),
                                     ))
                                 } else {
-                                    Ok(DbValue::String("".to_string()))
+                                    Ok(DbValue::string(""))
                                 }
                             }
                         }
@@ -625,7 +627,7 @@ impl Expr {
                             return Ok(DbValue::Null);
                         }
                         let s = coerce_to_string(&val);
-                        Ok(DbValue::String(s.to_uppercase()))
+                        Ok(DbValue::string(s.to_uppercase()))
                     }
                     "LOWER" => {
                         if args.len() != 1 {
@@ -639,7 +641,7 @@ impl Expr {
                             return Ok(DbValue::Null);
                         }
                         let s = coerce_to_string(&val);
-                        Ok(DbValue::String(s.to_lowercase()))
+                        Ok(DbValue::string(s.to_lowercase()))
                     }
                     "CONCAT" => {
                         if args.is_empty() {
@@ -653,7 +655,7 @@ impl Expr {
                             }
                             result.push_str(&coerce_to_string(&val));
                         }
-                        Ok(DbValue::String(result))
+                        Ok(DbValue::string(result))
                     }
                     "ABS" => {
                         if args.len() != 1 {
@@ -771,7 +773,7 @@ impl Expr {
 
 fn coerce_to_string(val: &DbValue) -> String {
     match val {
-        DbValue::String(s) => s.clone(),
+        DbValue::String(s) => s.to_string(),
         DbValue::Int(i) => i.to_string(),
         DbValue::Float(f) => f.to_string(),
         DbValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
@@ -793,7 +795,7 @@ fn to_bool(val: &DbValue) -> Result<bool, String> {
 /// Coerces a DbValue to a String.
 fn to_string_val(val: &DbValue) -> Result<String, String> {
     match val {
-        DbValue::String(s) => Ok(s.clone()),
+        DbValue::String(s) => Ok(s.to_string()),
         other => Err(format!("Expected string value, got: {:?}", other)),
     }
 }
@@ -945,7 +947,7 @@ mod tests {
     fn sample_row() -> Row {
         Row::new(vec![
             DbValue::Int(1),
-            DbValue::String("alice".to_string()),
+            DbValue::string("alice"),
             DbValue::Float(9.5),
         ])
     }
@@ -981,7 +983,7 @@ mod tests {
             Expr::Column("name".to_string(), None)
                 .eval(&row, &schema)
                 .unwrap(),
-            DbValue::String("alice".to_string())
+            DbValue::string("alice")
         );
         // Pre-bound index is used directly.
         assert_eq!(
@@ -1102,7 +1104,7 @@ mod tests {
             std::cmp::Ordering::Greater
         );
         // Incomparable types error.
-        assert!(compare_values(&DbValue::String("a".to_string()), &DbValue::Int(1)).is_err());
+        assert!(compare_values(&DbValue::string("a"), &DbValue::Int(1)).is_err());
         // NaN comparison errors.
         assert!(compare_values(&DbValue::Float(f64::NAN), &DbValue::Float(1.0)).is_err());
     }
@@ -1181,7 +1183,7 @@ mod tests {
         // Non-numeric operands.
         assert!(
             eval(&binop(
-                Expr::Literal(DbValue::String("x".to_string())),
+                Expr::Literal(DbValue::string("x")),
                 Operator::Add,
                 Expr::Literal(DbValue::Int(1))
             ))
@@ -1323,9 +1325,9 @@ mod tests {
     fn like_matching() {
         let like = |text: &str, pat: &str| {
             eval(&binop(
-                Expr::Literal(DbValue::String(text.to_string())),
+                Expr::Literal(DbValue::string(text.to_string())),
                 Operator::Like,
-                Expr::Literal(DbValue::String(pat.to_string())),
+                Expr::Literal(DbValue::string(pat.to_string())),
             ))
             .unwrap()
         };
@@ -1355,12 +1357,12 @@ mod tests {
                 Expr::Literal(DbValue::Bool(true)),
             ],
             results: vec![
-                Expr::Literal(DbValue::String("a".to_string())),
-                Expr::Literal(DbValue::String("b".to_string())),
+                Expr::Literal(DbValue::string("a")),
+                Expr::Literal(DbValue::string("b")),
             ],
-            else_result: Some(lit(DbValue::String("c".to_string()))),
+            else_result: Some(lit(DbValue::string("c"))),
         };
-        assert_eq!(eval(&expr).unwrap(), DbValue::String("b".to_string()));
+        assert_eq!(eval(&expr).unwrap(), DbValue::string("b"));
     }
 
     #[test]
@@ -1369,7 +1371,7 @@ mod tests {
         let expr = Expr::Case {
             operand: Some(lit(DbValue::Int(5))),
             conditions: vec![Expr::Literal(DbValue::Int(1))],
-            results: vec![Expr::Literal(DbValue::String("a".to_string()))],
+            results: vec![Expr::Literal(DbValue::string("a"))],
             else_result: None,
         };
         assert_eq!(eval(&expr).unwrap(), DbValue::Null);
@@ -1398,39 +1400,39 @@ mod tests {
     #[test]
     fn string_functions() {
         assert_eq!(
-            eval(&func("LENGTH", vec![DbValue::String("héllo".to_string())])).unwrap(),
+            eval(&func("LENGTH", vec![DbValue::string("héllo")])).unwrap(),
             DbValue::Int(5)
         );
         assert_eq!(
-            eval(&func("UPPER", vec![DbValue::String("abc".to_string())])).unwrap(),
-            DbValue::String("ABC".to_string())
+            eval(&func("UPPER", vec![DbValue::string("abc")])).unwrap(),
+            DbValue::string("ABC")
         );
         assert_eq!(
-            eval(&func("LOWER", vec![DbValue::String("ABC".to_string())])).unwrap(),
-            DbValue::String("abc".to_string())
+            eval(&func("LOWER", vec![DbValue::string("ABC")])).unwrap(),
+            DbValue::string("abc")
         );
         assert_eq!(
             eval(&func(
                 "CONCAT",
-                vec![DbValue::String("a".to_string()), DbValue::Int(2)]
+                vec![DbValue::string("a"), DbValue::Int(2)]
             ))
             .unwrap(),
-            DbValue::String("a2".to_string())
+            DbValue::string("a2")
         );
         // case-insensitive name.
         assert_eq!(
-            eval(&func("length", vec![DbValue::String("ab".to_string())])).unwrap(),
+            eval(&func("length", vec![DbValue::string("ab")])).unwrap(),
             DbValue::Int(2)
         );
     }
 
     #[test]
     fn substr_variants() {
-        let s = || DbValue::String("hello".to_string());
+        let s = || DbValue::string("hello");
         // 1-based start, no length: from 2nd char.
         assert_eq!(
             eval(&func("SUBSTR", vec![s(), DbValue::Int(2)])).unwrap(),
-            DbValue::String("ello".to_string())
+            DbValue::string("ello")
         );
         // start + length.
         assert_eq!(
@@ -1439,17 +1441,17 @@ mod tests {
                 vec![s(), DbValue::Int(1), DbValue::Int(3)]
             ))
             .unwrap(),
-            DbValue::String("hel".to_string())
+            DbValue::string("hel")
         );
         // negative start counts from end.
         assert_eq!(
             eval(&func("SUBSTR", vec![s(), DbValue::Int(-2)])).unwrap(),
-            DbValue::String("lo".to_string())
+            DbValue::string("lo")
         );
         // length 0 -> empty.
         assert_eq!(
             eval(&func("SUBSTR", vec![s(), DbValue::Int(1), DbValue::Int(0)])).unwrap(),
-            DbValue::String("".to_string())
+            DbValue::string("")
         );
         // absurd length saturates to "rest of string".
         assert_eq!(
@@ -1458,20 +1460,20 @@ mod tests {
                 vec![s(), DbValue::Int(1), DbValue::Int(i64::MAX)]
             ))
             .unwrap(),
-            DbValue::String("hello".to_string())
+            DbValue::string("hello")
         );
         // start past the end -> empty.
         assert_eq!(
             eval(&func("SUBSTR", vec![s(), DbValue::Int(100)])).unwrap(),
-            DbValue::String("".to_string())
+            DbValue::string("")
         );
     }
 
     #[test]
     fn substr_errors() {
-        let s = || DbValue::String("hello".to_string());
+        let s = || DbValue::string("hello");
         // non-integer start.
-        assert!(eval(&func("SUBSTR", vec![s(), DbValue::String("x".to_string())])).is_err());
+        assert!(eval(&func("SUBSTR", vec![s(), DbValue::string("x")])).is_err());
         // negative length.
         assert!(
             eval(&func(
@@ -1529,8 +1531,8 @@ mod tests {
             DbValue::Null
         );
         // ABS/ROUND on non-numeric error.
-        assert!(eval(&func("ABS", vec![DbValue::String("x".to_string())])).is_err());
-        assert!(eval(&func("ROUND", vec![DbValue::String("x".to_string())])).is_err());
+        assert!(eval(&func("ABS", vec![DbValue::string("x")])).is_err());
+        assert!(eval(&func("ROUND", vec![DbValue::string("x")])).is_err());
         // empty COALESCE / CONCAT.
         assert!(eval(&func("COALESCE", vec![])).is_err());
         assert!(eval(&func("CONCAT", vec![])).is_err());
@@ -1547,7 +1549,7 @@ mod tests {
         let schema = sample_schema();
         let row = Row::new(vec![
             DbValue::Int(1),
-            DbValue::String("the quick brown fox".to_string()),
+            DbValue::string("the quick brown fox"),
             DbValue::Float(0.0),
         ]);
         let m = |q: &str| {
@@ -1630,7 +1632,7 @@ mod tests {
         let mut expr = binop(
             Expr::Column("name".to_string(), None),
             Operator::Eq,
-            Expr::Literal(DbValue::String("alice".to_string())),
+            Expr::Literal(DbValue::string("alice")),
         );
         expr.bind_columns(&schema).unwrap();
         if let Expr::BinaryOp { left, .. } = &expr {

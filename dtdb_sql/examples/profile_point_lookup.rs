@@ -212,7 +212,7 @@ fn main() {
         tx.commit().unwrap();
         match res {
             ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
-                DbValue::String(s) => s.clone(),
+                DbValue::String(s) => s.to_string(),
                 _ => String::new(),
             },
             _ => String::new(),

@@ -11,7 +11,7 @@ fn k_int(val: i64) -> DbKey {
 }
 
 fn v_str(val: &str) -> DbValue {
-    DbValue::String(val.to_string())
+    DbValue::string(val)
 }
 
 fn get_test_options() -> EngineOptions {
