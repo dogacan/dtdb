@@ -608,15 +608,24 @@ fn test_scan_iter_single_group_fast_path() {
         ]
     );
 
-    // A column hint is I/O-only on a single-group table: the whole row lives in
-    // one blob, so the fast path still returns every column populated (not just
-    // the hinted one).
+    // With selective column deserialization, even on a single-group table the
+    // scan can skip parsing non-requested columns, returning them as Null.
     let hinted = drain_scan(
         table
             .scan_iter(&k_int(2), &k_int(2), Some(&["name".to_string()]))
             .unwrap(),
     );
-    assert_eq!(hinted, vec![(k_int(2), r_user(2, "Bob", 80.25))]);
+    assert_eq!(
+        hinted,
+        vec![(
+            k_int(2),
+            Row::new(vec![
+                DbValue::Null,
+                DbValue::String("Bob".to_string()),
+                DbValue::Null
+            ])
+        )]
+    );
 
     // Empty range: the fast path must terminate cleanly with no rows.
     let empty = drain_scan(table.scan_iter(&k_int(100), &k_int(200), None).unwrap());

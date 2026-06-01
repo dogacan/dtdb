@@ -719,7 +719,12 @@ impl Table {
             }
         }
 
-        TableScanIterator::new(self.schema.clone(), &needed_groups_vec, group_iters)
+        TableScanIterator::new(
+            self.schema.clone(),
+            &needed_groups_vec,
+            group_iters,
+            columns,
+        )
     }
 }
 
@@ -746,6 +751,9 @@ pub struct TableScanIterator {
     /// `advance` returns it directly and skips the merge (and its second Vec +
     /// per-column value clones) entirely.
     single_group: bool,
+    /// Per-group projections mapping which sub-row indices are actually needed by the query.
+    /// Parallel to `group_iters`. `None` if all columns are needed.
+    group_projections: Vec<Option<Vec<usize>>>,
 }
 
 impl TableScanIterator {
@@ -753,6 +761,7 @@ impl TableScanIterator {
         schema: Schema,
         needed_groups: &[String],
         mut group_iters: Vec<Option<dtdb_storage::ScanIterator>>,
+        columns: Option<&[String]>,
     ) -> Result<Self> {
         // Prime one peek per slot (parallel to `group_iters`).
         let mut group_peeks = Vec::with_capacity(group_iters.len());
@@ -786,6 +795,29 @@ impl TableScanIterator {
         // also makes the slot-0 indexing in the fast path provably in-bounds.
         let single_group = schema.locality_groups().len() == 1 && group_peeks.len() == 1;
 
+        let mut group_projections = Vec::with_capacity(needed_groups.len());
+        for group in needed_groups {
+            if let Some(cols) = columns {
+                let mut proj = Vec::new();
+                let mut relative_idx = 0;
+                for col in &schema.columns {
+                    let col_group = col.locality_group.as_deref().unwrap_or("");
+                    if col_group == group {
+                        if cols
+                            .iter()
+                            .any(|c| crate::schema::column_names_match(&col.name, c))
+                        {
+                            proj.push(relative_idx);
+                        }
+                        relative_idx += 1;
+                    }
+                }
+                group_projections.push(Some(proj));
+            } else {
+                group_projections.push(None);
+            }
+        }
+
         let mut it = Self {
             schema,
             group_iters,
@@ -794,6 +826,7 @@ impl TableScanIterator {
             row_parts,
             peeked: None,
             single_group,
+            group_projections,
         };
         it.advance()?;
         Ok(it)
@@ -839,7 +872,11 @@ impl TableScanIterator {
                 // later `ALTER TABLE ADD COLUMN` decodes short, and `reconcile_row`
                 // pads the missing trailing columns with their defaults so no
                 // short row escapes the scan (see ADR 0003).
-                DbValue::Bytes(bytes) => self.schema.reconcile_row(Row::from_bytes(&bytes)?),
+                DbValue::Bytes(bytes) => {
+                    let proj = self.group_projections[0].as_deref();
+                    self.schema
+                        .reconcile_row(Row::from_bytes_projected(&bytes, proj)?)
+                }
                 // Mirror the general path: a non-Bytes value yields a row of
                 // all-NULLs (a missing/None group contributes only NULLs).
                 _ => Row::new(vec![DbValue::Null; self.schema.columns.len()]),
@@ -870,7 +907,10 @@ impl TableScanIterator {
             if matches {
                 let (_peek_k, peek_v) = self.group_peeks[slot].take().unwrap();
                 self.row_parts[slot] = match peek_v {
-                    DbValue::Bytes(bytes) => Some(Row::from_bytes(&bytes)?),
+                    DbValue::Bytes(bytes) => {
+                        let proj = self.group_projections[slot].as_deref();
+                        Some(Row::from_bytes_projected(&bytes, proj)?)
+                    }
                     _ => None,
                 };
                 if let Some(iter) = &mut self.group_iters[slot] {
