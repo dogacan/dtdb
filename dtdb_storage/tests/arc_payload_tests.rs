@@ -5,9 +5,7 @@
 //! mutation, and constructing a scan iterator does not hold the memtable read
 //! lock for the duration of the scan.
 
-use dtdb_storage::{
-    CompressionType, DbKey, DbValue, EngineOptions, ScanIterator, StorageEngine,
-};
+use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, ScanIterator, StorageEngine};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -54,9 +52,7 @@ fn scan_snapshot_is_isolated_from_later_mutations() {
 
     // Snapshot the range, then mutate every key behind the iterator's back.
     let it = engine.scan_iter(&k("k1"), &k("k3")).unwrap();
-    engine
-        .put(k("k2"), DbValue::string("CLOBBERED"))
-        .unwrap();
+    engine.put(k("k2"), DbValue::string("CLOBBERED")).unwrap();
     engine.delete(k("k3")).unwrap();
     engine.put(k("k4"), DbValue::string("inserted")).unwrap();
 

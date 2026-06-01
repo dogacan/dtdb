@@ -1467,10 +1467,7 @@ mod tests {
         assert_eq!(out.get("p1").unwrap(), &DbValue::Int(10));
         assert_eq!(out.get("p2").unwrap(), &DbValue::Float(1.5));
         assert_eq!(out.get("p3").unwrap(), &DbValue::Bool(true));
-        assert_eq!(
-            out.get("p4").unwrap(),
-            &DbValue::string("hello")
-        );
+        assert_eq!(out.get("p4").unwrap(), &DbValue::string("hello"));
         assert_eq!(out.get("p5").unwrap(), &DbValue::bytes(vec![1, 2]));
         assert_eq!(out.get("p6").unwrap(), &DbValue::Null);
         assert_eq!(out.get("p7").unwrap(), &DbValue::Null);

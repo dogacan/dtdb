@@ -437,10 +437,7 @@ mod tests {
 
         // Same variant comparison - String
         assert_eq!(
-            total_compare(
-                &DbValue::string("abc"),
-                &DbValue::string("def")
-            ),
+            total_compare(&DbValue::string("abc"), &DbValue::string("def")),
             Ordering::Less
         );
 

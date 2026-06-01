@@ -131,11 +131,7 @@ fn test_schema_validations() {
 
     // 4. Primary key validation: Key type mismatch (DbKey::String instead of DbKey::Int)
     assert!(matches!(
-        tx.put(
-            "users",
-            DbKey::string("1"),
-            r_user(1, "alice", 95.5)
-        ),
+        tx.put("users", DbKey::string("1"), r_user(1, "alice", 95.5)),
         Err(RelationalError::SchemaMismatch(_))
     ));
 
@@ -514,11 +510,7 @@ fn test_locality_group_pruning_verification() {
     assert_eq!(scan1.len(), 1);
     assert_eq!(
         scan1[0].1.values,
-        vec![
-            DbValue::Null,
-            DbValue::string("Alice"),
-            DbValue::Null
-        ]
+        vec![DbValue::Null, DbValue::string("Alice"), DbValue::Null]
     );
 
     // Case 2: Query only "score" column.
@@ -619,11 +611,7 @@ fn test_scan_iter_single_group_fast_path() {
         hinted,
         vec![(
             k_int(2),
-            Row::new(vec![
-                DbValue::Null,
-                DbValue::string("Bob"),
-                DbValue::Null
-            ])
+            Row::new(vec![DbValue::Null, DbValue::string("Bob"), DbValue::Null])
         )]
     );
 
@@ -821,11 +809,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
         only_name,
         vec![(
             k_int(1),
-            Row::new(vec![
-                DbValue::Null,
-                DbValue::string("Alice"),
-                DbValue::Null,
-            ]),
+            Row::new(vec![DbValue::Null, DbValue::string("Alice"), DbValue::Null,]),
         )]
     );
 }
@@ -1459,11 +1443,7 @@ fn test_database_alter_drop_column() {
     let got2 = table.get(&k_int(2), None).unwrap().unwrap();
     assert_eq!(
         got2.values,
-        vec![
-            DbValue::Int(2),
-            DbValue::string("Bob"),
-            DbValue::Bool(true),
-        ]
+        vec![DbValue::Int(2), DbValue::string("Bob"), DbValue::Bool(true),]
     );
 
     // Let's inspect the raw storage layout directly to check that the score column is not present.

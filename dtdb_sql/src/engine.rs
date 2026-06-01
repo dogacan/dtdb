@@ -1225,10 +1225,7 @@ impl SqlEngine {
                         match col.data_type {
                             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
                             DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
-                            _ => (
-                                DbKey::string(""),
-                                DbKey::string("\u{10ffff}"),
-                            ),
+                            _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
                         }
                     }
                 };

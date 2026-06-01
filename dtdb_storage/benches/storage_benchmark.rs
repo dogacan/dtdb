@@ -1,6 +1,4 @@
-use criterion::{
-    BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine};
 use tempfile::TempDir;
 

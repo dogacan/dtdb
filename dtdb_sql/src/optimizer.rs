@@ -1053,7 +1053,9 @@ fn extract_bounds_for_column(
                                         DbKey::Int(v) => {
                                             PlanKey::Value(DbKey::Int(v.checked_add(1)?))
                                         }
-                                        DbKey::String(s) => PlanKey::Value(DbKey::string(format!("{s}\0"))),
+                                        DbKey::String(s) => {
+                                            PlanKey::Value(DbKey::string(format!("{s}\0")))
+                                        }
                                         _ => PlanKey::Value(k),
                                     }
                                 } else {

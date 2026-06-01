@@ -534,10 +534,7 @@ impl Schema {
         let get_bounds = |dt: DataType| match dt {
             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
             DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
-            _ => (
-                DbKey::string(""),
-                DbKey::string("\u{10ffff}"),
-            ),
+            _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
         };
 
         if indices.len() == 1 {
@@ -749,10 +746,7 @@ mod tests {
             vec![DbValue::Int(1), DbValue::string("alice")]
         );
         let detail_sub = schema.split_row(&row, "detail");
-        assert_eq!(
-            detail_sub.values,
-            vec![DbValue::string("hello")]
-        );
+        assert_eq!(detail_sub.values, vec![DbValue::string("hello")]);
 
         // Merging the sub-rows back yields the original full row.
         let mut group_rows = HashMap::new();
@@ -972,10 +966,7 @@ mod tests {
         );
         assert_eq!(
             hi,
-            DbKey::composite(vec![
-                DbKey::Int(i64::MAX),
-                DbKey::string("\u{10ffff}")
-            ])
+            DbKey::composite(vec![DbKey::Int(i64::MAX), DbKey::string("\u{10ffff}")])
         );
 
         // No primary key -> error.
@@ -992,11 +983,7 @@ mod tests {
         assert!(schema.validate_key(&DbKey::Int(5), &row).is_ok());
 
         // Key type does not match column type.
-        assert!(
-            schema
-                .validate_key(&DbKey::string("5"), &row)
-                .is_err()
-        );
+        assert!(schema.validate_key(&DbKey::string("5"), &row).is_err());
         // Key value does not match the row's primary key value.
         assert!(schema.validate_key(&DbKey::Int(6), &row).is_err());
 
@@ -1004,10 +991,7 @@ mod tests {
         let no_pk = Schema::new(vec![col("name", DataType::String, false)]);
         assert!(
             no_pk
-                .validate_key(
-                    &DbKey::Int(1),
-                    &Row::new(vec![DbValue::string("x")])
-                )
+                .validate_key(&DbKey::Int(1), &Row::new(vec![DbValue::string("x")]))
                 .is_err()
         );
     }
@@ -1171,11 +1155,7 @@ mod tests {
         let reconciled = schema.reconcile_row(old_row);
         assert_eq!(
             reconciled.values,
-            vec![
-                DbValue::Int(1),
-                DbValue::Int(2),
-                DbValue::string("dflt"),
-            ]
+            vec![DbValue::Int(1), DbValue::Int(2), DbValue::string("dflt"),]
         );
     }
 
