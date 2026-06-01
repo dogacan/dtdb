@@ -213,14 +213,18 @@ impl Schema {
     /// prefix invariant (stored rows are always a prefix of `columns`) this is a
     /// pure tail-extend; rows already at full width are returned untouched. See
     /// ADR 0003.
-    pub fn reconcile_row(&self, mut row: Row) -> Row {
-        if row.values.len() < self.columns.len() {
-            for col in &self.columns[row.values.len()..] {
-                row.values
-                    .push(col.default_value.clone().unwrap_or(DbValue::Null));
+    pub fn reconcile_row(&self, row: Row) -> Row {
+        let mut columns = Vec::with_capacity(row.values.len());
+        for i in 0..row.values.len() {
+            if let Some(col) = self.columns.get(i) {
+                columns.push(StoredColumn {
+                    id: col.id,
+                    default_value: col.default_value.clone(),
+                });
             }
         }
-        row
+        let layout = StoredLayout { columns };
+        self.reconcile_row_with_layout(row, &layout)
     }
 
     /// Returns the set of all unique locality group names in the table schema.
@@ -584,6 +588,42 @@ impl Schema {
         let schema: Schema = bincode::deserialize(&bytes)?;
         Ok(schema)
     }
+
+    pub fn current_layout(&self) -> StoredLayout {
+        StoredLayout {
+            columns: self
+                .columns
+                .iter()
+                .map(|c| StoredColumn {
+                    id: c.id,
+                    default_value: c.default_value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn reconcile_row_with_layout(&self, row: Row, layout: &StoredLayout) -> Row {
+        let mut new_values = self.default_row_values();
+        for (src_pos, src_col) in layout.columns.iter().enumerate() {
+            if let Some(src_val) = row.values.get(src_pos)
+                && let Some(dst_pos) = self.columns.iter().position(|c| c.id == src_col.id)
+            {
+                new_values[dst_pos] = src_val.clone();
+            }
+        }
+        Row::new(new_values)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StoredColumn {
+    pub id: u32,
+    pub default_value: Option<DbValue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StoredLayout {
+    pub columns: Vec<StoredColumn>,
 }
 
 /// Helper to check if a string ends with a suffix preceded by a dot `.`,

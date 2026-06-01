@@ -4,7 +4,7 @@ use crate::memtable::MemTable;
 use crate::snapshot_log::SnapshotLog;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
-use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator};
+use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, ValueRewriter};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +45,8 @@ struct EngineInner {
     manifest: Mutex<SnapshotLog<Manifest>>,
     next_sst_id: AtomicU64,
     executor: Arc<dyn Executor>,
+    rewriter: Arc<dyn ValueRewriter>,
+    target_layout: RwLock<Vec<u8>>,
     /// Keeps the background WAL-sync schedule alive; dropping the engine
     /// cancels it.
     wal_sync_handle: Mutex<Option<PeriodicHandle>>,
@@ -55,7 +57,12 @@ struct EngineInner {
 impl StorageEngine {
     /// Opens a StorageEngine directory.
     pub fn open(dir_path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
-        Self::open_with_executor(dir_path, options, crate::default_executor())
+        Self::open_with_executor(
+            dir_path,
+            options,
+            crate::default_executor(),
+            Arc::new(crate::PassthroughValueRewriter),
+        )
     }
 
     /// Opens a StorageEngine directory backed by the given [`Executor`].
@@ -63,8 +70,14 @@ impl StorageEngine {
         dir_path: impl AsRef<Path>,
         options: EngineOptions,
         executor: Arc<dyn Executor>,
+        rewriter: Arc<dyn ValueRewriter>,
     ) -> Result<Self> {
-        let inner = Arc::new(EngineInner::open(dir_path, options, executor.clone())?);
+        let inner = Arc::new(EngineInner::open(
+            dir_path,
+            options,
+            executor.clone(),
+            rewriter,
+        )?);
 
         if let Some(ms) = inner.options.wal_sync_interval_ms
             && ms > 0
@@ -85,6 +98,14 @@ impl StorageEngine {
         }
 
         Ok(Self { inner })
+    }
+
+    pub fn set_target_layout(&self, layout: Vec<u8>) {
+        self.inner.set_target_layout(layout);
+    }
+
+    pub fn target_layout(&self) -> Vec<u8> {
+        self.inner.target_layout()
     }
 
     pub fn put(&self, key: DbKey, value: DbValue) -> Result<()> {
@@ -153,6 +174,7 @@ impl EngineInner {
         dir_path: impl AsRef<Path>,
         options: EngineOptions,
         executor: Arc<dyn Executor>,
+        rewriter: Arc<dyn ValueRewriter>,
     ) -> Result<Self> {
         let dir_path = dir_path.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
@@ -309,6 +331,7 @@ impl EngineInner {
                     active_options.block_size_limit,
                     active_options.compression,
                     memtable.len(),
+                    vec![],
                 )?;
                 for (key, val) in memtable.entries() {
                     writer.append(&key, val.as_ref())?;
@@ -349,6 +372,8 @@ impl EngineInner {
             manifest: Mutex::new(manifest),
             next_sst_id: AtomicU64::new(max_id + 1),
             executor,
+            rewriter,
+            target_layout: RwLock::new(Vec::new()),
             wal_sync_handle: Mutex::new(None),
             block_cache,
             last_compacted_keys: Mutex::new(std::collections::HashMap::new()),
@@ -457,7 +482,18 @@ impl EngineInner {
         if let Some(l0_ssts) = sstables_map.get(&0) {
             for sstable in l0_ssts.iter() {
                 if let Some(res) = sstable.get(key)? {
-                    return Ok(res);
+                    if let Some(val) = res {
+                        let target_layout = self.target_layout();
+                        let src_layout = &sstable.layout;
+                        let val = if src_layout != &target_layout {
+                            self.rewriter.rewrite(src_layout, &target_layout, &val)?
+                        } else {
+                            val
+                        };
+                        return Ok(Some(val));
+                    } else {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -487,7 +523,18 @@ impl EngineInner {
             if let Ok(idx) = idx_res
                 && let Some(res) = ssts[idx].get(key)?
             {
-                return Ok(res);
+                if let Some(val) = res {
+                    let target_layout = self.target_layout();
+                    let src_layout = &ssts[idx].layout;
+                    let val = if src_layout != &target_layout {
+                        self.rewriter.rewrite(src_layout, &target_layout, &val)?
+                    } else {
+                        val
+                    };
+                    return Ok(Some(val));
+                } else {
+                    return Ok(None);
+                }
             }
         }
 
@@ -529,7 +576,18 @@ impl EngineInner {
                     let idx = remaining_indices[i];
                     let key = &keys[idx];
                     if let Some(res) = sstable.get(key)? {
-                        results[idx] = res;
+                        if let Some(val) = res {
+                            let target_layout = self.target_layout();
+                            let src_layout = &sstable.layout;
+                            let val = if src_layout != &target_layout {
+                                self.rewriter.rewrite(src_layout, &target_layout, &val)?
+                            } else {
+                                val
+                            };
+                            results[idx] = Some(val);
+                        } else {
+                            results[idx] = None;
+                        }
                         remaining_indices.swap_remove(i);
                     } else {
                         i += 1;
@@ -569,7 +627,18 @@ impl EngineInner {
                 if let Ok(sst_idx) = idx_res
                     && let Some(res) = ssts[sst_idx].get(key)?
                 {
-                    results[idx] = res;
+                    if let Some(val) = res {
+                        let target_layout = self.target_layout();
+                        let src_layout = &ssts[sst_idx].layout;
+                        let val = if src_layout != &target_layout {
+                            self.rewriter.rewrite(src_layout, &target_layout, &val)?
+                        } else {
+                            val
+                        };
+                        results[idx] = Some(val);
+                    } else {
+                        results[idx] = None;
+                    }
                     remaining_indices.swap_remove(i);
                 } else {
                     i += 1;
@@ -637,7 +706,14 @@ impl EngineInner {
 
         // Decision (A): Owned iterator snapshots memtable range on construction.
         // No lifetime parameters are needed, avoiding complex lifetime annotations throughout the SQL engine.
-        ScanIterator::new(mem_entries, sst_iters, end.clone())
+        let target_layout = self.target_layout();
+        ScanIterator::new(
+            mem_entries,
+            sst_iters,
+            end.clone(),
+            self.rewriter.clone(),
+            target_layout,
+        )
     }
 
     pub fn filtered_scan<F>(
@@ -672,9 +748,17 @@ impl EngineInner {
                 for (k, v) in entries {
                     if seen.insert(k.clone())
                         && let Some(val) = v
-                        && filter(&k, &val)
                     {
-                        results.insert(k, val);
+                        let target_layout = self.target_layout();
+                        let src_layout = &sstable.layout;
+                        let val = if src_layout != &target_layout {
+                            self.rewriter.rewrite(src_layout, &target_layout, &val)?
+                        } else {
+                            val
+                        };
+                        if filter(&k, &val) {
+                            results.insert(k, val);
+                        }
                     }
                 }
             }
@@ -699,9 +783,17 @@ impl EngineInner {
                 for (k, v) in entries {
                     if seen.insert(k.clone())
                         && let Some(val) = v
-                        && filter(&k, &val)
                     {
-                        results.insert(k, val);
+                        let target_layout = self.target_layout();
+                        let src_layout = &sstable.layout;
+                        let val = if src_layout != &target_layout {
+                            self.rewriter.rewrite(src_layout, &target_layout, &val)?
+                        } else {
+                            val
+                        };
+                        if filter(&k, &val) {
+                            results.insert(k, val);
+                        }
                     }
                 }
             }
@@ -970,7 +1062,17 @@ impl EngineInner {
             Vec::new()
         };
 
-        while let Some((k, v)) = merge_iter.next()? {
+        let target_layout = self.target_layout();
+        while let Some((k, v, source_idx)) = merge_iter.next()? {
+            let mut v = v;
+            if let Some(val) = &v {
+                let src_reader = merge_iter.get_reader(source_idx);
+                let src_layout = &src_reader.layout;
+                if src_layout != &target_layout {
+                    v = Some(self.rewriter.rewrite(src_layout, &target_layout, val)?);
+                }
+            }
+
             if v.is_none() {
                 // Decision: To avoid expensive point lookups during compaction, we only
                 // check if any SSTable in lower levels has a key range overlapping with the tombstone.
@@ -999,6 +1101,7 @@ impl EngineInner {
                     self.options.block_size_limit,
                     self.options.compression,
                     expected_entries,
+                    target_layout.clone(),
                 )?);
                 current_writer_uncompressed_bytes = 0;
             }
@@ -1121,11 +1224,13 @@ impl EngineInner {
         let next_id = self.get_next_id();
         let sst_path = self.dir_path.join(format!("L0_{:05}.sst", next_id));
 
+        let target_layout = self.target_layout();
         let mut writer = SstableWriter::create(
             &sst_path,
             self.options.block_size_limit,
             self.options.compression,
             map.len(),
+            target_layout,
         )?;
         for (key, val) in map.iter() {
             writer.append(key, val.as_ref())?;
@@ -1191,5 +1296,14 @@ impl EngineInner {
         let wal = self.wal.lock().unwrap();
         wal.sync_all()?;
         Ok(())
+    }
+
+    pub fn set_target_layout(&self, layout: Vec<u8>) {
+        let mut target = self.target_layout.write().unwrap();
+        *target = layout;
+    }
+
+    pub fn target_layout(&self) -> Vec<u8> {
+        self.target_layout.read().unwrap().clone()
     }
 }

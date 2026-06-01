@@ -6170,19 +6170,52 @@ fn test_alter_table_rename_column() {
     assert!(engine.execute("SELECT name FROM t", &tx).is_err());
 }
 
-/// `DROP COLUMN` is parsed but explicitly not yet supported (Phase 2).
+/// `DROP COLUMN` drops the column; queries use the new schema and the dropped
+/// column no longer resolves.
 #[test]
-fn test_alter_table_drop_column_not_supported() {
+fn test_alter_table_drop_column() {
     let (_temp, db, engine) = setup_engine();
-    let tx = Transaction::new(1, db.clone());
-    engine
-        .execute("CREATE TABLE t (id INT PRIMARY KEY, name STRING)", &tx)
-        .unwrap();
-    let err = engine
-        .execute("ALTER TABLE t DROP COLUMN name", &tx)
-        .unwrap_err();
-    assert!(
-        err.contains("Unsupported ALTER TABLE operation"),
-        "unexpected error: {err}"
-    );
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE t (id INT PRIMARY KEY, name STRING, score FLOAT)",
+                &tx,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO t (id, name, score) VALUES (1, 'Alice', 95.5)",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    {
+        let tx = Transaction::new(2, db.clone());
+        let res = engine
+            .execute("ALTER TABLE t DROP COLUMN score", &tx)
+            .unwrap();
+        assert!(matches!(res, ExecutionResult::AlterTable));
+        tx.commit().unwrap();
+    }
+
+    // New schema has only id and name.
+    {
+        let tx = Transaction::new(3, db.clone());
+        let res = engine.execute("SELECT id, name FROM t", &tx).unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("Alice".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    // Dropped column no longer resolves.
+    let tx = Transaction::new(4, db.clone());
+    assert!(engine.execute("SELECT score FROM t", &tx).is_err());
 }

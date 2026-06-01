@@ -42,6 +42,7 @@ pub struct IndexBlock {
     pub stats: StatsBlock,
     #[serde(default)]
     pub bloom_filter: Option<crate::bloom::BloomFilter>,
+    pub layout: Vec<u8>,
 }
 
 /// SstableWriter builds an SSTable file on disk.
@@ -64,6 +65,7 @@ pub struct SstableWriter {
     min_key: Option<DbKey>,
     max_key: Option<DbKey>,
     bloom_filter: Option<crate::bloom::BloomFilter>,
+    layout: Vec<u8>,
 }
 
 impl SstableWriter {
@@ -73,6 +75,7 @@ impl SstableWriter {
         block_size_limit: usize,
         compression: CompressionType,
         expected_entries: usize,
+        layout: Vec<u8>,
     ) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let mut temp_path = final_path.clone();
@@ -107,6 +110,7 @@ impl SstableWriter {
             min_key: None,
             max_key: None,
             bloom_filter,
+            layout,
         })
     }
 
@@ -229,6 +233,7 @@ impl SstableWriter {
             compression: self.compression,
             stats,
             bloom_filter: self.bloom_filter.clone(),
+            layout: self.layout.clone(),
         };
         let index_bytes = bincode::serialize(&index_block)?;
         let index_len = index_bytes.len() as u64;
@@ -265,6 +270,7 @@ pub struct SstableReader {
     pub stats: StatsBlock,
     pub bloom_filter: Option<crate::bloom::BloomFilter>,
     pub file_size: u64,
+    pub layout: Vec<u8>,
 }
 
 impl SstableReader {
@@ -342,6 +348,7 @@ impl SstableReader {
             stats: index_block.stats,
             bloom_filter: index_block.bloom_filter,
             file_size: file_len,
+            layout: index_block.layout,
         };
 
         Ok(reader)

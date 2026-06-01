@@ -15,6 +15,10 @@ pub struct SstableBlockIterator {
 }
 
 impl SstableBlockIterator {
+    pub fn reader(&self) -> &Arc<SstableReader> {
+        &self.reader
+    }
+
     pub fn new(reader: Arc<SstableReader>, start: Option<&DbKey>, priority: usize) -> Result<Self> {
         Self::new_with_end(reader, start, None, priority)
     }
@@ -184,9 +188,13 @@ impl MergeIterator {
         })
     }
 
+    pub fn get_reader(&self, idx: usize) -> &Arc<SstableReader> {
+        &self.sources[idx].reader
+    }
+
     /// Pulls the next unique entry from the merged streams.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<(DbKey, Option<DbValue>)>> {
+    pub fn next(&mut self) -> Result<Option<(DbKey, Option<DbValue>, usize)>> {
         while let Some(entry) = self.heap.pop() {
             let source = &mut self.sources[entry.source_idx];
             source.advance()?;
@@ -206,7 +214,7 @@ impl MergeIterator {
             }
 
             self.last_key = Some(entry.key.clone());
-            return Ok(Some((entry.key, entry.value)));
+            return Ok(Some((entry.key, entry.value, entry.source_idx)));
         }
         Ok(None)
     }

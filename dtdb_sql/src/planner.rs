@@ -65,6 +65,7 @@ pub enum SqlStatement {
 pub enum AlterOp {
     AddColumn(Column),
     RenameColumn { old_name: String, new_name: String },
+    DropColumn(String),
 }
 
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
@@ -450,9 +451,18 @@ impl LogicalPlanner {
                         old_name: old_column_name.value.clone(),
                         new_name: new_column_name.value.clone(),
                     },
+                    sqlparser::ast::AlterTableOperation::DropColumn { column_names, .. } => {
+                        if column_names.len() != 1 {
+                            return Err(
+                                "ALTER TABLE DROP COLUMN supports dropping exactly one column"
+                                    .to_string(),
+                            );
+                        }
+                        AlterOp::DropColumn(column_names[0].value.clone())
+                    }
                     other => {
                         return Err(format!(
-                            "Unsupported ALTER TABLE operation: {} (only ADD COLUMN and RENAME COLUMN are supported)",
+                            "Unsupported ALTER TABLE operation: {} (only ADD COLUMN, RENAME COLUMN, and DROP COLUMN are supported)",
                             other
                         ));
                     }

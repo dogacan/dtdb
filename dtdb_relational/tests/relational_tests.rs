@@ -1299,3 +1299,183 @@ fn test_database_alter_add_column_multi_group() {
     );
     assert!(matches!(bad, Err(RelationalError::SchemaMismatch(_))));
 }
+
+#[test]
+fn test_database_alter_drop_column() {
+    use dtdb_relational::{Column, DataType, Schema};
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    // Create schema with id (pk), name, score, active (default true)
+    let schema = Schema::new(vec![
+        Column {
+            id: 0,
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 1,
+            name: "name".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 2,
+            name: "score".to_string(),
+            data_type: DataType::Float,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 3,
+            name: "active".to_string(),
+            data_type: DataType::Bool,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: Some(DbValue::Bool(true)),
+            is_auto_increment: false,
+        },
+    ]);
+
+    db.create_table("users", schema).unwrap();
+
+    // Insert a row. Row is serialized with all 4 values.
+    {
+        let tx = Transaction::new(1, db.clone());
+        let val = Row::new(vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Float(95.5),
+            DbValue::Bool(false),
+        ]);
+        tx.put("users", k_int(1), val).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Drop "score" column.
+    db.alter_table_drop_column("users", "score").unwrap();
+
+    // 1. Immediately hides it from get and scan
+    let table = db.get_table("users").unwrap();
+    assert_eq!(table.schema.columns.len(), 3);
+    assert!(table.schema.column_index("score").is_none());
+
+    // Get should return the row without the score column
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(
+        got.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Bool(false),
+        ]
+    );
+
+    // Scan should also hide it
+    let rows = drain_scan(table.scan_iter(&k_int(0), &k_int(10), None).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Bool(false),
+        ]
+    );
+
+    // Attempting to drop primary key column "id" must fail
+    let drop_pk = db.alter_table_drop_column("users", "id");
+    assert!(matches!(drop_pk, Err(RelationalError::SchemaMismatch(_))));
+
+    // Attempting to drop non-existent column must fail
+    let drop_none = db.alter_table_drop_column("users", "score");
+    assert!(matches!(drop_none, Err(RelationalError::SchemaMismatch(_))));
+
+    // 2. Verify that subsequent compaction physically purges the dropped column values.
+    // First, let's flush and write some more data to ensure we have files in L0.
+    {
+        let tx = Transaction::new(2, db.clone());
+        tx.put(
+            "users",
+            k_int(2),
+            Row::new(vec![
+                DbValue::Int(2),
+                DbValue::String("Bob".to_string()),
+                DbValue::Bool(true),
+            ]),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Force a compaction on the underlying storage engines.
+    for engine in table.engines.values() {
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap();
+    }
+
+    db.checkpoint().unwrap();
+
+    // Reopen database from disk to verify schema is preserved and compaction did not lose data.
+    drop(table);
+    drop(db);
+
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+
+    // Retrieve values from the table. They should still be readable and correct.
+    let got1 = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(
+        got1.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Bool(false),
+        ]
+    );
+
+    let got2 = table.get(&k_int(2), None).unwrap().unwrap();
+    assert_eq!(
+        got2.values,
+        vec![
+            DbValue::Int(2),
+            DbValue::String("Bob".to_string()),
+            DbValue::Bool(true),
+        ]
+    );
+
+    // Let's inspect the raw storage layout directly to check that the score column is not present.
+    // We can read raw DbValue from the storage engine.
+    for engine in table.engines.values() {
+        let raw_val = engine.get(&k_int(1)).unwrap().unwrap();
+        if let DbValue::Bytes(bytes) = raw_val {
+            let row = Row::from_bytes(&bytes).unwrap();
+            // In the raw storage engine (post-compaction), the row value count must be 3,
+            // because the rewriter successfully rewrote it to the new 3-column layout during compaction.
+            assert_eq!(row.values.len(), 3);
+            assert_eq!(
+                row.values,
+                vec![
+                    DbValue::Int(1),
+                    DbValue::String("Alice".to_string()),
+                    DbValue::Bool(false),
+                ]
+            );
+        } else {
+            panic!("Expected DbValue::Bytes");
+        }
+    }
+}

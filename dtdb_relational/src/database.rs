@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use crate::schema::{Column, IndexDefinition, IndexType, Schema};
+use crate::schema::{Column, IndexDefinition, IndexType, Schema, StoredLayout};
 use crate::transaction::Transaction;
 use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, Executor, FramedLog, FsyncMethod, LogFormat,
@@ -1169,6 +1169,7 @@ impl Database {
 
                     let mut engines = HashMap::new();
                     let groups = schema.locality_groups();
+                    let layout_bytes = bincode::serialize(&schema.current_layout()).unwrap();
 
                     // Check for old table layout (backward compatibility): a
                     // table dir that is itself a single storage engine, marked
@@ -1185,7 +1186,9 @@ impl Database {
                             &path,
                             group_opts,
                             executor.clone(),
+                            Arc::new(RelationalValueRewriter),
                         )?);
+                        engine.set_target_layout(layout_bytes);
                         engines.insert("".to_string(), engine);
                     } else {
                         // Multi-engine / new layout
@@ -1199,7 +1202,9 @@ impl Database {
                                 &g_path,
                                 group_opts,
                                 executor.clone(),
+                                Arc::new(RelationalValueRewriter),
                             )?);
+                            engine.set_target_layout(layout_bytes.clone());
                             engines.insert(group, engine);
                         }
                     }
@@ -1211,6 +1216,7 @@ impl Database {
                             &idx_path,
                             engine_opts,
                             executor.clone(),
+                            Arc::new(RelationalValueRewriter),
                         )?);
                         index_engines.insert(idx_def.name.clone(), engine);
                     }
@@ -1352,6 +1358,7 @@ impl Database {
 
         let mut engines = HashMap::new();
         let groups = schema.locality_groups();
+        let layout_bytes = bincode::serialize(&schema.current_layout()).unwrap();
         if groups.len() <= 1 && groups.contains("") {
             let mut group_opts = engine_opts;
             if let Some(opts) = schema.locality_group_options.get("") {
@@ -1361,7 +1368,9 @@ impl Database {
                 &table_path,
                 group_opts,
                 self.executor.clone(),
+                Arc::new(RelationalValueRewriter),
             )?);
+            engine.set_target_layout(layout_bytes);
             engines.insert("".to_string(), engine);
         } else {
             for group in groups {
@@ -1374,7 +1383,9 @@ impl Database {
                     &g_path,
                     group_opts,
                     self.executor.clone(),
+                    Arc::new(RelationalValueRewriter),
                 )?);
+                engine.set_target_layout(layout_bytes.clone());
                 engines.insert(group, engine);
             }
         }
@@ -1404,6 +1415,7 @@ impl Database {
                 &idx_path,
                 engine_opts,
                 self.executor.clone(),
+                Arc::new(RelationalValueRewriter),
             )?);
             index_engines.insert(idx_def.name.clone(), engine);
         }
@@ -1597,6 +1609,12 @@ impl Database {
         self.wait_for_table_quiescent(table_name);
         let schema_path = self.dir_path.join(table_name).join("schema.bin");
         new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+
+        let layout_bytes = bincode::serialize(&new_schema.current_layout()).unwrap();
+        for engine in table.engines.values() {
+            engine.set_target_layout(layout_bytes.clone());
+        }
+
         table.schema = new_schema;
 
         self.schema_version
@@ -1656,6 +1674,72 @@ impl Database {
         self.wait_for_table_quiescent(table_name);
         let schema_path = self.dir_path.join(table_name).join("schema.bin");
         new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+        table.schema = new_schema;
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Drops a column from an existing table (lazy `ALTER TABLE DROP COLUMN`).
+    ///
+    /// Metadata-only: existing rows on disk are left untouched and mapped to the
+    /// new layout on read (ignoring the dropped column ID). Compaction will
+    /// physically erase the dropped column values over time.
+    pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+        let table_arc = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        let table = Arc::make_mut(table_arc);
+
+        // 1. Column must exist.
+        let col_idx = table.schema.column_index(column_name).ok_or_else(|| {
+            RelationalError::SchemaMismatch(format!(
+                "Column '{}' does not exist in table '{}'",
+                column_name, table_name
+            ))
+        })?;
+
+        // 2. Cannot drop a PRIMARY KEY column.
+        let col = &table.schema.columns[col_idx];
+        if col.is_primary_key {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Cannot drop primary key column '{}' in table '{}'",
+                column_name, table_name
+            )));
+        }
+
+        // 3. Reject if referenced by secondary indexes.
+        for idx in &table.schema.indexes {
+            if idx.columns.iter().any(|c| c == column_name) {
+                return Err(RelationalError::SchemaMismatch(format!(
+                    "Cannot drop column '{}' because it is referenced by secondary index '{}'",
+                    column_name, idx.name
+                )));
+            }
+        }
+
+        // 4. Clone and modify schema.
+        let mut new_schema = table.schema.clone();
+        new_schema.columns.remove(col_idx);
+        new_schema.relative_indices = std::sync::OnceLock::new();
+
+        // 5. Quiesce, flush memtable, update target layout, swap schema.bin, publish.
+        self.wait_for_table_quiescent(table_name);
+
+        for engine in table.engines.values() {
+            engine.flush_memtable()?;
+        }
+
+        let schema_path = self.dir_path.join(table_name).join("schema.bin");
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+
+        let layout_bytes = bincode::serialize(&new_schema.current_layout()).unwrap();
+        for engine in table.engines.values() {
+            engine.set_target_layout(layout_bytes.clone());
+        }
+
         table.schema = new_schema;
 
         self.schema_version
@@ -2252,6 +2336,7 @@ impl Database {
             &idx_path,
             engine_opts,
             self.executor.clone(),
+            Arc::new(RelationalValueRewriter),
         )?);
 
         // 8. Wait until all active transactions accessing this table have finished (matching DDL behavior)
@@ -2635,6 +2720,58 @@ impl Database {
     pub fn get_table_statistics(&self, table_name: &str) -> Option<TableStatistics> {
         let stats_guard = self.statistics.read().unwrap();
         stats_guard.get(table_name).cloned()
+    }
+}
+
+#[derive(Clone)]
+pub struct RelationalValueRewriter;
+
+impl dtdb_storage::ValueRewriter for RelationalValueRewriter {
+    fn rewrite(
+        &self,
+        src_layout: &[u8],
+        dst_layout: &[u8],
+        value: &DbValue,
+    ) -> dtdb_storage::Result<DbValue> {
+        if src_layout == dst_layout || dst_layout.is_empty() {
+            return Ok(value.clone());
+        }
+        let dst: StoredLayout =
+            bincode::deserialize(dst_layout).map_err(dtdb_storage::StorageError::Serialization)?;
+
+        if let DbValue::Bytes(bytes) = value {
+            let row = Row::from_bytes(bytes)
+                .map_err(|e| dtdb_storage::StorageError::Corruption(e.to_string()))?;
+            let src = if src_layout.is_empty() {
+                let num_vals = row.values.len();
+                let columns = dst.columns.iter().take(num_vals).cloned().collect();
+                StoredLayout { columns }
+            } else {
+                bincode::deserialize(src_layout)
+                    .map_err(dtdb_storage::StorageError::Serialization)?
+            };
+            let mut new_values = Vec::with_capacity(dst.columns.len());
+            for dst_col in &dst.columns {
+                if let Some(src_pos) = src.columns.iter().position(|c| c.id == dst_col.id) {
+                    if let Some(val) = row.values.get(src_pos) {
+                        new_values.push(val.clone());
+                    } else {
+                        let def = dst_col.default_value.clone().unwrap_or(DbValue::Null);
+                        new_values.push(def);
+                    }
+                } else {
+                    let def = dst_col.default_value.clone().unwrap_or(DbValue::Null);
+                    new_values.push(def);
+                }
+            }
+            let new_row = Row::new(new_values);
+            let new_bytes = new_row
+                .to_bytes()
+                .map_err(|e| dtdb_storage::StorageError::Corruption(e.to_string()))?;
+            Ok(DbValue::Bytes(new_bytes))
+        } else {
+            Ok(value.clone())
+        }
     }
 }
 

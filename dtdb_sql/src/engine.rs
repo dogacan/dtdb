@@ -587,6 +587,11 @@ impl SqlEngine {
                             .alter_table_rename_column(&table_name, &old_name, &new_name)
                             .map_err(|e| e.to_string())?;
                     }
+                    crate::planner::AlterOp::DropColumn(column_name) => {
+                        self.database
+                            .alter_table_drop_column(&table_name, &column_name)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
                 Ok(ExecutionResult::AlterTable)
             }
