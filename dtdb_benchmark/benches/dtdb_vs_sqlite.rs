@@ -31,6 +31,7 @@ fn main() {
 }
 
 #[cfg(feature = "compare-sqlite")]
+#[allow(clippy::result_large_err)]
 mod imp {
     use criterion::{BatchSize, Criterion, Throughput};
     use dtdb_api::in_process::InProcessClient;
