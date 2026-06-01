@@ -922,6 +922,7 @@ mod tests {
 
     fn col(name: &str, dt: DataType) -> Column {
         Column {
+            id: 0,
             name: name.to_string(),
             data_type: dt,
             is_primary_key: false,

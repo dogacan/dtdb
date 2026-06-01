@@ -26,6 +26,19 @@ pub use scan_iter::ScanIterator;
 pub use snapshot_log::{SnapshotLog, Snapshotable};
 pub use wal::WalEntry;
 
+pub trait ValueRewriter: Send + Sync {
+    fn rewrite(&self, src_layout: &[u8], dst_layout: &[u8], value: &DbValue) -> Result<DbValue>;
+}
+
+#[derive(Debug, Clone)]
+pub struct PassthroughValueRewriter;
+
+impl ValueRewriter for PassthroughValueRewriter {
+    fn rewrite(&self, _src_layout: &[u8], _dst_layout: &[u8], value: &DbValue) -> Result<DbValue> {
+        Ok(value.clone())
+    }
+}
+
 /// Result type wrapper for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
 

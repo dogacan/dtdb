@@ -8,6 +8,7 @@ use tempfile::TempDir;
 fn create_test_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -17,6 +18,7 @@ fn create_test_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,

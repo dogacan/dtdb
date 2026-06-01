@@ -12,6 +12,7 @@ use tempfile::TempDir;
 fn create_test_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -21,6 +22,7 @@ fn create_test_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -30,6 +32,7 @@ fn create_test_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
@@ -374,6 +377,7 @@ fn test_drop_table_stranded_cleanup_on_startup() {
 fn auto_inc_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -383,6 +387,7 @@ fn auto_inc_schema() -> Schema {
             is_auto_increment: true,
         },
         Column {
+            id: 0,
             name: "val".to_string(),
             data_type: DataType::Int,
             is_primary_key: false,
@@ -462,6 +467,7 @@ fn test_locality_group_pruning_verification() {
     // 3. "lg_score" for score
     let schema = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -471,6 +477,7 @@ fn test_locality_group_pruning_verification() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -480,6 +487,7 @@ fn test_locality_group_pruning_verification() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
@@ -615,6 +623,120 @@ fn test_scan_iter_single_group_fast_path() {
     assert!(empty.is_empty());
 }
 
+/// A four-column schema (the 3-column `create_test_schema` plus a `verified`
+/// bool column with a default), modeling the result of a lazy
+/// `ALTER TABLE ADD COLUMN verified BOOL DEFAULT true`. `default_value` is what
+/// the read path substitutes for rows that predate the column (ADR 0003).
+fn create_test_schema_with_added_column(default: Option<DbValue>) -> Schema {
+    let mut schema = create_test_schema();
+    schema.columns.push(Column {
+        id: schema.next_column_id,
+        name: "verified".to_string(),
+        data_type: DataType::Bool,
+        is_primary_key: false,
+        is_nullable: true,
+        locality_group: None,
+        default_value: default,
+        is_auto_increment: false,
+    });
+    schema.next_column_id += 1;
+    schema
+}
+
+/// End-to-end check of lazy `ADD COLUMN` reconciliation through the real scan
+/// path. We reproduce exactly the on-disk state a metadata-only ADD produces:
+/// rows are written under the original N-column schema, then `schema.bin` is
+/// replaced with an (N+1)-column schema and the database reopened. The added
+/// column's bytes are absent from every stored row, so the scan must pad them
+/// with the column's default. This is the single-locality-group fast path.
+#[test]
+fn test_add_column_reconciles_old_rows_on_scan_single_group() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // 1. Original 3-column table; insert rows that predate the new column.
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.put("users", k_int(2), r_user(2, "Bob", 80.25)).unwrap();
+        tx.commit().unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // 2. Simulate the lazy ALTER's atomic schema swap: overwrite schema.bin with
+    //    the 4-column schema (added `verified BOOL DEFAULT true`). No row bytes
+    //    are touched -- exactly what a metadata-only ADD does.
+    let schema_path = temp_dir.path().join("users").join("schema.bin");
+    create_test_schema_with_added_column(Some(DbValue::Bool(true)))
+        .save_to_file(&schema_path, dtdb_storage::FsyncMethod::Fullfsync)
+        .unwrap();
+
+    // 3. Reopen and scan. Old rows must come back full width with the default.
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+    let rows = drain_scan(
+        table
+            .scan_iter(&k_int(i64::MIN), &k_int(i64::MAX), None)
+            .unwrap(),
+    );
+    let mut alice = r_user(1, "Alice", 95.5).values;
+    alice.push(DbValue::Bool(true));
+    let mut bob = r_user(2, "Bob", 80.25).values;
+    bob.push(DbValue::Bool(true));
+    assert_eq!(
+        rows,
+        vec![(k_int(1), Row::new(alice)), (k_int(2), Row::new(bob))]
+    );
+
+    // A point get goes through the merge path; it must reconcile identically.
+    let got = table.get(&k_int(2), None).unwrap().unwrap();
+    assert_eq!(
+        got.values,
+        vec![
+            DbValue::Int(2),
+            DbValue::String("Bob".to_string()),
+            DbValue::Float(80.25),
+            DbValue::Bool(true),
+        ]
+    );
+
+    // A row inserted *after* the ALTER carries the new column explicitly; mixing
+    // it with reconciled old rows must yield consistent full-width rows.
+    let tx = Transaction::new(2, db.clone());
+    let mut carol = r_user(3, "Carol", 70.0).values;
+    carol.push(DbValue::Bool(false));
+    tx.put("users", k_int(3), Row::new(carol)).unwrap();
+    tx.commit().unwrap();
+    let table = db.get_table("users").unwrap();
+    let after = table.get(&k_int(3), None).unwrap().unwrap();
+    assert_eq!(after.values.last(), Some(&DbValue::Bool(false)));
+}
+
+/// Same lazy-ADD reconciliation, but the column has no default, so old rows must
+/// pad to NULL rather than a value.
+#[test]
+fn test_add_column_without_default_pads_null() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+        db.checkpoint().unwrap();
+    }
+    let schema_path = temp_dir.path().join("users").join("schema.bin");
+    create_test_schema_with_added_column(None)
+        .save_to_file(&schema_path, dtdb_storage::FsyncMethod::Fullfsync)
+        .unwrap();
+
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(got.values.last(), Some(&DbValue::Null));
+}
+
 /// Guards the *other* side of the gate: a genuinely multi-locality-group table
 /// must keep using the merge path. A full scan (all groups) has to reassemble
 /// each row from its per-group sub-rows; the fast path would be wrong here, so
@@ -626,6 +748,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
 
     let schema = Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -635,6 +758,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -644,6 +768,7 @@ fn test_scan_iter_multi_group_uses_merge_path() {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "score".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,
@@ -901,5 +1026,456 @@ fn test_create_index_persists_schema_only_after_index_data() {
             has_data,
             "index directory should hold persisted data, not be empty"
         );
+    }
+}
+
+// ----- ALTER TABLE Database API (ADR 0003, Phase 1) -----
+
+/// `alter_table_add_column` is metadata-only: existing rows reconcile to the new
+/// column's default on read, and a row written afterward carries it natively.
+#[test]
+fn test_database_alter_add_column_with_default() {
+    use dtdb_relational::Column;
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Add `verified BOOL DEFAULT true`. The id must be assigned from the
+    // schema's high-water mark (3 -> the new column gets id 3), not left at 0.
+    db.alter_table_add_column(
+        "users",
+        Column {
+            id: 0,
+            name: "verified".to_string(),
+            data_type: DataType::Bool,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: Some(DbValue::Bool(true)),
+            is_auto_increment: false,
+        },
+    )
+    .unwrap();
+
+    let table = db.get_table("users").unwrap();
+    assert_eq!(table.schema.columns.len(), 4);
+    assert_eq!(table.schema.columns[3].id, 3);
+    assert_eq!(table.schema.next_column_id, 4);
+
+    // Old row reconciles to the default.
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(got.values.last(), Some(&DbValue::Bool(true)));
+}
+
+/// Adding a duplicate column name, or a NOT NULL column without a default to a
+/// non-empty table, is rejected with a SchemaMismatch error.
+#[test]
+fn test_database_alter_add_column_validation() {
+    use dtdb_relational::Column;
+    let mk = |name: &str, nullable: bool, default: Option<DbValue>| Column {
+        id: 0,
+        name: name.to_string(),
+        data_type: DataType::Int,
+        is_primary_key: false,
+        is_nullable: nullable,
+        locality_group: None,
+        default_value: default,
+        is_auto_increment: false,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Duplicate name ("name" already exists).
+    let dup = db.alter_table_add_column("users", mk("name", true, None));
+    assert!(matches!(dup, Err(RelationalError::SchemaMismatch(_))));
+
+    // NOT NULL without default on a non-empty table.
+    let nn = db.alter_table_add_column("users", mk("c", false, None));
+    assert!(matches!(nn, Err(RelationalError::SchemaMismatch(_))));
+
+    // NOT NULL *with* default is fine.
+    db.alter_table_add_column("users", mk("c", false, Some(DbValue::Int(0))))
+        .unwrap();
+
+    // Neither failed ALTER should have advanced the column count beyond the one
+    // successful add.
+    assert_eq!(db.get_table("users").unwrap().schema.columns.len(), 4);
+}
+
+/// `alter_table_rename_column` renames the column and rewrites any index
+/// reference to it; the data is untouched.
+#[test]
+fn test_database_alter_rename_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    db.create_index(
+        "users",
+        "idx_name",
+        vec!["name".to_string()],
+        dtdb_relational::IndexType::BTree,
+        None,
+    )
+    .unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    db.alter_table_rename_column("users", "name", "full_name")
+        .unwrap();
+
+    let table = db.get_table("users").unwrap();
+    assert!(table.schema.column_index("full_name").is_some());
+    assert!(table.schema.column_index("name").is_none());
+    // The index that referenced `name` now references `full_name`.
+    assert_eq!(
+        table.schema.indexes[0].columns,
+        vec!["full_name".to_string()]
+    );
+
+    // Renaming a missing column, or onto an existing name, is rejected.
+    assert!(matches!(
+        db.alter_table_rename_column("users", "nope", "x"),
+        Err(RelationalError::SchemaMismatch(_))
+    ));
+    assert!(matches!(
+        db.alter_table_rename_column("users", "full_name", "id"),
+        Err(RelationalError::SchemaMismatch(_))
+    ));
+}
+
+/// An ADD COLUMN survives a reopen: the swapped schema.bin is durable, and old
+/// rows still reconcile after the database is reopened from disk.
+#[test]
+fn test_database_alter_add_column_survives_reopen() {
+    use dtdb_relational::Column;
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        db.create_table("users", create_test_schema()).unwrap();
+        {
+            let tx = Transaction::new(1, db.clone());
+            tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+            tx.commit().unwrap();
+        }
+        db.alter_table_add_column(
+            "users",
+            Column {
+                id: 0,
+                name: "verified".to_string(),
+                data_type: DataType::Bool,
+                is_primary_key: false,
+                is_nullable: true,
+                locality_group: None,
+                default_value: Some(DbValue::Bool(true)),
+                is_auto_increment: false,
+            },
+        )
+        .unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // Reopen and confirm the added column and its default-reconciliation persist.
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+    assert_eq!(table.schema.columns.len(), 4);
+    assert_eq!(table.schema.next_column_id, 4);
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(got.values.last(), Some(&DbValue::Bool(true)));
+}
+
+/// ADD COLUMN on a *multi-locality-group* table exercises the scan merge path
+/// (not the single-group fast path) and the `relative_indices` cache reset:
+/// after the new default-group column is appended, an old row read through the
+/// merge must reconcile to the new column's default at the correct position.
+#[test]
+fn test_database_alter_add_column_multi_group() {
+    use dtdb_relational::Column;
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    // id in the default group; name/score in their own groups.
+    let schema = Schema::new(vec![
+        Column {
+            id: 0,
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 0,
+            name: "name".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_name".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 0,
+            name: "score".to_string(),
+            data_type: DataType::Float,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_score".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+    ]);
+    db.create_table("users", schema).unwrap();
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(1), r_user(1, "Alice", 95.5)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Force the read path (and thus the relative_indices cache) to populate
+    // before the ALTER, so the cache-reset path is actually exercised.
+    let _ = db.get_table("users").unwrap().get(&k_int(1), None).unwrap();
+
+    // Append a default-group column with a default value.
+    db.alter_table_add_column(
+        "users",
+        Column {
+            id: 0,
+            name: "active".to_string(),
+            data_type: DataType::Bool,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: Some(DbValue::Bool(true)),
+            is_auto_increment: false,
+        },
+    )
+    .unwrap();
+
+    // The old row reconciles to the default in the new (4th) position, with the
+    // group-resident columns still correctly merged into their positions.
+    let table = db.get_table("users").unwrap();
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(
+        got.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Float(95.5),
+            DbValue::Bool(true),
+        ]
+    );
+
+    // A non-default-group column is rejected.
+    let bad = db.alter_table_add_column(
+        "users",
+        Column {
+            id: 0,
+            name: "extra".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: Some("lg_name".to_string()),
+            default_value: None,
+            is_auto_increment: false,
+        },
+    );
+    assert!(matches!(bad, Err(RelationalError::SchemaMismatch(_))));
+}
+
+#[test]
+fn test_database_alter_drop_column() {
+    use dtdb_relational::{Column, DataType, Schema};
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    // Create schema with id (pk), name, score, active (default true)
+    let schema = Schema::new(vec![
+        Column {
+            id: 0,
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            is_primary_key: true,
+            is_nullable: false,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 1,
+            name: "name".to_string(),
+            data_type: DataType::String,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 2,
+            name: "score".to_string(),
+            data_type: DataType::Float,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: None,
+            is_auto_increment: false,
+        },
+        Column {
+            id: 3,
+            name: "active".to_string(),
+            data_type: DataType::Bool,
+            is_primary_key: false,
+            is_nullable: true,
+            locality_group: None,
+            default_value: Some(DbValue::Bool(true)),
+            is_auto_increment: false,
+        },
+    ]);
+
+    db.create_table("users", schema).unwrap();
+
+    // Insert a row. Row is serialized with all 4 values.
+    {
+        let tx = Transaction::new(1, db.clone());
+        let val = Row::new(vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Float(95.5),
+            DbValue::Bool(false),
+        ]);
+        tx.put("users", k_int(1), val).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Drop "score" column.
+    db.alter_table_drop_column("users", "score").unwrap();
+
+    // 1. Immediately hides it from get and scan
+    let table = db.get_table("users").unwrap();
+    assert_eq!(table.schema.columns.len(), 3);
+    assert!(table.schema.column_index("score").is_none());
+
+    // Get should return the row without the score column
+    let got = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(
+        got.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Bool(false),
+        ]
+    );
+
+    // Scan should also hide it
+    let rows = drain_scan(table.scan_iter(&k_int(0), &k_int(10), None).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Bool(false),
+        ]
+    );
+
+    // Attempting to drop primary key column "id" must fail
+    let drop_pk = db.alter_table_drop_column("users", "id");
+    assert!(matches!(drop_pk, Err(RelationalError::SchemaMismatch(_))));
+
+    // Attempting to drop non-existent column must fail
+    let drop_none = db.alter_table_drop_column("users", "score");
+    assert!(matches!(drop_none, Err(RelationalError::SchemaMismatch(_))));
+
+    // 2. Verify that subsequent compaction physically purges the dropped column values.
+    // First, let's flush and write some more data to ensure we have files in L0.
+    {
+        let tx = Transaction::new(2, db.clone());
+        tx.put(
+            "users",
+            k_int(2),
+            Row::new(vec![
+                DbValue::Int(2),
+                DbValue::String("Bob".to_string()),
+                DbValue::Bool(true),
+            ]),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Force a compaction on the underlying storage engines.
+    for engine in table.engines.values() {
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap();
+    }
+
+    db.checkpoint().unwrap();
+
+    // Reopen database from disk to verify schema is preserved and compaction did not lose data.
+    drop(table);
+    drop(db);
+
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let table = db.get_table("users").unwrap();
+
+    // Retrieve values from the table. They should still be readable and correct.
+    let got1 = table.get(&k_int(1), None).unwrap().unwrap();
+    assert_eq!(
+        got1.values,
+        vec![
+            DbValue::Int(1),
+            DbValue::String("Alice".to_string()),
+            DbValue::Bool(false),
+        ]
+    );
+
+    let got2 = table.get(&k_int(2), None).unwrap().unwrap();
+    assert_eq!(
+        got2.values,
+        vec![
+            DbValue::Int(2),
+            DbValue::String("Bob".to_string()),
+            DbValue::Bool(true),
+        ]
+    );
+
+    // Let's inspect the raw storage layout directly to check that the score column is not present.
+    // We can read raw DbValue from the storage engine.
+    for engine in table.engines.values() {
+        let raw_val = engine.get(&k_int(1)).unwrap().unwrap();
+        if let DbValue::Bytes(bytes) = raw_val {
+            let row = Row::from_bytes(&bytes).unwrap();
+            // In the raw storage engine (post-compaction), the row value count must be 3,
+            // because the rewriter successfully rewrote it to the new 3-column layout during compaction.
+            assert_eq!(row.values.len(), 3);
+            assert_eq!(
+                row.values,
+                vec![
+                    DbValue::Int(1),
+                    DbValue::String("Alice".to_string()),
+                    DbValue::Bool(false),
+                ]
+            );
+        } else {
+            panic!("Expected DbValue::Bytes");
+        }
     }
 }

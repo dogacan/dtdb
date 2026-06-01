@@ -38,6 +38,7 @@ fn log_record_count(log_path: &Path) -> usize {
 fn create_user_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -47,6 +48,7 @@ fn create_user_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "name".to_string(),
             data_type: DataType::String,
             is_primary_key: false,
@@ -62,6 +64,7 @@ fn create_user_schema() -> Schema {
 fn create_product_schema() -> Schema {
     Schema::new(vec![
         Column {
+            id: 0,
             name: "sku".to_string(),
             data_type: DataType::String,
             is_primary_key: true,
@@ -71,6 +74,7 @@ fn create_product_schema() -> Schema {
             is_auto_increment: false,
         },
         Column {
+            id: 0,
             name: "price".to_string(),
             data_type: DataType::Float,
             is_primary_key: false,

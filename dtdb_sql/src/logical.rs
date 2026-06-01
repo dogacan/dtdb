@@ -214,6 +214,8 @@ impl LogicalPlan {
         for (name, expr) in field_names.iter().zip(expressions.iter()) {
             let dt = infer_expr_type(expr, &source_schema);
             cols.push(Column {
+                // Ephemeral query-output column; id is unused (not persisted).
+                id: 0,
                 name: name.clone(),
                 data_type: dt,
                 is_primary_key: false,
@@ -276,6 +278,8 @@ impl LogicalPlan {
                 _ => DataType::String,
             };
             cols.push(Column {
+                // Ephemeral query-output column; id is unused (not persisted).
+                id: 0,
                 name: field_names[idx].clone(),
                 data_type: dt,
                 is_primary_key: false,
@@ -312,6 +316,8 @@ impl LogicalPlan {
                 },
             };
             cols.push(Column {
+                // Ephemeral query-output column; id is unused (not persisted).
+                id: 0,
                 name: field_names[start_idx + idx].clone(),
                 data_type: dt,
                 is_primary_key: false,

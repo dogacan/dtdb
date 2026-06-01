@@ -1186,6 +1186,7 @@ mod tests {
     #[test]
     fn test_get_plan_sort_key_projection() {
         let schema = Schema::new(vec![Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -1447,6 +1448,7 @@ mod tests {
     #[test]
     fn test_get_plan_sort_key_edge_cases() {
         let mut schema = Schema::new(vec![Column {
+            id: 0,
             name: "id".to_string(),
             data_type: DataType::Int,
             is_primary_key: true,
@@ -1517,6 +1519,7 @@ mod tests {
     fn test_try_promote_to_index_scan_edge_cases() {
         let mut schema = Schema::new(vec![
             Column {
+                id: 0,
                 name: "id".to_string(),
                 data_type: DataType::Int,
                 is_primary_key: true,
@@ -1526,6 +1529,7 @@ mod tests {
                 is_auto_increment: false,
             },
             Column {
+                id: 0,
                 name: "val".to_string(),
                 data_type: DataType::Int,
                 is_primary_key: false,

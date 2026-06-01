@@ -90,7 +90,8 @@ fn test_sstable_write_read() {
 
     // Write to SSTable with small block size (e.g. 50 bytes) to force block splitting
     {
-        let mut writer = SstableWriter::create(&sst_path, 50, CompressionType::Lz4, 4).unwrap();
+        let mut writer =
+            SstableWriter::create(&sst_path, 50, CompressionType::Lz4, 4, vec![]).unwrap();
         writer.append(&k_int(1), Some(&v_int(10))).unwrap();
         writer.append(&k_int(2), Some(&v_int(20))).unwrap();
         writer.append(&k_int(3), None).unwrap(); // Tombstone
@@ -604,7 +605,8 @@ fn test_sstable_block_checksum_detects_bitrot() {
     let sst_path = temp_dir.path().join("00001.sst");
 
     {
-        let mut writer = SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4).unwrap();
+        let mut writer =
+            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![]).unwrap();
         for i in 0..16 {
             writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
         }

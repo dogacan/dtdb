@@ -21,8 +21,18 @@ fn default_nullable() -> bool {
 }
 
 /// Column represents a schema definition for a single table column.
+///
+/// `id` is a stable, never-reused identifier for the column within its table.
+/// It is what makes lazy `ALTER TABLE` sound: a set of positional row bytes can
+/// be described by the ordered list of column ids it corresponds to, so adds,
+/// drops, and renames remain expressible regardless of the current column order
+/// (see ADR 0003). Ids are assigned by the catalog at the `Schema::new`
+/// chokepoint; ephemeral query-output columns (projection/join output schemas,
+/// the EXPLAIN schema) never persist to `schema.bin` and simply carry id 0.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Column {
+    #[serde(default)]
+    pub id: u32,
     pub name: String,
     pub data_type: DataType,
     pub is_primary_key: bool,
@@ -112,6 +122,13 @@ pub struct IndexDefinition {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub columns: Vec<Column>,
+    /// Monotonic high-water mark for [`Column::id`]. Only ever increases: an
+    /// `ALTER TABLE ADD COLUMN` mints `next_column_id` and increments it, and a
+    /// future `DROP COLUMN` retires an id without lowering this. Guarantees ids
+    /// are never reused within a table's lifetime, which is what keeps a stored
+    /// row's layout (its ordered list of column ids) unambiguous. See ADR 0003.
+    #[serde(default)]
+    pub next_column_id: u32,
     #[serde(default)]
     pub locality_group_options: HashMap<String, LocalityGroupOptions>,
     #[serde(default)]
@@ -159,25 +176,55 @@ impl Schema {
 
     /// Creates a new Schema.
     pub fn new(columns: Vec<Column>) -> Self {
+        Self::new_with_options(columns, HashMap::new())
+    }
+
+    /// Creates a new Schema with options.
+    ///
+    /// This is the catalog chokepoint where stable column ids are assigned:
+    /// incoming columns are renumbered `0..n` (ignoring any id the caller set)
+    /// and `next_column_id` is seeded to `n`. Callers therefore never need to
+    /// populate [`Column::id`] themselves — including the ephemeral query-output
+    /// schemas built by the SQL layer, whose ids are meaningless and harmless.
+    pub fn new_with_options(
+        mut columns: Vec<Column>,
+        locality_group_options: HashMap<String, LocalityGroupOptions>,
+    ) -> Self {
+        for (idx, col) in columns.iter_mut().enumerate() {
+            col.id = idx as u32;
+        }
+        let next_column_id = columns.len() as u32;
         Self {
             columns,
-            locality_group_options: HashMap::new(),
+            next_column_id,
+            locality_group_options,
             indexes: Vec::new(),
             relative_indices: std::sync::OnceLock::new(),
         }
     }
 
-    /// Creates a new Schema with options.
-    pub fn new_with_options(
-        columns: Vec<Column>,
-        locality_group_options: HashMap<String, LocalityGroupOptions>,
-    ) -> Self {
-        Self {
-            columns,
-            locality_group_options,
-            indexes: Vec::new(),
-            relative_indices: std::sync::OnceLock::new(),
+    /// Normalizes a stored row to the schema's current full width, filling any
+    /// absent trailing columns with their [`Column::default_value`] (or `NULL`).
+    ///
+    /// This is the read-path reconciliation step that makes lazy `ADD COLUMN`
+    /// work: an old row serialized before the column was added decodes with
+    /// fewer values than the live schema has columns, and this pads it back to
+    /// full width so nothing downstream ever sees a short row. Under the Phase 1
+    /// prefix invariant (stored rows are always a prefix of `columns`) this is a
+    /// pure tail-extend; rows already at full width are returned untouched. See
+    /// ADR 0003.
+    pub fn reconcile_row(&self, row: Row) -> Row {
+        let mut columns = Vec::with_capacity(row.values.len());
+        for i in 0..row.values.len() {
+            if let Some(col) = self.columns.get(i) {
+                columns.push(StoredColumn {
+                    id: col.id,
+                    default_value: col.default_value.clone(),
+                });
+            }
         }
+        let layout = StoredLayout { columns };
+        self.reconcile_row_with_layout(row, &layout)
     }
 
     /// Returns the set of all unique locality group names in the table schema.
@@ -228,10 +275,25 @@ impl Schema {
         })
     }
 
+    /// Returns a full-width value vector pre-filled with each column's default
+    /// (or `NULL` when the column has none). Used as the initial state of a
+    /// merged row so any column position that storage does not supply — e.g. a
+    /// column added by a later `ALTER TABLE` that older rows predate — falls
+    /// back to its default rather than a bare `NULL`. A position that storage
+    /// *does* supply (including an explicitly-stored `NULL`) overwrites it.
+    pub fn default_row_values(&self) -> Vec<DbValue> {
+        self.columns
+            .iter()
+            .map(|c| c.default_value.clone().unwrap_or(DbValue::Null))
+            .collect()
+    }
+
     /// Merges sub-rows from various locality groups back into a single full row.
-    /// Columns in groups that are missing/None in the input map will be populated with DbValue::Null.
+    /// Columns not supplied by any group sub-row fall back to their default
+    /// (see [`Schema::default_row_values`]); a stored value, including an
+    /// explicit `NULL`, overrides that default.
     pub fn merge_rows(&self, group_rows: &HashMap<String, Option<Row>>) -> Row {
-        let mut full_values = vec![DbValue::Null; self.columns.len()];
+        let mut full_values = self.default_row_values();
         let mapping = self.get_relative_indices();
         for (col_idx, (group, r_idx)) in mapping.iter().enumerate() {
             if let Some(Some(sub_row)) = group_rows.get(group)
@@ -526,6 +588,42 @@ impl Schema {
         let schema: Schema = bincode::deserialize(&bytes)?;
         Ok(schema)
     }
+
+    pub fn current_layout(&self) -> StoredLayout {
+        StoredLayout {
+            columns: self
+                .columns
+                .iter()
+                .map(|c| StoredColumn {
+                    id: c.id,
+                    default_value: c.default_value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn reconcile_row_with_layout(&self, row: Row, layout: &StoredLayout) -> Row {
+        let mut new_values = self.default_row_values();
+        for (src_pos, src_col) in layout.columns.iter().enumerate() {
+            if let Some(src_val) = row.values.get(src_pos)
+                && let Some(dst_pos) = self.columns.iter().position(|c| c.id == src_col.id)
+            {
+                new_values[dst_pos] = src_val.clone();
+            }
+        }
+        Row::new(new_values)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StoredColumn {
+    pub id: u32,
+    pub default_value: Option<DbValue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StoredLayout {
+    pub columns: Vec<StoredColumn>,
 }
 
 /// Helper to check if a string ends with a suffix preceded by a dot `.`,
@@ -545,6 +643,7 @@ mod tests {
 
     fn col(name: &str, dt: DataType, pk: bool) -> Column {
         Column {
+            id: 0,
             name: name.to_string(),
             data_type: dt,
             is_primary_key: pk,
@@ -1024,5 +1123,71 @@ mod tests {
         schema.save_to_file(&path, FsyncMethod::Fullfsync).unwrap();
         let tmp = dir.path().join(".schema.bin.tmp");
         assert!(!tmp.exists());
+    }
+
+    // ----- stable column ids & lazy ADD COLUMN reconciliation (ADR 0003) -----
+
+    #[test]
+    fn new_assigns_sequential_ids_and_seeds_high_water_mark() {
+        // `Schema::new` renumbers columns 0..n regardless of any id the caller
+        // set, and seeds `next_column_id` to n.
+        let mut a = col("a", DataType::Int, true);
+        a.id = 999; // deliberately wrong; the constructor must overwrite it.
+        let schema = Schema::new(vec![a, col("b", DataType::String, false)]);
+        assert_eq!(schema.columns[0].id, 0);
+        assert_eq!(schema.columns[1].id, 1);
+        assert_eq!(schema.next_column_id, 2);
+
+        // Empty schema is well-defined.
+        let empty = Schema::new(vec![]);
+        assert_eq!(empty.next_column_id, 0);
+    }
+
+    #[test]
+    fn default_row_values_uses_per_column_defaults() {
+        let mut with_default = col("b", DataType::Int, false);
+        with_default.default_value = Some(DbValue::Int(7));
+        // `a` has no default -> NULL; `b` has a default -> that value.
+        let schema = Schema::new(vec![col("a", DataType::Int, true), with_default]);
+        assert_eq!(
+            schema.default_row_values(),
+            vec![DbValue::Null, DbValue::Int(7)]
+        );
+    }
+
+    #[test]
+    fn reconcile_row_pads_short_rows_with_defaults() {
+        let mut c = col("c", DataType::String, false);
+        c.default_value = Some(DbValue::String("dflt".to_string()));
+        // Three-column schema: a (no default), b (no default), c (default "dflt").
+        let schema = Schema::new(vec![
+            col("a", DataType::Int, true),
+            col("b", DataType::Int, false),
+            c,
+        ]);
+
+        // A row stored when the table had only columns a, b decodes with 2 values.
+        let old_row = Row::new(vec![DbValue::Int(1), DbValue::Int(2)]);
+        let reconciled = schema.reconcile_row(old_row);
+        assert_eq!(
+            reconciled.values,
+            vec![
+                DbValue::Int(1),
+                DbValue::Int(2),
+                DbValue::String("dflt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_row_leaves_full_width_rows_untouched() {
+        let schema = Schema::new(vec![
+            col("a", DataType::Int, true),
+            col("b", DataType::Int, false),
+        ]);
+        // A full-width row -- including one whose trailing value is an explicit
+        // NULL -- must be returned exactly, never re-defaulted.
+        let full = Row::new(vec![DbValue::Int(1), DbValue::Null]);
+        assert_eq!(schema.reconcile_row(full.clone()), full);
     }
 }

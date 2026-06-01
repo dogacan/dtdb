@@ -6024,3 +6024,258 @@ fn test_plan_cache_registry() {
     // Check that the plan cache does not exceed 1024
     assert_eq!(engine.plan_cache_len(), 1024);
 }
+
+// ----- ALTER TABLE (lazy ADD / RENAME COLUMN, ADR 0003) -----
+//
+// Each transaction is scoped in its own block so it is dropped -- releasing its
+// `active_table_access` slot -- before a later ALTER, whose stop-the-world
+// quiesce spin-waits for active readers of the table. (Real callers go through
+// `run_in_transaction`, which drops the transaction promptly; these white-box
+// tests construct `Transaction` directly and must scope it themselves.)
+
+/// `ADD COLUMN ... DEFAULT <const>`: rows inserted before the ALTER read back
+/// with the default; rows inserted after carry their own value. End-to-end
+/// through the SQL engine, exercising parse -> plan -> execute -> reconcile.
+#[test]
+fn test_alter_table_add_column_with_default() {
+    let (_temp, db, engine) = setup_engine();
+
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name STRING)", &tx)
+            .unwrap();
+        engine
+            .execute("INSERT INTO users (id, name) VALUES (1, 'Alice')", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // ADD COLUMN with a default; the existing row predates it.
+    {
+        let tx = Transaction::new(2, db.clone());
+        let res = engine
+            .execute("ALTER TABLE users ADD COLUMN active BOOL DEFAULT true", &tx)
+            .unwrap();
+        assert!(matches!(res, ExecutionResult::AlterTable));
+        tx.commit().unwrap();
+    }
+
+    // Insert a post-ALTER row that sets the new column explicitly.
+    {
+        let tx = Transaction::new(3, db.clone());
+        engine
+            .execute(
+                "INSERT INTO users (id, name, active) VALUES (2, 'Bob', false)",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = Transaction::new(4, db.clone());
+    let res = engine
+        .execute("SELECT id, name, active FROM users ORDER BY id ASC", &tx)
+        .unwrap();
+    if let ExecutionResult::Select { schema, rows } = res {
+        assert_eq!(schema.columns.len(), 3);
+        assert_eq!(schema.columns[2].name, "active");
+        // Old row reconciles to the default; new row keeps its explicit value.
+        assert_eq!(
+            rows[0].values,
+            vec![
+                DbValue::Int(1),
+                DbValue::String("Alice".to_string()),
+                DbValue::Bool(true),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                DbValue::Int(2),
+                DbValue::String("Bob".to_string()),
+                DbValue::Bool(false),
+            ]
+        );
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+/// `ADD COLUMN` with no default pads existing rows with NULL.
+#[test]
+fn test_alter_table_add_column_no_default_is_null() {
+    let (_temp, db, engine) = setup_engine();
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)", &tx)
+            .unwrap();
+        engine
+            .execute("INSERT INTO t (id) VALUES (1)", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let tx = Transaction::new(2, db.clone());
+        engine
+            .execute("ALTER TABLE t ADD COLUMN note STRING", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = Transaction::new(3, db.clone());
+    let res = engine.execute("SELECT id, note FROM t", &tx).unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        assert_eq!(rows[0].values, vec![DbValue::Int(1), DbValue::Null]);
+    } else {
+        panic!("Expected Select");
+    }
+}
+
+/// `ADD COLUMN NOT NULL` without a default is rejected on a non-empty table,
+/// but allowed on an empty one.
+#[test]
+fn test_alter_table_add_not_null_without_default() {
+    let (_temp, db, engine) = setup_engine();
+
+    // Empty table: NOT NULL without default is allowed (no rows to violate it).
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)", &tx)
+            .unwrap();
+        assert!(
+            engine
+                .execute("ALTER TABLE t ADD COLUMN c INT NOT NULL", &tx)
+                .is_ok()
+        );
+        tx.commit().unwrap();
+    }
+
+    // Non-empty table: now rejected.
+    {
+        let tx = Transaction::new(2, db.clone());
+        engine
+            .execute("CREATE TABLE u (id INT PRIMARY KEY)", &tx)
+            .unwrap();
+        engine
+            .execute("INSERT INTO u (id) VALUES (1)", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = Transaction::new(3, db.clone());
+    let err = engine
+        .execute("ALTER TABLE u ADD COLUMN c INT NOT NULL", &tx)
+        .unwrap_err();
+    assert!(err.contains("NOT NULL"), "unexpected error: {err}");
+}
+
+/// A duplicate column name is rejected.
+#[test]
+fn test_alter_table_add_duplicate_column_rejected() {
+    let (_temp, db, engine) = setup_engine();
+    let tx = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, name STRING)", &tx)
+        .unwrap();
+    let err = engine
+        .execute("ALTER TABLE t ADD COLUMN name STRING", &tx)
+        .unwrap_err();
+    assert!(err.contains("already exists"), "unexpected error: {err}");
+}
+
+/// `RENAME COLUMN` changes the column name; queries use the new name and the
+/// old name no longer resolves.
+#[test]
+fn test_alter_table_rename_column() {
+    let (_temp, db, engine) = setup_engine();
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name STRING)", &tx)
+            .unwrap();
+        engine
+            .execute("INSERT INTO t (id, name) VALUES (1, 'Alice')", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    {
+        let tx = Transaction::new(2, db.clone());
+        let res = engine
+            .execute("ALTER TABLE t RENAME COLUMN name TO full_name", &tx)
+            .unwrap();
+        assert!(matches!(res, ExecutionResult::AlterTable));
+        tx.commit().unwrap();
+    }
+
+    // New name resolves and returns the original data.
+    {
+        let tx = Transaction::new(3, db.clone());
+        let res = engine.execute("SELECT id, full_name FROM t", &tx).unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("Alice".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    // Old name no longer resolves.
+    let tx = Transaction::new(4, db.clone());
+    assert!(engine.execute("SELECT name FROM t", &tx).is_err());
+}
+
+/// `DROP COLUMN` drops the column; queries use the new schema and the dropped
+/// column no longer resolves.
+#[test]
+fn test_alter_table_drop_column() {
+    let (_temp, db, engine) = setup_engine();
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE t (id INT PRIMARY KEY, name STRING, score FLOAT)",
+                &tx,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO t (id, name, score) VALUES (1, 'Alice', 95.5)",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    {
+        let tx = Transaction::new(2, db.clone());
+        let res = engine
+            .execute("ALTER TABLE t DROP COLUMN score", &tx)
+            .unwrap();
+        assert!(matches!(res, ExecutionResult::AlterTable));
+        tx.commit().unwrap();
+    }
+
+    // New schema has only id and name.
+    {
+        let tx = Transaction::new(3, db.clone());
+        let res = engine.execute("SELECT id, name FROM t", &tx).unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(
+                rows[0].values,
+                vec![DbValue::Int(1), DbValue::String("Alice".to_string())]
+            );
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    // Dropped column no longer resolves.
+    let tx = Transaction::new(4, db.clone());
+    assert!(engine.execute("SELECT score FROM t", &tx).is_err());
+}

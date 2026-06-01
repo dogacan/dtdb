@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
-use crate::schema::{IndexDefinition, IndexType, Schema};
+use crate::schema::{Column, IndexDefinition, IndexType, Schema, StoredLayout};
 use crate::transaction::Transaction;
 use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, Executor, FramedLog, FsyncMethod, LogFormat,
@@ -835,7 +835,11 @@ impl TableScanIterator {
                 self.group_peeks[0] = iter.next()?;
             }
             let row = match value {
-                DbValue::Bytes(bytes) => Row::from_bytes(&bytes)?,
+                // Reconcile to the current schema width: a row stored before a
+                // later `ALTER TABLE ADD COLUMN` decodes short, and `reconcile_row`
+                // pads the missing trailing columns with their defaults so no
+                // short row escapes the scan (see ADR 0003).
+                DbValue::Bytes(bytes) => self.schema.reconcile_row(Row::from_bytes(&bytes)?),
                 // Mirror the general path: a non-Bytes value yields a row of
                 // all-NULLs (a missing/None group contributes only NULLs).
                 _ => Row::new(vec![DbValue::Null; self.schema.columns.len()]),
@@ -879,7 +883,10 @@ impl TableScanIterator {
 
         // Index-keyed merge: copy each column from its slot's sub-row at the
         // precomputed relative index. No group-name hashing, no per-row map.
-        let mut full_values = vec![DbValue::Null; self.schema.columns.len()];
+        // Seed with per-column defaults (not bare NULL) so a column added by a
+        // later `ALTER TABLE` that an old sub-row predates -- its relative index
+        // is past that sub-row's end -- reconciles to its default (see ADR 0003).
+        let mut full_values = self.schema.default_row_values();
         for (col_idx, (slot, rel_idx)) in self.column_mapping.iter().enumerate() {
             if let Some(slot) = slot
                 && let Some(sub_row) = &self.row_parts[*slot]
@@ -1162,6 +1169,7 @@ impl Database {
 
                     let mut engines = HashMap::new();
                     let groups = schema.locality_groups();
+                    let layout_bytes = bincode::serialize(&schema.current_layout()).unwrap();
 
                     // Check for old table layout (backward compatibility): a
                     // table dir that is itself a single storage engine, marked
@@ -1178,7 +1186,9 @@ impl Database {
                             &path,
                             group_opts,
                             executor.clone(),
+                            Arc::new(RelationalValueRewriter),
                         )?);
+                        engine.set_target_layout(layout_bytes);
                         engines.insert("".to_string(), engine);
                     } else {
                         // Multi-engine / new layout
@@ -1192,7 +1202,9 @@ impl Database {
                                 &g_path,
                                 group_opts,
                                 executor.clone(),
+                                Arc::new(RelationalValueRewriter),
                             )?);
+                            engine.set_target_layout(layout_bytes.clone());
                             engines.insert(group, engine);
                         }
                     }
@@ -1204,6 +1216,7 @@ impl Database {
                             &idx_path,
                             engine_opts,
                             executor.clone(),
+                            Arc::new(RelationalValueRewriter),
                         )?);
                         index_engines.insert(idx_def.name.clone(), engine);
                     }
@@ -1345,6 +1358,7 @@ impl Database {
 
         let mut engines = HashMap::new();
         let groups = schema.locality_groups();
+        let layout_bytes = bincode::serialize(&schema.current_layout()).unwrap();
         if groups.len() <= 1 && groups.contains("") {
             let mut group_opts = engine_opts;
             if let Some(opts) = schema.locality_group_options.get("") {
@@ -1354,7 +1368,9 @@ impl Database {
                 &table_path,
                 group_opts,
                 self.executor.clone(),
+                Arc::new(RelationalValueRewriter),
             )?);
+            engine.set_target_layout(layout_bytes);
             engines.insert("".to_string(), engine);
         } else {
             for group in groups {
@@ -1367,7 +1383,9 @@ impl Database {
                     &g_path,
                     group_opts,
                     self.executor.clone(),
+                    Arc::new(RelationalValueRewriter),
                 )?);
+                engine.set_target_layout(layout_bytes.clone());
                 engines.insert(group, engine);
             }
         }
@@ -1397,6 +1415,7 @@ impl Database {
                 &idx_path,
                 engine_opts,
                 self.executor.clone(),
+                Arc::new(RelationalValueRewriter),
             )?);
             index_engines.insert(idx_def.name.clone(), engine);
         }
@@ -1493,6 +1512,238 @@ impl Database {
         self.schema_version
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    /// Spin-waits until no transaction is actively accessing `table_name`.
+    ///
+    /// This is the "stop the world" quiesce shared by every catalog mutation:
+    /// the caller holds the `tables` write lock (so no *new* transaction can
+    /// resolve the table), and this drains the transactions already reading it
+    /// before the schema is swapped. Mirrors the inline loops in `create_index`
+    /// / `drop_index` / `drop_table`.
+    ///
+    /// TODO: bound this with a timeout that returns an error naming the
+    /// offending table instead of spinning forever; a leaked reader currently
+    /// hangs the DDL with no diagnostic (tracked for all quiesce sites).
+    fn wait_for_table_quiescent(&self, table_name: &str) {
+        loop {
+            let has_active_readers = {
+                let access = self.active_table_access.lock().unwrap();
+                access
+                    .get(table_name)
+                    .is_some_and(|readers| !readers.is_empty())
+            };
+            if !has_active_readers {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Adds a column to an existing table (lazy `ALTER TABLE ADD COLUMN`).
+    ///
+    /// Metadata-only and O(1) in the table size: existing rows are left on disk
+    /// untouched and reconciled to the new column's `default_value` (or NULL) on
+    /// read (see [`Schema::reconcile_row`] and ADR 0003). The new column is
+    /// always appended, preserving the Phase 1 invariant that a stored row is a
+    /// prefix of the live schema.
+    ///
+    /// The column's `id` is assigned here from the schema's monotonic
+    /// `next_column_id`; any id on the passed-in `Column` is ignored.
+    pub fn alter_table_add_column(&self, table_name: &str, mut column: Column) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+        let table_arc = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        // Copy-on-write so in-flight transactions keep their old schema snapshot.
+        let table = Arc::make_mut(table_arc);
+
+        // 1. Reject a duplicate column name.
+        if table.schema.column_index(&column.name).is_some() {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Column '{}' already exists in table '{}'",
+                column.name, table_name
+            )));
+        }
+
+        // 2. A new NOT NULL column needs a value for the rows that predate it.
+        //    Allow it only when it has a default, or the table is empty (no rows
+        //    to violate the constraint). Checked while quiesced below; here we
+        //    only need the cheap default check up front.
+        if !column.is_nullable && column.default_value.is_none() {
+            let (start, end) = table.schema.primary_key_bounds()?;
+            let is_empty = table.filtered_scan(&start, &end, None)?.is_empty();
+            if !is_empty {
+                return Err(RelationalError::SchemaMismatch(format!(
+                    "Cannot add NOT NULL column '{}' without a default to non-empty table '{}'",
+                    column.name, table_name
+                )));
+            }
+        }
+
+        // 3. A new column may not join a non-default locality group: that group's
+        //    engine would not exist for the existing rows. (Adding columns only
+        //    to the default group keeps the prefix invariant and needs no new
+        //    storage engine.) Reject explicit non-default groups for now.
+        if let Some(group) = &column.locality_group
+            && !group.is_empty()
+        {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "ALTER TABLE ADD COLUMN into locality group '{}' is not supported",
+                group
+            )));
+        }
+
+        // 4. Assign the stable id and stage the new schema.
+        column.id = table.schema.next_column_id;
+        let mut new_schema = table.schema.clone();
+        new_schema.columns.push(column);
+        new_schema.next_column_id += 1;
+        // `Schema::clone` copies the populated `relative_indices` cache; adding a
+        // column changes the group->index mapping, so drop it to be rebuilt lazily.
+        new_schema.relative_indices = std::sync::OnceLock::new();
+
+        // 5. Quiesce, then atomically swap schema.bin and publish. No row data is
+        //    written, so the single atomic rename is the entire durability story.
+        self.wait_for_table_quiescent(table_name);
+        let schema_path = self.dir_path.join(table_name).join("schema.bin");
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+
+        let layout_bytes = bincode::serialize(&new_schema.current_layout()).unwrap();
+        for engine in table.engines.values() {
+            engine.set_target_layout(layout_bytes.clone());
+        }
+
+        table.schema = new_schema;
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Renames a column of an existing table (`ALTER TABLE RENAME COLUMN`).
+    ///
+    /// Pure metadata: no row bytes are touched (positions are unchanged). Any
+    /// index column reference or locality-group key naming the old column is
+    /// updated in lockstep so the rename is internally consistent.
+    pub fn alter_table_rename_column(
+        &self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+        let table_arc = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        let table = Arc::make_mut(table_arc);
+
+        // 1. Old column must exist; new name must not collide. A no-op rename
+        //    (old == new) is accepted and changes nothing.
+        if table.schema.column_index(old_name).is_none() {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Column '{}' does not exist in table '{}'",
+                old_name, table_name
+            )));
+        }
+        if old_name != new_name && table.schema.column_index(new_name).is_some() {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Column '{}' already exists in table '{}'",
+                new_name, table_name
+            )));
+        }
+
+        // 2. Stage the rename across the column, any index that references it,
+        //    and locality-group membership (keyed by column name elsewhere).
+        let mut new_schema = table.schema.clone();
+        for col in &mut new_schema.columns {
+            if col.name == old_name {
+                col.name = new_name.to_string();
+            }
+        }
+        for idx in &mut new_schema.indexes {
+            for col in &mut idx.columns {
+                if col == old_name {
+                    *col = new_name.to_string();
+                }
+            }
+        }
+
+        // 3. Quiesce, atomically swap schema.bin, publish.
+        self.wait_for_table_quiescent(table_name);
+        let schema_path = self.dir_path.join(table_name).join("schema.bin");
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+        table.schema = new_schema;
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Drops a column from an existing table (lazy `ALTER TABLE DROP COLUMN`).
+    ///
+    /// Metadata-only: existing rows on disk are left untouched and mapped to the
+    /// new layout on read (ignoring the dropped column ID). Compaction will
+    /// physically erase the dropped column values over time.
+    pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        let mut tables_guard = self.tables.write().unwrap();
+        let table_arc = tables_guard
+            .get_mut(table_name)
+            .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
+        let table = Arc::make_mut(table_arc);
+
+        // 1. Column must exist.
+        let col_idx = table.schema.column_index(column_name).ok_or_else(|| {
+            RelationalError::SchemaMismatch(format!(
+                "Column '{}' does not exist in table '{}'",
+                column_name, table_name
+            ))
+        })?;
+
+        // 2. Cannot drop a PRIMARY KEY column.
+        let col = &table.schema.columns[col_idx];
+        if col.is_primary_key {
+            return Err(RelationalError::SchemaMismatch(format!(
+                "Cannot drop primary key column '{}' in table '{}'",
+                column_name, table_name
+            )));
+        }
+
+        // 3. Reject if referenced by secondary indexes.
+        for idx in &table.schema.indexes {
+            if idx.columns.iter().any(|c| c == column_name) {
+                return Err(RelationalError::SchemaMismatch(format!(
+                    "Cannot drop column '{}' because it is referenced by secondary index '{}'",
+                    column_name, idx.name
+                )));
+            }
+        }
+
+        // 4. Clone and modify schema.
+        let mut new_schema = table.schema.clone();
+        new_schema.columns.remove(col_idx);
+        new_schema.relative_indices = std::sync::OnceLock::new();
+
+        // 5. Quiesce, flush memtable, update target layout, swap schema.bin, publish.
+        self.wait_for_table_quiescent(table_name);
+
+        for engine in table.engines.values() {
+            engine.flush_memtable()?;
+        }
+
+        let schema_path = self.dir_path.join(table_name).join("schema.bin");
+        new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
+
+        let layout_bytes = bincode::serialize(&new_schema.current_layout()).unwrap();
+        for engine in table.engines.values() {
+            engine.set_target_layout(layout_bytes.clone());
+        }
+
+        table.schema = new_schema;
+
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -2085,6 +2336,7 @@ impl Database {
             &idx_path,
             engine_opts,
             self.executor.clone(),
+            Arc::new(RelationalValueRewriter),
         )?);
 
         // 8. Wait until all active transactions accessing this table have finished (matching DDL behavior)
@@ -2468,6 +2720,58 @@ impl Database {
     pub fn get_table_statistics(&self, table_name: &str) -> Option<TableStatistics> {
         let stats_guard = self.statistics.read().unwrap();
         stats_guard.get(table_name).cloned()
+    }
+}
+
+#[derive(Clone)]
+pub struct RelationalValueRewriter;
+
+impl dtdb_storage::ValueRewriter for RelationalValueRewriter {
+    fn rewrite(
+        &self,
+        src_layout: &[u8],
+        dst_layout: &[u8],
+        value: &DbValue,
+    ) -> dtdb_storage::Result<DbValue> {
+        if src_layout == dst_layout || dst_layout.is_empty() {
+            return Ok(value.clone());
+        }
+        let dst: StoredLayout =
+            bincode::deserialize(dst_layout).map_err(dtdb_storage::StorageError::Serialization)?;
+
+        if let DbValue::Bytes(bytes) = value {
+            let row = Row::from_bytes(bytes)
+                .map_err(|e| dtdb_storage::StorageError::Corruption(e.to_string()))?;
+            let src = if src_layout.is_empty() {
+                let num_vals = row.values.len();
+                let columns = dst.columns.iter().take(num_vals).cloned().collect();
+                StoredLayout { columns }
+            } else {
+                bincode::deserialize(src_layout)
+                    .map_err(dtdb_storage::StorageError::Serialization)?
+            };
+            let mut new_values = Vec::with_capacity(dst.columns.len());
+            for dst_col in &dst.columns {
+                if let Some(src_pos) = src.columns.iter().position(|c| c.id == dst_col.id) {
+                    if let Some(val) = row.values.get(src_pos) {
+                        new_values.push(val.clone());
+                    } else {
+                        let def = dst_col.default_value.clone().unwrap_or(DbValue::Null);
+                        new_values.push(def);
+                    }
+                } else {
+                    let def = dst_col.default_value.clone().unwrap_or(DbValue::Null);
+                    new_values.push(def);
+                }
+            }
+            let new_row = Row::new(new_values);
+            let new_bytes = new_row
+                .to_bytes()
+                .map_err(|e| dtdb_storage::StorageError::Corruption(e.to_string()))?;
+            Ok(DbValue::Bytes(new_bytes))
+        } else {
+            Ok(value.clone())
+        }
     }
 }
 

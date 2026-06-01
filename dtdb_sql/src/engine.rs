@@ -30,6 +30,7 @@ pub enum ExecutionResult {
     DropTable,
     CreateIndex,
     DropIndex,
+    AlterTable,
     Insert { count: usize },
     Delete { count: usize },
     Update { count: usize },
@@ -454,6 +455,7 @@ impl SqlEngine {
                 sqlparser::ast::Statement::CreateTable(_)
                     | sqlparser::ast::Statement::Drop { .. }
                     | sqlparser::ast::Statement::CreateIndex(_)
+                    | sqlparser::ast::Statement::AlterTable(_)
             );
         }
         false
@@ -675,6 +677,26 @@ impl SqlEngine {
                     .drop_index(table_name, index_name)
                     .map_err(|e| e.to_string())?;
                 Ok(ExecutionResult::DropIndex)
+            }
+            SqlStatement::AlterTable { table_name, op } => {
+                match op {
+                    crate::planner::AlterOp::AddColumn(column) => {
+                        self.database
+                            .alter_table_add_column(table_name, column.clone())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    crate::planner::AlterOp::RenameColumn { old_name, new_name } => {
+                        self.database
+                            .alter_table_rename_column(table_name, old_name, new_name)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    crate::planner::AlterOp::DropColumn(column_name) => {
+                        self.database
+                            .alter_table_drop_column(table_name, column_name)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(ExecutionResult::AlterTable)
             }
             SqlStatement::Insert {
                 table_name,
@@ -1006,6 +1028,8 @@ impl SqlEngine {
 
                 // 4. Wrap the result in a select output with "Query Plan" schema column
                 let schema = Schema::new(vec![dtdb_relational::Column {
+                    // Ephemeral EXPLAIN output column; id is unused (not persisted).
+                    id: 0,
                     name: "Query Plan".to_string(),
                     data_type: DataType::String,
                     is_primary_key: false,

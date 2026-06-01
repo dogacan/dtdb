@@ -34,6 +34,8 @@ impl Ord for HeapEntry {
     }
 }
 
+use std::sync::Arc;
+
 /// An owned streaming iterator that merges the memtable range with SSTable block iterators.
 ///
 /// Implements Option (A) — Owned iterator.
@@ -52,6 +54,8 @@ pub struct ScanIterator {
     // `HashSet` that retains the whole scan in memory.
     last_key: Option<DbKey>,
     end: DbKey,
+    rewriter: Arc<dyn crate::ValueRewriter>,
+    target_layout: Vec<u8>,
 }
 
 impl ScanIterator {
@@ -59,6 +63,8 @@ impl ScanIterator {
         mem_entries: Vec<(DbKey, Option<DbValue>)>,
         sst_iters: Vec<SstableBlockIterator>,
         end: DbKey,
+        rewriter: Arc<dyn crate::ValueRewriter>,
+        target_layout: Vec<u8>,
     ) -> Result<Self> {
         let mut heap = BinaryHeap::new();
         for (idx, iter) in sst_iters.iter().enumerate() {
@@ -78,6 +84,8 @@ impl ScanIterator {
             heap,
             last_key: None,
             end,
+            rewriter,
+            target_layout,
         })
     }
 
@@ -139,7 +147,15 @@ impl ScanIterator {
                 if self.last_key.as_ref() != Some(&entry.key) {
                     self.last_key = Some(entry.key.clone());
                     if let Some(val) = entry.value {
-                        return Ok(Some((entry.key, val)));
+                        let source = &self.sst_iters[entry.source_idx];
+                        let src_layout = &source.reader().layout;
+                        let rewritten_val = if src_layout != &self.target_layout {
+                            self.rewriter
+                                .rewrite(src_layout, &self.target_layout, &val)?
+                        } else {
+                            val
+                        };
+                        return Ok(Some((entry.key, rewritten_val)));
                     }
                 }
             }
