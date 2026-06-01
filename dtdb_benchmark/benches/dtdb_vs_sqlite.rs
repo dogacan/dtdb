@@ -240,6 +240,75 @@ mod imp {
         g.finish();
     }
 
+    /// Full scan filtered on the unindexed `k` column that projects the heap-
+    /// allocated `v STRING` column. Unlike `select_scan_aggregate` (which only
+    /// touches the `Int` column `k`), this materializes and clones a string
+    /// payload per scanned row, exercising the `Arc<str>` snapshot/clone path.
+    fn bench_select_scan_text(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
+        let mut g = c.benchmark_group("dml/select_scan_text");
+        g.throughput(Throughput::Elements(READ_ROWS as u64));
+
+        // Setup dtdb once
+        let dtdb_tmp = TempDir::new().unwrap();
+        let dtdb_client = InProcessClient::open(dtdb_tmp.path()).unwrap();
+        dtdb_client
+            .create_db("bench", CompressionType::Lz4)
+            .unwrap();
+        let results = dtdb_client
+            .execute_query(
+                "bench",
+                sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, k INT, v STRING)"),
+            )
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
+        populate_dtdb(&dtdb_client, READ_ROWS);
+
+        g.bench_function("dtdb_client", |b| {
+            b.iter(|| {
+                let results = dtdb_client
+                    .execute_query(
+                        "bench",
+                        sql_query!("SELECT v FROM bench WHERE k BETWEEN @lo AND @hi")
+                            .bind("lo", 0i64)
+                            .bind("hi", 50000i64),
+                    )
+                    .unwrap();
+                for r in results {
+                    let _resp = r.unwrap();
+                }
+            });
+        });
+
+        // Setup sqlite once
+        let sqlite_tmp = TempDir::new().unwrap();
+        let mut sqlite_conn =
+            rusqlite::Connection::open(sqlite_tmp.path().join("bench.sqlite")).unwrap();
+        sqlite_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                 CREATE TABLE bench (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);",
+            )
+            .unwrap();
+        populate_sqlite(&mut sqlite_conn, READ_ROWS);
+
+        g.bench_function("sqlite_prepared", |b| {
+            let mut stmt = sqlite_conn
+                .prepare("SELECT v FROM bench WHERE k BETWEEN ?1 AND ?2")
+                .unwrap();
+            b.iter(|| {
+                let mut rows = stmt.query(rusqlite::params![0i64, 50000i64]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            });
+        });
+
+        g.finish();
+    }
+
     /// 200 point lookups by primary key.
     fn bench_select_point(c: &mut Criterion) {
         use dtdb_api::sql_query;
@@ -664,6 +733,7 @@ mod imp {
         bench_insert_autocommit(&mut c);
         bench_insert_txn_client(&mut c);
         bench_select_scan(&mut c);
+        bench_select_scan_text(&mut c);
         bench_select_point(&mut c);
         bench_update_point(&mut c);
         bench_delete_range(&mut c);
