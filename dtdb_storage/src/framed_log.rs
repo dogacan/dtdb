@@ -11,7 +11,7 @@
 //! ```text
 //! [ 8-byte header ][ frame ][ frame ]...
 //!   header = magic[4] ++ version[1] ++ reserved[3]
-//!   frame  = len: u32 LE ++ checksum: xxh32 LE ++ bincode(payload)[len]
+//!   frame  = len: u32 LE ++ checksum: xxh32 LE ++ postcard(payload)[len]
 //! ```
 //!
 //! The header lets us evolve the format and detect type confusion (e.g. a
@@ -127,7 +127,7 @@ impl<E: DeserializeOwned> FramedLog<E> {
 
     /// Appends one record and (depending on sync policy) forces it to disk.
     pub fn append<S: Serialize>(&mut self, entry: &S) -> Result<()> {
-        let bytes = bincode::serialize(entry)?;
+        let bytes = postcard::to_allocvec(entry)?;
         let len = bytes.len() as u32;
         let checksum = compute_checksum(&bytes);
 
@@ -270,7 +270,7 @@ impl<E: DeserializeOwned> FramedLog<E> {
             }
 
             // 5. Deserialize.
-            match bincode::deserialize(&bytes) {
+            match postcard::from_bytes(&bytes) {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
                     tracing::warn!(error = %e, "framed log entry deserialization failed; stopping recovery");
@@ -338,7 +338,7 @@ mod tests {
     }
 
     fn rec_payload(rec: &TestRec) -> Vec<u8> {
-        bincode::serialize(rec).unwrap()
+        postcard::to_allocvec(rec).unwrap()
     }
 
     /// Prepend a valid `TEST_FORMAT` header to a body of frames.
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn test_recover_stops_at_undeserializable_payload() {
         let good = frame(&rec_payload(&TestRec::A(1)));
-        // Valid checksum over bytes bincode can't decode into TestRec (a bogus
+        // Valid checksum over bytes postcard can't decode into TestRec (a bogus
         // enum discriminant well past the defined variants).
         let garbage = vec![0xFFu8; 8];
         let body = [good, frame(&garbage)].concat();

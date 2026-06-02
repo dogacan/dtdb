@@ -464,6 +464,27 @@ fn test_engine_compaction_round_robin() {
         engine.compact().unwrap(); // L0 -> L1 (File 3: key 30)
     }
 
+    // Measure the on-disk size of the three single-entry L1 files so the
+    // compaction threshold is derived from the actual serialized size rather
+    // than a magic constant tied to one serialization format (the absolute
+    // sizes differ between e.g. bincode and postcard).
+    let l1_total_size: u64 = std::fs::read_dir(&db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "sst")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("L1_"))
+        })
+        .map(|p| std::fs::metadata(&p).unwrap().len())
+        .sum();
+    // All three files have the same size, so a limit one byte below their
+    // total triggers L1 -> L2 compaction only when all three are present: any
+    // two of them stay at or below the limit.
+    let three_file_limit = (l1_total_size - 1) as usize;
+
     // 2. Reopen the engine with a tiny base_level_size_limit to trigger L1 -> L2 compaction
     let mut l2_keys = Vec::new();
     {
@@ -477,7 +498,7 @@ fn test_engine_compaction_round_robin() {
             wal_size_limit: 32 * 1024 * 1024,
             l0_compaction_threshold: 10,
             sstable_target_size: 1,
-            base_level_size_limit: 400, // Limit of 400 bytes triggers compaction only when >= 3 files are present
+            base_level_size_limit: three_file_limit,
             level_size_multiplier: 1000, // Large multiplier to prevent L2 -> L3 cascading
             max_level: 4,
             block_cache_capacity: 0,

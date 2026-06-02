@@ -172,7 +172,7 @@ impl SstableWriter {
         self.max_key = Some(self.current_block.last().unwrap().0.clone());
 
         // Serialize block
-        let raw_bytes = bincode::serialize(&self.current_block)?;
+        let raw_bytes = postcard::to_allocvec(&self.current_block)?;
 
         // Compress block if compression is Lz4
         let block_bytes = match self.compression {
@@ -235,7 +235,7 @@ impl SstableWriter {
             bloom_filter: self.bloom_filter.clone(),
             layout: self.layout.clone(),
         };
-        let index_bytes = bincode::serialize(&index_block)?;
+        let index_bytes = postcard::to_allocvec(&index_block)?;
         let index_len = index_bytes.len() as u64;
 
         file.write_all(&index_bytes)?;
@@ -321,7 +321,7 @@ impl SstableReader {
         let mut index_bytes = vec![0u8; index_len as usize];
         file.read_exact(&mut index_bytes)?;
 
-        let index_block: IndexBlock = bincode::deserialize(&index_bytes)?;
+        let index_block: IndexBlock = postcard::from_bytes(&index_bytes)?;
 
         // The index stats record the max key for every non-empty SSTable, so we
         // take `last_key` straight from there and never touch a data block at
@@ -454,7 +454,7 @@ impl SstableReader {
             CompressionType::Uncompressed => block_bytes,
         };
 
-        let block: Vec<(DbKey, Option<DbValue>)> = bincode::deserialize(&raw_bytes)?;
+        let block: Vec<(DbKey, Option<DbValue>)> = postcard::from_bytes(&raw_bytes)?;
         let block_arc = Arc::new(block);
 
         if let Some(ref cache) = self.block_cache {

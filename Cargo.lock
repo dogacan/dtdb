@@ -606,9 +606,9 @@ dependencies = [
 name = "dtdb_storage"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "criterion",
  "lz4_flex",
+ "postcard",
  "serde",
  "tempfile",
  "thiserror 1.0.69",
