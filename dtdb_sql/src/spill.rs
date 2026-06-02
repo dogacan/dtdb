@@ -2,7 +2,7 @@
 //!
 //! Operators that would otherwise buffer their full input in RAM (external sort,
 //! spilling aggregation, sort-based distinct/set-ops, sort-merge join) share the
-//! machinery here: byte estimation for budgeting, count-prefixed `bincode` run
+//! machinery here: byte estimation for budgeting, count-prefixed `postcard` run
 //! files keyed by a `Vec<DbValue>` sort key, and a k-way merge over those runs.
 
 use dtdb_storage::DbValue;
@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Stable type-rank used to give cross-type comparisons a deterministic order.
@@ -114,7 +114,7 @@ impl<P: DeserializeOwned> Run<P> {
         let file = File::open(&self.path)
             .map_err(|e| format!("Failed to open temp file {:?}: {}", self.path, e))?;
         let mut reader = BufReader::new(file);
-        let count: u64 = bincode::deserialize_from(&mut reader)
+        let count = read_count(&mut reader)
             .map_err(|e| format!("Failed to read count from run file: {}", e))?;
         self.remaining = count as usize;
         self.reader = Some(reader);
@@ -130,9 +130,9 @@ impl<P: DeserializeOwned> Run<P> {
         }
 
         let reader = self.reader.as_mut().ok_or("Advance called on closed run")?;
-        let keys: Vec<DbValue> = bincode::deserialize_from(&mut *reader)
-            .map_err(|e| format!("Failed to deserialize keys: {}", e))?;
-        let payload: P = bincode::deserialize_from(&mut *reader)
+        let keys: Vec<DbValue> =
+            read_framed(&mut *reader).map_err(|e| format!("Failed to deserialize keys: {}", e))?;
+        let payload: P = read_framed(&mut *reader)
             .map_err(|e| format!("Failed to deserialize payload: {}", e))?;
 
         self.peeked = Some((keys, payload));
@@ -157,6 +157,59 @@ fn next_run_path(temp_dir: &Path, prefix: &str) -> PathBuf {
     temp_dir.join(format!("{}_{}_{}.bin", prefix, std::process::id(), run_id))
 }
 
+/// Run files begin with a fixed-width `u64` record count: the writer reserves it,
+/// streams records, then seeks back and patches in the total. It is kept a fixed
+/// 8 bytes (rather than postcard's varint `u64`) precisely so `merge_chunk` can
+/// overwrite it in place without shifting the records that follow.
+fn write_count<W: Write>(writer: &mut W, count: u64) -> Result<(), String> {
+    writer
+        .write_all(&count.to_le_bytes())
+        .map_err(|e| format!("Failed to write run count: {}", e))
+}
+
+fn read_count<R: Read>(reader: &mut R) -> Result<u64, String> {
+    let mut buf = [0u8; 8];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("Failed to read run count: {}", e))?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Writes one length-framed postcard record: a `u32` LE byte length followed by the
+/// postcard encoding of `value`. Unlike bincode's `serialize_into`, postcard has no
+/// reader/writer streaming API, so the explicit length prefix is what lets the reader
+/// pull records back one at a time without buffering the whole run in memory.
+fn write_framed<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<(), String> {
+    let bytes = postcard::to_allocvec(value).map_err(|e| format!("Serialization error: {}", e))?;
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        format!(
+            "Spill record of {} bytes exceeds the 4 GiB frame limit",
+            bytes.len()
+        )
+    })?;
+    writer
+        .write_all(&len.to_le_bytes())
+        .map_err(|e| format!("Failed to write frame length: {}", e))?;
+    writer
+        .write_all(&bytes)
+        .map_err(|e| format!("Failed to write frame: {}", e))?;
+    Ok(())
+}
+
+/// Reads one length-framed postcard record written by [`write_framed`].
+fn read_framed<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, String> {
+    let mut len_buf = [0u8; 4];
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("Failed to read frame length: {}", e))?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("Failed to read frame: {}", e))?;
+    postcard::from_bytes(&buf).map_err(|e| e.to_string())
+}
+
 /// Serializes a buffer of `(key, payload)` entries to a fresh temp file and returns
 /// a `Run` handle over it. The caller is responsible for having sorted the buffer.
 pub fn write_run<P: Serialize>(
@@ -170,14 +223,11 @@ pub fn write_run<P: Serialize>(
         File::create(&path).map_err(|e| format!("Failed to create temp file {:?}: {}", path, e))?;
     let mut writer = BufWriter::new(file);
 
-    bincode::serialize_into(&mut writer, &(buffer.len() as u64))
-        .map_err(|e| format!("Serialization error: {}", e))?;
+    write_count(&mut writer, buffer.len() as u64)?;
 
     for (keys, payload) in buffer {
-        bincode::serialize_into(&mut writer, keys)
-            .map_err(|e| format!("Serialization error: {}", e))?;
-        bincode::serialize_into(&mut writer, payload)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+        write_framed(&mut writer, keys)?;
+        write_framed(&mut writer, payload)?;
     }
 
     writer
@@ -335,15 +385,12 @@ fn merge_chunk<P: Serialize + DeserializeOwned>(
     let mut writer = BufWriter::new(file);
 
     // Reserve a fixed-width count prefix; patched in once the total is known.
-    bincode::serialize_into(&mut writer, &0u64)
-        .map_err(|e| format!("Serialization error: {}", e))?;
+    write_count(&mut writer, 0)?;
 
     let mut count: u64 = 0;
     while let Some((keys, payload)) = merger.next()? {
-        bincode::serialize_into(&mut writer, &keys)
-            .map_err(|e| format!("Serialization error: {}", e))?;
-        bincode::serialize_into(&mut writer, &payload)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+        write_framed(&mut writer, &keys)?;
+        write_framed(&mut writer, &payload)?;
         count += 1;
     }
 
@@ -352,8 +399,7 @@ fn merge_chunk<P: Serialize + DeserializeOwned>(
         .map_err(|e| format!("Failed to flush temp file: {}", e))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|e| format!("Failed to seek temp file {:?}: {}", path, e))?;
-    bincode::serialize_into(&mut file, &count)
-        .map_err(|e| format!("Serialization error: {}", e))?;
+    write_count(&mut file, count)?;
 
     // Dropping `merger` here releases and deletes the chunk's input run files.
     Ok(Run {

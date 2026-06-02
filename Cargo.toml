@@ -30,6 +30,10 @@ dtdb_api = { path = "dtdb_api" }
 # those enums won't compile. Note: deserialization does not dedup Arcs.
 serde = { version = "1.0", features = ["derive", "rc"] }
 bincode = "1.3"
+# Migration target replacing the unmaintained `bincode` (RUSTSEC-2025-0141).
+# `use-std` pulls in `alloc` (for `to_allocvec`) plus std error impls. Added
+# alongside `bincode` while the migration proceeds file-by-file.
+postcard = { version = "1", features = ["use-std"] }
 thiserror = "1.0"
 tempfile = "3.27.0"
 tokio = "1.35"
