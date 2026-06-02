@@ -549,14 +549,4 @@ impl SstableReader {
 
         Ok(results)
     }
-
-    /// Reads all entries from the SSTable file. Used for compaction.
-    pub fn read_all(&self) -> Result<Vec<(DbKey, Option<DbValue>)>> {
-        let mut entries = Vec::new();
-        for idx in 0..self.index.len() {
-            let block = self.read_block(idx)?;
-            entries.extend(block.iter().cloned());
-        }
-        Ok(entries)
-    }
 }

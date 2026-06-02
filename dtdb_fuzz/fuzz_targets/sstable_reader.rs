@@ -129,8 +129,7 @@ fn fuzz_sstable_reader() {
             let _ = reader.get(&DbKey::Int(i64::MIN));
             let _ = reader.get(&DbKey::Int(i64::MAX));
 
-            // Full range scan and read_all.
+            // Full range scan.
             let _ = reader.scan_raw(&DbKey::Int(i64::MIN), &DbKey::Int(i64::MAX));
-            let _ = reader.read_all();
         });
 }
