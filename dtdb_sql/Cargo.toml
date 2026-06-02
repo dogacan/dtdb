@@ -8,7 +8,6 @@ dtdb_storage = { workspace = true }
 dtdb_relational = { workspace = true }
 sqlparser = "0.62.0"
 serde = { workspace = true }
-bincode = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
 regex = "1.12"

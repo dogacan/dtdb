@@ -1381,7 +1381,7 @@ fn test_locality_groups_overrides_end_to_end() {
         assert!(lg_name_opts_path.exists());
         let lg_name_bytes = std::fs::read(&lg_name_opts_path).unwrap();
         let lg_name_engine_opts: dtdb_storage::EngineOptions =
-            bincode::deserialize(&lg_name_bytes).unwrap();
+            postcard::from_bytes(&lg_name_bytes).unwrap();
         assert_eq!(lg_name_engine_opts.block_size_limit, 8192);
         assert_eq!(
             lg_name_engine_opts.compression,
@@ -1394,7 +1394,7 @@ fn test_locality_groups_overrides_end_to_end() {
         assert!(lg_finance_opts_path.exists());
         let lg_finance_bytes = std::fs::read(&lg_finance_opts_path).unwrap();
         let lg_finance_engine_opts: dtdb_storage::EngineOptions =
-            bincode::deserialize(&lg_finance_bytes).unwrap();
+            postcard::from_bytes(&lg_finance_bytes).unwrap();
         assert_eq!(lg_finance_engine_opts.wal_size_limit, 1048576);
         assert_eq!(lg_finance_engine_opts.max_level, 5);
         assert_eq!(lg_finance_engine_opts.block_cache_capacity, 0);
@@ -1439,7 +1439,7 @@ fn test_locality_groups_wal_sync_override() {
     assert!(lg_name_opts_path.exists());
     let lg_name_bytes = std::fs::read(&lg_name_opts_path).unwrap();
     let lg_name_engine_opts: dtdb_storage::EngineOptions =
-        bincode::deserialize(&lg_name_bytes).unwrap();
+        postcard::from_bytes(&lg_name_bytes).unwrap();
     assert_eq!(lg_name_engine_opts.wal_sync_interval_ms, Some(100));
 
     // lg_finance options.bin verification (should be None)
@@ -1447,7 +1447,7 @@ fn test_locality_groups_wal_sync_override() {
     assert!(lg_finance_opts_path.exists());
     let lg_finance_bytes = std::fs::read(&lg_finance_opts_path).unwrap();
     let lg_finance_engine_opts: dtdb_storage::EngineOptions =
-        bincode::deserialize(&lg_finance_bytes).unwrap();
+        postcard::from_bytes(&lg_finance_bytes).unwrap();
     assert_eq!(lg_finance_engine_opts.wal_sync_interval_ms, None);
 }
 
@@ -2561,7 +2561,12 @@ fn test_cbo_index_selection_by_cardinality() {
     let options = dtdb_relational::DatabaseOptions {
         compression: dtdb_storage::CompressionType::Lz4,
         memtable_size_limit: 1024 * 1024,
-        block_size_limit: 4096,
+        // Small blocks so the 500-row table spans many data blocks regardless of
+        // how compact the serialization is: a full scan then reads many blocks
+        // while the selective index scan (5 matching rows) reads only a few. With
+        // larger blocks postcard's compact rows would fit the whole table in ~3
+        // blocks, erasing the index advantage this test checks for.
+        block_size_limit: 256,
         wal_size_limit: 32 * 1024 * 1024,
         flush_interval_ms: None,
         l0_compaction_threshold: None,
