@@ -579,8 +579,8 @@ dependencies = [
 name = "dtdb_relational"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "dtdb_storage",
+ "postcard",
  "serde",
  "tempfile",
  "thiserror 1.0.69",

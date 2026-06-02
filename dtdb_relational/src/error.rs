@@ -12,7 +12,7 @@ pub enum RelationalError {
     Io(#[from] std::io::Error),
 
     #[error("Serialization/Deserialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] postcard::Error),
 
     #[error("Schema mismatch: {0}")]
     SchemaMismatch(String),

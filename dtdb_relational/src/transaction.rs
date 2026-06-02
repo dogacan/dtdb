@@ -770,7 +770,7 @@ impl Transaction {
                         if let DbKey::Composite(parts) = idx_key
                             && let Some(pk) = parts.last().cloned()
                             && let DbValue::Bytes(bytes) = val
-                            && let Ok(positions) = bincode::deserialize::<Vec<u32>>(&bytes)
+                            && let Ok(positions) = postcard::from_bytes::<Vec<u32>>(&bytes)
                         {
                             pos_map.insert(pk, positions);
                         }

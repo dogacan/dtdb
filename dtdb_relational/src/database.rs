@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex, RwLock};
 /// `Batch` variant — because nesting is only meaningful inside the storage
 /// engine's WAL, never at the relational/transaction layer.
 ///
-/// The bincode tag layout matches `WalEntry`'s first two variants
-/// (0=Put, 1=Delete) so existing on-disk transaction logs decode unchanged.
+/// The postcard tag layout matches `WalEntry`'s first two variants
+/// (0=Put, 1=Delete), so `RelationalMutation` and `WalEntry` encode their
+/// shared variants identically.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum RelationalMutation {
     Put { key: DbKey, value: DbValue },
@@ -307,7 +308,7 @@ impl Table {
                                                 key.clone(),
                                             ]);
                                             let value_bytes =
-                                                bincode::serialize(&positions).unwrap();
+                                                postcard::to_allocvec(&positions).unwrap();
                                             index_batches.get_mut(&idx.name).unwrap().push(
                                                 WalEntry::Put {
                                                     key: idx_key,
@@ -1101,7 +1102,7 @@ impl Database {
         let db_options_path = dir_path.join("db_options.bin");
         let options = if db_options_path.exists() {
             let bytes = fs::read(&db_options_path)?;
-            bincode::deserialize::<DatabaseOptions>(&bytes).map_err(|e| {
+            postcard::from_bytes::<DatabaseOptions>(&bytes).map_err(|e| {
                 RelationalError::Storage(dtdb_storage::StorageError::Serialization(e))
             })?
         } else {
@@ -1160,7 +1161,7 @@ impl Database {
         }
 
         let db_options_path = dir_path.join("db_options.bin");
-        let bytes = bincode::serialize(&options)
+        let bytes = postcard::to_allocvec(&options)
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
         dtdb_storage::atomic_write(&db_options_path, &bytes, options.fsync_method)
             .map_err(RelationalError::Storage)?;
@@ -1209,7 +1210,7 @@ impl Database {
 
                     let mut engines = HashMap::new();
                     let groups = schema.locality_groups();
-                    let layout_bytes = bincode::serialize(&schema.current_layout()).unwrap();
+                    let layout_bytes = postcard::to_allocvec(&schema.current_layout()).unwrap();
 
                     // Check for old table layout (backward compatibility): a
                     // table dir that is itself a single storage engine, marked
@@ -1264,7 +1265,7 @@ impl Database {
                     let stats_path = path.join("statistics.bin");
                     if stats_path.exists()
                         && let Ok(bytes) = fs::read(&stats_path)
-                        && let Ok(stats) = bincode::deserialize::<TableStatistics>(&bytes)
+                        && let Ok(stats) = postcard::from_bytes::<TableStatistics>(&bytes)
                     {
                         statistics.insert(name.clone(), stats);
                     }
@@ -1398,7 +1399,7 @@ impl Database {
 
         let mut engines = HashMap::new();
         let groups = schema.locality_groups();
-        let layout_bytes = bincode::serialize(&schema.current_layout()).unwrap();
+        let layout_bytes = postcard::to_allocvec(&schema.current_layout()).unwrap();
         if groups.len() <= 1 && groups.contains("") {
             let mut group_opts = engine_opts;
             if let Some(opts) = schema.locality_group_options.get("") {
@@ -1443,7 +1444,7 @@ impl Database {
         }
 
         let stats_path = table_path.join("statistics.bin");
-        let bytes = bincode::serialize(&initial_stats)
+        let bytes = postcard::to_allocvec(&initial_stats)
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
         dtdb_storage::atomic_write(&stats_path, &bytes, self.options.fsync_method)
             .map_err(RelationalError::Storage)?;
@@ -1650,7 +1651,7 @@ impl Database {
         let schema_path = self.dir_path.join(table_name).join("schema.bin");
         new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
 
-        let layout_bytes = bincode::serialize(&new_schema.current_layout()).unwrap();
+        let layout_bytes = postcard::to_allocvec(&new_schema.current_layout()).unwrap();
         for engine in table.engines.values() {
             engine.set_target_layout(layout_bytes.clone());
         }
@@ -1775,7 +1776,7 @@ impl Database {
         let schema_path = self.dir_path.join(table_name).join("schema.bin");
         new_schema.save_to_file(&schema_path, self.options.fsync_method)?;
 
-        let layout_bytes = bincode::serialize(&new_schema.current_layout()).unwrap();
+        let layout_bytes = postcard::to_allocvec(&new_schema.current_layout()).unwrap();
         for engine in table.engines.values() {
             engine.set_target_layout(layout_bytes.clone());
         }
@@ -2416,7 +2417,7 @@ impl Database {
                     }
                     for (token, positions) in token_positions {
                         let idx_key = DbKey::composite(vec![DbKey::string(token), pk_key.clone()]);
-                        let value_bytes = bincode::serialize(&positions).unwrap();
+                        let value_bytes = postcard::to_allocvec(&positions).unwrap();
                         index_entries.push(WalEntry::Put {
                             key: idx_key,
                             value: DbValue::bytes(value_bytes),
@@ -2708,7 +2709,7 @@ impl Database {
             index_stats,
         };
 
-        let bytes = bincode::serialize(&stats)
+        let bytes = postcard::to_allocvec(&stats)
             .map_err(|e| RelationalError::Storage(dtdb_storage::StorageError::Serialization(e)))?;
 
         // 4. Update in-memory cache and persist to file under catalog read lock
@@ -2774,7 +2775,7 @@ impl dtdb_storage::ValueRewriter for RelationalValueRewriter {
             return Ok(value.clone());
         }
         let dst: StoredLayout =
-            bincode::deserialize(dst_layout).map_err(dtdb_storage::StorageError::Serialization)?;
+            postcard::from_bytes(dst_layout).map_err(dtdb_storage::StorageError::Serialization)?;
 
         if let DbValue::Bytes(bytes) = value {
             let row = Row::from_bytes(bytes)
@@ -2784,7 +2785,7 @@ impl dtdb_storage::ValueRewriter for RelationalValueRewriter {
                 let columns = dst.columns.iter().take(num_vals).cloned().collect();
                 StoredLayout { columns }
             } else {
-                bincode::deserialize(src_layout)
+                postcard::from_bytes(src_layout)
                     .map_err(dtdb_storage::StorageError::Serialization)?
             };
             let mut new_values = Vec::with_capacity(dst.columns.len());
