@@ -1,6 +1,10 @@
 #![allow(clippy::result_large_err)]
 
 pub mod proto {
+    // tonic-prost-build 0.14 carries the `.proto` file's leading comments into
+    // the generated Rust as doc comments; their indented continuation lines trip
+    // clippy's doc_lazy_continuation lint in code we don't control.
+    #![allow(clippy::doc_lazy_continuation)]
     tonic::include_proto!("dtdb");
 }
 

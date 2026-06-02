@@ -15,7 +15,7 @@ cxx = "1.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 futures-util = { workspace = true }
-tonic = { workspace = true, features = ["codegen", "transport", "prost"] }
+tonic = { workspace = true, features = ["codegen", "router", "transport"] }
 
 [build-dependencies]
 cxx-build = "1.0"
