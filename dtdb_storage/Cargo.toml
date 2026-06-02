@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 serde = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
 lz4_flex = "0.13"
 thiserror = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh3"] }

@@ -13,7 +13,7 @@
 //!
 //! ```text
 //!   CURRENT          -> decimal generation number of the live snapshot/log
-//!   snapshot.<gen>   -> bincode of the full state at generation <gen>
+//!   snapshot.<gen>   -> postcard of the full state at generation <gen>
 //!   log.<gen>        -> FramedLog of edit batches applied since snapshot.<gen>
 //! ```
 //!
@@ -73,7 +73,7 @@ impl<S: Snapshotable> SnapshotLog<S> {
 
             // Load the base snapshot, then replay the edit batches on top.
             let snap_bytes = fs::read(snapshot_path(&dir, generation))?;
-            let mut state: S = bincode::deserialize(&snap_bytes)?;
+            let mut state: S = postcard::from_bytes(&snap_bytes)?;
             let batches =
                 FramedLog::<Vec<S::Edit>>::recover(log_path(&dir, generation), log_format)?;
             for batch in &batches {
@@ -101,7 +101,7 @@ impl<S: Snapshotable> SnapshotLog<S> {
             let state = S::default();
             atomic_write(
                 &snapshot_path(&dir, generation),
-                &bincode::serialize(&state)?,
+                &postcard::to_allocvec(&state)?,
                 fsync_method,
             )?;
             let log = FramedLog::open(log_path(&dir, generation), log_format, None, fsync_method)?;
@@ -150,7 +150,7 @@ impl<S: Snapshotable> SnapshotLog<S> {
         // 1. Durably write the new snapshot and an empty log for it.
         atomic_write(
             &snapshot_path(&self.dir, new_gen),
-            &bincode::serialize(&self.state)?,
+            &postcard::to_allocvec(&self.state)?,
             self.fsync_method,
         )?;
         let new_log = FramedLog::open(

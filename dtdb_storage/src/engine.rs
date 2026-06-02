@@ -183,9 +183,9 @@ impl EngineInner {
         let options_path = dir_path.join("options.bin");
         let active_options = if options_path.exists() {
             let bytes = fs::read(&options_path)?;
-            bincode::deserialize::<EngineOptions>(&bytes)?
+            postcard::from_bytes::<EngineOptions>(&bytes)?
         } else {
-            let bytes = bincode::serialize(&options)?;
+            let bytes = postcard::to_allocvec(&options)?;
             crate::atomic_write(&options_path, &bytes, options.fsync_method)?;
             options
         };

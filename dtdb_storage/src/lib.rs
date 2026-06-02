@@ -50,7 +50,7 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 
     #[error("Serialization/Deserialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] postcard::Error),
 
     #[error("Lz4 compression error: {0}")]
     Compression(String),
@@ -681,22 +681,22 @@ mod tests {
         let arc_str: Arc<str> = Arc::from("héllo, wörld");
         let owned_str: String = "héllo, wörld".to_string();
         assert_eq!(
-            bincode::serialize(&arc_str).unwrap(),
-            bincode::serialize(&owned_str).unwrap(),
+            postcard::to_allocvec(&arc_str).unwrap(),
+            postcard::to_allocvec(&owned_str).unwrap(),
         );
 
         let arc_bytes: Arc<[u8]> = Arc::from(&[0u8, 1, 2, 250, 255][..]);
         let owned_bytes: Vec<u8> = vec![0, 1, 2, 250, 255];
         assert_eq!(
-            bincode::serialize(&arc_bytes).unwrap(),
-            bincode::serialize(&owned_bytes).unwrap(),
+            postcard::to_allocvec(&arc_bytes).unwrap(),
+            postcard::to_allocvec(&owned_bytes).unwrap(),
         );
     }
 
-    /// Every `DbKey`/`DbValue` variant must survive a bincode round-trip
+    /// Every `DbKey`/`DbValue` variant must survive a postcard round-trip
     /// unchanged (confirms the serde `rc` feature is wired up correctly).
     #[test]
-    fn test_dbkey_dbvalue_bincode_roundtrip() {
+    fn test_dbkey_dbvalue_postcard_roundtrip() {
         let keys = [
             DbKey::Int(-42),
             DbKey::string("key"),
@@ -704,7 +704,7 @@ mod tests {
             DbKey::composite(vec![DbKey::Int(1), DbKey::string("x")]),
         ];
         for k in keys {
-            let back: DbKey = bincode::deserialize(&bincode::serialize(&k).unwrap()).unwrap();
+            let back: DbKey = postcard::from_bytes(&postcard::to_allocvec(&k).unwrap()).unwrap();
             assert_eq!(k, back);
         }
 
@@ -717,7 +717,7 @@ mod tests {
             DbValue::Null,
         ];
         for v in values {
-            let back: DbValue = bincode::deserialize(&bincode::serialize(&v).unwrap()).unwrap();
+            let back: DbValue = postcard::from_bytes(&postcard::to_allocvec(&v).unwrap()).unwrap();
             assert_eq!(v, back);
         }
     }
