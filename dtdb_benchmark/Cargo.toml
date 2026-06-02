@@ -12,7 +12,7 @@ dtdb_sql = { workspace = true }
 # `bundled` feature compiles SQLite from source (needs a C compiler), so it is
 # gated behind the `compare-sqlite` feature to keep the default build — and the
 # CI `cargo bench --no-run` smoke test — free of any C toolchain dependency.
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 # Pulled in (with rusqlite) only for the comparison bench: the client-interface
 # INSERT case drives dtdb through the in-process `DuctTapeDbClient` +
