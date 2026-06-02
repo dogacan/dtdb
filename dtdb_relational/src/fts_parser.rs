@@ -370,8 +370,8 @@ mod tests {
     fn query_is_serde_roundtrippable() {
         let tokenizer = SimpleTokenizer;
         let q = FullTextQuery::parse("a AND (b OR c)", &tokenizer).unwrap();
-        let bytes = bincode::serialize(&q).unwrap();
-        let decoded: FullTextQuery = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&q).unwrap();
+        let decoded: FullTextQuery = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(q, decoded);
     }
 }

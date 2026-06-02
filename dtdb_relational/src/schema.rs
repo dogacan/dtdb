@@ -573,7 +573,7 @@ impl Schema {
     /// on-disk index data must still order this write *after* the index data is
     /// durable, so a crash can't surface a schema that references missing data.
     pub fn save_to_file(&self, path: impl AsRef<Path>, fsync_method: FsyncMethod) -> Result<()> {
-        let bytes = bincode::serialize(self)?;
+        let bytes = postcard::to_allocvec(self)?;
         dtdb_storage::atomic_write(path.as_ref(), &bytes, fsync_method)
             .map_err(RelationalError::Storage)?;
         Ok(())
@@ -582,7 +582,7 @@ impl Schema {
     /// Loads a schema from a file at the given path.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path)?;
-        let schema: Schema = bincode::deserialize(&bytes)?;
+        let schema: Schema = postcard::from_bytes(&bytes)?;
         Ok(schema)
     }
 

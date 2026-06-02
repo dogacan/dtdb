@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 dtdb_storage = { workspace = true }
 serde = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
