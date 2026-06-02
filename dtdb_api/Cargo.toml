@@ -7,7 +7,8 @@ edition = "2024"
 dtdb_storage = { workspace = true }
 dtdb_relational = { workspace = true }
 dtdb_sql = { workspace = true }
-tonic = { workspace = true, features = ["codegen", "transport", "tls", "prost"] }
+tonic = { workspace = true, features = ["codegen", "router", "transport", "tls-ring"] }
+tonic-prost = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -21,8 +22,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [build-dependencies]
-tonic-build = "0.12"
-prost-build = "0.13"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = { workspace = true }
