@@ -22,9 +22,9 @@ fn entries_eq(a: &[WalEntry], b: &[WalEntry]) -> bool {
     }
     a.iter().zip(b.iter()).all(|(x, y)| {
         // Both sides come from the same recover() path, so a round-trip
-        // through bincode gives a stable byte-level comparison without
+        // through postcard gives a stable byte-level comparison without
         // needing PartialEq on WalEntry.
-        bincode::serialize(x).ok() == bincode::serialize(y).ok()
+        postcard::to_allocvec(x).ok() == postcard::to_allocvec(y).ok()
     })
 }
 

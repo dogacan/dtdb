@@ -161,7 +161,7 @@ fn main() {
 
     // --- Layered decomposition of the raw scan: peel back one layer at a time
     // so we can split the 400 ns/row into INHERENT work (storage read +
-    // bincode deserialize) versus CHURN (the per-row HashMap/merge dance and
+    // postcard deserialize) versus CHURN (the per-row HashMap/merge dance and
     // the transaction wrapper). Each probe drops one layer relative to
     // `t_scan_raw` (= tx.scan_iter, the full thing).
 
@@ -184,7 +184,7 @@ fn main() {
         black_box(n);
     });
 
-    // Layer 1: storage read + bincode deserialize. Same scan, but decode each
+    // Layer 1: storage read + postcard deserialize. Same scan, but decode each
     // row's bytes into a Row (the unavoidable `Row::from_bytes` in advance()).
     // The delta over layer 0 is the pure deserialize cost.
     let t_engine_read_deser = bench(|_i| {
@@ -289,7 +289,7 @@ fn main() {
         per(t_engine_read)
     );
     println!(
-        "    bincode deserialize         {:>7.1}   <- inherent",
+        "    postcard deserialize        {:>7.1}   <- inherent",
         per(deserialize)
     );
     println!(

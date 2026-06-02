@@ -51,7 +51,9 @@ async fn test_grpc_client_server_integration() {
     let db_lz4_options_path = db_lz4_path.join("db_options.bin");
     assert!(db_lz4_options_path.exists());
     let lz4_options_bytes = fs::read(&db_lz4_options_path).unwrap();
-    let lz4_comp: CompressionType = bincode::deserialize(&lz4_options_bytes).unwrap();
+    let lz4_comp = postcard::take_from_bytes::<CompressionType>(&lz4_options_bytes)
+        .unwrap()
+        .0;
     assert_eq!(lz4_comp, CompressionType::Lz4);
 
     // 4. Test CreateDb with Uncompressed
@@ -67,7 +69,9 @@ async fn test_grpc_client_server_integration() {
     let db_raw_options_path = db_raw_path.join("db_options.bin");
     assert!(db_raw_options_path.exists());
     let raw_options_bytes = fs::read(&db_raw_options_path).unwrap();
-    let raw_comp: CompressionType = bincode::deserialize(&raw_options_bytes).unwrap();
+    let raw_comp = postcard::take_from_bytes::<CompressionType>(&raw_options_bytes)
+        .unwrap()
+        .0;
     assert_eq!(raw_comp, CompressionType::Uncompressed);
 
     // 5. Test ExecuteQuery on db_lz4

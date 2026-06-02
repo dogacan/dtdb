@@ -18,7 +18,7 @@ bolero = "0.13"
 proptest = "1.6"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-bincode = { workspace = true }
+postcard = { workspace = true }
 tonic = { workspace = true }
 futures-util = { workspace = true }
 

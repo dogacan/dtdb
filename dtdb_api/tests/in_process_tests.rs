@@ -24,7 +24,9 @@ fn test_in_process_client_integration() {
     let db_lz4_options_path = db_lz4_path.join("db_options.bin");
     assert!(db_lz4_options_path.exists());
     let lz4_options_bytes = fs::read(&db_lz4_options_path).unwrap();
-    let lz4_comp: CompressionType = bincode::deserialize(&lz4_options_bytes).unwrap();
+    let lz4_comp = postcard::take_from_bytes::<CompressionType>(&lz4_options_bytes)
+        .unwrap()
+        .0;
     assert_eq!(lz4_comp, CompressionType::Lz4);
 
     // 3. Test CreateDb with Options
@@ -54,7 +56,9 @@ fn test_in_process_client_integration() {
     let db_opt_options_path = db_opt_path.join("db_options.bin");
     assert!(db_opt_options_path.exists());
     let opt_options_bytes = fs::read(&db_opt_options_path).unwrap();
-    let opt_comp: CompressionType = bincode::deserialize(&opt_options_bytes).unwrap();
+    let opt_comp = postcard::take_from_bytes::<CompressionType>(&opt_options_bytes)
+        .unwrap()
+        .0;
     assert_eq!(opt_comp, CompressionType::Uncompressed);
 
     // 4. Test ExecuteQuery on db_lz4
