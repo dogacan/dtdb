@@ -60,6 +60,25 @@ pub enum Expr {
         index: Option<usize>,
         query_str: String,
     },
+    /// A scalar subquery, e.g. `(SELECT MAX(y) FROM t2)`. Carries an
+    /// already-planned subtree rather than raw AST so the plan stays
+    /// serializable (see ADR 0005). Uncorrelated instances are folded to an
+    /// [`Expr::Literal`] before execution; reaching [`Expr::eval`] is an error.
+    ScalarSubquery(Box<crate::logical::LogicalPlan>),
+    /// An `IN` / `NOT IN` subquery, e.g. `x IN (SELECT id FROM t2)`. Folded to
+    /// an [`Expr::InList`] (optionally wrapped in [`Expr::Not`]) before
+    /// execution.
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<crate::logical::LogicalPlan>,
+        negated: bool,
+    },
+    /// An `EXISTS` / `NOT EXISTS` subquery. Folded to an [`Expr::Literal`]
+    /// boolean before execution.
+    Exists {
+        subquery: Box<crate::logical::LogicalPlan>,
+        negated: bool,
+    },
 }
 
 impl Expr {
@@ -113,6 +132,13 @@ impl Expr {
             }
             Expr::Match { column, .. } => {
                 columns.insert(column.clone());
+            }
+            Expr::ScalarSubquery(subquery) | Expr::Exists { subquery, .. } => {
+                subquery.collect_columns(columns);
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                expr.collect_columns(columns);
+                subquery.collect_columns(columns);
             }
         }
     }
@@ -172,6 +198,11 @@ impl Expr {
                 }
                 Ok(())
             }
+            // A subquery's own columns are bound against its own schema when its
+            // subplan is compiled, not against the outer `schema`. Only the
+            // outer-facing left-hand side of an `IN (subquery)` binds here.
+            Expr::ScalarSubquery(_) | Expr::Exists { .. } => Ok(()),
+            Expr::InSubquery { expr, .. } => expr.bind_columns(schema),
         }
     }
 
@@ -226,6 +257,13 @@ impl Expr {
                     item.substitute_params(params)?;
                 }
                 Ok(())
+            }
+            Expr::ScalarSubquery(subquery) | Expr::Exists { subquery, .. } => {
+                subquery.substitute_params(params)
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                expr.substitute_params(params)?;
+                subquery.substitute_params(params)
             }
         }
     }
@@ -767,6 +805,12 @@ impl Expr {
                     Ok(DbValue::Bool(false))
                 }
             }
+            // Subqueries must be folded to literals before execution (see ADR
+            // 0005). Reaching here means the engine's fold pass was skipped.
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => Err(
+                "subquery reached execution; subqueries must be folded before the query runs"
+                    .to_string(),
+            ),
         }
     }
 }
