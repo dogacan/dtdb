@@ -13,4 +13,4 @@ pub use logical::{AggregateExpr, LogicalPlan, format_logical_plan};
 pub use optimizer::Optimizer;
 pub use parameters::bind_statement;
 pub use physical::PhysicalOperator;
-pub use planner::{LogicalPlanner, SqlStatement, plan_expr};
+pub use planner::{LogicalPlanner, SqlStatement};
