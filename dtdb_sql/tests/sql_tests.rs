@@ -100,6 +100,52 @@ fn test_sql_ddl_and_crud() {
 }
 
 #[test]
+fn test_prefix_like_returns_exact_matches() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE words (name STRING PRIMARY KEY)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO words (name) VALUES \
+             ('aardvark'), ('ab'), ('abc'), ('abz'), ('ac'), ('b'), ('ABC')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // `LIKE 'ab%'` is served by a [ab, ac] prefix range scan plus the residual
+    // LIKE filter. The result must be exactly the prefix matches: the filter
+    // drops the inclusive "ac" boundary and the case-mismatched "ABC" (LIKE is
+    // case-sensitive), while "aardvark"/"b" fall outside the range entirely.
+    let tx3 = Transaction::new(3, db.clone());
+    let res = engine
+        .execute(
+            "SELECT name FROM words WHERE name LIKE 'ab%' ORDER BY name ASC",
+            &tx3,
+        )
+        .unwrap();
+    if let ExecutionResult::Select { rows, .. } = res {
+        let names: Vec<_> = rows.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                DbValue::string("ab"),
+                DbValue::string("abc"),
+                DbValue::string("abz"),
+            ]
+        );
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
 fn test_sql_joins() {
     let (_temp, db, engine) = setup_engine();
 

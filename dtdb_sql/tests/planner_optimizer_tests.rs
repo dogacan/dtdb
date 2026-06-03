@@ -429,6 +429,38 @@ fn test_optimizer_boundary_ranges() {
 }
 
 #[test]
+fn test_prefix_like_becomes_range_scan() {
+    let (_tmp, db) = setup_db();
+
+    // A prefix LIKE on the string PK is reduced to a bounded range scan
+    // (["ab", "ac"]), while the LIKE predicate is retained as a Filter above
+    // the scan so the inclusive "ac" boundary is removed.
+    let plan = optimize_plan(db.clone(), "SELECT name FROM t_str WHERE name LIKE 'ab%';").unwrap();
+    let plan_str = dtdb_sql::logical::format_logical_plan(&plan);
+    assert!(
+        plan_str.contains("String(\"ab\")") && plan_str.contains("String(\"ac\")"),
+        "Expected a prefix range scan over [ab, ac]: {plan_str}"
+    );
+    assert!(
+        !plan_str.contains("range=all"),
+        "Prefix LIKE should not full-scan: {plan_str}"
+    );
+    assert!(
+        plan_str.contains("Filter"),
+        "LIKE predicate must be retained as a Filter: {plan_str}"
+    );
+
+    // A leading-wildcard LIKE has no literal prefix and cannot be reduced to a
+    // range; it stays a full scan.
+    let plan = optimize_plan(db, "SELECT name FROM t_str WHERE name LIKE '%ab';").unwrap();
+    let plan_str = dtdb_sql::logical::format_logical_plan(&plan);
+    assert!(
+        plan_str.contains("range=all"),
+        "Leading-wildcard LIKE should remain a full scan: {plan_str}"
+    );
+}
+
+#[test]
 fn test_optimizer_sort_elimination_and_index_scan_promotions() {
     let (_tmp, db) = setup_db();
 

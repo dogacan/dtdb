@@ -1057,6 +1057,11 @@ fn extract_bounds_for_column(
             op: Operator::Eq,
             right,
         } => get_column_comparison(left, right, col_name).map(|key| (key.clone(), key)),
+        Expr::BinaryOp {
+            left,
+            op: Operator::Like,
+            right,
+        } => extract_like_prefix_bounds(left, right, col_name, col_type),
         Expr::BinaryOp { left, op, right } => {
             if let Some(key) = get_column_comparison(left, right, col_name) {
                 match op {
@@ -1139,6 +1144,83 @@ fn extract_bounds_for_column(
         }
         Expr::Match { .. } => None,
         _ => None,
+    }
+}
+
+/// Reduces `col LIKE 'literal…'` to the key range that brackets every value
+/// sharing the pattern's leading literal prefix. dtdb's LIKE has no `ESCAPE`,
+/// so `%` and `_` are always wildcards.
+///
+/// The range is a deliberate *superset*: the upper bound is inclusive (so it
+/// admits one boundary value just past the prefix space), and a pattern like
+/// `'ab%c'` constrains only its prefix. This is sound because
+/// `select_best_scan_path` always re-applies the original `LIKE` as a `Filter`
+/// above the chosen scan, which removes the extra rows.
+///
+/// Returns `None` unless the column is the string column we are bounding, the
+/// pattern is a literal (a bound parameter's value is unknown at plan time),
+/// and the pattern has a non-empty literal prefix (a leading wildcard such as
+/// `'%abc'` is not reducible to a prefix range).
+fn extract_like_prefix_bounds(
+    left: &Expr,
+    right: &Expr,
+    col_name: &str,
+    col_type: &DataType,
+) -> Option<(PlanKey, PlanKey)> {
+    if !matches!(col_type, DataType::String) {
+        return None;
+    }
+    let (Expr::Column(name, _), Expr::Literal(DbValue::String(pattern))) = (left, right) else {
+        return None;
+    };
+    if !dtdb_relational::column_names_match(name, col_name) {
+        return None;
+    }
+    let prefix = like_literal_prefix(pattern)?;
+    let start = PlanKey::Value(DbKey::string(prefix.as_str()));
+    let end = match prefix_successor(&prefix) {
+        Some(succ) => PlanKey::Value(DbKey::string(succ)),
+        // The prefix is composed entirely of U+10FFFF and has no representable
+        // successor; fall back to the unbounded string maximum.
+        None => PlanKey::Value(DbKey::string("\u{10ffff}")),
+    };
+    Some((start, end))
+}
+
+/// The maximal run of literal characters at the start of a LIKE pattern, up to
+/// (but not including) the first `%` or `_` wildcard. `None` when the pattern
+/// begins with a wildcard.
+fn like_literal_prefix(pattern: &str) -> Option<String> {
+    let prefix: String = pattern
+        .chars()
+        .take_while(|&c| c != '%' && c != '_')
+        .collect();
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+/// The lexicographically smallest string strictly greater than every string
+/// that has `prefix` as a prefix: increment the last scalar that can be
+/// incremented, dropping trailing U+10FFFF scalars. `None` when `prefix` is
+/// composed entirely of U+10FFFF.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = next_scalar(last) {
+            let mut s: String = chars.into_iter().collect();
+            s.push(next);
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// The next Unicode scalar value after `c`, stepping over the UTF-16 surrogate
+/// gap. `None` for U+10FFFF, which has no successor.
+fn next_scalar(c: char) -> Option<char> {
+    match c as u32 {
+        0xD7FF => Some('\u{E000}'),
+        0x10FFFF => None,
+        n => char::from_u32(n + 1),
     }
 }
 
@@ -1479,6 +1561,90 @@ mod tests {
                 PlanKey::Value(DbKey::Int(5)),
                 PlanKey::Value(DbKey::Int(10))
             ))
+        );
+    }
+
+    #[test]
+    fn test_like_literal_prefix_extraction() {
+        assert_eq!(like_literal_prefix("ab%"), Some("ab".to_string()));
+        assert_eq!(like_literal_prefix("abc"), Some("abc".to_string())); // no wildcard at all
+        assert_eq!(like_literal_prefix("ab_d"), Some("ab".to_string())); // `_` also terminates
+        assert_eq!(like_literal_prefix("abc%xyz"), Some("abc".to_string()));
+        // A leading wildcard leaves no literal prefix.
+        assert_eq!(like_literal_prefix("%ab"), None);
+        assert_eq!(like_literal_prefix("_ab"), None);
+        assert_eq!(like_literal_prefix(""), None);
+    }
+
+    #[test]
+    fn test_next_scalar_and_prefix_successor() {
+        assert_eq!(next_scalar('a'), Some('b'));
+        // Steps over the UTF-16 surrogate gap (U+D800..=U+DFFF).
+        assert_eq!(next_scalar('\u{D7FF}'), Some('\u{E000}'));
+        // The maximum scalar has no successor.
+        assert_eq!(next_scalar('\u{10FFFF}'), None);
+
+        assert_eq!(prefix_successor("ab"), Some("ac".to_string()));
+        // Trailing max scalars carry into the preceding character.
+        assert_eq!(prefix_successor("a\u{10FFFF}"), Some("b".to_string()));
+        // An all-max prefix has no representable successor.
+        assert_eq!(prefix_successor("\u{10FFFF}\u{10FFFF}"), None);
+    }
+
+    #[test]
+    fn test_extract_like_prefix_bounds() {
+        let like = |pat: &str| Expr::BinaryOp {
+            left: Box::new(Expr::Column("name".to_string(), None)),
+            op: Operator::Like,
+            right: Box::new(Expr::Literal(DbValue::string(pat))),
+        };
+
+        // `name LIKE 'ab%'` brackets the prefix space as the inclusive range
+        // ["ab", "ac"]; the residual LIKE filter drops the lone "ac" boundary.
+        assert_eq!(
+            extract_bounds_for_column(&like("ab%"), "name", &DataType::String),
+            Some((
+                PlanKey::Value(DbKey::string("ab")),
+                PlanKey::Value(DbKey::string("ac"))
+            ))
+        );
+        // A later `_`/`%` only narrows beyond the prefix, so the prefix range is
+        // identical to the pure-prefix case.
+        assert_eq!(
+            extract_bounds_for_column(&like("ab_d"), "name", &DataType::String),
+            Some((
+                PlanKey::Value(DbKey::string("ab")),
+                PlanKey::Value(DbKey::string("ac"))
+            ))
+        );
+
+        // Not reducible to a prefix range: leading wildcard, parameterized
+        // pattern, column on the wrong side, or a non-string column.
+        assert_eq!(
+            extract_bounds_for_column(&like("%ab"), "name", &DataType::String),
+            None
+        );
+        let like_param = Expr::BinaryOp {
+            left: Box::new(Expr::Column("name".to_string(), None)),
+            op: Operator::Like,
+            right: Box::new(Expr::Parameter("p".to_string())),
+        };
+        assert_eq!(
+            extract_bounds_for_column(&like_param, "name", &DataType::String),
+            None
+        );
+        let like_reversed = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(DbValue::string("ab%"))),
+            op: Operator::Like,
+            right: Box::new(Expr::Column("name".to_string(), None)),
+        };
+        assert_eq!(
+            extract_bounds_for_column(&like_reversed, "name", &DataType::String),
+            None
+        );
+        assert_eq!(
+            extract_bounds_for_column(&like("ab%"), "name", &DataType::Int),
+            None
         );
     }
 
