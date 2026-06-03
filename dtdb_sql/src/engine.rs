@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{JoinType, LogicalPlan, PlanKey, format_logical_plan};
+use crate::logical::{AggregateExpr, JoinType, LogicalPlan, PlanKey, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
@@ -598,6 +598,11 @@ impl SqlEngine {
     ) -> Result<ExecutionStreamingResult, String> {
         match planned_stmt {
             SqlStatement::Query(optimized_plan) => {
+                // Fold uncorrelated subqueries to constants first (ADR 0005), so a
+                // folded literal can even enable the point-get fast path below.
+                let folded = self.fold_subqueries(optimized_plan, tx, params)?;
+                let optimized_plan = folded.as_ref();
+
                 // 1a. Fast path: primary-key point lookups skip the Volcano
                 // operator tree entirely (see `execute_point_get`).
                 if let Some(result) = self.execute_point_get(optimized_plan, tx, params)? {
@@ -772,6 +777,9 @@ impl SqlEngine {
                 columns,
                 query: optimized_plan,
             } => {
+                let folded = self.fold_subqueries(optimized_plan, tx, params)?;
+                let optimized_plan = folded.as_ref();
+
                 let table = self
                     .database
                     .get_table(table_name)
@@ -865,10 +873,15 @@ impl SqlEngine {
                 };
 
                 let plan = match filter {
-                    Some(pred) => LogicalPlan::Filter {
-                        source: Box::new(scan_plan),
-                        predicate: pred.clone(),
-                    },
+                    Some(pred) => {
+                        // Fold any subquery in the WHERE predicate (ADR 0005).
+                        let mut pred = pred.clone();
+                        self.fold_expr(&mut pred, tx, params)?;
+                        LogicalPlan::Filter {
+                            source: Box::new(scan_plan),
+                            predicate: pred,
+                        }
+                    }
                     None => scan_plan,
                 };
 
@@ -906,10 +919,15 @@ impl SqlEngine {
                 };
 
                 let plan = match filter {
-                    Some(pred) => LogicalPlan::Filter {
-                        source: Box::new(scan_plan),
-                        predicate: pred.clone(),
-                    },
+                    Some(pred) => {
+                        // Fold any subquery in the WHERE predicate (ADR 0005).
+                        let mut pred = pred.clone();
+                        self.fold_expr(&mut pred, tx, params)?;
+                        LogicalPlan::Filter {
+                            source: Box::new(scan_plan),
+                            predicate: pred,
+                        }
+                    }
                     None => scan_plan,
                 };
 
@@ -921,6 +939,7 @@ impl SqlEngine {
                 for (col_name, expr) in assignments {
                     let mut bound_expr = expr.clone();
                     bound_expr.substitute_params(params)?;
+                    self.fold_expr(&mut bound_expr, tx, params)?;
                     bound_assignments.push((col_name, bound_expr));
                 }
 
@@ -964,6 +983,11 @@ impl SqlEngine {
                 })
             }
             SqlStatement::Query(optimized_plan) => {
+                // Fold uncorrelated subqueries to constants first (ADR 0005), so a
+                // folded literal can even enable the point-get fast path below.
+                let folded = self.fold_subqueries(optimized_plan, tx, params)?;
+                let optimized_plan = folded.as_ref();
+
                 // 1a. Fast path: primary-key point lookups skip the Volcano
                 // operator tree entirely (see `execute_point_get`).
                 if let Some(result) = self.execute_point_get(optimized_plan, tx, params)? {
@@ -1160,6 +1184,240 @@ impl SqlEngine {
             schema: output_schema,
             rows,
         }))
+    }
+
+    /// Replaces every *uncorrelated* expression subquery in `plan` with a
+    /// constant, by executing each subquery once against `tx` (ADR 0005).
+    ///
+    /// Returns a borrow when the plan has no subqueries (the common case, no
+    /// allocation), or an owned, folded copy otherwise. The original plan —
+    /// which may be a cached, parameterized plan shared across executions — is
+    /// never mutated; folding is per-execution because a subquery's result can
+    /// change between runs.
+    fn fold_subqueries<'a>(
+        &self,
+        plan: &'a LogicalPlan,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<std::borrow::Cow<'a, LogicalPlan>, String> {
+        if !plan_contains_subquery(plan) {
+            return Ok(std::borrow::Cow::Borrowed(plan));
+        }
+        let mut owned = plan.clone();
+        self.fold_plan(&mut owned, tx, params)?;
+        Ok(std::borrow::Cow::Owned(owned))
+    }
+
+    /// Recursively folds every subquery in the expressions carried by `plan`.
+    fn fold_plan(
+        &self,
+        plan: &mut LogicalPlan,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<(), String> {
+        match plan {
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::IndexScan { .. }
+            | LogicalPlan::FullTextScan { .. } => {}
+            LogicalPlan::Filter { source, predicate } => {
+                self.fold_plan(source, tx, params)?;
+                self.fold_expr(predicate, tx, params)?;
+            }
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                ..
+            } => {
+                self.fold_plan(source, tx, params)?;
+                for e in expressions {
+                    self.fold_expr(e, tx, params)?;
+                }
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                ..
+            } => {
+                self.fold_plan(left, tx, params)?;
+                self.fold_plan(right, tx, params)?;
+                self.fold_expr(condition, tx, params)?;
+            }
+            LogicalPlan::Aggregate {
+                source,
+                group_by,
+                aggrs,
+                ..
+            } => {
+                self.fold_plan(source, tx, params)?;
+                for e in group_by {
+                    self.fold_expr(e, tx, params)?;
+                }
+                for a in aggrs {
+                    self.fold_expr(aggregate_expr_mut(a), tx, params)?;
+                }
+            }
+            LogicalPlan::Sort { source, keys } => {
+                self.fold_plan(source, tx, params)?;
+                for (e, _) in keys {
+                    self.fold_expr(e, tx, params)?;
+                }
+            }
+            LogicalPlan::Limit { source, .. } | LogicalPlan::Distinct { source } => {
+                self.fold_plan(source, tx, params)?;
+            }
+            LogicalPlan::SetOp { left, right, .. } => {
+                self.fold_plan(left, tx, params)?;
+                self.fold_plan(right, tx, params)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively folds every subquery node inside a single expression.
+    fn fold_expr(
+        &self,
+        expr: &mut Expr,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<(), String> {
+        match expr {
+            Expr::BinaryOp { left, right, .. } => {
+                self.fold_expr(left, tx, params)?;
+                self.fold_expr(right, tx, params)?;
+                return Ok(());
+            }
+            Expr::Not(inner) | Expr::IsNull(inner) => {
+                self.fold_expr(inner, tx, params)?;
+                return Ok(());
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    self.fold_expr(o, tx, params)?;
+                }
+                for c in conditions {
+                    self.fold_expr(c, tx, params)?;
+                }
+                for r in results {
+                    self.fold_expr(r, tx, params)?;
+                }
+                if let Some(e) = else_result {
+                    self.fold_expr(e, tx, params)?;
+                }
+                return Ok(());
+            }
+            Expr::Function { args, .. } => {
+                for a in args {
+                    self.fold_expr(a, tx, params)?;
+                }
+                return Ok(());
+            }
+            Expr::InList { expr: e, list } => {
+                self.fold_expr(e, tx, params)?;
+                for it in list {
+                    self.fold_expr(it, tx, params)?;
+                }
+                return Ok(());
+            }
+            Expr::Column(..) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Match { .. } => {
+                return Ok(());
+            }
+            // Only the subquery variants fall through to the rewrite below.
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
+        }
+        let replacement = self.fold_subquery_node(expr, tx, params)?;
+        *expr = replacement;
+        Ok(())
+    }
+
+    /// Executes a single subquery node and returns the constant it folds to.
+    /// Correlated subqueries are rejected earlier in planning (ADR 0005); any
+    /// node reaching here is uncorrelated and self-contained.
+    fn fold_subquery_node(
+        &self,
+        expr: &mut Expr,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<Expr, String> {
+        match expr {
+            Expr::ScalarSubquery(subquery) => {
+                self.fold_plan(subquery, tx, params)?;
+                let (schema, mut rows) = self.exec_subplan(subquery, tx, params)?;
+                if schema.columns.len() != 1 {
+                    return Err("scalar subquery must return exactly one column".to_string());
+                }
+                match rows.len() {
+                    0 => Ok(Expr::Literal(DbValue::Null)),
+                    1 => Ok(Expr::Literal(
+                        rows.remove(0)
+                            .values
+                            .into_iter()
+                            .next()
+                            .unwrap_or(DbValue::Null),
+                    )),
+                    _ => Err("scalar subquery returned more than one row".to_string()),
+                }
+            }
+            Expr::InSubquery {
+                expr: lhs,
+                subquery,
+                negated,
+            } => {
+                self.fold_expr(lhs, tx, params)?;
+                self.fold_plan(subquery, tx, params)?;
+                let (schema, rows) = self.exec_subplan(subquery, tx, params)?;
+                if schema.columns.len() != 1 {
+                    return Err("IN subquery must return exactly one column".to_string());
+                }
+                let list = rows
+                    .into_iter()
+                    .map(|r| Expr::Literal(r.values.into_iter().next().unwrap_or(DbValue::Null)))
+                    .collect();
+                let in_list = Expr::InList {
+                    expr: lhs.clone(),
+                    list,
+                };
+                Ok(if *negated {
+                    Expr::Not(Box::new(in_list))
+                } else {
+                    in_list
+                })
+            }
+            Expr::Exists { subquery, negated } => {
+                self.fold_plan(subquery, tx, params)?;
+                let (_schema, rows) = self.exec_subplan(subquery, tx, params)?;
+                let exists = !rows.is_empty();
+                Ok(Expr::Literal(DbValue::Bool(if *negated {
+                    !exists
+                } else {
+                    exists
+                })))
+            }
+            _ => unreachable!("fold_subquery_node called on a non-subquery expression"),
+        }
+    }
+
+    /// Optimizes, compiles, and fully drains a subquery's plan, returning its
+    /// output schema and all result rows.
+    fn exec_subplan(
+        &self,
+        subplan: &LogicalPlan,
+        tx: &Transaction,
+        params: &std::collections::HashMap<String, DbValue>,
+    ) -> Result<(Schema, Vec<Row>), String> {
+        let optimized = Optimizer::new(self.database.clone()).optimize(subplan.clone());
+        let mut op = self.compile_physical(&optimized, tx, None, params)?;
+        let schema = op.schema().clone();
+        let mut rows = Vec::new();
+        while let Some(r) = op.next()? {
+            rows.push(r);
+        }
+        Ok((schema, rows))
     }
 
     /// Compiles a logical plan node into a Volcano Physical Operator tree.
@@ -1630,6 +1888,105 @@ impl SqlEngine {
 
 fn schema_contains_col(schema: &Schema, col_name: &str) -> bool {
     schema.matches_column(col_name)
+}
+
+/// Returns the mutable inner expression of an aggregate call (the `col` in
+/// `SUM(col)`), so the fold pass can rewrite subqueries used as aggregate
+/// arguments.
+fn aggregate_expr_mut(aggr: &mut AggregateExpr) -> &mut Expr {
+    match aggr {
+        AggregateExpr::Count { expr, .. }
+        | AggregateExpr::Sum { expr, .. }
+        | AggregateExpr::Min { expr, .. }
+        | AggregateExpr::Max { expr, .. }
+        | AggregateExpr::Avg { expr, .. } => expr,
+    }
+}
+
+/// Whether any expression anywhere in `plan` contains a subquery node. Used to
+/// skip the clone-and-fold pass for the common no-subquery case.
+fn plan_contains_subquery(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::FullTextScan { .. } => false,
+        LogicalPlan::Filter { source, predicate } => {
+            expr_contains_subquery(predicate) || plan_contains_subquery(source)
+        }
+        LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } => expressions.iter().any(expr_contains_subquery) || plan_contains_subquery(source),
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            expr_contains_subquery(condition)
+                || plan_contains_subquery(left)
+                || plan_contains_subquery(right)
+        }
+        LogicalPlan::Aggregate {
+            source,
+            group_by,
+            aggrs,
+            ..
+        } => {
+            group_by.iter().any(expr_contains_subquery)
+                || aggrs
+                    .iter()
+                    .any(|a| expr_contains_subquery(aggregate_expr_ref(a)))
+                || plan_contains_subquery(source)
+        }
+        LogicalPlan::Sort { source, keys } => {
+            keys.iter().any(|(e, _)| expr_contains_subquery(e)) || plan_contains_subquery(source)
+        }
+        LogicalPlan::Limit { source, .. } | LogicalPlan::Distinct { source } => {
+            plan_contains_subquery(source)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            plan_contains_subquery(left) || plan_contains_subquery(right)
+        }
+    }
+}
+
+/// Shared-reference counterpart of [`aggregate_expr_mut`].
+fn aggregate_expr_ref(aggr: &AggregateExpr) -> &Expr {
+    match aggr {
+        AggregateExpr::Count { expr, .. }
+        | AggregateExpr::Sum { expr, .. }
+        | AggregateExpr::Min { expr, .. }
+        | AggregateExpr::Max { expr, .. }
+        | AggregateExpr::Avg { expr, .. } => expr,
+    }
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) => expr_contains_subquery(inner),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_subquery)
+                || conditions.iter().any(expr_contains_subquery)
+                || results.iter().any(expr_contains_subquery)
+                || else_result.as_deref().is_some_and(expr_contains_subquery)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_subquery),
+        Expr::InList { expr, list } => {
+            expr_contains_subquery(expr) || list.iter().any(expr_contains_subquery)
+        }
+        Expr::Column(..) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Match { .. } => false,
+    }
 }
 
 fn parent_cols_union(
