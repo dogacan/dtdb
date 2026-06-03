@@ -20,6 +20,44 @@ pub enum DataType {
     Decimal,
 }
 
+impl DataType {
+    /// Returns the `(min, max)` [`DbKey`] pair that brackets every value of this
+    /// type, used to build full-range key/index scan bounds.
+    ///
+    /// The bounds must be typed: index keys carry a `DbKey` of the column's type
+    /// as their leading component, and under `DbKey`'s enum ordering an untyped
+    /// string bound would not bracket `Date`/`Time`/`Timestamp`/`Decimal` keys,
+    /// silently yielding an empty scan. The `String`/`Bytes` (and any other) case
+    /// uses `""`..`"\u{10ffff}"` as a practical sentinel range.
+    ///
+    /// This is the single source of truth for full-range bounds; callers in the
+    /// SQL planner and transaction layer rely on it staying in sync with how
+    /// index keys are built, so adding a new type means extending only this match.
+    pub fn key_bounds(self) -> (DbKey, DbKey) {
+        match self {
+            DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+            DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
+            DataType::Date => (
+                DbKey::Date(chrono::NaiveDate::MIN),
+                DbKey::Date(chrono::NaiveDate::MAX),
+            ),
+            DataType::Time => (
+                DbKey::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
+                DbKey::Time(chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap()),
+            ),
+            DataType::Timestamp => (
+                DbKey::Timestamp(chrono::NaiveDateTime::MIN),
+                DbKey::Timestamp(chrono::NaiveDateTime::MAX),
+            ),
+            DataType::Decimal => (
+                DbKey::Decimal(rust_decimal::Decimal::MIN),
+                DbKey::Decimal(rust_decimal::Decimal::MAX),
+            ),
+            _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
+        }
+    }
+}
+
 fn default_nullable() -> bool {
     true
 }
@@ -559,37 +597,15 @@ impl Schema {
             ));
         }
 
-        let get_bounds = |dt: DataType| match dt {
-            DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
-            DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
-            DataType::Date => (
-                DbKey::Date(chrono::NaiveDate::MIN),
-                DbKey::Date(chrono::NaiveDate::MAX),
-            ),
-            DataType::Time => (
-                DbKey::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
-                DbKey::Time(chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap()),
-            ),
-            DataType::Timestamp => (
-                DbKey::Timestamp(chrono::NaiveDateTime::MIN),
-                DbKey::Timestamp(chrono::NaiveDateTime::MAX),
-            ),
-            DataType::Decimal => (
-                DbKey::Decimal(rust_decimal::Decimal::MIN),
-                DbKey::Decimal(rust_decimal::Decimal::MAX),
-            ),
-            _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
-        };
-
         if indices.len() == 1 {
             let col = &self.columns[indices[0]];
-            Ok(get_bounds(col.data_type))
+            Ok(col.data_type.key_bounds())
         } else {
             let mut mins = Vec::new();
             let mut maxs = Vec::new();
             for &idx in &indices {
                 let col = &self.columns[idx];
-                let (min_val, max_val) = get_bounds(col.data_type);
+                let (min_val, max_val) = col.data_type.key_bounds();
                 mins.push(min_val);
                 maxs.push(max_val);
             }
