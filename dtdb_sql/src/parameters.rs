@@ -133,6 +133,24 @@ pub fn bind_expr(expr: &mut SqlExpr, params: &HashMap<String, DbValue>) -> Resul
                 bind_expr(for_expr, params)?;
             }
         }
+        // Parameters can be nested inside subqueries (ADR 0005). The cached-plan
+        // path binds these via `Expr::substitute_params`; this AST-fallback path
+        // must descend into the subquery body the same way `bind_table_factor`
+        // already does for `Derived` (FROM-clause) subqueries.
+        SqlExpr::Subquery(query) => {
+            bind_query(query, params)?;
+        }
+        SqlExpr::InSubquery {
+            expr: lhs,
+            subquery,
+            ..
+        } => {
+            bind_expr(lhs, params)?;
+            bind_query(subquery, params)?;
+        }
+        SqlExpr::Exists { subquery, .. } => {
+            bind_query(subquery, params)?;
+        }
         _ => {}
     }
     Ok(())

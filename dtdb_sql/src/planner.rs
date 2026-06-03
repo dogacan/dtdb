@@ -526,7 +526,7 @@ impl LogicalPlanner {
                             }
                             let mut row_vals = Vec::new();
                             for expr in &row_exprs.content {
-                                match plan_expr(expr)? {
+                                match self.plan_expr(expr)? {
                                     Expr::Literal(val) => row_vals.push(val),
                                     other => {
                                         return Err(format!(
@@ -571,7 +571,7 @@ impl LogicalPlanner {
                     }
                 };
                 let filter = match selection {
-                    Some(expr) => Some(plan_expr(expr)?),
+                    Some(expr) => Some(self.plan_expr(expr)?),
                     None => None,
                 };
                 Ok(SqlStatement::Delete {
@@ -615,11 +615,11 @@ impl LogicalPlanner {
                             return Err("Tuple assignments are not supported".to_string());
                         }
                     };
-                    let planned_expr = plan_expr(&assign.value)?;
+                    let planned_expr = self.plan_expr(&assign.value)?;
                     my_assignments.push((col_name, planned_expr));
                 }
                 let filter = match selection {
-                    Some(expr) => Some(plan_expr(expr)?),
+                    Some(expr) => Some(self.plan_expr(expr)?),
                     None => None,
                 };
                 Ok(SqlStatement::Update {
@@ -673,7 +673,7 @@ impl LogicalPlanner {
                 if !order_by_exprs.is_empty() {
                     let mut sort_keys = Vec::new();
                     for sort_expr in order_by_exprs {
-                        let expr = plan_expr(&sort_expr.expr)?;
+                        let expr = self.plan_expr(&sort_expr.expr)?;
                         let asc = sort_expr.options.asc.unwrap_or(true);
                         sort_keys.push((expr, asc));
                     }
@@ -844,13 +844,13 @@ impl LogicalPlanner {
                     ))
                     | sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(
                         expr,
-                    )) => (plan_expr(expr)?, JoinType::Inner),
+                    )) => (self.plan_expr(expr)?, JoinType::Inner),
                     sqlparser::ast::JoinOperator::LeftOuter(
                         sqlparser::ast::JoinConstraint::On(expr),
                     )
                     | sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(
                         expr,
-                    )) => (plan_expr(expr)?, JoinType::Left),
+                    )) => (self.plan_expr(expr)?, JoinType::Left),
                     sqlparser::ast::JoinOperator::CrossJoin(_) => (
                         Expr::Literal(dtdb_storage::DbValue::Int(1)),
                         JoinType::Cross,
@@ -872,7 +872,7 @@ impl LogicalPlanner {
         if let Some(selection) = &select.selection {
             plan = LogicalPlan::Filter {
                 source: Box::new(plan),
-                predicate: plan_expr(selection)?,
+                predicate: self.plan_expr(selection)?,
             };
         }
 
@@ -895,7 +895,7 @@ impl LogicalPlanner {
             // Aggregate planning
             let group_exprs = group_by_exprs
                 .iter()
-                .map(plan_expr)
+                .map(|e| self.plan_expr(e))
                 .collect::<Result<Vec<_>, String>>()?;
 
             let mut aggr_exprs = Vec::new();
@@ -915,12 +915,12 @@ impl LogicalPlanner {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let mut expr_mut = expr.clone();
-                        rewrite_having_expr(&mut expr_mut, &mut aggr_exprs, &mut field_names)?;
+                        self.rewrite_having_expr(&mut expr_mut, &mut aggr_exprs, &mut field_names)?;
                         rewritten_projection.push(SelectItem::UnnamedExpr(expr_mut));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let mut expr_mut = expr.clone();
-                        rewrite_having_expr(&mut expr_mut, &mut aggr_exprs, &mut field_names)?;
+                        self.rewrite_having_expr(&mut expr_mut, &mut aggr_exprs, &mut field_names)?;
                         rewritten_projection.push(SelectItem::ExprWithAlias {
                             expr: expr_mut,
                             alias: alias.clone(),
@@ -936,8 +936,8 @@ impl LogicalPlanner {
             // Extract aggregates from HAVING clause and rewrite the HAVING predicate
             let planned_having = if let Some(having_expr) = &select.having {
                 let mut having_mut = having_expr.clone();
-                rewrite_having_expr(&mut having_mut, &mut aggr_exprs, &mut field_names)?;
-                Some(plan_expr(&having_mut)?)
+                self.rewrite_having_expr(&mut having_mut, &mut aggr_exprs, &mut field_names)?;
+                Some(self.plan_expr(&having_mut)?)
             } else {
                 None
             };
@@ -959,7 +959,7 @@ impl LogicalPlanner {
             for item in &rewritten_projection {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
-                        let planned_expr = plan_expr(expr)?;
+                        let planned_expr = self.plan_expr(expr)?;
                         let name = match &planned_expr {
                             Expr::Column(name, _) => name.clone(),
                             _ => expr.to_string(),
@@ -968,7 +968,7 @@ impl LogicalPlanner {
                         projection_field_names.push(name);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
-                        let planned_expr = plan_expr(expr)?;
+                        let planned_expr = self.plan_expr(expr)?;
                         expressions.push(planned_expr);
                         projection_field_names.push(alias.value.clone());
                     }
@@ -982,7 +982,7 @@ impl LogicalPlanner {
             if !order_by.is_empty() {
                 let mut sort_keys = Vec::new();
                 for sort_expr in order_by {
-                    let expr = plan_expr(&sort_expr.expr)?;
+                    let expr = self.plan_expr(&sort_expr.expr)?;
                     let asc = sort_expr.options.asc.unwrap_or(true);
                     sort_keys.push((expr, asc));
                 }
@@ -996,7 +996,7 @@ impl LogicalPlanner {
             if !order_by.is_empty() {
                 let mut sort_keys = Vec::new();
                 for sort_expr in order_by {
-                    let expr = plan_expr(&sort_expr.expr)?;
+                    let expr = self.plan_expr(&sort_expr.expr)?;
                     let asc = sort_expr.options.asc.unwrap_or(true);
                     sort_keys.push((expr, asc));
                 }
@@ -1015,7 +1015,7 @@ impl LogicalPlanner {
             for item in &select.projection {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
-                        let planned_expr = plan_expr(expr)?;
+                        let planned_expr = self.plan_expr(expr)?;
                         let name = match &planned_expr {
                             Expr::Column(name, _) => name.clone(),
                             _ => expr.to_string(),
@@ -1024,7 +1024,7 @@ impl LogicalPlanner {
                         field_names.push(name);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
-                        let planned_expr = plan_expr(expr)?;
+                        let planned_expr = self.plan_expr(expr)?;
                         expressions.push(planned_expr);
                         field_names.push(alias.value.clone());
                     }
@@ -1193,279 +1193,298 @@ impl LogicalPlanner {
     }
 }
 
-/// Helper to plan sqlparser scalar expression to custom Expr.
-pub fn plan_expr(expr: &SqlExpr) -> Result<Expr, String> {
-    match expr {
-        SqlExpr::Identifier(ident) => {
-            if ident.quote_style == Some('"') {
-                Ok(Expr::Literal(DbValue::string(ident.value.clone())))
-            } else if let Some(name) = ident.value.strip_prefix('@') {
-                // `@name` is a bind-parameter placeholder, not a column.
-                Ok(Expr::Parameter(name.to_string()))
-            } else {
-                Ok(Expr::Column(ident.value.clone(), None))
-            }
-        }
-        SqlExpr::CompoundIdentifier(parts) => {
-            let name = parts
-                .iter()
-                .map(|p| p.value.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            Ok(Expr::Column(name, None))
-        }
-        SqlExpr::Value(val) => {
-            let db_val = match &**val {
-                SqlValue::Number(num_str, _) => {
-                    if let Ok(i) = num_str.parse::<i64>() {
-                        DbValue::Int(i)
-                    } else if let Ok(f) = num_str.parse::<f64>() {
-                        DbValue::Float(f)
-                    } else {
-                        return Err(format!("Invalid numeric literal: {}", num_str));
-                    }
+impl LogicalPlanner {
+    /// Helper to plan sqlparser scalar expression to custom Expr.
+    fn plan_expr(&self, expr: &SqlExpr) -> Result<Expr, String> {
+        match expr {
+            SqlExpr::Identifier(ident) => {
+                if ident.quote_style == Some('"') {
+                    Ok(Expr::Literal(DbValue::string(ident.value.clone())))
+                } else if let Some(name) = ident.value.strip_prefix('@') {
+                    // `@name` is a bind-parameter placeholder, not a column.
+                    Ok(Expr::Parameter(name.to_string()))
+                } else {
+                    Ok(Expr::Column(ident.value.clone(), None))
                 }
-                SqlValue::SingleQuotedString(s) => DbValue::string(s.clone()),
-                SqlValue::Boolean(b) => DbValue::Bool(*b),
-                SqlValue::Null => DbValue::Null,
-                // `:name` / `?` bind-parameter placeholder: keep it symbolic in
-                // the plan (a leading ':' is stripped to match the bound name).
-                SqlValue::Placeholder(p) => {
-                    let name = p.strip_prefix(':').unwrap_or(p).to_string();
-                    return Ok(Expr::Parameter(name));
-                }
-                other => return Err(format!("Unsupported SQL value type: {:?}", other)),
-            };
-            Ok(Expr::Literal(db_val))
-        }
-        SqlExpr::Like {
-            negated,
-            expr,
-            pattern,
-            ..
-        } => {
-            let like_expr = Expr::BinaryOp {
-                left: Box::new(plan_expr(expr)?),
-                op: Operator::Like,
-                right: Box::new(plan_expr(pattern)?),
-            };
-            if *negated {
-                Ok(Expr::Not(Box::new(like_expr)))
-            } else {
-                Ok(like_expr)
             }
-        }
-        SqlExpr::BinaryOp { left, op, right } => {
-            let my_op = match op {
-                BinaryOperator::Eq => Operator::Eq,
-                BinaryOperator::Gt => Operator::Gt,
-                BinaryOperator::Lt => Operator::Lt,
-                BinaryOperator::GtEq => Operator::GtEq,
-                BinaryOperator::LtEq => Operator::LtEq,
-                BinaryOperator::NotEq => Operator::NotEq,
-                BinaryOperator::And => Operator::And,
-                BinaryOperator::Or => Operator::Or,
-                BinaryOperator::Plus => Operator::Add,
-                BinaryOperator::Minus => Operator::Sub,
-                BinaryOperator::Multiply => Operator::Mul,
-                BinaryOperator::Divide => Operator::Div,
-                other => return Err(format!("Unsupported operator: {:?}", other)),
-            };
-            Ok(Expr::BinaryOp {
-                left: Box::new(plan_expr(left)?),
-                op: my_op,
-                right: Box::new(plan_expr(right)?),
-            })
-        }
-        SqlExpr::Nested(inner) => plan_expr(inner),
-        SqlExpr::UnaryOp { op, expr } => {
-            let inner = plan_expr(expr)?;
-            match op {
-                sqlparser::ast::UnaryOperator::Minus => match inner {
-                    Expr::Literal(DbValue::Int(i)) => Ok(Expr::Literal(DbValue::Int(-i))),
-                    Expr::Literal(DbValue::Float(f)) => Ok(Expr::Literal(DbValue::Float(-f))),
-                    other => Ok(Expr::BinaryOp {
-                        left: Box::new(Expr::Literal(DbValue::Int(0))),
-                        op: Operator::Sub,
-                        right: Box::new(other),
-                    }),
-                },
-                sqlparser::ast::UnaryOperator::Plus => Ok(inner),
-                sqlparser::ast::UnaryOperator::Not => Ok(Expr::Not(Box::new(inner))),
-                other => Err(format!("Unsupported unary operator: {:?}", other)),
+            SqlExpr::CompoundIdentifier(parts) => {
+                let name = parts
+                    .iter()
+                    .map(|p| p.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Ok(Expr::Column(name, None))
             }
-        }
-        SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(plan_expr(inner)?))),
-        SqlExpr::IsNotNull(inner) => Ok(Expr::Not(Box::new(Expr::IsNull(Box::new(plan_expr(
-            inner,
-        )?))))),
-        SqlExpr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => {
-            let planned_expr = plan_expr(expr)?;
-            let planned_low = plan_expr(low)?;
-            let planned_high = plan_expr(high)?;
-            let between_expr = Expr::BinaryOp {
-                left: Box::new(Expr::BinaryOp {
-                    left: Box::new(planned_expr.clone()),
-                    op: Operator::GtEq,
-                    right: Box::new(planned_low),
-                }),
-                op: Operator::And,
-                right: Box::new(Expr::BinaryOp {
-                    left: Box::new(planned_expr),
-                    op: Operator::LtEq,
-                    right: Box::new(planned_high),
-                }),
-            };
-            if *negated {
-                Ok(Expr::Not(Box::new(between_expr)))
-            } else {
-                Ok(between_expr)
-            }
-        }
-        SqlExpr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let planned_expr = plan_expr(expr)?;
-            let planned_list = list
-                .iter()
-                .map(plan_expr)
-                .collect::<Result<Vec<_>, String>>()?;
-            let in_list_expr = Expr::InList {
-                expr: Box::new(planned_expr),
-                list: planned_list,
-            };
-            if *negated {
-                Ok(Expr::Not(Box::new(in_list_expr)))
-            } else {
-                Ok(in_list_expr)
-            }
-        }
-        SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            let planned_operand = match operand {
-                Some(expr) => Some(Box::new(plan_expr(expr)?)),
-                None => None,
-            };
-            let mut planned_conditions = Vec::new();
-            let mut planned_results = Vec::new();
-            for cw in conditions {
-                planned_conditions.push(plan_expr(&cw.condition)?);
-                planned_results.push(plan_expr(&cw.result)?);
-            }
-            let planned_else = match else_result {
-                Some(expr) => Some(Box::new(plan_expr(expr)?)),
-                None => None,
-            };
-            Ok(Expr::Case {
-                operand: planned_operand,
-                conditions: planned_conditions,
-                results: planned_results,
-                else_result: planned_else,
-            })
-        }
-        SqlExpr::Substring {
-            expr: sub_expr,
-            substring_from,
-            substring_for,
-            ..
-        } => {
-            let mut args = vec![plan_expr(sub_expr)?];
-            if let Some(from_expr) = substring_from {
-                args.push(plan_expr(from_expr)?);
-            }
-            if let Some(for_expr) = substring_for {
-                args.push(plan_expr(for_expr)?);
-            }
-            Ok(Expr::Function {
-                name: "SUBSTRING".to_string(),
-                args,
-            })
-        }
-        SqlExpr::Function(func) => {
-            let name = func.name.to_string();
-            let name_upper = name.to_uppercase();
-            if matches!(name_upper.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
-                return Err(format!(
-                    "Aggregate function {} cannot be used in scalar expression context",
-                    name
-                ));
-            }
-            if matches!(
-                name_upper.as_str(),
-                "SUBSTR"
-                    | "SUBSTRING"
-                    | "LENGTH"
-                    | "COALESCE"
-                    | "UPPER"
-                    | "LOWER"
-                    | "CONCAT"
-                    | "ABS"
-                    | "ROUND"
-            ) {
-                let mut args = Vec::new();
-                if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args {
-                    for arg in &arg_list.args {
-                        match arg {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
-                                args.push(plan_expr(inner_expr)?);
-                            }
-                            other => {
-                                return Err(format!(
-                                    "Unsupported function argument type: {:?}",
-                                    other
-                                ));
-                            }
+            SqlExpr::Value(val) => {
+                let db_val = match &**val {
+                    SqlValue::Number(num_str, _) => {
+                        if let Ok(i) = num_str.parse::<i64>() {
+                            DbValue::Int(i)
+                        } else if let Ok(f) = num_str.parse::<f64>() {
+                            DbValue::Float(f)
+                        } else {
+                            return Err(format!("Invalid numeric literal: {}", num_str));
                         }
                     }
+                    SqlValue::SingleQuotedString(s) => DbValue::string(s.clone()),
+                    SqlValue::Boolean(b) => DbValue::Bool(*b),
+                    SqlValue::Null => DbValue::Null,
+                    // `:name` / `?` bind-parameter placeholder: keep it symbolic in
+                    // the plan (a leading ':' is stripped to match the bound name).
+                    SqlValue::Placeholder(p) => {
+                        let name = p.strip_prefix(':').unwrap_or(p).to_string();
+                        return Ok(Expr::Parameter(name));
+                    }
+                    other => return Err(format!("Unsupported SQL value type: {:?}", other)),
+                };
+                Ok(Expr::Literal(db_val))
+            }
+            SqlExpr::Like {
+                negated,
+                expr,
+                pattern,
+                ..
+            } => {
+                let like_expr = Expr::BinaryOp {
+                    left: Box::new(self.plan_expr(expr)?),
+                    op: Operator::Like,
+                    right: Box::new(self.plan_expr(pattern)?),
+                };
+                if *negated {
+                    Ok(Expr::Not(Box::new(like_expr)))
                 } else {
+                    Ok(like_expr)
+                }
+            }
+            SqlExpr::BinaryOp { left, op, right } => {
+                let my_op = match op {
+                    BinaryOperator::Eq => Operator::Eq,
+                    BinaryOperator::Gt => Operator::Gt,
+                    BinaryOperator::Lt => Operator::Lt,
+                    BinaryOperator::GtEq => Operator::GtEq,
+                    BinaryOperator::LtEq => Operator::LtEq,
+                    BinaryOperator::NotEq => Operator::NotEq,
+                    BinaryOperator::And => Operator::And,
+                    BinaryOperator::Or => Operator::Or,
+                    BinaryOperator::Plus => Operator::Add,
+                    BinaryOperator::Minus => Operator::Sub,
+                    BinaryOperator::Multiply => Operator::Mul,
+                    BinaryOperator::Divide => Operator::Div,
+                    other => return Err(format!("Unsupported operator: {:?}", other)),
+                };
+                Ok(Expr::BinaryOp {
+                    left: Box::new(self.plan_expr(left)?),
+                    op: my_op,
+                    right: Box::new(self.plan_expr(right)?),
+                })
+            }
+            SqlExpr::Nested(inner) => self.plan_expr(inner),
+            SqlExpr::UnaryOp { op, expr } => {
+                let inner = self.plan_expr(expr)?;
+                match op {
+                    sqlparser::ast::UnaryOperator::Minus => match inner {
+                        Expr::Literal(DbValue::Int(i)) => Ok(Expr::Literal(DbValue::Int(-i))),
+                        Expr::Literal(DbValue::Float(f)) => Ok(Expr::Literal(DbValue::Float(-f))),
+                        other => Ok(Expr::BinaryOp {
+                            left: Box::new(Expr::Literal(DbValue::Int(0))),
+                            op: Operator::Sub,
+                            right: Box::new(other),
+                        }),
+                    },
+                    sqlparser::ast::UnaryOperator::Plus => Ok(inner),
+                    sqlparser::ast::UnaryOperator::Not => Ok(Expr::Not(Box::new(inner))),
+                    other => Err(format!("Unsupported unary operator: {:?}", other)),
+                }
+            }
+            SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(self.plan_expr(inner)?))),
+            SqlExpr::IsNotNull(inner) => Ok(Expr::Not(Box::new(Expr::IsNull(Box::new(
+                self.plan_expr(inner)?,
+            ))))),
+            SqlExpr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
+                let planned_expr = self.plan_expr(expr)?;
+                let planned_low = self.plan_expr(low)?;
+                let planned_high = self.plan_expr(high)?;
+                let between_expr = Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(planned_expr.clone()),
+                        op: Operator::GtEq,
+                        right: Box::new(planned_low),
+                    }),
+                    op: Operator::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(planned_expr),
+                        op: Operator::LtEq,
+                        right: Box::new(planned_high),
+                    }),
+                };
+                if *negated {
+                    Ok(Expr::Not(Box::new(between_expr)))
+                } else {
+                    Ok(between_expr)
+                }
+            }
+            SqlExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let planned_expr = self.plan_expr(expr)?;
+                let planned_list = list
+                    .iter()
+                    .map(|e| self.plan_expr(e))
+                    .collect::<Result<Vec<_>, String>>()?;
+                let in_list_expr = Expr::InList {
+                    expr: Box::new(planned_expr),
+                    list: planned_list,
+                };
+                if *negated {
+                    Ok(Expr::Not(Box::new(in_list_expr)))
+                } else {
+                    Ok(in_list_expr)
+                }
+            }
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                let planned_operand = match operand {
+                    Some(expr) => Some(Box::new(self.plan_expr(expr)?)),
+                    None => None,
+                };
+                let mut planned_conditions = Vec::new();
+                let mut planned_results = Vec::new();
+                for cw in conditions {
+                    planned_conditions.push(self.plan_expr(&cw.condition)?);
+                    planned_results.push(self.plan_expr(&cw.result)?);
+                }
+                let planned_else = match else_result {
+                    Some(expr) => Some(Box::new(self.plan_expr(expr)?)),
+                    None => None,
+                };
+                Ok(Expr::Case {
+                    operand: planned_operand,
+                    conditions: planned_conditions,
+                    results: planned_results,
+                    else_result: planned_else,
+                })
+            }
+            SqlExpr::Substring {
+                expr: sub_expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let mut args = vec![self.plan_expr(sub_expr)?];
+                if let Some(from_expr) = substring_from {
+                    args.push(self.plan_expr(from_expr)?);
+                }
+                if let Some(for_expr) = substring_for {
+                    args.push(self.plan_expr(for_expr)?);
+                }
+                Ok(Expr::Function {
+                    name: "SUBSTRING".to_string(),
+                    args,
+                })
+            }
+            SqlExpr::Function(func) => {
+                let name = func.name.to_string();
+                let name_upper = name.to_uppercase();
+                if matches!(name_upper.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
                     return Err(format!(
-                        "Unsupported function argument format: {:?}",
-                        func.args
+                        "Aggregate function {} cannot be used in scalar expression context",
+                        name
                     ));
                 }
-                Ok(Expr::Function { name, args })
-            } else {
-                Err(format!("Unsupported or unrecognized function: {}", name))
-            }
-        }
-        SqlExpr::MatchAgainst {
-            columns,
-            match_value,
-            ..
-        } => {
-            if columns.len() != 1 {
-                return Err(
-                    "MATCH against multiple columns is not supported in Phase 2".to_string()
-                );
-            }
-            let col_name = columns[0].to_string();
-            let query_str = match &**match_value {
-                sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
-                other => {
-                    return Err(format!(
-                        "MATCH expects a string literal token, got {:?}",
-                        other
-                    ));
+                if matches!(
+                    name_upper.as_str(),
+                    "SUBSTR"
+                        | "SUBSTRING"
+                        | "LENGTH"
+                        | "COALESCE"
+                        | "UPPER"
+                        | "LOWER"
+                        | "CONCAT"
+                        | "ABS"
+                        | "ROUND"
+                ) {
+                    let mut args = Vec::new();
+                    if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args {
+                        for arg in &arg_list.args {
+                            match arg {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
+                                    args.push(self.plan_expr(inner_expr)?);
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "Unsupported function argument type: {:?}",
+                                        other
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(format!(
+                            "Unsupported function argument format: {:?}",
+                            func.args
+                        ));
+                    }
+                    Ok(Expr::Function { name, args })
+                } else {
+                    Err(format!("Unsupported or unrecognized function: {}", name))
                 }
-            };
-            Ok(Expr::Match {
-                column: col_name,
-                index: None,
-                query_str,
-            })
+            }
+            SqlExpr::MatchAgainst {
+                columns,
+                match_value,
+                ..
+            } => {
+                if columns.len() != 1 {
+                    return Err(
+                        "MATCH against multiple columns is not supported in Phase 2".to_string()
+                    );
+                }
+                let col_name = columns[0].to_string();
+                let query_str = match &**match_value {
+                    sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                    other => {
+                        return Err(format!(
+                            "MATCH expects a string literal token, got {:?}",
+                            other
+                        ));
+                    }
+                };
+                Ok(Expr::Match {
+                    column: col_name,
+                    index: None,
+                    query_str,
+                })
+            }
+            // Subqueries plan their body into a LogicalPlan subtree (ADR 0005).
+            // Uncorrelated instances are folded to constants before execution; the
+            // correlation check that rejects the rest lands in a later step.
+            SqlExpr::Subquery(query) => Ok(Expr::ScalarSubquery(Box::new(self.plan_query(query)?))),
+            SqlExpr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Ok(Expr::InSubquery {
+                expr: Box::new(self.plan_expr(expr)?),
+                subquery: Box::new(self.plan_query(subquery)?),
+                negated: *negated,
+            }),
+            SqlExpr::Exists { subquery, negated } => Ok(Expr::Exists {
+                subquery: Box::new(self.plan_query(subquery)?),
+                negated: *negated,
+            }),
+            other => Err(format!("Unsupported expression: {:?}", other)),
         }
-        other => Err(format!("Unsupported expression: {:?}", other)),
     }
 }
 
@@ -1597,116 +1616,128 @@ fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {
     }
 }
 
-fn rewrite_having_expr(
-    expr: &mut SqlExpr,
-    aggr_exprs: &mut Vec<AggregateExpr>,
-    field_names: &mut Vec<String>,
-) -> Result<(), String> {
-    match expr {
-        SqlExpr::Function(func) => {
-            let name = func.name.to_string().to_uppercase();
-            if matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
-                let alias = func.to_string();
+impl LogicalPlanner {
+    fn rewrite_having_expr(
+        &self,
+        expr: &mut SqlExpr,
+        aggr_exprs: &mut Vec<AggregateExpr>,
+        field_names: &mut Vec<String>,
+    ) -> Result<(), String> {
+        match expr {
+            SqlExpr::Function(func) => {
+                let name = func.name.to_string().to_uppercase();
+                if matches!(name.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
+                    let alias = func.to_string();
 
-                // The DISTINCT quantifier lives on the argument list, not the
-                // function name (e.g. `COUNT(DISTINCT col)`); pull it out so the
-                // executor can deduplicate inputs before aggregating.
-                let (args_vec, distinct) = match &func.args {
-                    sqlparser::ast::FunctionArguments::List(arg_list) => (
-                        arg_list.args.as_slice(),
-                        matches!(
-                            arg_list.duplicate_treatment,
-                            Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                    // The DISTINCT quantifier lives on the argument list, not the
+                    // function name (e.g. `COUNT(DISTINCT col)`); pull it out so the
+                    // executor can deduplicate inputs before aggregating.
+                    let (args_vec, distinct) = match &func.args {
+                        sqlparser::ast::FunctionArguments::List(arg_list) => (
+                            arg_list.args.as_slice(),
+                            matches!(
+                                arg_list.duplicate_treatment,
+                                Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                            ),
                         ),
-                    ),
-                    sqlparser::ast::FunctionArguments::None => (&[][..], false),
-                    other => return Err(format!("Unsupported aggregate arguments: {:?}", other)),
-                };
-
-                let arg_expr = if args_vec.is_empty() {
-                    if distinct {
-                        return Err(format!("{} with DISTINCT requires a column argument", name));
-                    }
-                    Expr::Literal(DbValue::Int(1))
-                } else {
-                    match &args_vec[0] {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
-                            plan_expr(inner_expr)?
+                        sqlparser::ast::FunctionArguments::None => (&[][..], false),
+                        other => {
+                            return Err(format!("Unsupported aggregate arguments: {:?}", other));
                         }
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-                            if distinct {
-                                return Err("COUNT(DISTINCT *) is not supported".to_string());
+                    };
+
+                    let arg_expr = if args_vec.is_empty() {
+                        if distinct {
+                            return Err(format!(
+                                "{} with DISTINCT requires a column argument",
+                                name
+                            ));
+                        }
+                        Expr::Literal(DbValue::Int(1))
+                    } else {
+                        match &args_vec[0] {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) => {
+                                self.plan_expr(inner_expr)?
                             }
-                            Expr::Literal(DbValue::Int(1))
+                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                                if distinct {
+                                    return Err("COUNT(DISTINCT *) is not supported".to_string());
+                                }
+                                Expr::Literal(DbValue::Int(1))
+                            }
+                            other => {
+                                return Err(format!("Unsupported function argument: {:?}", other));
+                            }
                         }
-                        other => return Err(format!("Unsupported function argument: {:?}", other)),
+                    };
+
+                    let aggr = match name.as_str() {
+                        "COUNT" => AggregateExpr::Count {
+                            expr: arg_expr,
+                            distinct,
+                        },
+                        "SUM" => AggregateExpr::Sum {
+                            expr: arg_expr,
+                            distinct,
+                        },
+                        "MIN" => AggregateExpr::Min {
+                            expr: arg_expr,
+                            distinct,
+                        },
+                        "MAX" => AggregateExpr::Max {
+                            expr: arg_expr,
+                            distinct,
+                        },
+                        "AVG" => AggregateExpr::Avg {
+                            expr: arg_expr,
+                            distinct,
+                        },
+                        _ => unreachable!(),
+                    };
+
+                    if !aggr_exprs.contains(&aggr) {
+                        aggr_exprs.push(aggr);
+                        field_names.push(alias.clone());
                     }
-                };
 
-                let aggr = match name.as_str() {
-                    "COUNT" => AggregateExpr::Count {
-                        expr: arg_expr,
-                        distinct,
-                    },
-                    "SUM" => AggregateExpr::Sum {
-                        expr: arg_expr,
-                        distinct,
-                    },
-                    "MIN" => AggregateExpr::Min {
-                        expr: arg_expr,
-                        distinct,
-                    },
-                    "MAX" => AggregateExpr::Max {
-                        expr: arg_expr,
-                        distinct,
-                    },
-                    "AVG" => AggregateExpr::Avg {
-                        expr: arg_expr,
-                        distinct,
-                    },
-                    _ => unreachable!(),
-                };
-
-                if !aggr_exprs.contains(&aggr) {
-                    aggr_exprs.push(aggr);
-                    field_names.push(alias.clone());
-                }
-
-                *expr = SqlExpr::Identifier(sqlparser::ast::Ident::new(alias));
-                Ok(())
-            } else {
-                if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut func.args {
-                    for arg in &mut arg_list.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) = arg {
-                            rewrite_having_expr(inner_expr, aggr_exprs, field_names)?;
+                    *expr = SqlExpr::Identifier(sqlparser::ast::Ident::new(alias));
+                    Ok(())
+                } else {
+                    if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut func.args {
+                        for arg in &mut arg_list.args {
+                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr)) = arg {
+                                self.rewrite_having_expr(inner_expr, aggr_exprs, field_names)?;
+                            }
                         }
                     }
+                    Ok(())
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                self.rewrite_having_expr(left, aggr_exprs, field_names)?;
+                self.rewrite_having_expr(right, aggr_exprs, field_names)?;
+                Ok(())
+            }
+            SqlExpr::Nested(inner) => self.rewrite_having_expr(inner, aggr_exprs, field_names),
+            SqlExpr::UnaryOp { expr: inner, .. } => {
+                self.rewrite_having_expr(inner, aggr_exprs, field_names)
+            }
+            SqlExpr::Case {
+                conditions,
+                else_result,
+                ..
+            } => {
+                for cond in conditions {
+                    self.rewrite_having_expr(&mut cond.condition, aggr_exprs, field_names)?;
+                    self.rewrite_having_expr(&mut cond.result, aggr_exprs, field_names)?;
+                }
+                if let Some(el) = else_result {
+                    self.rewrite_having_expr(el, aggr_exprs, field_names)?;
                 }
                 Ok(())
             }
+            _ => Ok(()),
         }
-        SqlExpr::BinaryOp { left, right, .. } => {
-            rewrite_having_expr(left, aggr_exprs, field_names)?;
-            rewrite_having_expr(right, aggr_exprs, field_names)?;
-            Ok(())
-        }
-        SqlExpr::Nested(inner) => rewrite_having_expr(inner, aggr_exprs, field_names),
-        SqlExpr::UnaryOp { expr: inner, .. } => rewrite_having_expr(inner, aggr_exprs, field_names),
-        SqlExpr::Case {
-            conditions,
-            else_result,
-            ..
-        } => {
-            for cond in conditions {
-                rewrite_having_expr(&mut cond.condition, aggr_exprs, field_names)?;
-                rewrite_having_expr(&mut cond.result, aggr_exprs, field_names)?;
-            }
-            if let Some(el) = else_result {
-                rewrite_having_expr(el, aggr_exprs, field_names)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
 }
 
