@@ -215,8 +215,8 @@ Queries rows from table relations.
 *   **Syntax**:
     ```sql
     SELECT <projection>
-    FROM <table_name> [AS <alias>]
-    [JOIN | LEFT JOIN | CROSS JOIN <other_table> [AS <alias>] [ON <join_condition>]]
+    FROM <table_factor>
+    [JOIN | LEFT JOIN | CROSS JOIN <table_factor> [ON <join_condition>]]
     [WHERE <predicate>]
     [GROUP BY <group_by_columns>]
     [HAVING <having_predicate>]
@@ -224,6 +224,9 @@ Queries rows from table relations.
     [LIMIT <number>] [OFFSET <number>];
     ```
 *   **Clauses Detail**:
+    *   **Table Factors**: `<table_factor>` can be:
+        *   A table name with an optional alias: `<table_name> [AS <alias>]`
+        *   A derived table (subquery) with a **required** alias: `(<subquery>) AS <alias>` (see [Subqueries](#subqueries) for details).
     *   **Table Aliasing**: Supports table aliasing using `[AS] <alias>`. Qualified columns can use the table name or the alias prefix (e.g., `t.name` when using `FROM users AS t`). This also allows self-joins on the same table.
     *   **Projection**: Supports columns, expressions, aliases (`col AS alias`), aggregate functions, and wildcard (`*`).
     *   **JOIN**: Supports inner, left outer equality joins (e.g., `ON t1.id = t2.user_id` or `LEFT JOIN ... ON ...`), and cross joins (`CROSS JOIN` or inner join without `ON`). Non-equality joins (except cross join) or right/full outer joins are not supported. Unmatched left rows in left joins are padded with type-default values for the right-side columns.
@@ -324,7 +327,7 @@ Used to combine boolean expressions:
 *   `IS NULL`: Checks if an expression evaluates to `NULL`.
 *   `IS NOT NULL`: Checks if an expression does not evaluate to `NULL`.
 *   `BETWEEN` / `NOT BETWEEN`: Checks if a value is within a range (e.g. `col BETWEEN low AND high` or `col NOT BETWEEN low AND high`).
-*   `IN` / `NOT IN`: Checks if a value equals any value in a list of expressions (e.g. `col IN (val1, val2)` or `col NOT IN (val1, val2)`).
+*   `IN` / `NOT IN`: Checks if a value equals any value in a list of expressions or is returned by an uncorrelated subquery (e.g. `col IN (val1, val2)` or `col NOT IN (SELECT y FROM t2)`). See [Subqueries](#subqueries) for details.
 
 ### Pattern Matching
 *   `LIKE` / `NOT LIKE`: Performs wildcard string matching using `%`.
@@ -424,7 +427,79 @@ Rounds a float value to the nearest integer. Passes integers through unchanged.
 
 ---
 
-## 6. Transactions & DDL Restrictions
+## 6. Subqueries
+
+DuctTapeDB supports several forms of subqueries, provided they are **uncorrelated** (i.e., they do not reference columns or tables from the outer query scope). Correlated subqueries are strictly **not supported** and will be rejected at plan time with a validation error.
+
+### Supported Subquery Shapes
+
+#### 1. Scalar Subqueries
+A subquery that returns a single column and at most one row. It can be used anywhere an expression is allowed (e.g., projection, `WHERE` predicates).
+*   **Behavior**:
+    *   If the subquery returns exactly one row, it evaluates to that value.
+    *   If the subquery returns zero rows, it evaluates to `NULL`.
+    *   If the subquery returns more than one row, execution fails with a runtime error (`more than one row returned by a subquery used as an expression`).
+*   **Examples**:
+    ```sql
+    -- Scalar subquery in WHERE predicate
+    SELECT id FROM t1 WHERE x > (SELECT MIN(y) FROM t2);
+
+    -- Scalar subquery in SELECT projection
+    SELECT id, (SELECT MAX(y) FROM t2) AS max_val FROM t1;
+    ```
+
+#### 2. `IN` / `NOT IN` Subqueries
+Checks whether a value matches any value returned by a single-column subquery.
+*   **Behavior**:
+    *   Follows standard SQL three-valued logic for `NULL` values. If the subquery result contains a `NULL` value, a `NOT IN` condition will evaluate to `NULL` for non-matching rows, meaning no row will qualify.
+*   **Examples**:
+    ```sql
+    -- IN subquery
+    SELECT id FROM t1 WHERE x IN (SELECT y FROM t2);
+
+    -- NOT IN subquery
+    SELECT id FROM t1 WHERE x NOT IN (SELECT y FROM t2);
+    ```
+
+#### 3. `EXISTS` / `NOT EXISTS` Subqueries
+Checks whether a subquery returns any rows.
+*   **Behavior**:
+    *   Evaluates to `TRUE` if the subquery returns one or more rows, and `FALSE` otherwise. `NOT EXISTS` inverts this behavior.
+*   **Examples**:
+    ```sql
+    SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE y > 25);
+    ```
+
+#### 4. Derived Tables (Subqueries in `FROM` / `JOIN` clauses)
+Allows querying the results of a subquery as if it were a table.
+*   **Behavior**:
+    *   Derived tables **must** be enclosed in parentheses and **require** a table alias (e.g., `AS <alias>`). If no alias is specified, it fails with a validation error.
+    *   Optionally supports explicit column aliasing using the `AS alias(col1, col2, ...)` syntax.
+*   **Examples**:
+    ```sql
+    -- Basic derived table
+    SELECT d.id, d.x FROM (SELECT id, x FROM t1) AS d;
+
+    -- Derived table with column aliases
+    SELECT d.a, d.b FROM (SELECT id, x FROM t1) AS d(a, b);
+
+    -- Derived table inside a JOIN
+    SELECT t1.x, d.y FROM t1 JOIN (SELECT id, y FROM t2) AS d ON t1.id = d.id;
+    ```
+
+### Limitations & Correlation Rejection
+
+*   **No Correlation**: If a subquery references columns from the outer query, the planner will reject it immediately.
+    *   *Rejected Example*:
+        ```sql
+        -- Fails with: "correlated subqueries are not supported (column 't1.id' refers to the outer query)"
+        SELECT id FROM t1 WHERE x = (SELECT y FROM t2 WHERE t2.id = t1.id);
+        ```
+*   **No General Index Scan Pushdown**: Uncorrelated subqueries are folded to constants at compile time. Although point-get lookup optimizations can recognize the folded constant (e.g., `WHERE id = (SELECT MIN(id) FROM t2)`), general index scans are not optimized through them.
+
+---
+
+## 7. Transactions & DDL Restrictions
 
 DuctTapeDB supports explicit multi-statement transactions using a stream-based API or the client `run_in_transaction` method.
 
