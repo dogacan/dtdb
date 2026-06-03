@@ -487,6 +487,10 @@ impl Transaction {
                             DbValue::Int(v) => Some(DbKey::Int(*v)),
                             DbValue::String(s) => Some(DbKey::String(s.clone())),
                             DbValue::Bool(b) => Some(DbKey::Bool(*b)),
+                            DbValue::Date(d) => Some(DbKey::Date(*d)),
+                            DbValue::Time(t) => Some(DbKey::Time(*t)),
+                            DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
+                            DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
                             _ => None,
                         };
                         if let Some(k) = k
@@ -513,6 +517,10 @@ impl Transaction {
                     DbValue::Int(v) => DbKey::Int(*v),
                     DbValue::String(s) => DbKey::String(s.clone()),
                     DbValue::Bool(b) => DbKey::Bool(*b),
+                    DbValue::Date(d) => DbKey::Date(*d),
+                    DbValue::Time(t) => DbKey::Time(*t),
+                    DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
+                    DbValue::Decimal(dec) => DbKey::Decimal(*dec),
                     _ => DbKey::Int(0),
                 }
             };

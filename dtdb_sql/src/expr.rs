@@ -2005,4 +2005,162 @@ mod tests {
         let de_dec: DbValue = postcard::from_bytes(&ser_dec).unwrap();
         assert_eq!(de_dec, val_dec);
     }
+
+    /// Exercises the real `BinaryOp` dispatch (not just the `eval_arithmetic`
+    /// helper) for the decimal-specific paths added by the typed-literal commit:
+    /// the `is_zero()` division-by-zero guard, the `checked_*` overflow errors,
+    /// exact subtraction/division, and decimal/float promotion to `Float`.
+    #[test]
+    fn test_decimal_binop_div_zero_overflow_and_float_promotion() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        let dec = |s: &str| DbValue::Decimal(Decimal::from_str(s).unwrap());
+
+        // Division by zero on a Decimal divisor is rejected before arithmetic.
+        let err = eval(&binop(*lit(dec("10.5")), Operator::Div, *lit(dec("0.00")))).unwrap_err();
+        assert_eq!(err, "Division by zero");
+
+        // checked_* overflow surfaces the decimal-specific error strings.
+        let max = DbValue::Decimal(Decimal::MAX);
+        let min = DbValue::Decimal(Decimal::MIN);
+        assert_eq!(
+            eval(&binop(*lit(max.clone()), Operator::Add, *lit(max.clone()))).unwrap_err(),
+            "Decimal addition overflow"
+        );
+        assert_eq!(
+            eval(&binop(*lit(min.clone()), Operator::Sub, *lit(max.clone()))).unwrap_err(),
+            "Decimal subtraction overflow"
+        );
+        assert_eq!(
+            eval(&binop(*lit(max), Operator::Mul, *lit(dec("2")))).unwrap_err(),
+            "Decimal multiplication overflow"
+        );
+
+        // Exact decimal subtraction and division stay in Decimal.
+        assert_eq!(
+            eval(&binop(*lit(dec("10.5")), Operator::Sub, *lit(dec("2.25")))).unwrap(),
+            dec("8.25")
+        );
+        assert_eq!(
+            eval(&binop(*lit(dec("10")), Operator::Div, *lit(dec("4")))).unwrap(),
+            dec("2.5")
+        );
+
+        // Mixing Decimal with Float promotes the result to Float, both orders.
+        assert_eq!(
+            eval(&binop(*lit(dec("1.5")), Operator::Add, *lit(DbValue::Float(2.0)))).unwrap(),
+            DbValue::Float(3.5)
+        );
+        assert_eq!(
+            eval(&binop(*lit(DbValue::Float(5.0)), Operator::Sub, *lit(dec("1.5")))).unwrap(),
+            DbValue::Float(3.5)
+        );
+    }
+
+    /// `cast_value` numeric/temporal conversions and the failure paths that the
+    /// happy-path commit tests skipped: cross-numeric casts, stringification,
+    /// NULL pass-through, alternate timestamp formats, and the `Err` branches.
+    #[test]
+    fn test_cast_value_numeric_conversions_and_failures() {
+        use chrono::{NaiveDate, NaiveTime};
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+
+        // Decimal -> Int truncates toward zero; Decimal -> Float.
+        assert_eq!(
+            cast_value(DbValue::Decimal(d("123.99")), DataType::Int).unwrap(),
+            DbValue::Int(123)
+        );
+        assert_eq!(
+            cast_value(DbValue::Decimal(d("123.5")), DataType::Float).unwrap(),
+            DbValue::Float(123.5)
+        );
+        // Int/Float -> Decimal.
+        assert_eq!(
+            cast_value(DbValue::Int(42), DataType::Decimal).unwrap(),
+            DbValue::Decimal(d("42"))
+        );
+        assert_eq!(
+            cast_value(DbValue::Float(2.5), DataType::Decimal).unwrap(),
+            DbValue::Decimal(d("2.5"))
+        );
+        // Bool -> Int/Float.
+        assert_eq!(
+            cast_value(DbValue::Bool(true), DataType::Int).unwrap(),
+            DbValue::Int(1)
+        );
+        assert_eq!(
+            cast_value(DbValue::Bool(false), DataType::Float).unwrap(),
+            DbValue::Float(0.0)
+        );
+
+        // Temporal/decimal -> String go through coerce_to_string.
+        assert_eq!(
+            cast_value(DbValue::Decimal(d("123.45")), DataType::String).unwrap(),
+            DbValue::string("123.45")
+        );
+        assert_eq!(
+            cast_value(
+                DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap()),
+                DataType::String
+            )
+            .unwrap(),
+            DbValue::string("2026-06-02")
+        );
+
+        // NULL casts to NULL regardless of target type.
+        assert_eq!(
+            cast_value(DbValue::Null, DataType::Date).unwrap(),
+            DbValue::Null
+        );
+
+        // Alternate timestamp string formats: ISO 'T', fractional seconds, and
+        // date-only (which fills midnight).
+        assert_eq!(
+            cast_value(DbValue::string("2026-06-02T12:34:56"), DataType::Timestamp).unwrap(),
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 2)
+                    .unwrap()
+                    .and_hms_opt(12, 34, 56)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            cast_value(DbValue::string("2026-06-02 12:34:56.5"), DataType::Timestamp).unwrap(),
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 2)
+                    .unwrap()
+                    .and_hms_milli_opt(12, 34, 56, 500)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            cast_value(DbValue::string("2026-06-02"), DataType::Timestamp).unwrap(),
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 2)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+            )
+        );
+        // Time round-trips a valid value.
+        assert_eq!(
+            cast_value(DbValue::string("01:02:03"), DataType::Time).unwrap(),
+            DbValue::Time(NaiveTime::from_hms_opt(1, 2, 3).unwrap())
+        );
+
+        // Failure paths: unparseable strings and incompatible source types.
+        assert!(cast_value(DbValue::string("not-a-date"), DataType::Date).is_err());
+        assert!(cast_value(DbValue::string("25:00:00"), DataType::Time).is_err());
+        assert!(cast_value(DbValue::string("nope"), DataType::Timestamp).is_err());
+        assert!(cast_value(DbValue::string("xyz"), DataType::Int).is_err());
+        assert!(cast_value(DbValue::string("xyz"), DataType::Decimal).is_err());
+        // A Date cannot be cast to a Time (no sensible conversion).
+        assert!(cast_value(
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap()),
+            DataType::Time
+        )
+        .is_err());
+    }
 }

@@ -6492,3 +6492,731 @@ fn test_sql_date_time_timestamp_decimal() {
         }
     }
 }
+
+/// Helper: run a SELECT and return its rows, panicking on a non-Select result.
+fn select_rows(
+    engine: &SqlEngine,
+    db: &Arc<Database>,
+    txid: u64,
+    sql: &str,
+) -> Vec<dtdb_relational::Row> {
+    let tx = Transaction::new(txid, db.clone());
+    match engine.execute(sql, &tx).unwrap() {
+        ExecutionResult::Select { rows, .. } => rows,
+        other => panic!("Expected Select result, got {:?}", other),
+    }
+}
+
+/// Range / inequality / BETWEEN scans and ORDER BY over indexed temporal and
+/// decimal columns. The commit added bound-extraction code in the optimizer for
+/// each of these types, but only equality (`=`) was exercised. ORDER BY also
+/// pins numeric (not lexicographic) decimal ordering: string-serialized "123"
+/// would sort before "9" if comparison ran on the serialized form.
+#[test]
+fn test_temporal_decimal_range_and_order() {
+    use chrono::NaiveDate;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE events (
+                    id INT PRIMARY KEY,
+                    dec DECIMAL,
+                    d DATE,
+                    ts TIMESTAMP
+                )",
+                &tx,
+            )
+            .unwrap();
+        // Index the typed columns so the optimizer's range-bound extraction runs.
+        engine
+            .execute("CREATE INDEX idx_dec ON events (dec)", &tx)
+            .unwrap();
+        engine
+            .execute("CREATE INDEX idx_d ON events (d)", &tx)
+            .unwrap();
+        engine
+            .execute("CREATE INDEX idx_ts ON events (ts)", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    {
+        let tx = Transaction::new(2, db.clone());
+        engine
+            .execute(
+                "INSERT INTO events (id, dec, d, ts) VALUES
+                    (1, DECIMAL '9.00',   DATE '2026-01-09', TIMESTAMP '2026-01-09 08:00:00'),
+                    (2, DECIMAL '123.00', DATE '2026-03-15', TIMESTAMP '2026-03-15 12:00:00'),
+                    (3, DECIMAL '50.50',  DATE '2026-02-20', TIMESTAMP '2026-02-20 10:00:00')",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let ids = |rows: &[dtdb_relational::Row]| -> Vec<i64> {
+        rows.iter()
+            .map(|r| match &r.values[0] {
+                DbValue::Int(i) => *i,
+                other => panic!("expected Int id, got {:?}", other),
+            })
+            .collect()
+    };
+
+    // Decimal range scans (numeric semantics).
+    let rows = select_rows(
+        &engine,
+        &db,
+        10,
+        "SELECT id FROM events WHERE dec > DECIMAL '10' ORDER BY id ASC",
+    );
+    assert_eq!(ids(&rows), vec![2, 3]);
+
+    let rows = select_rows(
+        &engine,
+        &db,
+        11,
+        "SELECT id FROM events WHERE dec BETWEEN DECIMAL '10' AND DECIMAL '100' ORDER BY id ASC",
+    );
+    assert_eq!(ids(&rows), vec![3]);
+
+    let rows = select_rows(
+        &engine,
+        &db,
+        12,
+        "SELECT id FROM events WHERE dec <= DECIMAL '50.50' ORDER BY id ASC",
+    );
+    assert_eq!(ids(&rows), vec![1, 3]);
+
+    // Date range scan.
+    let rows = select_rows(
+        &engine,
+        &db,
+        13,
+        "SELECT id FROM events WHERE d >= DATE '2026-02-01' ORDER BY id ASC",
+    );
+    assert_eq!(ids(&rows), vec![2, 3]);
+
+    // Timestamp range scan.
+    let rows = select_rows(
+        &engine,
+        &db,
+        14,
+        "SELECT id FROM events WHERE ts < TIMESTAMP '2026-02-01 00:00:00' ORDER BY id ASC",
+    );
+    assert_eq!(ids(&rows), vec![1]);
+
+    // ORDER BY on a decimal column must sort numerically (9 < 50.5 < 123), not
+    // lexicographically by the string serialization (which would give 123,50,9).
+    let rows = select_rows(&engine, &db, 15, "SELECT id, dec FROM events ORDER BY dec ASC");
+    assert_eq!(ids(&rows), vec![1, 3, 2]);
+    assert_eq!(
+        rows[2].values[1],
+        DbValue::Decimal(Decimal::from_str("123.00").unwrap())
+    );
+
+    // ORDER BY DESC on a date column.
+    let rows = select_rows(&engine, &db, 16, "SELECT id, d FROM events ORDER BY d DESC");
+    assert_eq!(ids(&rows), vec![2, 3, 1]);
+    assert_eq!(
+        rows[0].values[1],
+        DbValue::Date(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap())
+    );
+}
+
+/// Temporal and decimal columns must work as PRIMARY KEYs: this drives the
+/// `value_to_key` / `row_to_key` conversions and the key-type validation in
+/// `schema.rs`, plus numeric key ordering and duplicate-key rejection.
+#[test]
+fn test_temporal_decimal_primary_keys() {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+
+    // --- Decimal primary key ---
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE pk_dec (k DECIMAL PRIMARY KEY, v STRING)", &tx)
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO pk_dec (k, v) VALUES
+                    (DECIMAL '1.5', 'a'),
+                    (DECIMAL '2.25', 'b'),
+                    (DECIMAL '0.5', 'c')",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Point lookup by decimal key.
+    let rows = select_rows(&engine, &db, 2, "SELECT v FROM pk_dec WHERE k = DECIMAL '2.25'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], DbValue::string("b"));
+
+    // Keys iterate in numeric order: 0.5, 1.5, 2.25.
+    let rows = select_rows(&engine, &db, 3, "SELECT k, v FROM pk_dec ORDER BY k ASC");
+    assert_eq!(
+        rows.iter().map(|r| r.values[1].clone()).collect::<Vec<_>>(),
+        vec![
+            DbValue::string("c"),
+            DbValue::string("a"),
+            DbValue::string("b"),
+        ]
+    );
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Decimal(Decimal::from_str("0.5").unwrap())
+    );
+
+    // Re-inserting an existing decimal key is rejected.
+    {
+        let tx = Transaction::new(4, db.clone());
+        let dup = engine.execute("INSERT INTO pk_dec (k, v) VALUES (DECIMAL '1.5', 'dup')", &tx);
+        assert!(dup.is_err(), "duplicate decimal primary key should error");
+    }
+
+    // --- Date primary key ---
+    {
+        let tx = Transaction::new(5, db.clone());
+        engine
+            .execute("CREATE TABLE pk_date (k DATE PRIMARY KEY, v INT)", &tx)
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO pk_date (k, v) VALUES
+                    (DATE '2026-05-01', 10),
+                    (DATE '2026-01-01', 20)",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let rows = select_rows(&engine, &db, 6, "SELECT v FROM pk_date WHERE k = DATE '2026-01-01'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], DbValue::Int(20));
+
+    // Date keys iterate chronologically.
+    let rows = select_rows(&engine, &db, 7, "SELECT v FROM pk_date ORDER BY k ASC");
+    assert_eq!(
+        rows.iter().map(|r| r.values[0].clone()).collect::<Vec<_>>(),
+        vec![DbValue::Int(20), DbValue::Int(10)]
+    );
+}
+
+/// MIN/MAX over temporal and decimal columns, and SUM/AVG/COUNT in the presence
+/// of NULLs. The aggregation rewrite added decimal accumulators but only the
+/// all-non-null SUM/AVG happy path was tested; MIN/MAX and NULL-skipping for
+/// these types were not.
+#[test]
+fn test_temporal_decimal_aggregates_and_nulls() {
+    use chrono::NaiveDate;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE measures (id INT PRIMARY KEY, dec DECIMAL, d DATE)",
+                &tx,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO measures (id, dec, d) VALUES
+                    (1, DECIMAL '10.00', DATE '2026-01-10'),
+                    (2, NULL,            DATE '2026-03-20'),
+                    (3, DECIMAL '30.00', NULL)",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // SUM/AVG/COUNT skip the NULL decimal; COUNT(*) counts every row.
+    let rows = select_rows(
+        &engine,
+        &db,
+        2,
+        "SELECT SUM(dec), AVG(dec), COUNT(dec), COUNT(*) FROM measures",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Decimal(Decimal::from_str("40.00").unwrap())
+    );
+    assert_eq!(
+        rows[0].values[1],
+        DbValue::Decimal(Decimal::from_str("20").unwrap())
+    );
+    assert_eq!(rows[0].values[2], DbValue::Int(2));
+    assert_eq!(rows[0].values[3], DbValue::Int(3));
+
+    // MIN/MAX over decimal and date columns (NULLs ignored).
+    let rows = select_rows(
+        &engine,
+        &db,
+        3,
+        "SELECT MIN(dec), MAX(dec), MIN(d), MAX(d) FROM measures",
+    );
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Decimal(Decimal::from_str("10.00").unwrap())
+    );
+    assert_eq!(
+        rows[0].values[1],
+        DbValue::Decimal(Decimal::from_str("30.00").unwrap())
+    );
+    assert_eq!(
+        rows[0].values[2],
+        DbValue::Date(NaiveDate::from_ymd_opt(2026, 1, 10).unwrap())
+    );
+    assert_eq!(
+        rows[0].values[3],
+        DbValue::Date(NaiveDate::from_ymd_opt(2026, 3, 20).unwrap())
+    );
+}
+
+/// CAST conversions through SQL, typed-literal/negated DEFAULTs, ALTER TABLE ADD
+/// COLUMN with a temporal type, the NUMERIC/DEC/DECIMAL(p,s) aliases, and NULL
+/// storage — all reachable only through end-to-end SQL, not the expr unit tests.
+#[test]
+fn test_temporal_decimal_cast_defaults_and_aliases() {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+
+    // NUMERIC, DEC and DECIMAL(p,s) all map to the Decimal type; DATE/DECIMAL
+    // typed-literal DEFAULTs are applied when the column is omitted on INSERT.
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE accounts (
+                    id INT PRIMARY KEY,
+                    balance DECIMAL DEFAULT DECIMAL '-1.50',
+                    opened DATE DEFAULT DATE '2026-01-01',
+                    n NUMERIC,
+                    dc DEC,
+                    dp DECIMAL(10, 2)
+                )",
+                &tx,
+            )
+            .unwrap();
+        engine
+            .execute("INSERT INTO accounts (id) VALUES (1)", &tx)
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO accounts (id, balance, opened, n, dc, dp) VALUES
+                    (2, DECIMAL '99.99', DATE '2026-12-31', DECIMAL '1', DECIMAL '2', DECIMAL '3.00')",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Row 1 picked up both typed-literal defaults; the alias columns are NULL.
+    let rows = select_rows(
+        &engine,
+        &db,
+        2,
+        "SELECT balance, opened, n FROM accounts WHERE id = 1",
+    );
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Decimal(Decimal::from_str("-1.50").unwrap())
+    );
+    assert_eq!(
+        rows[0].values[1],
+        DbValue::Date(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
+    );
+    assert_eq!(rows[0].values[2], DbValue::Null);
+
+    // The NUMERIC/DEC/DECIMAL(p,s) alias columns round-trip Decimal values.
+    let rows = select_rows(&engine, &db, 3, "SELECT n, dc, dp FROM accounts WHERE id = 2");
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Decimal(Decimal::from_str("1").unwrap())
+    );
+    assert_eq!(
+        rows[0].values[2],
+        DbValue::Decimal(Decimal::from_str("3.00").unwrap())
+    );
+
+    // CAST through SQL: numeric <-> decimal and string -> temporal.
+    let rows = select_rows(
+        &engine,
+        &db,
+        4,
+        "SELECT
+            CAST(balance AS INT),
+            CAST(7 AS DECIMAL),
+            CAST('2026-06-02' AS DATE)
+         FROM accounts WHERE id = 2",
+    );
+    assert_eq!(rows[0].values[0], DbValue::Int(99)); // 99.99 truncates toward zero
+    assert_eq!(
+        rows[0].values[1],
+        DbValue::Decimal(Decimal::from_str("7").unwrap())
+    );
+    assert_eq!(
+        rows[0].values[2],
+        DbValue::Date(chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap())
+    );
+
+    // A CAST of an unparseable string surfaces an error rather than panicking.
+    {
+        let tx = Transaction::new(5, db.clone());
+        let err = engine.execute("SELECT CAST('not-a-date' AS DATE) FROM accounts", &tx);
+        assert!(err.is_err(), "casting a bad date string should error");
+    }
+
+    // ALTER TABLE ADD COLUMN with a temporal type, then write/read it.
+    {
+        let tx = Transaction::new(6, db.clone());
+        engine
+            .execute("ALTER TABLE accounts ADD COLUMN last_seen TIMESTAMP", &tx)
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO accounts (id, last_seen) VALUES (3, TIMESTAMP '2026-06-02 12:00:00')",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let rows = select_rows(&engine, &db, 7, "SELECT last_seen FROM accounts WHERE id = 3");
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Timestamp(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 2)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+        )
+    );
+    // Pre-existing rows read NULL for the lazily-added column.
+    let rows = select_rows(&engine, &db, 8, "SELECT last_seen FROM accounts WHERE id = 1");
+    assert_eq!(rows[0].values[0], DbValue::Null);
+}
+
+/// Typed values (including a decimal primary key) must survive being flushed to
+/// SSTables and read back after the database is reopened — this exercises the
+/// full postcard storage round-trip (custom decimal serde included) end-to-end,
+/// not just the in-memory `to_allocvec` round-trip the unit tests cover.
+#[test]
+fn test_temporal_decimal_persistence_reopen() {
+    use chrono::NaiveDate;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Phase 1: write typed rows, then flush the memtable to disk.
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        let engine = SqlEngine::new(db.clone());
+
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE snap (k DECIMAL PRIMARY KEY, d DATE, t TIME, ts TIMESTAMP)",
+                &tx,
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO snap (k, d, t, ts) VALUES
+                    (DECIMAL '1.25', DATE '2026-06-02', TIME '12:34:56', TIMESTAMP '2026-06-02 12:34:56'),
+                    (DECIMAL '99.99', DATE '2026-07-04', TIME '01:02:03', TIMESTAMP '2026-07-04 01:02:03')",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        db.get_table("snap").unwrap().flush_memtable().unwrap();
+    }
+
+    // Phase 2: reopen the database from the same directory and read back.
+    {
+        let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+        let engine = SqlEngine::new(db.clone());
+
+        let rows = select_rows(&engine, &db, 2, "SELECT k, d, t, ts FROM snap ORDER BY k ASC");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values[0],
+            DbValue::Decimal(Decimal::from_str("1.25").unwrap())
+        );
+        assert_eq!(
+            rows[0].values[1],
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap())
+        );
+        assert_eq!(
+            rows[0].values[2],
+            DbValue::Time(chrono::NaiveTime::from_hms_opt(12, 34, 56).unwrap())
+        );
+        assert_eq!(
+            rows[1].values[0],
+            DbValue::Decimal(Decimal::from_str("99.99").unwrap())
+        );
+
+        // Point lookup by decimal primary key still works after reopen.
+        let rows = select_rows(&engine, &db, 3, "SELECT d FROM snap WHERE k = DECIMAL '99.99'");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values[0],
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 7, 4).unwrap())
+        );
+    }
+}
+
+
+
+
+
+
+
+/// Index maintenance on UPDATE and DELETE for a decimal-keyed secondary index.
+/// Inserting, then changing or removing the indexed value, must keep the index
+/// consistent — the old entry has to be removed, not left dangling. This guards
+/// the old-key removal paths (the `Delete` arms of `write_batch`), which had the
+/// same missing-variant bug as the insert path and would otherwise leave stale
+/// index entries pointing at rows that no longer match.
+#[test]
+fn test_temporal_decimal_index_update_delete() {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, dec DECIMAL)", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let tx = Transaction::new(2, db.clone());
+        engine
+            .execute("CREATE INDEX idx_dec ON t (dec)", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let tx = Transaction::new(3, db.clone());
+        engine
+            .execute(
+                "INSERT INTO t (id, dec) VALUES
+                    (1, DECIMAL '10.00'),
+                    (2, DECIMAL '20.00'),
+                    (3, DECIMAL '30.00')",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Baseline: the index resolves the seeded value.
+    let rows = select_rows(&engine, &db, 4, "SELECT id FROM t WHERE dec = DECIMAL '20.00'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], DbValue::Int(2));
+
+    // UPDATE the indexed value: the old key must disappear, the new one appear.
+    {
+        let tx = Transaction::new(5, db.clone());
+        engine
+            .execute("UPDATE t SET dec = DECIMAL '25.00' WHERE id = 2", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let rows = select_rows(&engine, &db, 6, "SELECT id FROM t WHERE dec = DECIMAL '20.00'");
+    assert!(rows.is_empty(), "stale index entry for the old decimal value");
+    let rows = select_rows(&engine, &db, 7, "SELECT id FROM t WHERE dec = DECIMAL '25.00'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], DbValue::Int(2));
+
+    // DELETE a row: its index entry must be removed too.
+    {
+        let tx = Transaction::new(8, db.clone());
+        engine
+            .execute("DELETE FROM t WHERE id = 1", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let rows = select_rows(&engine, &db, 9, "SELECT id FROM t WHERE dec = DECIMAL '10.00'");
+    assert!(rows.is_empty(), "deleted row still reachable via the index");
+
+    // A range scan reflects the post-update/delete state: 25.00 and 30.00.
+    let rows = select_rows(
+        &engine,
+        &db,
+        10,
+        "SELECT id FROM t WHERE dec >= DECIMAL '0' ORDER BY dec ASC",
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| match &r.values[0] {
+                DbValue::Int(i) => *i,
+                other => panic!("expected Int, got {:?}", other),
+            })
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    let rows = select_rows(&engine, &db, 11, "SELECT dec FROM t WHERE id = 2");
+    assert_eq!(
+        rows[0].values[0],
+        DbValue::Decimal(Decimal::from_str("25.00").unwrap())
+    );
+}
+
+
+
+/// Bound query parameters of the new typed columns must resolve to index/PK
+/// keys. The prepared-statement path keeps parameters symbolic (`PlanKey::
+/// Parameter`) and converts the bound value to a `DbKey` at compile time; those
+/// value→key resolvers handled only Int/String, so a Decimal/Date parameter on
+/// a primary-key or indexed column either silently skipped the point-get fast
+/// path or errored with "Unsupported key parameter type". This pins all three
+/// resolver sites: PK point-get, PK range scan, and secondary IndexScan.
+#[test]
+fn test_prepared_params_temporal_decimal_keys() {
+    use chrono::NaiveDate;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+    let run = |sql: &str, id: u64| {
+        let tx = Transaction::new(id, db.clone());
+        engine.execute(sql, &tx).unwrap();
+        tx.commit().unwrap();
+    };
+
+    // --- Decimal PRIMARY KEY: parameterized point-get and range scan ---
+    run("CREATE TABLE pk_dec (k DECIMAL PRIMARY KEY, v STRING)", 1);
+    run(
+        "INSERT INTO pk_dec (k, v) VALUES
+            (DECIMAL '1.50', 'a'),
+            (DECIMAL '2.25', 'b'),
+            (DECIMAL '10.00', 'c')",
+        2,
+    );
+
+    // Point lookup by a bound Decimal PK (resolver in the point-get fast path).
+    let pt = engine.prepare("SELECT v FROM pk_dec WHERE k = :k").unwrap();
+    {
+        let tx = Transaction::new(3, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("k".to_string(), DbValue::Decimal(Decimal::from_str("2.25").unwrap()));
+        let res = engine.execute_prepared(&pt, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values[0], DbValue::string("b"));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // Range scan over the Decimal PK with two bound parameters (resolver in the
+    // primary-key Scan range path).
+    let rng = engine
+        .prepare("SELECT v FROM pk_dec WHERE k >= :lo AND k <= :hi ORDER BY k ASC")
+        .unwrap();
+    {
+        let tx = Transaction::new(4, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("lo".to_string(), DbValue::Decimal(Decimal::from_str("2.00").unwrap()));
+        params.insert("hi".to_string(), DbValue::Decimal(Decimal::from_str("9.99").unwrap()));
+        let res = engine.execute_prepared(&rng, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => {
+                assert_eq!(
+                    rows.iter().map(|r| r.values[0].clone()).collect::<Vec<_>>(),
+                    vec![DbValue::string("b")] // 2.25 only; 1.50 and 10.00 excluded
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // --- Secondary indexes on Decimal and Date: parameterized IndexScan ---
+    run("CREATE TABLE t (id INT PRIMARY KEY, dec DECIMAL, d DATE)", 5);
+    run("CREATE INDEX idx_dec ON t (dec)", 6);
+    run("CREATE INDEX idx_d ON t (d)", 7);
+    run(
+        "INSERT INTO t (id, dec, d) VALUES
+            (1, DECIMAL '9.00',   DATE '2026-01-09'),
+            (2, DECIMAL '123.00', DATE '2026-03-15'),
+            (3, DECIMAL '50.50',  DATE '2026-02-20')",
+        8,
+    );
+
+    // Equality on the indexed Decimal column via a bound parameter.
+    let idx_eq = engine.prepare("SELECT id FROM t WHERE dec = :v").unwrap();
+    {
+        let tx = Transaction::new(9, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("v".to_string(), DbValue::Decimal(Decimal::from_str("50.50").unwrap()));
+        let res = engine.execute_prepared(&idx_eq, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values[0], DbValue::Int(3));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // Range on the indexed Date column with two bound Date parameters.
+    let idx_rng = engine
+        .prepare("SELECT id FROM t WHERE d >= :lo AND d <= :hi ORDER BY id ASC")
+        .unwrap();
+    {
+        let tx = Transaction::new(10, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "lo".to_string(),
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
+        );
+        params.insert(
+            "hi".to_string(),
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+        );
+        let res = engine.execute_prepared(&idx_rng, &tx, &params).unwrap();
+        tx.commit().unwrap();
+        match res {
+            ExecutionResult::Select { rows, .. } => {
+                assert_eq!(
+                    rows.iter()
+                        .map(|r| match &r.values[0] {
+                            DbValue::Int(i) => *i,
+                            other => panic!("expected Int, got {:?}", other),
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![2, 3] // 2026-03-15 and 2026-02-20; 2026-01-09 excluded
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+}

@@ -773,14 +773,27 @@ mod tests {
     }
 
     /// Every `DbKey`/`DbValue` variant must survive a postcard round-trip
-    /// unchanged (confirms the serde `rc` feature is wired up correctly).
+    /// unchanged (confirms the serde `rc` feature is wired up correctly). The
+    /// `Decimal` variants additionally exercise the custom `decimal_serde`
+    /// (string-backed) codec on both `DbKey` and `DbValue`.
     #[test]
     fn test_dbkey_dbvalue_postcard_roundtrip() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap();
+        let time = chrono::NaiveTime::from_hms_opt(12, 34, 56).unwrap();
+        let ts = date.and_hms_opt(12, 34, 56).unwrap();
+        let dec = Decimal::from_str("123.45").unwrap();
+
         let keys = [
             DbKey::Int(-42),
             DbKey::string("key"),
             DbKey::Bool(true),
-            DbKey::composite(vec![DbKey::Int(1), DbKey::string("x")]),
+            DbKey::Date(date),
+            DbKey::Time(time),
+            DbKey::Timestamp(ts),
+            DbKey::Decimal(dec),
+            DbKey::composite(vec![DbKey::Int(1), DbKey::Decimal(dec)]),
         ];
         for k in keys {
             let back: DbKey = postcard::from_bytes(&postcard::to_allocvec(&k).unwrap()).unwrap();
@@ -794,10 +807,58 @@ mod tests {
             DbValue::bytes(vec![9, 8, 7]),
             DbValue::Bool(false),
             DbValue::Null,
+            DbValue::Date(date),
+            DbValue::Time(time),
+            DbValue::Timestamp(ts),
+            DbValue::Decimal(dec),
         ];
         for v in values {
             let back: DbValue = postcard::from_bytes(&postcard::to_allocvec(&v).unwrap()).unwrap();
             assert_eq!(v, back);
         }
+    }
+
+    /// `decimal_serde` stringifies the value, so trailing-zero scale must be
+    /// preserved across the round-trip (e.g. `1.50` must not come back as `1.5`).
+    /// Scale matters because it is user-visible in projected results.
+    #[test]
+    fn test_decimal_serde_preserves_scale() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        for s in ["1.50", "0.000", "-42.0", "100"] {
+            let d = Decimal::from_str(s).unwrap();
+            let back: Decimal =
+                postcard::from_bytes(&postcard::to_allocvec(&DbValue::Decimal(d)).unwrap())
+                    .map(|v: DbValue| match v {
+                        DbValue::Decimal(x) => x,
+                        other => panic!("expected Decimal, got {:?}", other),
+                    })
+                    .unwrap();
+            assert_eq!(back.to_string(), s, "scale lost for {}", s);
+        }
+    }
+
+    /// A single-column index over a `Decimal` orders entries by the in-memory
+    /// `DbKey::cmp` (numeric `Ord`), NOT by the string serialization. Range
+    /// scans would be wrong if `"123"` sorted after `"9"` lexicographically, so
+    /// this pins the numeric ordering the LSM range scans depend on.
+    #[test]
+    fn test_decimal_dbkey_orders_numerically() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        let d = |s: &str| DbKey::Decimal(Decimal::from_str(s).unwrap());
+
+        // Lexicographic order would put "123" < "9"; numeric order must not.
+        assert!(d("9") < d("123"));
+        assert!(d("-5") < d("0"));
+        assert!(d("1.5") < d("1.50001"));
+
+        // Sorted iteration through a BTreeMap (the memtable's store) is numeric.
+        let mut map = std::collections::BTreeMap::new();
+        for s in ["9", "123", "0", "-5", "42"] {
+            map.insert(d(s), s);
+        }
+        let ordered: Vec<&str> = map.values().copied().collect();
+        assert_eq!(ordered, vec!["-5", "0", "9", "42", "123"]);
     }
 }
