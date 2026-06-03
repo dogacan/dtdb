@@ -1189,6 +1189,59 @@ impl LogicalPlanner {
                     range: None, // Configured later by optimizer
                 })
             }
+            TableFactor::Derived {
+                lateral,
+                subquery,
+                alias,
+                ..
+            } => {
+                if *lateral {
+                    return Err("LATERAL derived tables are not supported".to_string());
+                }
+                let alias = alias.as_ref().ok_or_else(|| {
+                    "a derived table (subquery in FROM) requires an alias, e.g. `(SELECT ...) AS t`"
+                        .to_string()
+                })?;
+                let qualifier = alias.name.value.clone();
+
+                let inner = self.plan_query(subquery)?;
+                // A non-LATERAL derived table cannot reference the enclosing
+                // query; reuse the correlation check to reject one that tries.
+                reject_if_correlated(&inner)?;
+                let inner_schema = inner.schema();
+
+                let col_aliases: Vec<&str> = alias
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.as_str())
+                    .collect();
+                if !col_aliases.is_empty() && col_aliases.len() != inner_schema.columns.len() {
+                    return Err(format!(
+                        "derived table '{}' yields {} column(s) but {} alias(es) were provided",
+                        qualifier,
+                        inner_schema.columns.len(),
+                        col_aliases.len()
+                    ));
+                }
+
+                // Re-alias every output column as `qualifier.name` so the
+                // enclosing query can reference `t.col` (or bare `col`). Columns
+                // are read positionally (`Some(i)`), so duplicate inner names do
+                // not make the wrapping projection ambiguous.
+                let mut expressions = Vec::with_capacity(inner_schema.columns.len());
+                let mut field_names = Vec::with_capacity(inner_schema.columns.len());
+                for (i, col) in inner_schema.columns.iter().enumerate() {
+                    expressions.push(Expr::Column(col.name.clone(), Some(i)));
+                    let base = if col_aliases.is_empty() {
+                        col.name.rsplit('.').next().unwrap_or(&col.name)
+                    } else {
+                        col_aliases[i]
+                    };
+                    field_names.push(format!("{qualifier}.{base}"));
+                }
+
+                Ok(LogicalPlan::new_projection(inner, expressions, field_names))
+            }
             other => Err(format!("Unsupported table factor in FROM: {:?}", other)),
         }
     }

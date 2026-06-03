@@ -264,3 +264,103 @@ fn nested_uncorrelated_subquery_is_accepted() {
     );
     assert_eq!(rows, vec![vec![int(10)], vec![int(30)]]);
 }
+
+// ---- Derived tables / subqueries in FROM (ADR 0005 step 5) ----
+
+#[test]
+fn derived_table_basic_and_qualified_refs() {
+    let h = setup();
+    let rows = h.select("SELECT d.id, d.x FROM (SELECT id, x FROM t1) AS d ORDER BY d.id");
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(1), int(10)],
+            vec![int(2), int(15)],
+            vec![int(3), int(30)],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_filtered_by_unqualified_column() {
+    let h = setup();
+    // The enclosing query references derived columns without the `d.` prefix.
+    let rows = h.select("SELECT id FROM (SELECT id, x FROM t1) AS d WHERE x > 10 ORDER BY id");
+    assert_eq!(rows, vec![vec![int(2)], vec![int(3)]]);
+}
+
+#[test]
+fn derived_table_with_wildcard() {
+    let h = setup();
+    let rows = h.select("SELECT id, x FROM (SELECT * FROM t1) AS d ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(1), int(10)],
+            vec![int(2), int(15)],
+            vec![int(3), int(30)],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_with_column_aliases() {
+    let h = setup();
+    let rows = h.select("SELECT d.a, d.b FROM (SELECT id, x FROM t1) AS d(a, b) ORDER BY d.a");
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(1), int(10)],
+            vec![int(2), int(15)],
+            vec![int(3), int(30)],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_in_join() {
+    let h = setup();
+    let rows = h.select(
+        "SELECT t1.x, d.y FROM t1 JOIN (SELECT id, y FROM t2) AS d ON t1.id = d.id ORDER BY t1.x",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(10), int(10)],
+            vec![int(15), int(20)],
+            vec![int(30), int(30)],
+        ]
+    );
+}
+
+#[test]
+fn derived_table_with_aggregation_inside() {
+    let h = setup();
+    let rows = h.select("SELECT d.cnt FROM (SELECT COUNT(*) AS cnt FROM t2) AS d");
+    assert_eq!(rows, vec![vec![int(3)]]);
+}
+
+#[test]
+fn derived_table_combined_with_expression_subquery() {
+    let h = setup();
+    let rows = h.select(
+        "SELECT d.id FROM (SELECT id FROM t1) AS d WHERE d.id IN (SELECT id FROM t2) ORDER BY d.id",
+    );
+    assert_eq!(rows, vec![vec![int(1)], vec![int(2)], vec![int(3)]]);
+}
+
+#[test]
+fn derived_table_requires_alias() {
+    let h = setup();
+    let err = h.run("SELECT id FROM (SELECT id FROM t1)").unwrap_err();
+    assert!(err.contains("requires an alias"), "got: {err}");
+}
+
+#[test]
+fn derived_table_alias_count_mismatch_is_error() {
+    let h = setup();
+    let err = h
+        .run("SELECT * FROM (SELECT id, x FROM t1) AS d(only_one)")
+        .unwrap_err();
+    assert!(err.contains("alias"), "got: {err}");
+}
