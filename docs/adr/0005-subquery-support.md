@@ -1,6 +1,6 @@
 # ADR 0005: Subquery support via compile-time folding and derived-table re-aliasing
 
-- **Status:** Accepted
+- **Status:** Accepted - implemented
 - **Date:** 2026-06-02
 - **Deciders:** dtdb maintainers
 
