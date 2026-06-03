@@ -428,6 +428,17 @@ impl Transaction {
             other => vec![other.clone()],
         };
 
+        // The padding loop below extends `start_parts` and `end_parts` in lockstep
+        // off a single `prefix_len`, so they must describe the same prefix of index
+        // columns. Every caller passes matching-shape bounds; assert it so a future
+        // mismatch fails loudly instead of silently misaligning the padded columns
+        // against the appended primary-key bounds.
+        debug_assert_eq!(
+            start_parts.len(),
+            end_parts.len(),
+            "index scan start/end bounds must cover the same number of columns"
+        );
+
         // Determine column min/max bounds for the columns that are not specified in start_val/end_val.
         let prefix_len = start_parts.len();
         for i in prefix_len..idx_def.columns.len() {
@@ -490,13 +501,7 @@ impl Transaction {
                 if resolved_pks.contains(pk) {
                     continue;
                 }
-                if let Some(row) = row_opt
-                    && let Some(idx_def) = table
-                        .schema
-                        .indexes
-                        .iter()
-                        .find(|idx| idx.name == index_name)
-                {
+                if let Some(row) = row_opt {
                     // Ensure all columns in the composite index are non-Null.
                     // If any column is Null, get_index_keys would not have generated a key,
                     // so it should not be returned by the index scan.
@@ -566,59 +571,54 @@ impl Transaction {
                 }
             }
         }
-        // Sort the final rows by the index columns to maintain sorted order even with write buffer insertions.
-        if let Some(idx_def) = table
-            .schema
-            .indexes
-            .iter()
-            .find(|idx| idx.name == index_name)
-        {
-            let row_val_to_key = |val: &DbValue| -> DbKey {
-                match val {
-                    DbValue::Int(v) => DbKey::Int(*v),
-                    DbValue::String(s) => DbKey::String(s.clone()),
-                    DbValue::Bool(b) => DbKey::Bool(*b),
-                    DbValue::Date(d) => DbKey::Date(*d),
-                    DbValue::Time(t) => DbKey::Time(*t),
-                    DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                    DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                    _ => DbKey::Int(0),
-                }
-            };
+        // Sort the final rows by the index columns to maintain sorted order even
+        // with write buffer insertions. `idx_def` was resolved at the top of this
+        // method, so it is always present here.
+        let row_val_to_key = |val: &DbValue| -> DbKey {
+            match val {
+                DbValue::Int(v) => DbKey::Int(*v),
+                DbValue::String(s) => DbKey::String(s.clone()),
+                DbValue::Bool(b) => DbKey::Bool(*b),
+                DbValue::Date(d) => DbKey::Date(*d),
+                DbValue::Time(t) => DbKey::Time(*t),
+                DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
+                DbValue::Decimal(dec) => DbKey::Decimal(*dec),
+                _ => DbKey::Int(0),
+            }
+        };
 
-            let extract_index_key = |row: &Row| -> DbKey {
-                if idx_def.columns.len() == 1 {
-                    let col_name = &idx_def.columns[0];
+        let extract_index_key = |row: &Row| -> DbKey {
+            if idx_def.columns.len() == 1 {
+                let col_name = &idx_def.columns[0];
+                let col_idx = table.schema.column_index(col_name).unwrap();
+                let val = row.get_by_index(col_idx).unwrap_or(&DbValue::Null);
+                row_val_to_key(val)
+            } else {
+                let mut parts = Vec::new();
+                for col_name in &idx_def.columns {
                     let col_idx = table.schema.column_index(col_name).unwrap();
                     let val = row.get_by_index(col_idx).unwrap_or(&DbValue::Null);
-                    row_val_to_key(val)
-                } else {
-                    let mut parts = Vec::new();
-                    for col_name in &idx_def.columns {
-                        let col_idx = table.schema.column_index(col_name).unwrap();
-                        let val = row.get_by_index(col_idx).unwrap_or(&DbValue::Null);
-                        parts.push(row_val_to_key(val));
-                    }
-                    DbKey::composite(parts)
+                    parts.push(row_val_to_key(val));
                 }
-            };
+                DbKey::composite(parts)
+            }
+        };
 
-            rows.sort_by(|a, b| {
-                let a_key = extract_index_key(a);
-                let b_key = extract_index_key(b);
-                let ord = a_key.cmp(&b_key);
-                if ord != std::cmp::Ordering::Equal {
-                    ord
-                } else {
-                    let a_pk = table.schema.extract_primary_key(a);
-                    let b_pk = table.schema.extract_primary_key(b);
-                    match (a_pk, b_pk) {
-                        (Ok(apk), Ok(bpk)) => apk.cmp(&bpk),
-                        _ => std::cmp::Ordering::Equal,
-                    }
+        rows.sort_by(|a, b| {
+            let a_key = extract_index_key(a);
+            let b_key = extract_index_key(b);
+            let ord = a_key.cmp(&b_key);
+            if ord != std::cmp::Ordering::Equal {
+                ord
+            } else {
+                let a_pk = table.schema.extract_primary_key(a);
+                let b_pk = table.schema.extract_primary_key(b);
+                match (a_pk, b_pk) {
+                    (Ok(apk), Ok(bpk)) => apk.cmp(&bpk),
+                    _ => std::cmp::Ordering::Equal,
                 }
-            });
-        }
+            }
+        });
 
         Ok(rows)
     }
