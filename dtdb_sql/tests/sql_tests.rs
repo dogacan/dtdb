@@ -6614,7 +6614,12 @@ fn test_temporal_decimal_range_and_order() {
 
     // ORDER BY on a decimal column must sort numerically (9 < 50.5 < 123), not
     // lexicographically by the string serialization (which would give 123,50,9).
-    let rows = select_rows(&engine, &db, 15, "SELECT id, dec FROM events ORDER BY dec ASC");
+    let rows = select_rows(
+        &engine,
+        &db,
+        15,
+        "SELECT id, dec FROM events ORDER BY dec ASC",
+    );
     assert_eq!(ids(&rows), vec![1, 3, 2]);
     assert_eq!(
         rows[2].values[1],
@@ -6659,7 +6664,12 @@ fn test_temporal_decimal_primary_keys() {
     }
 
     // Point lookup by decimal key.
-    let rows = select_rows(&engine, &db, 2, "SELECT v FROM pk_dec WHERE k = DECIMAL '2.25'");
+    let rows = select_rows(
+        &engine,
+        &db,
+        2,
+        "SELECT v FROM pk_dec WHERE k = DECIMAL '2.25'",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], DbValue::string("b"));
 
@@ -6681,7 +6691,10 @@ fn test_temporal_decimal_primary_keys() {
     // Re-inserting an existing decimal key is rejected.
     {
         let tx = Transaction::new(4, db.clone());
-        let dup = engine.execute("INSERT INTO pk_dec (k, v) VALUES (DECIMAL '1.5', 'dup')", &tx);
+        let dup = engine.execute(
+            "INSERT INTO pk_dec (k, v) VALUES (DECIMAL '1.5', 'dup')",
+            &tx,
+        );
         assert!(dup.is_err(), "duplicate decimal primary key should error");
     }
 
@@ -6702,7 +6715,12 @@ fn test_temporal_decimal_primary_keys() {
         tx.commit().unwrap();
     }
 
-    let rows = select_rows(&engine, &db, 6, "SELECT v FROM pk_date WHERE k = DATE '2026-01-01'");
+    let rows = select_rows(
+        &engine,
+        &db,
+        6,
+        "SELECT v FROM pk_date WHERE k = DATE '2026-01-01'",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], DbValue::Int(20));
 
@@ -6848,7 +6866,12 @@ fn test_temporal_decimal_cast_defaults_and_aliases() {
     assert_eq!(rows[0].values[2], DbValue::Null);
 
     // The NUMERIC/DEC/DECIMAL(p,s) alias columns round-trip Decimal values.
-    let rows = select_rows(&engine, &db, 3, "SELECT n, dc, dp FROM accounts WHERE id = 2");
+    let rows = select_rows(
+        &engine,
+        &db,
+        3,
+        "SELECT n, dc, dp FROM accounts WHERE id = 2",
+    );
     assert_eq!(
         rows[0].values[0],
         DbValue::Decimal(Decimal::from_str("1").unwrap())
@@ -6900,7 +6923,12 @@ fn test_temporal_decimal_cast_defaults_and_aliases() {
             .unwrap();
         tx.commit().unwrap();
     }
-    let rows = select_rows(&engine, &db, 7, "SELECT last_seen FROM accounts WHERE id = 3");
+    let rows = select_rows(
+        &engine,
+        &db,
+        7,
+        "SELECT last_seen FROM accounts WHERE id = 3",
+    );
     assert_eq!(
         rows[0].values[0],
         DbValue::Timestamp(
@@ -6911,7 +6939,12 @@ fn test_temporal_decimal_cast_defaults_and_aliases() {
         )
     );
     // Pre-existing rows read NULL for the lazily-added column.
-    let rows = select_rows(&engine, &db, 8, "SELECT last_seen FROM accounts WHERE id = 1");
+    let rows = select_rows(
+        &engine,
+        &db,
+        8,
+        "SELECT last_seen FROM accounts WHERE id = 1",
+    );
     assert_eq!(rows[0].values[0], DbValue::Null);
 }
 
@@ -6957,7 +6990,12 @@ fn test_temporal_decimal_persistence_reopen() {
         let db = Arc::new(Database::open(temp_dir.path()).unwrap());
         let engine = SqlEngine::new(db.clone());
 
-        let rows = select_rows(&engine, &db, 2, "SELECT k, d, t, ts FROM snap ORDER BY k ASC");
+        let rows = select_rows(
+            &engine,
+            &db,
+            2,
+            "SELECT k, d, t, ts FROM snap ORDER BY k ASC",
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values[0],
@@ -6977,7 +7015,12 @@ fn test_temporal_decimal_persistence_reopen() {
         );
 
         // Point lookup by decimal primary key still works after reopen.
-        let rows = select_rows(&engine, &db, 3, "SELECT d FROM snap WHERE k = DECIMAL '99.99'");
+        let rows = select_rows(
+            &engine,
+            &db,
+            3,
+            "SELECT d FROM snap WHERE k = DECIMAL '99.99'",
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values[0],
@@ -6985,12 +7028,6 @@ fn test_temporal_decimal_persistence_reopen() {
         );
     }
 }
-
-
-
-
-
-
 
 /// Index maintenance on UPDATE and DELETE for a decimal-keyed secondary index.
 /// Inserting, then changing or removing the indexed value, must keep the index
@@ -7034,7 +7071,12 @@ fn test_temporal_decimal_index_update_delete() {
     }
 
     // Baseline: the index resolves the seeded value.
-    let rows = select_rows(&engine, &db, 4, "SELECT id FROM t WHERE dec = DECIMAL '20.00'");
+    let rows = select_rows(
+        &engine,
+        &db,
+        4,
+        "SELECT id FROM t WHERE dec = DECIMAL '20.00'",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], DbValue::Int(2));
 
@@ -7046,21 +7088,37 @@ fn test_temporal_decimal_index_update_delete() {
             .unwrap();
         tx.commit().unwrap();
     }
-    let rows = select_rows(&engine, &db, 6, "SELECT id FROM t WHERE dec = DECIMAL '20.00'");
-    assert!(rows.is_empty(), "stale index entry for the old decimal value");
-    let rows = select_rows(&engine, &db, 7, "SELECT id FROM t WHERE dec = DECIMAL '25.00'");
+    let rows = select_rows(
+        &engine,
+        &db,
+        6,
+        "SELECT id FROM t WHERE dec = DECIMAL '20.00'",
+    );
+    assert!(
+        rows.is_empty(),
+        "stale index entry for the old decimal value"
+    );
+    let rows = select_rows(
+        &engine,
+        &db,
+        7,
+        "SELECT id FROM t WHERE dec = DECIMAL '25.00'",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], DbValue::Int(2));
 
     // DELETE a row: its index entry must be removed too.
     {
         let tx = Transaction::new(8, db.clone());
-        engine
-            .execute("DELETE FROM t WHERE id = 1", &tx)
-            .unwrap();
+        engine.execute("DELETE FROM t WHERE id = 1", &tx).unwrap();
         tx.commit().unwrap();
     }
-    let rows = select_rows(&engine, &db, 9, "SELECT id FROM t WHERE dec = DECIMAL '10.00'");
+    let rows = select_rows(
+        &engine,
+        &db,
+        9,
+        "SELECT id FROM t WHERE dec = DECIMAL '10.00'",
+    );
     assert!(rows.is_empty(), "deleted row still reachable via the index");
 
     // A range scan reflects the post-update/delete state: 25.00 and 30.00.
@@ -7085,8 +7143,6 @@ fn test_temporal_decimal_index_update_delete() {
         DbValue::Decimal(Decimal::from_str("25.00").unwrap())
     );
 }
-
-
 
 /// Bound query parameters of the new typed columns must resolve to index/PK
 /// keys. The prepared-statement path keeps parameters symbolic (`PlanKey::
@@ -7123,7 +7179,10 @@ fn test_prepared_params_temporal_decimal_keys() {
     {
         let tx = Transaction::new(3, db.clone());
         let mut params = std::collections::HashMap::new();
-        params.insert("k".to_string(), DbValue::Decimal(Decimal::from_str("2.25").unwrap()));
+        params.insert(
+            "k".to_string(),
+            DbValue::Decimal(Decimal::from_str("2.25").unwrap()),
+        );
         let res = engine.execute_prepared(&pt, &tx, &params).unwrap();
         tx.commit().unwrap();
         match res {
@@ -7143,8 +7202,14 @@ fn test_prepared_params_temporal_decimal_keys() {
     {
         let tx = Transaction::new(4, db.clone());
         let mut params = std::collections::HashMap::new();
-        params.insert("lo".to_string(), DbValue::Decimal(Decimal::from_str("2.00").unwrap()));
-        params.insert("hi".to_string(), DbValue::Decimal(Decimal::from_str("9.99").unwrap()));
+        params.insert(
+            "lo".to_string(),
+            DbValue::Decimal(Decimal::from_str("2.00").unwrap()),
+        );
+        params.insert(
+            "hi".to_string(),
+            DbValue::Decimal(Decimal::from_str("9.99").unwrap()),
+        );
         let res = engine.execute_prepared(&rng, &tx, &params).unwrap();
         tx.commit().unwrap();
         match res {
@@ -7159,7 +7224,10 @@ fn test_prepared_params_temporal_decimal_keys() {
     }
 
     // --- Secondary indexes on Decimal and Date: parameterized IndexScan ---
-    run("CREATE TABLE t (id INT PRIMARY KEY, dec DECIMAL, d DATE)", 5);
+    run(
+        "CREATE TABLE t (id INT PRIMARY KEY, dec DECIMAL, d DATE)",
+        5,
+    );
     run("CREATE INDEX idx_dec ON t (dec)", 6);
     run("CREATE INDEX idx_d ON t (d)", 7);
     run(
@@ -7175,7 +7243,10 @@ fn test_prepared_params_temporal_decimal_keys() {
     {
         let tx = Transaction::new(9, db.clone());
         let mut params = std::collections::HashMap::new();
-        params.insert("v".to_string(), DbValue::Decimal(Decimal::from_str("50.50").unwrap()));
+        params.insert(
+            "v".to_string(),
+            DbValue::Decimal(Decimal::from_str("50.50").unwrap()),
+        );
         let res = engine.execute_prepared(&idx_eq, &tx, &params).unwrap();
         tx.commit().unwrap();
         match res {

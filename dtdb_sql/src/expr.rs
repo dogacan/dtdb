@@ -2048,11 +2048,21 @@ mod tests {
 
         // Mixing Decimal with Float promotes the result to Float, both orders.
         assert_eq!(
-            eval(&binop(*lit(dec("1.5")), Operator::Add, *lit(DbValue::Float(2.0)))).unwrap(),
+            eval(&binop(
+                *lit(dec("1.5")),
+                Operator::Add,
+                *lit(DbValue::Float(2.0))
+            ))
+            .unwrap(),
             DbValue::Float(3.5)
         );
         assert_eq!(
-            eval(&binop(*lit(DbValue::Float(5.0)), Operator::Sub, *lit(dec("1.5")))).unwrap(),
+            eval(&binop(
+                *lit(DbValue::Float(5.0)),
+                Operator::Sub,
+                *lit(dec("1.5"))
+            ))
+            .unwrap(),
             DbValue::Float(3.5)
         );
     }
@@ -2127,7 +2137,11 @@ mod tests {
             )
         );
         assert_eq!(
-            cast_value(DbValue::string("2026-06-02 12:34:56.5"), DataType::Timestamp).unwrap(),
+            cast_value(
+                DbValue::string("2026-06-02 12:34:56.5"),
+                DataType::Timestamp
+            )
+            .unwrap(),
             DbValue::Timestamp(
                 NaiveDate::from_ymd_opt(2026, 6, 2)
                     .unwrap()
@@ -2157,10 +2171,12 @@ mod tests {
         assert!(cast_value(DbValue::string("xyz"), DataType::Int).is_err());
         assert!(cast_value(DbValue::string("xyz"), DataType::Decimal).is_err());
         // A Date cannot be cast to a Time (no sensible conversion).
-        assert!(cast_value(
-            DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap()),
-            DataType::Time
-        )
-        .is_err());
+        assert!(
+            cast_value(
+                DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap()),
+                DataType::Time
+            )
+            .is_err()
+        );
     }
 }
