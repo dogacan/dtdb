@@ -45,6 +45,17 @@ fn ensure_static_lib(profile_dir: &Path, workspace_root: &Path) {
 
 #[test]
 fn test_cpp_bridge_smoke() {
+    // Skip if MSan is enabled via RUSTFLAGS (in case cfg(sanitize = "memory") is not set by the compiler version/target configuration)
+    if std::env::var("RUSTFLAGS")
+        .map(|f| f.contains("sanitizer=memory"))
+        .unwrap_or(false)
+    {
+        println!(
+            "Skipping C++ smoke test under MemorySanitizer (MSan) to avoid uninstrumented C++ stdlib false positives."
+        );
+        return;
+    }
+
     // 1. Locate the workspace root
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().expect("workspace root");
