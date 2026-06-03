@@ -623,6 +623,19 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
         }
         Expr::Not(_) | Expr::IsNull(_) | Expr::InList { .. } => DataType::Int,
         Expr::Match { .. } => DataType::Bool,
+        // A scalar subquery contributes the type of its single output column.
+        Expr::ScalarSubquery(subquery) => subquery
+            .schema()
+            .columns
+            .first()
+            .map(|c| c.data_type)
+            .unwrap_or(DataType::Null),
+        // Each subquery predicate is typed as the expression it folds into, so
+        // the compile-time fold pass (ADR 0005) is type-preserving. `IN` folds
+        // to `InList`/`Not`, which follow dtdb's Int-for-boolean convention;
+        // `EXISTS` folds to a boolean literal.
+        Expr::InSubquery { .. } => DataType::Int,
+        Expr::Exists { .. } => DataType::Bool,
         // A parameter's type is unknown until it is bound to a value.
         Expr::Parameter(_) => DataType::Null,
     }
