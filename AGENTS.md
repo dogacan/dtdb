@@ -6,9 +6,9 @@ Welcome! If you are an AI assistant contributing to **DuctTapeDB**, please follo
 
 ## 🚦 Verification Checklist (Must Pass Before Commit)
 
-Always run the following commands and verify they pass cleanly before proposing or committing any changes:
+Before proposing or committing any changes, run the appropriate verification checks:
 
-1. **Format and Lints**:
+1. **Format and Lints (Always Run)**:
    Ensure the code compiles without warnings and passes all Clippy guidelines:
 
    ```bash
@@ -16,15 +16,15 @@ Always run the following commands and verify they pass cleanly before proposing 
    cargo clippy --all-targets -- -D warnings
    ```
 
-2. **Unit & Integration Tests**:
+2. **Unit & Integration Tests (Always Run)**:
    Ensure all tests compile and pass:
 
    ```bash
    RUSTFLAGS="-D warnings" cargo test
    ```
 
-3. **ThreadSanitizer (TSAN) Checks**:
-   Since DuctTapeDB has multi-threaded operations in its storage engine (e.g., background compaction spawner), if your work has possible concurrency errors, verify that no thread/concurrency issues are introduced:
+3. **ThreadSanitizer (TSAN) Checks (Run only when changes have possible thread safety/concurrency effects)**:
+   Since DuctTapeDB has multi-threaded operations in its storage engine (e.g., background compaction spawner), if your work has possible concurrency errors or thread-safety implications, verify that no thread/concurrency issues are introduced:
 
    ```bash
    ./scripts/run_tsan.sh

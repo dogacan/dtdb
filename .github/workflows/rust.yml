@@ -7,6 +7,7 @@ on:
     branches: [ "main" ]
   schedule:
     - cron: '0 0 * * *' # Runs daily at 00:00 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -142,3 +143,72 @@ jobs:
         BOLERO_FUZZ_ITERATIONS: ${{ github.event_name == 'schedule' && '50000' || '1024' }}
         PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '256' }}
       run: ./scripts/run_fuzz.sh
+
+  asan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust Nightly
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+        components: rust-src
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Protocol Buffers Compiler
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Run tests with AddressSanitizer (ASan)
+      run: ./scripts/run_asan.sh
+
+  msan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust Nightly
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+        components: rust-src
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Protocol Buffers Compiler
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Run tests with MemorySanitizer (MSan)
+      run: ./scripts/run_msan.sh
+
+  miri:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust Nightly
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+        components: miri
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install Protocol Buffers Compiler
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Run tests with Miri
+      run: ./scripts/run_miri.sh
