@@ -5305,15 +5305,19 @@ fn test_like_handles_adversarial_pattern_in_bounded_time() {
     // measure wall-clock time here (CI variance), but if we ever regress to
     // backtracking it would take many seconds to minutes on this input.
     let tx_q = Transaction::new(3, db.clone());
+    #[cfg(not(miri))]
     let start = std::time::Instant::now();
     let res = engine
         .execute("SELECT id FROM t WHERE s LIKE '%a%a%a%a%a%a%a%b'", &tx_q)
         .unwrap();
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "LIKE took too long ({elapsed:?}) — backtracking regression?"
-    );
+    #[cfg(not(miri))]
+    {
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "LIKE took too long ({elapsed:?}) — backtracking regression?"
+        );
+    }
     if let ExecutionResult::Select { rows, .. } = res {
         assert!(
             rows.is_empty(),

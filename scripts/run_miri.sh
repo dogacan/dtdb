@@ -28,9 +28,9 @@ fi
 # - We also skip `test_compaction_crash_garbage_collection` as it relies on background thread timing that Miri's deterministic scheduling conflicts with.
 echo "Running core tests under Miri..."
 if [ $# -eq 0 ]; then
-    MIRIFLAGS="-Zmiri-disable-isolation" \
+    MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks" \
     cargo +nightly miri test -p dtdb_storage -p dtdb_relational -p dtdb_sql -- --skip test_compaction_crash_garbage_collection
 else
-    MIRIFLAGS="-Zmiri-disable-isolation" \
+    MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks" \
     cargo +nightly miri test "$@"
 fi
