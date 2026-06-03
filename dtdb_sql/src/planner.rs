@@ -6,6 +6,7 @@ use sqlparser::ast::{
     BinaryOperator, ColumnOption, DataType as SqlDataType, Expr as SqlExpr, FunctionArg,
     FunctionArgExpr, Query, SelectItem, Statement, TableFactor, Value as SqlValue,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Represents a parsed and planned SQL statement.
@@ -1467,22 +1468,35 @@ impl LogicalPlanner {
                 })
             }
             // Subqueries plan their body into a LogicalPlan subtree (ADR 0005).
-            // Uncorrelated instances are folded to constants before execution; the
-            // correlation check that rejects the rest lands in a later step.
-            SqlExpr::Subquery(query) => Ok(Expr::ScalarSubquery(Box::new(self.plan_query(query)?))),
+            // Uncorrelated instances are folded to constants before execution;
+            // correlated ones are rejected here (`reject_if_correlated`).
+            SqlExpr::Subquery(query) => {
+                let subplan = self.plan_query(query)?;
+                reject_if_correlated(&subplan)?;
+                Ok(Expr::ScalarSubquery(Box::new(subplan)))
+            }
             SqlExpr::InSubquery {
                 expr,
                 subquery,
                 negated,
-            } => Ok(Expr::InSubquery {
-                expr: Box::new(self.plan_expr(expr)?),
-                subquery: Box::new(self.plan_query(subquery)?),
-                negated: *negated,
-            }),
-            SqlExpr::Exists { subquery, negated } => Ok(Expr::Exists {
-                subquery: Box::new(self.plan_query(subquery)?),
-                negated: *negated,
-            }),
+            } => {
+                let lhs = self.plan_expr(expr)?;
+                let subplan = self.plan_query(subquery)?;
+                reject_if_correlated(&subplan)?;
+                Ok(Expr::InSubquery {
+                    expr: Box::new(lhs),
+                    subquery: Box::new(subplan),
+                    negated: *negated,
+                })
+            }
+            SqlExpr::Exists { subquery, negated } => {
+                let subplan = self.plan_query(subquery)?;
+                reject_if_correlated(&subplan)?;
+                Ok(Expr::Exists {
+                    subquery: Box::new(subplan),
+                    negated: *negated,
+                })
+            }
             other => Err(format!("Unsupported expression: {:?}", other)),
         }
     }
@@ -1738,6 +1752,162 @@ impl LogicalPlanner {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// Rejects correlated subqueries (ADR 0005). A subquery is *correlated* when it
+/// references a column that its own `FROM` clause does not provide — such a
+/// reference can only resolve against an enclosing query, which dtdb does not
+/// support. Nested subqueries each get this check when they are planned, so a
+/// reference from an inner level to a middle level is caught at that level.
+///
+/// The check mirrors `compile_physical`'s binding: every expression is resolved
+/// against *its own node's input schema* (the source's output schema, exactly
+/// what binding sees), using the same name-matching as real column resolution.
+/// It therefore accepts precisely the subqueries that would bind successfully in
+/// isolation and flags exactly those with an unresolvable reference — no false
+/// positives on self-contained subqueries, and no false negatives from a
+/// projection passing a correlated column straight through as its output name.
+fn reject_if_correlated(plan: &LogicalPlan) -> Result<(), String> {
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::FullTextScan { .. } => Ok(()),
+        LogicalPlan::Filter { source, predicate } => {
+            check_expr_resolves(predicate, &source.schema())?;
+            reject_if_correlated(source)
+        }
+        LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } => {
+            let input = source.schema();
+            for e in expressions {
+                check_expr_resolves(e, &input)?;
+            }
+            reject_if_correlated(source)
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            schema,
+            ..
+        } => {
+            // The join's own schema is the concatenation of both inputs, i.e.
+            // exactly the columns the ON condition may reference.
+            check_expr_resolves(condition, schema)?;
+            reject_if_correlated(left)?;
+            reject_if_correlated(right)
+        }
+        LogicalPlan::Aggregate {
+            source,
+            group_by,
+            aggrs,
+            ..
+        } => {
+            let input = source.schema();
+            for e in group_by {
+                check_expr_resolves(e, &input)?;
+            }
+            for a in aggrs {
+                let inner = match a {
+                    AggregateExpr::Count { expr, .. }
+                    | AggregateExpr::Sum { expr, .. }
+                    | AggregateExpr::Min { expr, .. }
+                    | AggregateExpr::Max { expr, .. }
+                    | AggregateExpr::Avg { expr, .. } => expr,
+                };
+                check_expr_resolves(inner, &input)?;
+            }
+            reject_if_correlated(source)
+        }
+        LogicalPlan::Sort { source, keys } => {
+            let input = source.schema();
+            for (e, _) in keys {
+                check_expr_resolves(e, &input)?;
+            }
+            reject_if_correlated(source)
+        }
+        LogicalPlan::Limit { source, .. } | LogicalPlan::Distinct { source } => {
+            reject_if_correlated(source)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            reject_if_correlated(left)?;
+            reject_if_correlated(right)
+        }
+    }
+}
+
+/// Verifies every column referenced *directly* by `expr` (not inside a nested
+/// subquery, which has its own scope) resolves in `schema`. An unresolved
+/// reference means the subquery is correlated.
+fn check_expr_resolves(expr: &Expr, schema: &Schema) -> Result<(), String> {
+    let mut cols = HashSet::new();
+    collect_local_columns(expr, &mut cols);
+    for c in &cols {
+        if !schema.matches_column(c) {
+            return Err(format!(
+                "correlated subqueries are not supported: column '{c}' is not provided by the \
+                 subquery's own FROM clause"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Column names referenced by `expr`, *not* descending into nested subqueries
+/// (their references belong to their own scope). Mirrors [`Expr::collect_columns`]
+/// except for that boundary.
+fn collect_local_columns(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Column(name, _) => {
+            out.insert(name.clone());
+        }
+        Expr::Match { column, .. } => {
+            out.insert(column.clone());
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_local_columns(left, out);
+            collect_local_columns(right, out);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) => collect_local_columns(inner, out),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_local_columns(o, out);
+            }
+            for c in conditions {
+                collect_local_columns(c, out);
+            }
+            for r in results {
+                collect_local_columns(r, out);
+            }
+            if let Some(e) = else_result {
+                collect_local_columns(e, out);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_local_columns(a, out);
+            }
+        }
+        Expr::InList { expr, list } => {
+            collect_local_columns(expr, out);
+            for it in list {
+                collect_local_columns(it, out);
+            }
+        }
+        // Nested subqueries resolve in their own scope and are validated when
+        // planned; only the `IN` left-hand side is local to this subquery.
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } => {}
+        Expr::InSubquery { expr, .. } => collect_local_columns(expr, out),
     }
 }
 
