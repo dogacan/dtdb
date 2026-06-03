@@ -6216,3 +6216,279 @@ fn test_alter_table_drop_column() {
     let tx = Transaction::new(4, db.clone());
     assert!(engine.execute("SELECT score FROM t", &tx).is_err());
 }
+
+#[test]
+fn test_sql_date_time_timestamp_decimal() {
+    use chrono::{NaiveDate, NaiveTime};
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create table with Date, Time, Timestamp, and Decimal columns
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE test_types (
+                    id INT PRIMARY KEY,
+                    d DATE,
+                    t TIME,
+                    ts TIMESTAMP,
+                    dec DECIMAL
+                )",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 2. Insert values using typed literals
+    {
+        let tx = Transaction::new(2, db.clone());
+        engine
+            .execute(
+                "INSERT INTO test_types (id, d, t, ts, dec) VALUES (
+                    1,
+                    DATE '2026-06-02',
+                    TIME '12:34:56',
+                    TIMESTAMP '2026-06-02 12:34:56',
+                    DECIMAL '123.45'
+                )",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 3. Insert values using typed literals for Row 2
+    {
+        let tx = Transaction::new(3, db.clone());
+        engine
+            .execute(
+                "INSERT INTO test_types (id, d, t, ts, dec) VALUES (
+                    2,
+                    DATE '2026-06-03',
+                    TIME '13:45:00',
+                    TIMESTAMP '2026-06-03 13:45:00',
+                    DECIMAL '678.90'
+                )",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 3b. Test explicit CAST using SELECT
+    {
+        let tx = Transaction::new(100, db.clone());
+        let res = engine
+            .execute(
+                "SELECT
+                    CAST('2026-06-03' AS DATE),
+                    CAST('13:45:00' AS TIME),
+                    CAST('2026-06-03 13:45:00' AS TIMESTAMP),
+                    CAST('678.90' AS DECIMAL)
+                 FROM test_types WHERE id = 1",
+                &tx,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values[0],
+                DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 3).unwrap())
+            );
+            assert_eq!(
+                rows[0].values[1],
+                DbValue::Time(NaiveTime::from_hms_opt(13, 45, 0).unwrap())
+            );
+            assert_eq!(
+                rows[0].values[2],
+                DbValue::Timestamp(
+                    NaiveDate::from_ymd_opt(2026, 6, 3)
+                        .unwrap()
+                        .and_hms_opt(13, 45, 0)
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                rows[0].values[3],
+                DbValue::Decimal(Decimal::from_str("678.90").unwrap())
+            );
+        } else {
+            panic!("Expected Select result");
+        }
+    }
+
+    // 4. Select and assert the inserted values
+    {
+        let tx = Transaction::new(4, db.clone());
+        let res = engine
+            .execute(
+                "SELECT id, d, t, ts, dec FROM test_types ORDER BY id ASC",
+                &tx,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 2);
+
+            // Row 1
+            assert_eq!(rows[0].values[0], DbValue::Int(1));
+            assert_eq!(
+                rows[0].values[1],
+                DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap())
+            );
+            assert_eq!(
+                rows[0].values[2],
+                DbValue::Time(NaiveTime::from_hms_opt(12, 34, 56).unwrap())
+            );
+            assert_eq!(
+                rows[0].values[3],
+                DbValue::Timestamp(
+                    NaiveDate::from_ymd_opt(2026, 6, 2)
+                        .unwrap()
+                        .and_hms_opt(12, 34, 56)
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                rows[0].values[4],
+                DbValue::Decimal(Decimal::from_str("123.45").unwrap())
+            );
+
+            // Row 2
+            assert_eq!(rows[1].values[0], DbValue::Int(2));
+            assert_eq!(
+                rows[1].values[1],
+                DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 3).unwrap())
+            );
+            assert_eq!(
+                rows[1].values[2],
+                DbValue::Time(NaiveTime::from_hms_opt(13, 45, 0).unwrap())
+            );
+            assert_eq!(
+                rows[1].values[3],
+                DbValue::Timestamp(
+                    NaiveDate::from_ymd_opt(2026, 6, 3)
+                        .unwrap()
+                        .and_hms_opt(13, 45, 0)
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                rows[1].values[4],
+                DbValue::Decimal(Decimal::from_str("678.90").unwrap())
+            );
+        } else {
+            panic!("Expected Select result");
+        }
+    }
+
+    // 5. Test rejection of implicit coercion (Date / Decimal vs String)
+    {
+        let tx = Transaction::new(5, db.clone());
+
+        let res_date = engine.execute("SELECT * FROM test_types WHERE d = '2026-06-02'", &tx);
+        assert!(res_date.is_err());
+        assert!(res_date.unwrap_err().contains("Type mismatch"));
+
+        let res_dec = engine.execute("SELECT * FROM test_types WHERE dec = '123.45'", &tx);
+        assert!(res_dec.is_err());
+        assert!(res_dec.unwrap_err().contains("Type mismatch"));
+    }
+
+    // 6. Test arithmetic operations on Decimals (eval_arithmetic)
+    {
+        let tx = Transaction::new(6, db.clone());
+        let res = engine
+            .execute(
+                "SELECT dec + 10, dec * 2, dec - 100, dec / 2 FROM test_types WHERE id = 1",
+                &tx,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values[0],
+                DbValue::Decimal(Decimal::from_str("133.45").unwrap())
+            );
+            assert_eq!(
+                rows[0].values[1],
+                DbValue::Decimal(Decimal::from_str("246.90").unwrap())
+            );
+            assert_eq!(
+                rows[0].values[2],
+                DbValue::Decimal(Decimal::from_str("23.45").unwrap())
+            );
+            assert_eq!(
+                rows[0].values[3],
+                DbValue::Decimal(Decimal::from_str("61.725").unwrap())
+            );
+        } else {
+            panic!("Expected Select result");
+        }
+    }
+
+    // 7. Test aggregations (SUM and AVG)
+    {
+        let tx = Transaction::new(7, db.clone());
+        let res = engine
+            .execute("SELECT SUM(dec), AVG(dec) FROM test_types", &tx)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            // 123.45 + 678.90 = 802.35
+            assert_eq!(
+                rows[0].values[0],
+                DbValue::Decimal(Decimal::from_str("802.35").unwrap())
+            );
+            // 802.35 / 2 = 401.175
+            assert_eq!(
+                rows[0].values[1],
+                DbValue::Decimal(Decimal::from_str("401.175").unwrap())
+            );
+        } else {
+            panic!("Expected Select result");
+        }
+    }
+
+    // 8. Test secondary index on Date and Decimal columns
+    {
+        let tx = Transaction::new(8, db.clone());
+        engine
+            .execute("CREATE INDEX idx_d ON test_types (d)", &tx)
+            .unwrap();
+        engine
+            .execute("CREATE INDEX idx_dec ON test_types (dec)", &tx)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Query using indexes
+    {
+        let tx = Transaction::new(9, db.clone());
+        let res_idx_d = engine
+            .execute("SELECT id FROM test_types WHERE d = DATE '2026-06-02'", &tx)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res_idx_d {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], DbValue::Int(1));
+        } else {
+            panic!("Expected Select result");
+        }
+
+        let res_idx_dec = engine
+            .execute(
+                "SELECT id FROM test_types WHERE dec = DECIMAL '678.90'",
+                &tx,
+            )
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res_idx_dec {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], DbValue::Int(2));
+        } else {
+            panic!("Expected Select result");
+        }
+    }
+}

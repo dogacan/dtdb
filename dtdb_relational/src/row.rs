@@ -45,6 +45,7 @@ impl Row {
 
         let mut values = Vec::with_capacity(len);
         for i in 0..len {
+            let pre_tag_cursor = cursor;
             let tag = read_varint_u64(&mut cursor)?;
             let keep = projected.contains(&i);
 
@@ -101,6 +102,13 @@ impl Row {
                 }
                 // Null: no payload.
                 5 => values.push(DbValue::Null),
+                // Date, Time, Timestamp, Decimal: deserialize directly using postcard
+                6..=9 => {
+                    let (val, remaining) = postcard::take_from_bytes::<DbValue>(pre_tag_cursor)
+                        .map_err(|e| corruption(format!("Failed to deserialize DbValue: {}", e)))?;
+                    cursor = remaining;
+                    values.push(if keep { val } else { DbValue::Null });
+                }
                 other => {
                     return Err(corruption(format!(
                         "Unknown DbValue variant tag: {}",

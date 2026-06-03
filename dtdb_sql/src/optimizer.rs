@@ -1,8 +1,10 @@
 use crate::expr::{Expr, Operator};
 use crate::logical::{JoinType, LogicalPlan, PlanKey, SetOpType};
+use chrono;
 use dtdb_relational::{DataType, Database, Schema};
 use dtdb_storage::DbKey;
 use dtdb_storage::DbValue;
+use rust_decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -926,6 +928,10 @@ fn is_key_unbounded_min(key: &DbKey) -> bool {
         DbKey::Int(v) => *v == i64::MIN,
         DbKey::String(s) => s.is_empty(),
         DbKey::Bool(b) => !*b,
+        DbKey::Date(d) => *d == chrono::NaiveDate::MIN,
+        DbKey::Time(t) => *t == chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        DbKey::Timestamp(ts) => *ts == chrono::NaiveDateTime::MIN,
+        DbKey::Decimal(dec) => *dec == rust_decimal::Decimal::MIN,
         DbKey::Composite(parts) => parts.first().is_none_or(is_key_unbounded_min),
     }
 }
@@ -935,6 +941,12 @@ fn is_key_unbounded_max(key: &DbKey) -> bool {
         DbKey::Int(v) => *v == i64::MAX,
         DbKey::String(s) => &**s == "\u{10ffff}",
         DbKey::Bool(b) => *b,
+        DbKey::Date(d) => *d == chrono::NaiveDate::MAX,
+        DbKey::Time(t) => {
+            *t == chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap()
+        }
+        DbKey::Timestamp(ts) => *ts == chrono::NaiveDateTime::MAX,
+        DbKey::Decimal(dec) => *dec == rust_decimal::Decimal::MAX,
         DbKey::Composite(parts) => parts.first().is_none_or(is_key_unbounded_max),
     }
 }
@@ -975,6 +987,10 @@ fn val_to_key(val: &DbValue) -> Option<DbKey> {
     match val {
         DbValue::Int(v) => Some(DbKey::Int(*v)),
         DbValue::String(s) => Some(DbKey::String(s.clone())),
+        DbValue::Date(d) => Some(DbKey::Date(*d)),
+        DbValue::Time(t) => Some(DbKey::Time(*t)),
+        DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
+        DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
         _ => None,
     }
 }
@@ -1066,6 +1082,17 @@ fn extract_bounds_for_column(
                         };
                         let end = match col_type {
                             DataType::Int => PlanKey::Value(DbKey::Int(i64::MAX)),
+                            DataType::Date => PlanKey::Value(DbKey::Date(chrono::NaiveDate::MAX)),
+                            DataType::Time => PlanKey::Value(DbKey::Time(
+                                chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999)
+                                    .unwrap(),
+                            )),
+                            DataType::Timestamp => {
+                                PlanKey::Value(DbKey::Timestamp(chrono::NaiveDateTime::MAX))
+                            }
+                            DataType::Decimal => {
+                                PlanKey::Value(DbKey::Decimal(rust_decimal::Decimal::MAX))
+                            }
                             _ => PlanKey::Value(DbKey::string("\u{10ffff}")),
                         };
                         Some((start, end))
@@ -1073,6 +1100,16 @@ fn extract_bounds_for_column(
                     Operator::LtEq | Operator::Lt => {
                         let start = match col_type {
                             DataType::Int => PlanKey::Value(DbKey::Int(i64::MIN)),
+                            DataType::Date => PlanKey::Value(DbKey::Date(chrono::NaiveDate::MIN)),
+                            DataType::Time => PlanKey::Value(DbKey::Time(
+                                chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                            )),
+                            DataType::Timestamp => {
+                                PlanKey::Value(DbKey::Timestamp(chrono::NaiveDateTime::MIN))
+                            }
+                            DataType::Decimal => {
+                                PlanKey::Value(DbKey::Decimal(rust_decimal::Decimal::MIN))
+                            }
                             _ => PlanKey::Value(DbKey::string("")),
                         };
                         let end = match key {

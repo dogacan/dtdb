@@ -126,6 +126,10 @@ impl SstableWriter {
             Some(DbValue::Bytes(b)) => b.len(),
             Some(DbValue::Null) => 1,
             Some(DbValue::Bool(_)) => 1,
+            Some(DbValue::Date(_)) => 4,
+            Some(DbValue::Time(_)) => 8,
+            Some(DbValue::Timestamp(_)) => 8,
+            Some(DbValue::Decimal(_)) => 16,
             None => 1,
         };
 

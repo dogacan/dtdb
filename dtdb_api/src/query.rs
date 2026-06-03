@@ -75,6 +75,18 @@ impl SqlQuery {
                             DbValue::Null => {
                                 result.push_str("NULL");
                             }
+                            DbValue::Date(d) => {
+                                result.push_str(&format!("DATE '{}'", d));
+                            }
+                            DbValue::Time(t) => {
+                                result.push_str(&format!("TIME '{}'", t));
+                            }
+                            DbValue::Timestamp(ts) => {
+                                result.push_str(&format!("TIMESTAMP '{}'", ts));
+                            }
+                            DbValue::Decimal(dec) => {
+                                result.push_str(&dec.to_string());
+                            }
                         }
                     } else {
                         return Err(format!("Unbound query parameter: @{}", name));

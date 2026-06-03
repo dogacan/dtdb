@@ -1324,6 +1324,10 @@ impl SqlEngine {
                 }
                 return Ok(());
             }
+            Expr::Cast { expr, .. } => {
+                self.fold_expr(expr, tx, params)?;
+                return Ok(());
+            }
             Expr::Column(..) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Match { .. } => {
                 return Ok(());
             }
@@ -1985,6 +1989,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
         Expr::InList { expr, list } => {
             expr_contains_subquery(expr) || list.iter().any(expr_contains_subquery)
         }
+        Expr::Cast { expr, .. } => expr_contains_subquery(expr),
         Expr::Column(..) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Match { .. } => false,
     }
 }

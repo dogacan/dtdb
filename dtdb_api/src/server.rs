@@ -360,6 +360,10 @@ pub(crate) fn execution_result_to_responses(
                         DbValue::Bytes(b) => format!("{:?}", b),
                         DbValue::Bool(b) => b.to_string(),
                         DbValue::Null => "NULL".to_string(),
+                        DbValue::Date(d) => d.to_string(),
+                        DbValue::Time(t) => t.to_string(),
+                        DbValue::Timestamp(ts) => ts.to_string(),
+                        DbValue::Decimal(dec) => dec.to_string(),
                     })
                     .collect();
 
@@ -499,6 +503,10 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                         DbValue::Bytes(b) => format!("{:?}", b),
                                         DbValue::Bool(b) => b.to_string(),
                                         DbValue::Null => "NULL".to_string(),
+                                        DbValue::Date(d) => d.to_string(),
+                                        DbValue::Time(t) => t.to_string(),
+                                        DbValue::Timestamp(ts) => ts.to_string(),
+                                        DbValue::Decimal(dec) => dec.to_string(),
                                     })
                                     .collect();
                                 responses.push(ExecuteQueryResponse {
@@ -770,6 +778,10 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                                         DbValue::Bytes(b) => format!("{:?}", b),
                                                         DbValue::Bool(b) => b.to_string(),
                                                         DbValue::Null => "NULL".to_string(),
+                                                        DbValue::Date(d) => d.to_string(),
+                                                        DbValue::Time(t) => t.to_string(),
+                                                        DbValue::Timestamp(ts) => ts.to_string(),
+                                                        DbValue::Decimal(dec) => dec.to_string(),
                                                     })
                                                     .collect();
                                                 responses.push(ExecuteQueryResponse {

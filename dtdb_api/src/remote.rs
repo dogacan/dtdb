@@ -379,6 +379,14 @@ fn db_params_to_proto_params(bindings: &[(String, DbValue)]) -> Vec<crate::proto
                     DbValue::String(s) => crate::proto::param_value::Val::StringVal(s.to_string()),
                     DbValue::Bytes(b) => crate::proto::param_value::Val::BytesVal(b.to_vec()),
                     DbValue::Null => crate::proto::param_value::Val::NullVal(true),
+                    DbValue::Date(d) => crate::proto::param_value::Val::StringVal(d.to_string()),
+                    DbValue::Time(t) => crate::proto::param_value::Val::StringVal(t.to_string()),
+                    DbValue::Timestamp(ts) => {
+                        crate::proto::param_value::Val::StringVal(ts.to_string())
+                    }
+                    DbValue::Decimal(dec) => {
+                        crate::proto::param_value::Val::StringVal(dec.to_string())
+                    }
                 }),
             }),
         })

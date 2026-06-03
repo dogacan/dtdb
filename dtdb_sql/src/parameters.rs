@@ -20,6 +20,25 @@ fn db_value_to_sql_expr(val: &DbValue) -> SqlExpr {
             }
             SqlExpr::Value(SqlValue::HexStringLiteral(hex).into())
         }
+        DbValue::Decimal(dec) => SqlExpr::Value(SqlValue::Number(dec.to_string(), false).into()),
+        DbValue::Date(d) => SqlExpr::TypedString(sqlparser::ast::TypedString {
+            data_type: sqlparser::ast::DataType::Date,
+            value: sqlparser::ast::Value::SingleQuotedString(d.to_string()).into(),
+            uses_odbc_syntax: false,
+        }),
+        DbValue::Time(t) => SqlExpr::TypedString(sqlparser::ast::TypedString {
+            data_type: sqlparser::ast::DataType::Time(None, sqlparser::ast::TimezoneInfo::None),
+            value: sqlparser::ast::Value::SingleQuotedString(t.to_string()).into(),
+            uses_odbc_syntax: false,
+        }),
+        DbValue::Timestamp(ts) => SqlExpr::TypedString(sqlparser::ast::TypedString {
+            data_type: sqlparser::ast::DataType::Timestamp(
+                None,
+                sqlparser::ast::TimezoneInfo::None,
+            ),
+            value: sqlparser::ast::Value::SingleQuotedString(ts.to_string()).into(),
+            uses_odbc_syntax: false,
+        }),
     }
 }
 

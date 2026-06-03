@@ -14,6 +14,10 @@ pub enum DataType {
     Bytes,
     Null,
     Bool,
+    Date,
+    Time,
+    Timestamp,
+    Decimal,
 }
 
 fn default_nullable() -> bool {
@@ -334,6 +338,10 @@ impl Schema {
                 (DataType::String, DbValue::String(_)) => {}
                 (DataType::Bytes, DbValue::Bytes(_)) => {}
                 (DataType::Bool, DbValue::Bool(_)) => {}
+                (DataType::Date, DbValue::Date(_)) => {}
+                (DataType::Time, DbValue::Time(_)) => {}
+                (DataType::Timestamp, DbValue::Timestamp(_)) => {}
+                (DataType::Decimal, DbValue::Decimal(_)) => {}
                 (expected, actual) => {
                     return Err(RelationalError::SchemaMismatch(format!(
                         "Column '{}' (index {}) expects type {:?}, but got value {:?}",
@@ -362,6 +370,10 @@ impl Schema {
                 (DataType::Int, DbKey::Int(_)) => {}
                 (DataType::String, DbKey::String(_)) => {}
                 (DataType::Bool, DbKey::Bool(_)) => {}
+                (DataType::Date, DbKey::Date(_)) => {}
+                (DataType::Time, DbKey::Time(_)) => {}
+                (DataType::Timestamp, DbKey::Timestamp(_)) => {}
+                (DataType::Decimal, DbKey::Decimal(_)) => {}
                 (expected, actual_key) => {
                     return Err(RelationalError::SchemaMismatch(format!(
                         "Primary key column '{}' expects {:?}, but key is {:?}",
@@ -374,6 +386,10 @@ impl Schema {
                 (DbKey::Int(kv), DbValue::Int(vv)) if kv == vv => {}
                 (DbKey::String(kv), DbValue::String(vv)) if kv == vv => {}
                 (DbKey::Bool(kv), DbValue::Bool(vv)) if kv == vv => {}
+                (DbKey::Date(kv), DbValue::Date(vv)) if kv == vv => {}
+                (DbKey::Time(kv), DbValue::Time(vv)) if kv == vv => {}
+                (DbKey::Timestamp(kv), DbValue::Timestamp(vv)) if kv == vv => {}
+                (DbKey::Decimal(kv), DbValue::Decimal(vv)) if kv == vv => {}
                 (kv, vv) => {
                     return Err(RelationalError::SchemaMismatch(format!(
                         "Key mismatch: primary key value in Row is {:?}, but passed key is {:?}",
@@ -430,6 +446,10 @@ impl Schema {
                 (DataType::Int, DbKey::Int(_)) => Ok(()),
                 (DataType::String, DbKey::String(_)) => Ok(()),
                 (DataType::Bool, DbKey::Bool(_)) => Ok(()),
+                (DataType::Date, DbKey::Date(_)) => Ok(()),
+                (DataType::Time, DbKey::Time(_)) => Ok(()),
+                (DataType::Timestamp, DbKey::Timestamp(_)) => Ok(()),
+                (DataType::Decimal, DbKey::Decimal(_)) => Ok(()),
                 (expected, actual_key) => Err(RelationalError::SchemaMismatch(format!(
                     "Primary key column '{}' expects {:?}, but key is {:?}",
                     col.name, expected, actual_key
@@ -488,6 +508,10 @@ impl Schema {
                 DbValue::Int(v) => Ok(DbKey::Int(*v)),
                 DbValue::String(s) => Ok(DbKey::String(s.clone())),
                 DbValue::Bool(b) => Ok(DbKey::Bool(*b)),
+                DbValue::Date(d) => Ok(DbKey::Date(*d)),
+                DbValue::Time(t) => Ok(DbKey::Time(*t)),
+                DbValue::Timestamp(ts) => Ok(DbKey::Timestamp(*ts)),
+                DbValue::Decimal(dec) => Ok(DbKey::Decimal(*dec)),
                 DbValue::Null => Err(RelationalError::SchemaMismatch(
                     "Primary key cannot be NULL".to_string(),
                 )),
@@ -504,6 +528,10 @@ impl Schema {
                     DbValue::Int(v) => DbKey::Int(*v),
                     DbValue::String(s) => DbKey::String(s.clone()),
                     DbValue::Bool(b) => DbKey::Bool(*b),
+                    DbValue::Date(d) => DbKey::Date(*d),
+                    DbValue::Time(t) => DbKey::Time(*t),
+                    DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
+                    DbValue::Decimal(dec) => DbKey::Decimal(*dec),
                     DbValue::Null => {
                         return Err(RelationalError::SchemaMismatch(
                             "Primary key cannot be NULL".to_string(),
@@ -534,6 +562,22 @@ impl Schema {
         let get_bounds = |dt: DataType| match dt {
             DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
             DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
+            DataType::Date => (
+                DbKey::Date(chrono::NaiveDate::MIN),
+                DbKey::Date(chrono::NaiveDate::MAX),
+            ),
+            DataType::Time => (
+                DbKey::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
+                DbKey::Time(chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap()),
+            ),
+            DataType::Timestamp => (
+                DbKey::Timestamp(chrono::NaiveDateTime::MIN),
+                DbKey::Timestamp(chrono::NaiveDateTime::MAX),
+            ),
+            DataType::Decimal => (
+                DbKey::Decimal(rust_decimal::Decimal::MIN),
+                DbKey::Decimal(rust_decimal::Decimal::MAX),
+            ),
             _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
         };
 

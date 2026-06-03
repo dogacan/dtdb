@@ -31,6 +31,10 @@ fn value_byte_size(val: &DbValue) -> usize {
         DbValue::Bytes(b) => b.len(),
         DbValue::Bool(_) => 1,
         DbValue::Null => 1,
+        DbValue::Date(_) => 4,
+        DbValue::Time(_) => 8,
+        DbValue::Timestamp(_) => 8,
+        DbValue::Decimal(_) => 16,
     }
 }
 

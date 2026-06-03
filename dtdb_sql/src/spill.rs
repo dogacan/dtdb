@@ -24,6 +24,10 @@ fn type_rank(v: &DbValue) -> u8 {
         DbValue::Float(_) => 3,
         DbValue::String(_) => 4,
         DbValue::Bytes(_) => 5,
+        DbValue::Date(_) => 6,
+        DbValue::Time(_) => 7,
+        DbValue::Timestamp(_) => 8,
+        DbValue::Decimal(_) => 9,
     }
 }
 
@@ -58,6 +62,10 @@ pub fn total_compare(l: &DbValue, r: &DbValue) -> Ordering {
         (DbValue::Float(a), DbValue::Float(b)) => total_f64(*a, *b),
         (DbValue::String(a), DbValue::String(b)) => a.cmp(b),
         (DbValue::Bytes(a), DbValue::Bytes(b)) => a.cmp(b),
+        (DbValue::Date(a), DbValue::Date(b)) => a.cmp(b),
+        (DbValue::Time(a), DbValue::Time(b)) => a.cmp(b),
+        (DbValue::Timestamp(a), DbValue::Timestamp(b)) => a.cmp(b),
+        (DbValue::Decimal(a), DbValue::Decimal(b)) => a.cmp(b),
         _ => Ordering::Equal,
     }
 }

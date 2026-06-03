@@ -297,7 +297,23 @@ impl LogicalPlan {
                 AggregateExpr::Count { .. } => DataType::Int,
                 // AVG always produces a fractional value; runtime emits Float
                 // regardless of input type, so the schema must match.
-                AggregateExpr::Avg { .. } => DataType::Float,
+                AggregateExpr::Avg { expr, .. } => {
+                    let mut is_decimal = false;
+                    if let Expr::Column(col_name, _) = expr
+                        && let Some(pos) = source_schema
+                            .columns
+                            .iter()
+                            .position(|c| c.matches_name(col_name))
+                        && source_schema.columns[pos].data_type == DataType::Decimal
+                    {
+                        is_decimal = true;
+                    }
+                    if is_decimal {
+                        DataType::Decimal
+                    } else {
+                        DataType::Float
+                    }
+                }
                 AggregateExpr::Sum { expr, .. }
                 | AggregateExpr::Min { expr, .. }
                 | AggregateExpr::Max { expr, .. } => match expr {
@@ -573,6 +589,10 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
             dtdb_storage::DbValue::Bytes(_) => DataType::Bytes,
             dtdb_storage::DbValue::Bool(_) => DataType::Bool,
             dtdb_storage::DbValue::Null => DataType::Null,
+            dtdb_storage::DbValue::Date(_) => DataType::Date,
+            dtdb_storage::DbValue::Time(_) => DataType::Time,
+            dtdb_storage::DbValue::Timestamp(_) => DataType::Timestamp,
+            dtdb_storage::DbValue::Decimal(_) => DataType::Decimal,
         },
         Expr::Column(col_name, _) => {
             let idx = source_schema
@@ -638,6 +658,7 @@ fn infer_expr_type(expr: &Expr, source_schema: &Schema) -> DataType {
         Expr::Exists { .. } => DataType::Bool,
         // A parameter's type is unknown until it is bound to a value.
         Expr::Parameter(_) => DataType::Null,
+        Expr::Cast { target_type, .. } => *target_type,
     }
 }
 

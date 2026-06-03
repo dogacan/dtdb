@@ -1,7 +1,9 @@
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 /// Operator represents binary operations in SQL WHERE conditions.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,10 @@ pub enum Expr {
         subquery: Box<crate::logical::LogicalPlan>,
         negated: bool,
     },
+    Cast {
+        expr: Box<Expr>,
+        target_type: dtdb_relational::DataType,
+    },
 }
 
 impl Expr {
@@ -139,6 +145,9 @@ impl Expr {
             Expr::InSubquery { expr, subquery, .. } => {
                 expr.collect_columns(columns);
                 subquery.collect_columns(columns);
+            }
+            Expr::Cast { expr, .. } => {
+                expr.collect_columns(columns);
             }
         }
     }
@@ -203,6 +212,7 @@ impl Expr {
             // outer-facing left-hand side of an `IN (subquery)` binds here.
             Expr::ScalarSubquery(_) | Expr::Exists { .. } => Ok(()),
             Expr::InSubquery { expr, .. } => expr.bind_columns(schema),
+            Expr::Cast { expr, .. } => expr.bind_columns(schema),
         }
     }
 
@@ -265,6 +275,7 @@ impl Expr {
                 expr.substitute_params(params)?;
                 subquery.substitute_params(params)
             }
+            Expr::Cast { expr, .. } => expr.substitute_params(params),
         }
     }
 }
@@ -447,6 +458,10 @@ impl Expr {
                                 .ok_or_else(|| "Integer overflow".to_string())
                         },
                         |a, b| Ok(a + b),
+                        |a, b| {
+                            a.checked_add(b)
+                                .ok_or_else(|| "Decimal addition overflow".to_string())
+                        },
                     ),
                     Operator::Sub => eval_arithmetic(
                         &l_val,
@@ -456,6 +471,10 @@ impl Expr {
                                 .ok_or_else(|| "Integer overflow".to_string())
                         },
                         |a, b| Ok(a - b),
+                        |a, b| {
+                            a.checked_sub(b)
+                                .ok_or_else(|| "Decimal subtraction overflow".to_string())
+                        },
                     ),
                     Operator::Mul => eval_arithmetic(
                         &l_val,
@@ -465,10 +484,15 @@ impl Expr {
                                 .ok_or_else(|| "Integer overflow".to_string())
                         },
                         |a, b| Ok(a * b),
+                        |a, b| {
+                            a.checked_mul(b)
+                                .ok_or_else(|| "Decimal multiplication overflow".to_string())
+                        },
                     ),
                     Operator::Div => match r_val {
                         DbValue::Int(0) => Err("Division by zero".to_string()),
                         DbValue::Float(0.0) => Err("Division by zero".to_string()),
+                        DbValue::Decimal(d) if d.is_zero() => Err("Division by zero".to_string()),
                         _ => eval_arithmetic(
                             &l_val,
                             &r_val,
@@ -477,6 +501,10 @@ impl Expr {
                                     .ok_or_else(|| "Integer overflow".to_string())
                             },
                             |a, b| Ok(a / b),
+                            |a, b| {
+                                a.checked_div(b)
+                                    .ok_or_else(|| "Decimal division overflow".to_string())
+                            },
                         ),
                     },
                     other_op => {
@@ -805,6 +833,10 @@ impl Expr {
                     Ok(DbValue::Bool(false))
                 }
             }
+            Expr::Cast { expr, target_type } => {
+                let val = expr.eval(row, schema)?;
+                cast_value(val, *target_type)
+            }
             // Subqueries must be folded to literals before execution (see ADR
             // 0005). Reaching here means the engine's fold pass was skipped.
             Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => Err(
@@ -823,6 +855,10 @@ fn coerce_to_string(val: &DbValue) -> String {
         DbValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         DbValue::Bool(b) => b.to_string(),
         DbValue::Null => "NULL".to_string(),
+        DbValue::Date(d) => d.to_string(),
+        DbValue::Time(t) => t.to_string(),
+        DbValue::Timestamp(ts) => ts.to_string(),
+        DbValue::Decimal(dec) => dec.to_string(),
     }
 }
 
@@ -841,6 +877,108 @@ fn to_string_val(val: &DbValue) -> Result<String, String> {
     match val {
         DbValue::String(s) => Ok(s.to_string()),
         other => Err(format!("Expected string value, got: {:?}", other)),
+    }
+}
+
+pub fn cast_value(val: DbValue, target: dtdb_relational::DataType) -> Result<DbValue, String> {
+    if matches!(val, DbValue::Null) {
+        return Ok(DbValue::Null);
+    }
+    match target {
+        dtdb_relational::DataType::Int => match val {
+            DbValue::Int(v) => Ok(DbValue::Int(v)),
+            DbValue::Float(f) => Ok(DbValue::Int(f as i64)),
+            DbValue::Decimal(d) => d
+                .to_i64()
+                .map(DbValue::Int)
+                .ok_or_else(|| format!("Decimal conversion to i64 failed for {}", d)),
+            DbValue::Bool(b) => Ok(DbValue::Int(if b { 1 } else { 0 })),
+            DbValue::String(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(DbValue::Int)
+                .map_err(|e| format!("Failed to cast string to INT: {}", e)),
+            other => Err(format!("Cannot cast {:?} to INT", other)),
+        },
+        dtdb_relational::DataType::Float => match val {
+            DbValue::Int(v) => Ok(DbValue::Float(v as f64)),
+            DbValue::Float(f) => Ok(DbValue::Float(f)),
+            DbValue::Decimal(d) => d
+                .to_f64()
+                .map(DbValue::Float)
+                .ok_or_else(|| format!("Decimal conversion to f64 failed for {}", d)),
+            DbValue::Bool(b) => Ok(DbValue::Float(if b { 1.0 } else { 0.0 })),
+            DbValue::String(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(DbValue::Float)
+                .map_err(|e| format!("Failed to cast string to FLOAT: {}", e)),
+            other => Err(format!("Cannot cast {:?} to FLOAT", other)),
+        },
+        dtdb_relational::DataType::Decimal => match val {
+            DbValue::Int(v) => Ok(DbValue::Decimal(rust_decimal::Decimal::from(v))),
+            DbValue::Float(f) => rust_decimal::Decimal::from_f64(f)
+                .map(DbValue::Decimal)
+                .ok_or_else(|| format!("Float conversion to Decimal failed for {}", f)),
+            DbValue::Decimal(d) => Ok(DbValue::Decimal(d)),
+            DbValue::String(s) => rust_decimal::Decimal::from_str(&s)
+                .map(DbValue::Decimal)
+                .map_err(|e| format!("Failed to cast string to DECIMAL: {}", e)),
+            other => Err(format!("Cannot cast {:?} to DECIMAL", other)),
+        },
+        dtdb_relational::DataType::String => Ok(DbValue::string(coerce_to_string(&val))),
+        dtdb_relational::DataType::Bytes => match val {
+            DbValue::Bytes(b) => Ok(DbValue::Bytes(b)),
+            DbValue::String(s) => Ok(DbValue::Bytes(s.as_bytes().into())),
+            other => Err(format!("Cannot cast {:?} to BYTES", other)),
+        },
+        dtdb_relational::DataType::Bool => {
+            let b = to_bool(&val)?;
+            Ok(DbValue::Bool(b))
+        }
+        dtdb_relational::DataType::Null => Ok(DbValue::Null),
+        dtdb_relational::DataType::Date => match val {
+            DbValue::Date(d) => Ok(DbValue::Date(d)),
+            DbValue::Timestamp(ts) => Ok(DbValue::Date(ts.date())),
+            DbValue::String(s) => s
+                .trim()
+                .parse::<chrono::NaiveDate>()
+                .map(DbValue::Date)
+                .map_err(|e| format!("Failed to parse date '{}': {}", s, e)),
+            other => Err(format!("Cannot cast {:?} to DATE", other)),
+        },
+        dtdb_relational::DataType::Time => match val {
+            DbValue::Time(t) => Ok(DbValue::Time(t)),
+            DbValue::String(s) => s
+                .trim()
+                .parse::<chrono::NaiveTime>()
+                .map(DbValue::Time)
+                .map_err(|e| format!("Failed to parse time '{}': {}", s, e)),
+            other => Err(format!("Cannot cast {:?} to TIME", other)),
+        },
+        dtdb_relational::DataType::Timestamp => match val {
+            DbValue::Timestamp(ts) => Ok(DbValue::Timestamp(ts)),
+            DbValue::Date(d) => Ok(DbValue::Timestamp(d.and_hms_opt(0, 0, 0).unwrap())),
+            DbValue::String(s) => {
+                let trimmed = s.trim();
+                if let Ok(dt) = trimmed.parse::<chrono::NaiveDateTime>() {
+                    Ok(DbValue::Timestamp(dt))
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+                {
+                    Ok(DbValue::Timestamp(dt))
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
+                {
+                    Ok(DbValue::Timestamp(dt))
+                } else if let Ok(d) = trimmed.parse::<chrono::NaiveDate>() {
+                    Ok(DbValue::Timestamp(d.and_hms_opt(0, 0, 0).unwrap()))
+                } else {
+                    Err(format!("Failed to parse timestamp '{}'", s))
+                }
+            }
+            other => Err(format!("Cannot cast {:?} to TIMESTAMP", other)),
+        },
     }
 }
 
@@ -864,6 +1002,33 @@ pub(crate) fn compare_values(l: &DbValue, r: &DbValue) -> Result<std::cmp::Order
         (DbValue::Int(lv), DbValue::Bool(rv)) => Ok(lv.cmp(&(*rv as i64))),
         (DbValue::String(lv), DbValue::String(rv)) => Ok(lv.cmp(rv)),
         (DbValue::Bytes(lv), DbValue::Bytes(rv)) => Ok(lv.cmp(rv)),
+
+        // Decimal comparisons and promotions
+        (DbValue::Decimal(lv), DbValue::Decimal(rv)) => Ok(lv.cmp(rv)),
+        (DbValue::Decimal(lv), DbValue::Int(rv)) => Ok(lv.cmp(&rust_decimal::Decimal::from(*rv))),
+        (DbValue::Int(lv), DbValue::Decimal(rv)) => Ok(rust_decimal::Decimal::from(*lv).cmp(rv)),
+        (DbValue::Decimal(lv), DbValue::Float(rv)) => {
+            if let Some(lf) = lv.to_f64() {
+                lf.partial_cmp(rv)
+                    .ok_or_else(|| "NaN float comparison".to_string())
+            } else {
+                Err("Decimal to float conversion failed".to_string())
+            }
+        }
+        (DbValue::Float(lv), DbValue::Decimal(rv)) => {
+            if let Some(rf) = rv.to_f64() {
+                lv.partial_cmp(&rf)
+                    .ok_or_else(|| "NaN float comparison".to_string())
+            } else {
+                Err("Decimal to float conversion failed".to_string())
+            }
+        }
+
+        // Homogeneous temporal comparisons
+        (DbValue::Date(lv), DbValue::Date(rv)) => Ok(lv.cmp(rv)),
+        (DbValue::Time(lv), DbValue::Time(rv)) => Ok(lv.cmp(rv)),
+        (DbValue::Timestamp(lv), DbValue::Timestamp(rv)) => Ok(lv.cmp(rv)),
+
         (expected, actual) => Err(format!(
             "Type mismatch: cannot compare {:?} and {:?}",
             expected, actual
@@ -939,21 +1104,49 @@ fn like_pattern_to_regex(pattern: &str) -> String {
 }
 
 /// Helper to evaluate arithmetic operations on DbValues with promotion logic.
-fn eval_arithmetic<FI, FF>(
+fn eval_arithmetic<FI, FF, FD>(
     l: &DbValue,
     r: &DbValue,
     int_op: FI,
     float_op: FF,
+    decimal_op: FD,
 ) -> Result<DbValue, String>
 where
     FI: FnOnce(i64, i64) -> Result<i64, String>,
     FF: FnOnce(f64, f64) -> Result<f64, String>,
+    FD: FnOnce(
+        rust_decimal::Decimal,
+        rust_decimal::Decimal,
+    ) -> Result<rust_decimal::Decimal, String>,
 {
     match (l, r) {
         (DbValue::Int(lv), DbValue::Int(rv)) => Ok(DbValue::Int(int_op(*lv, *rv)?)),
         (DbValue::Float(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv, *rv)?)),
         (DbValue::Int(lv), DbValue::Float(rv)) => Ok(DbValue::Float(float_op(*lv as f64, *rv)?)),
         (DbValue::Float(lv), DbValue::Int(rv)) => Ok(DbValue::Float(float_op(*lv, *rv as f64)?)),
+        (DbValue::Decimal(lv), DbValue::Decimal(rv)) => Ok(DbValue::Decimal(decimal_op(*lv, *rv)?)),
+        (DbValue::Decimal(lv), DbValue::Int(rv)) => {
+            let rv_dec = rust_decimal::Decimal::from(*rv);
+            Ok(DbValue::Decimal(decimal_op(*lv, rv_dec)?))
+        }
+        (DbValue::Int(lv), DbValue::Decimal(rv)) => {
+            let lv_dec = rust_decimal::Decimal::from(*lv);
+            Ok(DbValue::Decimal(decimal_op(lv_dec, *rv)?))
+        }
+        (DbValue::Decimal(lv), DbValue::Float(rv)) => {
+            if let Some(lf) = lv.to_f64() {
+                Ok(DbValue::Float(float_op(lf, *rv)?))
+            } else {
+                Err("Decimal to float conversion failed for arithmetic operation".to_string())
+            }
+        }
+        (DbValue::Float(lv), DbValue::Decimal(rv)) => {
+            if let Some(rf) = rv.to_f64() {
+                Ok(DbValue::Float(float_op(*lv, rf)?))
+            } else {
+                Err("Decimal to float conversion failed for arithmetic operation".to_string())
+            }
+        }
         (expected, actual) => Err(format!(
             "Cannot perform arithmetic on non-numeric types: {:?} and {:?}",
             expected, actual
@@ -1684,5 +1877,132 @@ mod tests {
         // Binding an unknown column errors.
         let mut bad = Expr::Column("missing".to_string(), None);
         assert!(bad.bind_columns(&schema).is_err());
+    }
+
+    #[test]
+    fn test_date_time_timestamp_decimal_eval_and_cast() {
+        use chrono::{NaiveDate, NaiveTime};
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        // 1. Check CAST conversions from strings
+        assert_eq!(
+            cast_value(DbValue::string("2026-06-02"), DataType::Date).unwrap(),
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap())
+        );
+        assert_eq!(
+            cast_value(DbValue::string("12:34:56"), DataType::Time).unwrap(),
+            DbValue::Time(NaiveTime::from_hms_opt(12, 34, 56).unwrap())
+        );
+        assert_eq!(
+            cast_value(DbValue::string("2026-06-02 12:34:56"), DataType::Timestamp).unwrap(),
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 2)
+                    .unwrap()
+                    .and_hms_opt(12, 34, 56)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            cast_value(DbValue::string("123.45"), DataType::Decimal).unwrap(),
+            DbValue::Decimal(Decimal::from_str("123.45").unwrap())
+        );
+
+        // 2. Check conversions to target types
+        // Date to Timestamp (with 00:00:00 time)
+        let d_val = DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap());
+        assert_eq!(
+            cast_value(d_val.clone(), DataType::Timestamp).unwrap(),
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 2)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+            )
+        );
+        // Timestamp to Date (truncating time)
+        let ts_val = DbValue::Timestamp(
+            NaiveDate::from_ymd_opt(2026, 6, 2)
+                .unwrap()
+                .and_hms_opt(12, 34, 56)
+                .unwrap(),
+        );
+        assert_eq!(cast_value(ts_val, DataType::Date).unwrap(), d_val.clone());
+
+        // 3. Comparisons (homogeneous and heterogeneous promotions)
+        let dec_val1 = DbValue::Decimal(Decimal::from_str("100.5").unwrap());
+        let dec_val2 = DbValue::Decimal(Decimal::from_str("200.5").unwrap());
+        assert_eq!(
+            compare_values(&dec_val1, &dec_val2).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&dec_val1, &DbValue::Int(100)).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_values(&dec_val1, &DbValue::Float(100.5)).unwrap(),
+            std::cmp::Ordering::Equal
+        );
+
+        // Rejection of implicit coercion (Date/Time/Timestamp vs String)
+        assert!(compare_values(&d_val, &DbValue::string("2026-06-02")).is_err());
+        assert!(compare_values(&dec_val1, &DbValue::string("100.5")).is_err());
+
+        // 4. Decimal Arithmetic
+        let dec_left = DbValue::Decimal(Decimal::from_str("10.5").unwrap());
+        let dec_right = DbValue::Decimal(Decimal::from_str("2.5").unwrap());
+
+        let sum_res = eval_arithmetic(
+            &dec_left,
+            &dec_right,
+            |a, b| Ok(a + b),
+            |a, b| Ok(a + b),
+            |a, b| Ok(a + b),
+        )
+        .unwrap();
+        assert_eq!(
+            sum_res,
+            DbValue::Decimal(Decimal::from_str("13.0").unwrap())
+        );
+
+        let mul_res = eval_arithmetic(
+            &dec_left,
+            &dec_right,
+            |a, b| Ok(a * b),
+            |a, b| Ok(a * b),
+            |a, b| Ok(a * b),
+        )
+        .unwrap();
+        assert_eq!(
+            mul_res,
+            DbValue::Decimal(Decimal::from_str("26.25").unwrap())
+        );
+
+        // 5. Test postcard serialization
+        let val_d = DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 2).unwrap());
+        let ser_d = postcard::to_allocvec(&val_d).unwrap();
+        let de_d: DbValue = postcard::from_bytes(&ser_d).unwrap();
+        assert_eq!(de_d, val_d);
+
+        let val_t = DbValue::Time(NaiveTime::from_hms_opt(12, 34, 56).unwrap());
+        let ser_t = postcard::to_allocvec(&val_t).unwrap();
+        let de_t: DbValue = postcard::from_bytes(&ser_t).unwrap();
+        assert_eq!(de_t, val_t);
+
+        let val_ts = DbValue::Timestamp(
+            NaiveDate::from_ymd_opt(2026, 6, 2)
+                .unwrap()
+                .and_hms_opt(12, 34, 56)
+                .unwrap(),
+        );
+        let ser_ts = postcard::to_allocvec(&val_ts).unwrap();
+        let de_ts: DbValue = postcard::from_bytes(&ser_ts).unwrap();
+        assert_eq!(de_ts, val_ts);
+
+        let val_dec = DbValue::Decimal(Decimal::from_str("123.45").unwrap());
+        let ser_dec = postcard::to_allocvec(&val_dec).unwrap();
+        let de_dec: DbValue = postcard::from_bytes(&ser_dec).unwrap();
+        assert_eq!(de_dec, val_dec);
     }
 }

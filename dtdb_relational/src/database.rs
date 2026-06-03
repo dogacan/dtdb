@@ -2439,6 +2439,10 @@ impl Database {
                         DbValue::Int(v) => DbKey::Int(*v),
                         DbValue::String(s) => DbKey::String(s.clone()),
                         DbValue::Bool(b) => DbKey::Bool(*b),
+                        DbValue::Date(d) => DbKey::Date(*d),
+                        DbValue::Time(t) => DbKey::Time(*t),
+                        DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
+                        DbValue::Decimal(dec) => DbKey::Decimal(*dec),
                         other => {
                             return Err(RelationalError::SchemaMismatch(format!(
                                 "Cannot index non-indexable value type {:?}",
@@ -2660,6 +2664,25 @@ impl Database {
                             (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX))
                         }
                         crate::schema::DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
+                        crate::schema::DataType::Date => (
+                            DbKey::Date(chrono::NaiveDate::MIN),
+                            DbKey::Date(chrono::NaiveDate::MAX),
+                        ),
+                        crate::schema::DataType::Time => (
+                            DbKey::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
+                            DbKey::Time(
+                                chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999)
+                                    .unwrap(),
+                            ),
+                        ),
+                        crate::schema::DataType::Timestamp => (
+                            DbKey::Timestamp(chrono::NaiveDateTime::MIN),
+                            DbKey::Timestamp(chrono::NaiveDateTime::MAX),
+                        ),
+                        crate::schema::DataType::Decimal => (
+                            DbKey::Decimal(rust_decimal::Decimal::MIN),
+                            DbKey::Decimal(rust_decimal::Decimal::MAX),
+                        ),
                         _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
                     };
                     min_idx_keys.push(min_val);

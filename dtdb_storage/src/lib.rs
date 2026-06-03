@@ -2,6 +2,27 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 
+mod decimal_serde {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S>(decimal: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&decimal.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Decimal::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 pub mod block_cache;
 pub mod bloom;
 pub mod engine;
@@ -76,6 +97,11 @@ pub enum StorageError {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DbKey {
     Int(i64),
+    Date(chrono::NaiveDate),
+    Time(chrono::NaiveTime),
+    Timestamp(chrono::NaiveDateTime),
+    #[serde(with = "decimal_serde")]
+    Decimal(rust_decimal::Decimal),
     String(Arc<str>),
     Bool(bool),
     Composite(Arc<Vec<DbKey>>),
@@ -97,6 +123,10 @@ impl DbKey {
     pub fn byte_size(&self) -> usize {
         match self {
             DbKey::Int(_) => 8,
+            DbKey::Date(_) => 4,
+            DbKey::Time(_) => 8,
+            DbKey::Timestamp(_) => 8,
+            DbKey::Decimal(_) => 16,
             DbKey::String(s) => s.len(),
             DbKey::Bool(_) => 1,
             DbKey::Composite(keys) => keys.iter().map(|k| k.byte_size()).sum(),
@@ -116,6 +146,11 @@ pub enum DbValue {
     Bytes(Arc<[u8]>),
     Bool(bool),
     Null,
+    Date(chrono::NaiveDate),
+    Time(chrono::NaiveTime),
+    Timestamp(chrono::NaiveDateTime),
+    #[serde(with = "decimal_serde")]
+    Decimal(rust_decimal::Decimal),
 }
 
 impl DbValue {
@@ -147,6 +182,10 @@ impl PartialEq for DbValue {
             (DbValue::Bytes(l), DbValue::Bytes(r)) => l == r,
             (DbValue::Bool(l), DbValue::Bool(r)) => l == r,
             (DbValue::Null, DbValue::Null) => true,
+            (DbValue::Date(l), DbValue::Date(r)) => l == r,
+            (DbValue::Time(l), DbValue::Time(r)) => l == r,
+            (DbValue::Timestamp(l), DbValue::Timestamp(r)) => l == r,
+            (DbValue::Decimal(l), DbValue::Decimal(r)) => l == r,
             _ => false,
         }
     }
@@ -183,6 +222,22 @@ impl std::hash::Hash for DbValue {
             }
             DbValue::Null => {
                 5u8.hash(state);
+            }
+            DbValue::Date(v) => {
+                6u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Time(v) => {
+                7u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Timestamp(v) => {
+                8u8.hash(state);
+                v.hash(state);
+            }
+            DbValue::Decimal(v) => {
+                9u8.hash(state);
+                v.hash(state);
             }
         }
     }
@@ -279,6 +334,30 @@ impl From<Vec<u8>> for DbValue {
 impl<'a> From<&'a [u8]> for DbValue {
     fn from(v: &'a [u8]) -> Self {
         DbValue::bytes(v)
+    }
+}
+
+impl From<chrono::NaiveDate> for DbValue {
+    fn from(v: chrono::NaiveDate) -> Self {
+        DbValue::Date(v)
+    }
+}
+
+impl From<chrono::NaiveTime> for DbValue {
+    fn from(v: chrono::NaiveTime) -> Self {
+        DbValue::Time(v)
+    }
+}
+
+impl From<chrono::NaiveDateTime> for DbValue {
+    fn from(v: chrono::NaiveDateTime) -> Self {
+        DbValue::Timestamp(v)
+    }
+}
+
+impl From<rust_decimal::Decimal> for DbValue {
+    fn from(v: rust_decimal::Decimal) -> Self {
+        DbValue::Decimal(v)
     }
 }
 

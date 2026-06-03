@@ -258,37 +258,7 @@ impl LogicalPlanner {
                 }
 
                 for col in columns {
-                    let dt = match &col.data_type {
-                        SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => {
-                            DataType::Int
-                        }
-                        SqlDataType::Custom(name, _)
-                            if {
-                                let name_str = name.to_string().to_uppercase();
-                                name_str == "SERIAL" || name_str == "BIGSERIAL"
-                            } =>
-                        {
-                            DataType::Int
-                        }
-                        SqlDataType::Custom(name, _)
-                            if {
-                                let name_str = name.to_string().to_uppercase();
-                                name_str == "BOOL"
-                            } =>
-                        {
-                            DataType::Bool
-                        }
-                        SqlDataType::Float(_) | SqlDataType::Double(_) | SqlDataType::Real => {
-                            DataType::Float
-                        }
-                        SqlDataType::Boolean | SqlDataType::Bool => DataType::Bool,
-                        SqlDataType::Text
-                        | SqlDataType::Varchar(_)
-                        | SqlDataType::Char(_)
-                        | SqlDataType::String(_) => DataType::String,
-                        SqlDataType::Bytea | SqlDataType::Blob(_) => DataType::Bytes,
-                        other => return Err(format!("Unsupported SQL data type: {:?}", other)),
-                    };
+                    let dt = map_sql_data_type(&col.data_type)?;
 
                     let mut is_pk = col
                         .options
@@ -1550,6 +1520,30 @@ impl LogicalPlanner {
                     negated: *negated,
                 })
             }
+            SqlExpr::TypedString(sqlparser::ast::TypedString {
+                data_type, value, ..
+            }) => {
+                let dt = map_sql_data_type(data_type)?;
+                let val_str = match &value.value {
+                    SqlValue::SingleQuotedString(s) => s.clone(),
+                    SqlValue::DoubleQuotedString(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let casted = crate::expr::cast_value(DbValue::string(val_str), dt)?;
+                Ok(Expr::Literal(casted))
+            }
+            SqlExpr::Cast {
+                expr: cast_expr,
+                data_type,
+                ..
+            } => {
+                let target_type = map_sql_data_type(data_type)?;
+                let planned_expr = self.plan_expr(cast_expr)?;
+                Ok(Expr::Cast {
+                    expr: Box::new(planned_expr),
+                    target_type,
+                })
+            }
             other => Err(format!("Unsupported expression: {:?}", other)),
         }
     }
@@ -1581,6 +1575,37 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
     }
 }
 
+fn map_sql_data_type(sql_dt: &SqlDataType) -> Result<DataType, String> {
+    match sql_dt {
+        SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => Ok(DataType::Int),
+        SqlDataType::Custom(name, _)
+            if {
+                let n = name.to_string().to_uppercase();
+                n == "SERIAL" || n == "BIGSERIAL"
+            } =>
+        {
+            Ok(DataType::Int)
+        }
+        SqlDataType::Custom(name, _) if name.to_string().to_uppercase() == "BOOL" => {
+            Ok(DataType::Bool)
+        }
+        SqlDataType::Float(_) | SqlDataType::Double(_) | SqlDataType::Real => Ok(DataType::Float),
+        SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Bool),
+        SqlDataType::Text
+        | SqlDataType::Varchar(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::String(_) => Ok(DataType::String),
+        SqlDataType::Bytea | SqlDataType::Blob(_) => Ok(DataType::Bytes),
+        SqlDataType::Date => Ok(DataType::Date),
+        SqlDataType::Time(_, _) => Ok(DataType::Time),
+        SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
+        SqlDataType::Decimal(_) | SqlDataType::Dec(_) | SqlDataType::Numeric(_) => {
+            Ok(DataType::Decimal)
+        }
+        other => Err(format!("Unsupported SQL data type: {:?}", other)),
+    }
+}
+
 /// Translates a single sqlparser `ColumnDef` into a relational [`Column`].
 ///
 /// Used by `ALTER TABLE ADD COLUMN`, where there is no table-level primary-key
@@ -1589,26 +1614,7 @@ fn has_aggregate_function(expr: &SqlExpr) -> bool {
 /// table-level inputs.) The returned column's `id` is a placeholder (0); the
 /// catalog assigns the real stable id in `Database::alter_table_add_column`.
 fn column_def_to_column(col: &sqlparser::ast::ColumnDef) -> Result<Column, String> {
-    let data_type = match &col.data_type {
-        SqlDataType::Integer(_) | SqlDataType::Int(_) | SqlDataType::BigInt(_) => DataType::Int,
-        SqlDataType::Custom(name, _)
-            if {
-                let n = name.to_string().to_uppercase();
-                n == "SERIAL" || n == "BIGSERIAL"
-            } =>
-        {
-            DataType::Int
-        }
-        SqlDataType::Custom(name, _) if name.to_string().to_uppercase() == "BOOL" => DataType::Bool,
-        SqlDataType::Float(_) | SqlDataType::Double(_) | SqlDataType::Real => DataType::Float,
-        SqlDataType::Boolean | SqlDataType::Bool => DataType::Bool,
-        SqlDataType::Text
-        | SqlDataType::Varchar(_)
-        | SqlDataType::Char(_)
-        | SqlDataType::String(_) => DataType::String,
-        SqlDataType::Bytea | SqlDataType::Blob(_) => DataType::Bytes,
-        other => return Err(format!("Unsupported SQL data type: {:?}", other)),
-    };
+    let data_type = map_sql_data_type(&col.data_type)?;
 
     let is_primary_key = col
         .options
@@ -1661,6 +1667,28 @@ fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {
             SqlValue::Null => Ok(DbValue::Null),
             other => Err(format!("Unsupported value type for default: {:?}", other)),
         },
+        SqlExpr::TypedString(sqlparser::ast::TypedString {
+            data_type, value, ..
+        }) => {
+            let dt = map_sql_data_type(data_type)?;
+            let val_str = match &value.value {
+                SqlValue::SingleQuotedString(s) => s.clone(),
+                SqlValue::DoubleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let casted = crate::expr::cast_value(DbValue::string(val_str), dt)?;
+            Ok(casted)
+        }
+        SqlExpr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let val = eval_default_expr(inner)?;
+            let dt = map_sql_data_type(data_type)?;
+            let casted = crate::expr::cast_value(val, dt)?;
+            Ok(casted)
+        }
         SqlExpr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Minus,
             expr: inner,
@@ -1669,6 +1697,7 @@ fn eval_default_expr(expr: &SqlExpr) -> Result<DbValue, String> {
             match val {
                 DbValue::Int(i) => Ok(DbValue::Int(-i)),
                 DbValue::Float(f) => Ok(DbValue::Float(-f)),
+                DbValue::Decimal(d) => Ok(DbValue::Decimal(-d)),
                 _ => Err("Invalid negative default value".to_string()),
             }
         }
@@ -1961,6 +1990,7 @@ fn collect_local_columns(expr: &Expr, out: &mut HashSet<String>) {
         // planned; only the `IN` left-hand side is local to this subquery.
         Expr::ScalarSubquery(_) | Expr::Exists { .. } => {}
         Expr::InSubquery { expr, .. } => collect_local_columns(expr, out),
+        Expr::Cast { expr, .. } => collect_local_columns(expr, out),
     }
 }
 

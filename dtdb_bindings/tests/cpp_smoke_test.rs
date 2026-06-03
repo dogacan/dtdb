@@ -129,6 +129,7 @@ fn test_cpp_bridge_smoke() {
 
     if cfg!(target_os = "macos") {
         compile_cmd.arg("-lresolv");
+        compile_cmd.arg("-framework").arg("CoreFoundation");
     }
 
     // Detect if we need to pass sanitizer flags to the C++ compiler/linker

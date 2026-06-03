@@ -138,6 +138,10 @@ fn display_result(res: ExecutionResult) {
                         DbValue::Bytes(b) => format!("{:?}", b),
                         DbValue::Bool(b) => b.to_string(),
                         DbValue::Null => "NULL".to_string(),
+                        DbValue::Date(d) => d.to_string(),
+                        DbValue::Time(t) => t.to_string(),
+                        DbValue::Timestamp(ts) => ts.to_string(),
+                        DbValue::Decimal(dec) => dec.to_string(),
                     };
                     if val_str.len() > col_widths[i] {
                         col_widths[i] = val_str.len();

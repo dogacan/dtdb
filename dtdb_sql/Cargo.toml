@@ -11,6 +11,9 @@ serde = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
 regex = "1.12"
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+
 
 [dev-dependencies]
 tempfile = { workspace = true }

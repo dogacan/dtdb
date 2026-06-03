@@ -192,7 +192,11 @@ fn test_create_table_datatypes() {
         val_varchar VARCHAR(100),
         val_char CHAR(10),
         val_text TEXT,
-        val_bytes BYTEA
+        val_bytes BYTEA,
+        val_date DATE,
+        val_time TIME,
+        val_timestamp TIMESTAMP,
+        val_decimal DECIMAL
     );";
     let res = plan_sql(db, sql).unwrap();
     if let SqlStatement::CreateTable { schema, .. } = res {
@@ -207,6 +211,10 @@ fn test_create_table_datatypes() {
         assert_eq!(schema.columns[7].data_type, DataType::String);
         assert_eq!(schema.columns[8].data_type, DataType::String);
         assert_eq!(schema.columns[9].data_type, DataType::Bytes);
+        assert_eq!(schema.columns[10].data_type, DataType::Date);
+        assert_eq!(schema.columns[11].data_type, DataType::Time);
+        assert_eq!(schema.columns[12].data_type, DataType::Timestamp);
+        assert_eq!(schema.columns[13].data_type, DataType::Decimal);
     } else {
         panic!("expected CreateTable");
     }
@@ -251,7 +259,7 @@ fn test_drop_table_planning() {
 #[test]
 fn test_unsupported_datatype_error() {
     let (_tmp, db) = setup_db();
-    let sql = "CREATE TABLE t (id DECIMAL);";
+    let sql = "CREATE TABLE t (id JSON);";
     let res = plan_sql(db, sql);
     assert!(res.is_err());
     let err = match res {

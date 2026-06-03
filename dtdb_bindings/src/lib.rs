@@ -188,6 +188,10 @@ fn handle_in_process_query_result(
                             dtdb_storage::DbValue::Bytes(b) => format!("{:?}", b),
                             dtdb_storage::DbValue::Bool(b) => b.to_string(),
                             dtdb_storage::DbValue::Null => "NULL".to_string(),
+                            dtdb_storage::DbValue::Date(d) => d.to_string(),
+                            dtdb_storage::DbValue::Time(t) => t.to_string(),
+                            dtdb_storage::DbValue::Timestamp(ts) => ts.to_string(),
+                            dtdb_storage::DbValue::Decimal(dec) => dec.to_string(),
                         })
                         .collect::<Vec<_>>();
                     rows.extend(row_vals);

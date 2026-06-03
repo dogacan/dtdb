@@ -3,6 +3,7 @@ use crate::logical::{AggregateExpr, JoinType, SetOpType};
 use crate::spill::{self, KWayMerge, Run};
 use dtdb_relational::{Row, Schema};
 use dtdb_storage::DbValue;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -1060,6 +1061,7 @@ enum Accumulator {
     Sum {
         int_sum: Option<i64>,
         float_sum: Option<f64>,
+        decimal_sum: Option<rust_decimal::Decimal>,
     },
     Min {
         min: Option<DbValue>,
@@ -1070,6 +1072,7 @@ enum Accumulator {
     Avg {
         sum: f64,
         count: i64,
+        decimal_sum: Option<rust_decimal::Decimal>,
     },
     // DISTINCT aggregate (COUNT/SUM/AVG DISTINCT). Inputs are collected into
     // `seen`, deduplicated by value, and the wrapped `inner` aggregate is applied
@@ -1093,10 +1096,18 @@ fn make_accumulator(aggr: &AggregateExpr) -> Accumulator {
             Accumulator::Sum {
                 int_sum: None,
                 float_sum: None,
+                decimal_sum: None,
             },
             *distinct,
         ),
-        AggregateExpr::Avg { distinct, .. } => (Accumulator::Avg { sum: 0.0, count: 0 }, *distinct),
+        AggregateExpr::Avg { distinct, .. } => (
+            Accumulator::Avg {
+                sum: 0.0,
+                count: 0,
+                decimal_sum: None,
+            },
+            *distinct,
+        ),
         AggregateExpr::Min { .. } => (Accumulator::Min { min: None }, false),
         AggregateExpr::Max { .. } => (Accumulator::Max { max: None }, false),
     };
@@ -1138,17 +1149,29 @@ impl Accumulator {
             Accumulator::Count { count } => {
                 *count += 1;
             }
-            Accumulator::Sum { int_sum, float_sum } => match val {
+            Accumulator::Sum {
+                int_sum,
+                float_sum,
+                decimal_sum,
+            } => match val {
+                DbValue::Decimal(v) => {
+                    if let Some(dec) = decimal_sum {
+                        *decimal_sum = Some(*dec + *v);
+                    } else {
+                        let current = int_sum.take().unwrap_or(0);
+                        *decimal_sum = Some(rust_decimal::Decimal::from(current) + *v);
+                    }
+                }
                 DbValue::Int(v) => {
-                    if float_sum.is_some() {
-                        // Already promoted to float; just keep accumulating in float.
+                    if let Some(dec) = decimal_sum {
+                        *decimal_sum = Some(*dec + rust_decimal::Decimal::from(*v));
+                    } else if float_sum.is_some() {
                         *float_sum.as_mut().unwrap() += *v as f64;
                     } else {
                         let current = int_sum.unwrap_or(0);
                         match current.checked_add(*v) {
                             Some(new_sum) => *int_sum = Some(new_sum),
                             None => {
-                                // Overflow: promote to float and continue there.
                                 let promoted = current as f64 + *v as f64;
                                 *int_sum = None;
                                 *float_sum = Some(promoted);
@@ -1157,9 +1180,14 @@ impl Accumulator {
                     }
                 }
                 DbValue::Float(v) => {
-                    // First float input promotes any accumulated integers into floats.
-                    let promoted = float_sum.unwrap_or(0.0) + int_sum.take().unwrap_or(0) as f64;
-                    *float_sum = Some(promoted + *v);
+                    if let Some(dec) = decimal_sum.take() {
+                        let dec_f = dec.to_f64().unwrap_or(0.0);
+                        *float_sum = Some(dec_f + *v);
+                    } else {
+                        let promoted =
+                            float_sum.unwrap_or(0.0) + int_sum.take().unwrap_or(0) as f64;
+                        *float_sum = Some(promoted + *v);
+                    }
                 }
                 other => {
                     return Err(format!(
@@ -1186,10 +1214,41 @@ impl Accumulator {
                 }
                 None => *max = Some(val.clone()),
             },
-            Accumulator::Avg { sum, count } => {
+            Accumulator::Avg {
+                sum,
+                count,
+                decimal_sum,
+            } => {
                 match val {
-                    DbValue::Int(v) => *sum += *v as f64,
-                    DbValue::Float(v) => *sum += *v,
+                    DbValue::Decimal(v) => {
+                        if let Some(dec) = decimal_sum {
+                            *decimal_sum = Some(*dec + *v);
+                        } else {
+                            if *count > 0 {
+                                if let Some(dec_prev) = rust_decimal::Decimal::from_f64(*sum) {
+                                    *decimal_sum = Some(dec_prev + *v);
+                                } else {
+                                    *sum += v.to_f64().unwrap_or(0.0);
+                                }
+                            } else {
+                                *decimal_sum = Some(*v);
+                            }
+                        }
+                    }
+                    DbValue::Int(v) => {
+                        if let Some(dec) = decimal_sum {
+                            *decimal_sum = Some(*dec + rust_decimal::Decimal::from(*v));
+                        } else {
+                            *sum += *v as f64;
+                        }
+                    }
+                    DbValue::Float(v) => {
+                        if let Some(dec) = decimal_sum.take() {
+                            *sum = dec.to_f64().unwrap_or(0.0) + *v;
+                        } else {
+                            *sum += *v;
+                        }
+                    }
                     other => {
                         return Err(format!(
                             "Cannot compute AVG on non-numeric value {:?}",
@@ -1212,13 +1271,24 @@ impl Accumulator {
                 *count += o;
             }
             (
-                Accumulator::Sum { int_sum, float_sum },
+                Accumulator::Sum {
+                    int_sum,
+                    float_sum,
+                    decimal_sum,
+                },
                 Accumulator::Sum {
                     int_sum: o_int,
                     float_sum: o_float,
+                    decimal_sum: o_dec,
                 },
             ) => {
-                if float_sum.is_some() || o_float.is_some() {
+                if decimal_sum.is_some() || o_dec.is_some() {
+                    let a = decimal_sum.unwrap_or(rust_decimal::Decimal::ZERO)
+                        + rust_decimal::Decimal::from(int_sum.take().unwrap_or(0));
+                    let b = o_dec.unwrap_or(rust_decimal::Decimal::ZERO)
+                        + rust_decimal::Decimal::from(o_int.unwrap_or(0));
+                    *decimal_sum = Some(a + b);
+                } else if float_sum.is_some() || o_float.is_some() {
                     let a = float_sum.unwrap_or(0.0) + int_sum.take().unwrap_or(0) as f64;
                     let b = o_float.unwrap_or(0.0) + o_int.unwrap_or(0) as f64;
                     *float_sum = Some(a + b);
@@ -1254,13 +1324,24 @@ impl Accumulator {
                 }
             }
             (
-                Accumulator::Avg { sum, count },
+                Accumulator::Avg {
+                    sum,
+                    count,
+                    decimal_sum,
+                },
                 Accumulator::Avg {
                     sum: o_sum,
                     count: o_count,
+                    decimal_sum: o_dec,
                 },
             ) => {
-                *sum += o_sum;
+                if decimal_sum.is_some() || o_dec.is_some() {
+                    let a = decimal_sum.unwrap_or(rust_decimal::Decimal::ZERO);
+                    let b = o_dec.unwrap_or(rust_decimal::Decimal::ZERO);
+                    *decimal_sum = Some(a + b);
+                } else {
+                    *sum += o_sum;
+                }
                 *count += o_count;
             }
             // Partial distinct groups from different spilled runs may share values,
@@ -1277,16 +1358,33 @@ impl Accumulator {
     fn finalize(&self) -> Result<DbValue, String> {
         let val = match self {
             Accumulator::Count { count } => DbValue::Int(*count),
-            Accumulator::Sum { int_sum, float_sum } => match (float_sum, int_sum) {
-                (Some(f), _) => DbValue::Float(*f),
-                (None, Some(i)) => DbValue::Int(*i),
-                (None, None) => DbValue::Null,
-            },
+            Accumulator::Sum {
+                int_sum,
+                float_sum,
+                decimal_sum,
+            } => {
+                if let Some(dec) = decimal_sum {
+                    DbValue::Decimal(*dec)
+                } else {
+                    match (float_sum, int_sum) {
+                        (Some(f), _) => DbValue::Float(*f),
+                        (None, Some(i)) => DbValue::Int(*i),
+                        (None, None) => DbValue::Null,
+                    }
+                }
+            }
             Accumulator::Min { min } => min.clone().unwrap_or(DbValue::Null),
             Accumulator::Max { max } => max.clone().unwrap_or(DbValue::Null),
-            Accumulator::Avg { sum, count } => {
+            Accumulator::Avg {
+                sum,
+                count,
+                decimal_sum,
+            } => {
                 if *count == 0 {
                     DbValue::Null
+                } else if let Some(dec) = decimal_sum {
+                    let count_dec = rust_decimal::Decimal::from(*count);
+                    DbValue::Decimal(*dec / count_dec)
                 } else {
                     DbValue::Float(*sum / (*count as f64))
                 }
