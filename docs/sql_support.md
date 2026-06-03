@@ -226,7 +226,7 @@ Queries rows from table relations.
 *   **Clauses Detail**:
     *   **Table Factors**: `<table_factor>` can be:
         *   A table name with an optional alias: `<table_name> [AS <alias>]`
-        *   A derived table (subquery) with a **required** alias: `(<subquery>) AS <alias>` (see [Subqueries](#subqueries) for details).
+        *   A derived table (subquery) with a **required** alias: `(<subquery>) AS <alias>` (see [Subqueries](#6-subqueries) for details).
     *   **Table Aliasing**: Supports table aliasing using `[AS] <alias>`. Qualified columns can use the table name or the alias prefix (e.g., `t.name` when using `FROM users AS t`). This also allows self-joins on the same table.
     *   **Projection**: Supports columns, expressions, aliases (`col AS alias`), aggregate functions, and wildcard (`*`).
     *   **JOIN**: Supports inner, left outer equality joins (e.g., `ON t1.id = t2.user_id` or `LEFT JOIN ... ON ...`), and cross joins (`CROSS JOIN` or inner join without `ON`). Non-equality joins (except cross join) or right/full outer joins are not supported. Unmatched left rows in left joins are padded with type-default values for the right-side columns.
@@ -327,7 +327,7 @@ Used to combine boolean expressions:
 *   `IS NULL`: Checks if an expression evaluates to `NULL`.
 *   `IS NOT NULL`: Checks if an expression does not evaluate to `NULL`.
 *   `BETWEEN` / `NOT BETWEEN`: Checks if a value is within a range (e.g. `col BETWEEN low AND high` or `col NOT BETWEEN low AND high`).
-*   `IN` / `NOT IN`: Checks if a value equals any value in a list of expressions or is returned by an uncorrelated subquery (e.g. `col IN (val1, val2)` or `col NOT IN (SELECT y FROM t2)`). See [Subqueries](#subqueries) for details.
+*   `IN` / `NOT IN`: Checks if a value equals any value in a list of expressions or is returned by an uncorrelated subquery (e.g. `col IN (val1, val2)` or `col NOT IN (SELECT y FROM t2)`). See [Subqueries](#6-subqueries) for details.
 
 ### Pattern Matching
 *   `LIKE` / `NOT LIKE`: Performs wildcard string matching using `%`.
@@ -431,6 +431,8 @@ Rounds a float value to the nearest integer. Passes integers through unchanged.
 
 DuctTapeDB supports several forms of subqueries, provided they are **uncorrelated** (i.e., they do not reference columns or tables from the outer query scope). Correlated subqueries are strictly **not supported** and will be rejected at plan time with a validation error.
 
+The expression subqueries below (scalar, `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS`) are available wherever an expression is allowed — not only in `SELECT`, but also in the `WHERE` clause of `DELETE` and `UPDATE`, in `UPDATE ... SET` assignments, and in the query of an `INSERT ... SELECT`.
+
 ### Supported Subquery Shapes
 
 #### 1. Scalar Subqueries
@@ -438,7 +440,7 @@ A subquery that returns a single column and at most one row. It can be used anyw
 *   **Behavior**:
     *   If the subquery returns exactly one row, it evaluates to that value.
     *   If the subquery returns zero rows, it evaluates to `NULL`.
-    *   If the subquery returns more than one row, execution fails with a runtime error (`more than one row returned by a subquery used as an expression`).
+    *   If the subquery returns more than one row, execution fails with a runtime error (`scalar subquery returned more than one row`).
 *   **Examples**:
     ```sql
     -- Scalar subquery in WHERE predicate
@@ -492,7 +494,7 @@ Allows querying the results of a subquery as if it were a table.
 *   **No Correlation**: If a subquery references columns from the outer query, the planner will reject it immediately.
     *   *Rejected Example*:
         ```sql
-        -- Fails with: "correlated subqueries are not supported (column 't1.id' refers to the outer query)"
+        -- Fails with: "correlated subqueries are not supported: column 't1.id' is not provided by the subquery's own FROM clause"
         SELECT id FROM t1 WHERE x = (SELECT y FROM t2 WHERE t2.id = t1.id);
         ```
 *   **No General Index Scan Pushdown**: Uncorrelated subqueries are folded to constants at compile time. Although point-get lookup optimizations can recognize the folded constant (e.g., `WHERE id = (SELECT MIN(id) FROM t2)`), general index scans are not optimized through them.
