@@ -110,3 +110,78 @@ impl SqlQuery {
         &self.bindings
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    #[test]
+    fn interpolate_temporal_and_decimal_params() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 3).unwrap();
+        let time = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+        let ts = NaiveDateTime::new(date, time);
+        let dec = Decimal::from_str("1.50").unwrap();
+
+        let q = SqlQuery::new(
+            "INSERT INTO t VALUES (@d, @t, @ts, @dec)".to_string(),
+        )
+        .bind("d", date)
+        .bind("t", time)
+        .bind("ts", ts)
+        .bind("dec", dec);
+
+        // Date/Time/Timestamp render as typed SQL literals; Decimal renders as a
+        // bare numeric literal preserving its scale.
+        assert_eq!(
+            q.interpolate().unwrap(),
+            "INSERT INTO t VALUES (DATE '2026-06-03', TIME '14:30:00', \
+             TIMESTAMP '2026-06-03 14:30:00', 1.50)"
+        );
+    }
+
+    #[test]
+    fn interpolate_handles_all_scalar_kinds() {
+        let q = SqlQuery::new("VALUES (@i, @f, @b, @s, @nul)".to_string())
+            .bind("i", 42i64)
+            .bind("f", 1.5f64)
+            .bind("b", true)
+            .bind("s", "O'Brien")
+            .bind("nul", DbValue::Null);
+
+        // String params are single-quoted with embedded quotes doubled per the
+        // SQL standard, so injection via the value is not possible.
+        assert_eq!(
+            q.interpolate().unwrap(),
+            "VALUES (42, 1.5, true, 'O''Brien', NULL)"
+        );
+    }
+
+    #[test]
+    fn interpolate_renders_bytes_as_hex_literal() {
+        let q = SqlQuery::new("SELECT @raw".to_string())
+            .bind("raw", vec![0x01u8, 0x02, 0xff]);
+        assert_eq!(q.interpolate().unwrap(), "SELECT x'0102ff'");
+    }
+
+    #[test]
+    fn interpolate_skips_placeholders_inside_quotes() {
+        // An @name sequence inside a string literal must be left untouched, while
+        // the one outside is substituted.
+        let q = SqlQuery::new("SELECT '@d' , @d".to_string())
+            .bind("d", NaiveDate::from_ymd_opt(2026, 6, 3).unwrap());
+        assert_eq!(
+            q.interpolate().unwrap(),
+            "SELECT '@d' , DATE '2026-06-03'"
+        );
+    }
+
+    #[test]
+    fn interpolate_errors_on_unbound_param() {
+        let q = SqlQuery::new("SELECT @missing".to_string());
+        let err = q.interpolate().unwrap_err();
+        assert!(err.contains("missing"), "unexpected error: {err}");
+    }
+}

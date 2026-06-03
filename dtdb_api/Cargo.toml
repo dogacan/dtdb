@@ -26,3 +26,5 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = { workspace = true }
 postcard = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }

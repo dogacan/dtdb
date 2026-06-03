@@ -595,6 +595,7 @@ dependencies = [
 name = "dtdb_api"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dtdb_relational",
  "dtdb_sql",
  "dtdb_storage",
@@ -604,6 +605,7 @@ dependencies = [
  "pin-project",
  "postcard",
  "prost",
+ "rust_decimal",
  "serde",
  "tempfile",
  "tokio",
