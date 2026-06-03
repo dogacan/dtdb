@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document covers configuration knobs that aren't part of the SQL dialect itself: database-wide storage options, per-locality-group overrides, transaction isolation levels, the background analyze loop, tokenizer registration, and a few smaller features that exist but weren't documented elsewhere.
+This document covers configuration knobs that aren't part of the SQL dialect itself: database-wide storage options, per-locality-group overrides, transaction isolation levels, the background analyze loop, and a few smaller features that exist but weren't documented elsewhere.
 
 For the SQL dialect see [sql_support.md](sql_support.md); for the in-process API see [in_process_api.md](in_process_api.md); for the C++/Swift FFI see [bindings.md](bindings.md).
 
@@ -8,7 +8,7 @@ For the SQL dialect see [sql_support.md](sql_support.md); for the in-process API
 
 ## 1. `DatabaseOptions`
 
-`DatabaseOptions` is the per-database configuration struct passed to `Database::open_with_options` (or `DuctTapeDbClient::create_db_with_options` at the gRPC layer). It is persisted at `<data_dir>/<db>/db_options.bin` on first creation and reloaded on subsequent opens — changing field values in code only affects newly-created databases, **not** existing ones.
+`DatabaseOptions` is the per-database configuration struct passed to `create_db_with_options` on either client (`InProcessClient` or the gRPC `RemoteClient`). It is persisted at `<data_dir>/<db>/db_options.bin` on first creation and reloaded on subsequent opens — changing field values in code only affects newly-created databases, **not** existing ones.
 
 ```rust
 pub struct DatabaseOptions {
@@ -154,42 +154,7 @@ The OCC bookkeeping is shared between all levels: each commit appends a record o
 
 ## 4. Custom tokenizers (full-text search)
 
-`MATCH(column) AGAINST('query')` uses a registered tokenizer to split both indexed text and query strings into terms. The built-in tokenizer is `simple` (Unicode word-boundary split, lowercased, no stemming). You can register your own:
-
-```rust
-use std::sync::Arc;
-use dtdb_relational::{register_global_tokenizer, Tokenizer};
-
-struct LowercaseTrigram;
-impl Tokenizer for LowercaseTrigram {
-    fn name(&self) -> &str { "lc_trigram" }
-    fn tokenize(&self, input: &str) -> Vec<String> {
-        let chars: Vec<char> = input.to_lowercase().chars().collect();
-        chars.windows(3).map(|w| w.iter().collect()).collect()
-    }
-}
-
-register_global_tokenizer("lc_trigram", Arc::new(LowercaseTrigram));
-```
-
-Tokenizers live in a process-global registry; register them once at startup, before any DDL that references them. To use the registered tokenizer for a FULLTEXT index:
-
-```sql
-CREATE INDEX users_name_fts ON users(name) USING FULLTEXT WITH (tokenizer = 'lc_trigram');
-```
-
-The tokenizer name is stored in `schema.bin`, so a database that references a custom tokenizer will fail to open if that tokenizer isn't registered first. Re-register the same tokenizer (under the same name) on every process start.
-
-`Database::register_tokenizer(name, tokenizer)` is a convenience wrapper that delegates to `register_global_tokenizer` — it has no per-database scope and is provided only for discoverability.
-
-### Query syntax
-
-Inside `AGAINST(...)` the query string supports:
-
-- Bare words: `cat dog` matches rows containing both tokens (`AND` is the default).
-- Explicit boolean operators: `cat AND dog`, `cat OR dog`, parentheses for grouping.
-- Phrase queries: `"new york"` matches rows where those two tokens appear consecutively. Empty phrases (`""` or a phrase that tokenizes to nothing) are rejected at parse time.
-- Single-character SQL `LIKE` wildcard `_` is **not** an FTS feature; that lives in `LIKE`, not `MATCH … AGAINST`.
+Full-text search and custom Rust tokenizers — the `Tokenizer` trait, registering tokenizers, the `CREATE FULLTEXT INDEX … USING` DDL, and the `MATCH … AGAINST` boolean query language — are documented with the embedded client in [in_process_api.md → Full-text search with custom tokenizers](in_process_api.md#8-full-text-search-with-custom-tokenizers), which is their more natural home. (Tokenizer registration is a process-global, code-level concern, not a per-database `DatabaseOptions` knob.)
 
 ---
 

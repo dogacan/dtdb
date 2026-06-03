@@ -238,8 +238,9 @@ impl SqlEngine {
         if statements.len() > 1 {
             return Err(
                 "Multiple SQL statements in a single execute() call are not allowed. \
-                 Use DuctTapeDbClient::run_in_transaction() or the Transaction RPC to \
-                 execute multiple statements within a single transaction."
+                 Use the client's run_in_transaction() (InProcessClient or RemoteClient) \
+                 or the Transaction RPC to execute multiple statements within a single \
+                 transaction."
                     .to_string(),
             );
         }
@@ -478,8 +479,9 @@ impl SqlEngine {
     ///   leave partial results on failure.
     ///
     /// - **Explicit transactions**: Callers who need to execute multiple statements
-    ///   atomically should use `DuctTapeDbClient::run_in_transaction()` (client API)
-    ///   or the `Transaction` bidirectional streaming RPC, which provide proper
+    ///   atomically should use `InProcessClient::run_in_transaction()` /
+    ///   `RemoteClient::run_in_transaction()` (client API) or the `Transaction`
+    ///   bidirectional streaming RPC, which provide proper
     ///   transaction boundaries with commit/rollback semantics.
     ///
     /// This restriction ensures that every `execute()` call has clear, predictable
@@ -496,8 +498,9 @@ impl SqlEngine {
     ///   leave partial results on failure.
     ///
     /// - **Explicit transactions**: Callers who need to execute multiple statements
-    ///   atomically should use `DuctTapeDbClient::run_in_transaction()` (client API)
-    ///   or the `Transaction` bidirectional streaming RPC, which provide proper
+    ///   atomically should use `InProcessClient::run_in_transaction()` /
+    ///   `RemoteClient::run_in_transaction()` (client API) or the `Transaction`
+    ///   bidirectional streaming RPC, which provide proper
     ///   transaction boundaries with commit/rollback semantics.
     ///
     /// This restriction ensures that every `execute()` call has clear, predictable

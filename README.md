@@ -54,15 +54,15 @@ Exposes database resources over a client API supporting both embedded (in-proces
 
 * **Protobuf API**: Defines database creation/deletion, streaming query execution, and bidirectional streaming transaction endpoints.
 * **gRPC Server**: Restores existing databases on boot, implements stateful multi-statement transactions using a streaming RPC, and streams query rows back.
-* **Client Library**: A unified Rust client library (`DuctTapeDbClient`) that supports both in-process and remote gRPC execution, featuring an explicit transaction closure API (`run_in_transaction`). See the [In-Process API Guide](docs/in_process_api.md) for embedded usage.
+* **Client Library**: Two mirror-image Rust clients — the synchronous `InProcessClient` for embedded execution and the async `RemoteClient` for gRPC — sharing the same query types and an explicit transaction closure API (`run_in_transaction`). See the [In-Process API Guide](docs/in_process_api.md) for embedded usage.
 
 ---
 
 ## 📚 Documentation
 
 * [SQL Support Reference](docs/sql_support.md) — Supported statements, data types, expressions, and functions.
-* [In-Process API Guide](docs/in_process_api.md) — Using `DuctTapeDbClient::in_process` and the underlying `Database` / `Transaction` / `SqlEngine` types directly.
-* [Configuration Reference](docs/configuration.md) — `DatabaseOptions`, per-locality-group overrides, transaction isolation levels, custom tokenizers, and other knobs.
+* [In-Process API Guide](docs/in_process_api.md) — Embedding DuctTapeDB with the synchronous `InProcessClient`, plus full-text search with custom Rust tokenizers and the async `RemoteClient` counterpart.
+* [Configuration Reference](docs/configuration.md) — `DatabaseOptions`, per-locality-group overrides, transaction isolation levels, and other knobs.
 * [C++ & Swift Bindings Guide](docs/bindings.md) — Cross-language FFI for embedding DuctTapeDB in non-Rust applications.
 
 ---
@@ -177,53 +177,53 @@ exit
 
 ### Using the Rust Client Library
 
-You can embed DuctTapeDB directly into your Rust application (in-process mode) or run a remote `dtdb_server` and connect to it over gRPC (remote mode) using the exact same API interface.
+You can embed DuctTapeDB directly into your Rust application with the synchronous `InProcessClient`, or run a remote `dtdb_server` and connect to it over gRPC with the async `RemoteClient`. The two clients share the same query types and transaction-closure API, so porting between them is mechanical (add/remove `.await`, swap the constructor).
 
-Add `dtdb_api` as a dependency in your `Cargo.toml`. You'll also need `tokio` (with async runtime support) and `futures-util` (for stream processing):
+Add `dtdb_api` as a dependency in your `Cargo.toml`. The embedded client below is fully synchronous — no async runtime required:
 
 ```rust
-use dtdb_api::client::DuctTapeDbClient;
+use dtdb_api::in_process::InProcessClient;
 use dtdb_api::sql_query;
 use dtdb_storage::CompressionType;
-use futures_util::StreamExt;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize the client (In-Process mode)
-    let mut client = DuctTapeDbClient::in_process("./data")?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Open (or create) a data directory and a logical database inside it.
+    let client = InProcessClient::open("./data")?;
+    client.create_db("mydb", CompressionType::Lz4)?;
 
-    // Or connect to a remote server over gRPC (Remote mode):
-    // let mut client = DuctTapeDbClient::connect("http://127.0.0.1:50051").await?;
+    // 2. Run single statements (DDL/writes auto-commit before the call returns).
+    client.execute_query("mydb", sql_query!(
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);"
+    ))?;
 
-    // 2. Create a database
-    client.create_db("mydb", CompressionType::Lz4).await?;
-
-    // 3. Execute queries (streams result rows)
-    let mut stream = client
-        .execute_query("mydb", sql_query!("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);"))
-        .await?;
-    while let Some(resp) = stream.next().await {
-        println!("{:?}", resp?);
-    }
-
-    // 4. Run multiple statements atomically in a transaction using parameterized queries
-    client.run_in_transaction("mydb", |tx| async move {
+    // 3. Run multiple statements atomically in a transaction using parameterized
+    //    queries. Commits on Ok(_), rolls back on Err(_).
+    client.run_in_transaction("mydb", |tx| {
         tx.execute_query(
             sql_query!("INSERT INTO users (id, name) VALUES (@id, @name);")
                 .bind("id", 1i64)
-                .bind("name", "Alice")
-        ).await?;
+                .bind("name", "Alice"),
+        )?;
         tx.execute_query(
             sql_query!("INSERT INTO users (id, name) VALUES (@id, @name);")
                 .bind("id", 2i64)
-                .bind("name", "Bob")
-        ).await?;
+                .bind("name", "Bob"),
+        )?;
         Ok(())
-    }).await?;
+    })?;
+
+    // 4. Read results back — the query result is an iterator of rows.
+    let result = client.execute_query("mydb", sql_query!("SELECT id, name FROM users;"))?;
+    for row in result {
+        let row = row?;
+        println!("{:?} {:?}", row.get_by_index(0), row.get_by_index(1));
+    }
 
     Ok(())
 }
 ```
+
+The remote client mirrors this surface over gRPC; every method is `async` and `run_in_transaction` takes an `async move` closure. See the [In-Process API Guide](docs/in_process_api.md) for both clients in detail.
 
 ### C++ & Swift Bindings
 
@@ -255,7 +255,7 @@ Using `EXPLAIN <query>;` displays the query transformation timeline from plannin
 * **Locality Groups (Column Partitioning)**: Allows columns of a table to be physically partitioned and stored in separate LSM-tree subdirectories, optimizing read I/O via query column pruning.
 * **Flexible Deployment Modes**: Supports both in-process embedded execution and client-server execution over gRPC using a unified client library.
 * **Native Cross-Language Bindings**: Provides FFI bindings in the `dtdb_bindings` crate, allowing the database to be embedded directly into non‑Rust ecosystems.
-* **Full-Text Search**: Supports `MATCH ... AGAINST` syntax with token, boolean, and phrase queries via a secondary index, enabling efficient text search.
+* **Full-Text Search**: Supports `MATCH ... AGAINST` syntax with token, boolean, and phrase queries via an inverted secondary index, with pluggable custom Rust tokenizers (the built-in `simple` tokenizer plus anything implementing the `Tokenizer` trait).
 * **Fuzz & Property Testing**: A dedicated `dtdb_fuzz` crate runs random-input targets against WAL recovery, SSTable parsing, concurrent transactions, and end-to-end SQL durability (flush + reopen). Wired into CI with a small budget per PR and a larger budget on the nightly cron.
 
 ---
