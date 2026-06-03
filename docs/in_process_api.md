@@ -23,7 +23,7 @@ Both expose the same conceptual surface — `create_db`, `execute_query`, `run_i
 
 ## 2. Quick start: `InProcessClient`
 
-```rust
+```rust,no_run
 use dtdb_api::{in_process::InProcessClient, sql_query};
 use dtdb_storage::CompressionType;
 
@@ -76,10 +76,11 @@ Two things to notice up front:
 
 The `sql_query!` macro accepts **only string literals** — it fails to compile on a runtime `String`. This is deliberate: it forces you to use real parameter binding instead of formatting values into SQL text.
 
-```rust
+```rust,no_run
+# use dtdb_api::sql_query;
 let q = sql_query!("SELECT * FROM users WHERE name = @name AND id > @min")
     .bind("name", "alice")
-    .bind("min", 10);
+    .bind("min", 10i64);
 ```
 
 `@name` placeholders are filled from the values you `.bind(...)`; binding handles quoting and type coercion so user input can't break out of its slot. If you must build a query from a non-literal string, construct it explicitly with `SqlQuery::new(text)` and accept that you own the escaping.
@@ -101,19 +102,26 @@ These are the two ways to run statements. The difference is transaction scope.
 - read-your-own-writes across statements, or
 - a non-default isolation level (via `run_in_transaction_with_options`, see [§5](#5-transactions-isolation-and-conflicts)).
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# use dtdb_storage::DbValue;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = InProcessClient::open("/tmp/dtdb-doctest")?;
 let names: Vec<String> = client.run_in_transaction("app", |tx| {
     tx.execute_query(sql_query!("UPDATE users SET name = 'ALICE' WHERE id = 1"))?;
 
     let mut out = Vec::new();
     let result = tx.execute_query(sql_query!("SELECT name FROM users ORDER BY id"))?;
     for row in result {
+        // DbValue::String wraps an Arc<str>; to_string() gives an owned String.
         if let Some(DbValue::String(s)) = row?.get_by_index(0) {
-            out.push(s.clone());
+            out.push(s.to_string());
         }
     }
     Ok(out) // committed here
 })?;
+# Ok(())
+# }
 ```
 
 The closure returns any `Result<T, Status>`; the `T` is handed back to you on commit. Returning `Err(_)` (including propagating a `?` from a failed statement) rolls the whole transaction back.
@@ -126,7 +134,10 @@ The closure returns any `Result<T, Status>`; the `T` is handed back to you on co
 
 `execute_query` (and the transaction client's `execute_query`) returns an `InProcessQueryResult`, which is an `Iterator<Item = Result<Row, Status>>` plus two helpers:
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = InProcessClient::open("/tmp/dtdb-doctest")?;
 let result = client.execute_query("app", sql_query!("SELECT id, name FROM users"))?;
 
 // schema() describes the result columns (None for non-SELECT statements).
@@ -145,6 +156,8 @@ for row in result {
         .and_then(|s| row.get_by_name(s, "name")); // Option<&DbValue>, by column name
     println!("{id:?} {name:?}");
 }
+# Ok(())
+# }
 ```
 
 - **`row.get_by_index(i)`** → `Option<&DbValue>` by column position.
@@ -153,11 +166,16 @@ for row in result {
 
 For DDL and writes, `schema()` is `None` and the iterator is empty; use **`info_message()`** for a human-readable summary instead:
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = InProcessClient::open("/tmp/dtdb-doctest")?;
 let result = client.execute_query("app", sql_query!(
     "INSERT INTO users (id, name) VALUES (3, 'carol')"
 ))?;
 println!("{}", result.info_message().unwrap()); // "Inserted 1 row(s)."
+# Ok(())
+# }
 ```
 
 `info_message()` returns things like `"Inserted 3 row(s)."`, `"Table created successfully."`, or `"Updated 1 row(s)."`, and `None` for `SELECT`.
@@ -168,7 +186,10 @@ println!("{}", result.info_message().unwrap()); // "Inserted 1 row(s)."
 
 `run_in_transaction` uses the default isolation level (`SnapshotIsolation`). To pick another, use `run_in_transaction_with_options`:
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = InProcessClient::open("/tmp/dtdb-doctest")?;
 use dtdb_api::client::{IsolationLevel, TransactionOptions};
 
 let opts = TransactionOptions {
@@ -179,13 +200,18 @@ client.run_in_transaction_with_options("app", opts, |tx| {
     tx.execute_query(sql_query!("INSERT INTO users (id, name) VALUES (4, 'dave')"))?;
     Ok(())
 })?;
+# Ok(())
+# }
 ```
 
 The four levels (`ReadUncommitted`, `ReadCommitted`, `RepeatableRead`, `SnapshotIsolation`) and their conflict-detection semantics are documented in [configuration.md → Transaction isolation levels](configuration.md#3-transaction-isolation-levels).
 
 DuctTapeDB uses optimistic concurrency control: conflicts are detected **at commit time**, not by blocking. When a concurrent transaction has modified data your transaction read (or, under `SnapshotIsolation`, inserted into a range you scanned), the commit aborts and surfaces as `Status::aborted`. Treat that as a **retry signal** — the client does not retry on your behalf:
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = InProcessClient::open("/tmp/dtdb-doctest")?;
 let result = loop {
     match client.run_in_transaction("app", |tx| {
         tx.execute_query(sql_query!("UPDATE users SET name = 'ALICE' WHERE id = 1"))?;
@@ -196,6 +222,8 @@ let result = loop {
     }
 };
 result?;
+# Ok(())
+# }
 ```
 
 ---
@@ -204,12 +232,15 @@ result?;
 
 `InProcessClient` is `Clone` and `Send + Sync` — it's a thin handle over an `Arc`'d catalog. Clone it freely and hand clones to your worker threads; there is no connection pool to manage and clones share the same underlying databases.
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# use dtdb_storage::CompressionType;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let client = InProcessClient::open("/tmp/dtdb-data")?;
 client.create_db("app", CompressionType::Lz4)?;
 
 let mut handles = Vec::new();
-for i in 0..4 {
+for i in 0i64..4 {
     let client = client.clone();
     handles.push(std::thread::spawn(move || {
         client.run_in_transaction("app", |tx| {
@@ -223,6 +254,8 @@ for i in 0..4 {
     }));
 }
 for h in handles { h.join().unwrap()?; }
+# Ok(())
+# }
 ```
 
 What holds and what doesn't:
@@ -256,7 +289,7 @@ DuctTapeDB ships a full-text search engine built on an inverted index, and — d
 
 A tokenizer is any type implementing `dtdb_relational::Tokenizer`. The trait has a single method:
 
-```rust
+```rust,no_run
 use dtdb_relational::Tokenizer;
 
 /// Splits a comma-delimited column (e.g. a `tags` field) into normalized terms.
@@ -274,7 +307,8 @@ impl Tokenizer for CommaTokenizer {
 
 Because `tokenize` is plain Rust, the tokenizer can do whatever you need: character n-grams for substring/fuzzy matching, language-specific stemming, stripping diacritics, splitting `CamelCase`, and so on. For example, a character-trigram tokenizer that enables substring-style matching:
 
-```rust
+```rust,no_run
+# use dtdb_relational::Tokenizer;
 struct Trigram;
 
 impl Tokenizer for Trigram {
@@ -291,7 +325,12 @@ The built-in tokenizer is named **`simple`**: it splits on whitespace, lowercase
 
 Tokenizers live in a **process-global registry**, keyed by name. Register yours once at startup, before any DDL or query that references it:
 
-```rust
+```rust,no_run
+# use dtdb_relational::Tokenizer;
+# struct CommaTokenizer;
+# impl Tokenizer for CommaTokenizer { fn tokenize(&self, text: &str) -> Vec<String> { text.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect() } }
+# struct Trigram;
+# impl Tokenizer for Trigram { fn tokenize(&self, text: &str) -> Vec<String> { text.to_lowercase().chars().collect::<Vec<_>>().windows(3).map(|w| w.iter().collect()).collect() } }
 use std::sync::Arc;
 use dtdb_relational::register_global_tokenizer;
 
@@ -307,7 +346,10 @@ register_global_tokenizer("trigram", Arc::new(Trigram));
 
 Declare a `FULLTEXT` index with `CREATE FULLTEXT INDEX`, optionally naming a tokenizer with `USING`; query it with `MATCH(col) AGAINST('...')`:
 
-```rust
+```rust,no_run
+# use dtdb_api::{in_process::InProcessClient, sql_query};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = InProcessClient::open("/tmp/dtdb-doctest")?;
 // DDL must be a standalone statement (see §3).
 client.execute_query("app", sql_query!(
     "CREATE FULLTEXT INDEX idx_tags ON items (tags) USING comma"
@@ -316,6 +358,8 @@ client.execute_query("app", sql_query!(
 let result = client.execute_query("app", sql_query!(
     "SELECT id FROM items WHERE MATCH(tags) AGAINST('rust AND database')"
 ))?;
+# Ok(())
+# }
 ```
 
 Omit `USING <tokenizer>` to fall back to the built-in `simple` tokenizer. The optimizer uses the index automatically when one exists on the matched column (visible as `PhysicalFullTextScan` in `EXPLAIN`); without an index, `MATCH … AGAINST` still works by falling back to a sequential scan that evaluates the query against each row.
@@ -335,7 +379,7 @@ The DDL and `MATCH … AGAINST` grammar are also covered, from the SQL-dialect s
 
 The embedded client has an async twin, `dtdb_api::client::RemoteClient`, that speaks gRPC to a `dtdb` server. It mirrors `InProcessClient`'s surface so code ports with mechanical changes:
 
-```rust
+```rust,no_run
 use dtdb_api::{client::RemoteClient, sql_query};
 
 #[tokio::main]

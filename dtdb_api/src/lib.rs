@@ -16,6 +16,15 @@ pub mod server;
 
 pub use query::SqlQuery;
 
+// Compile-check the in-process API guide: every Rust code block in
+// docs/in_process_api.md is run as a doctest (all `no_run`, so they compile
+// and type-check against the real API but never touch disk or the network).
+// The `tests/doc_examples_no_run.rs` guard enforces the `no_run` annotation.
+// `#[cfg(doctest)]` keeps this item out of the built library and rendered docs.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/in_process_api.md")]
+struct InProcessApiGuideDoctests;
+
 /// Macro to enforce that SQL queries are compile-time literal strings.
 ///
 /// Example:
