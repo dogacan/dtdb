@@ -24,7 +24,7 @@ Always run the following commands and verify they pass cleanly before proposing 
    ```
 
 3. **ThreadSanitizer (TSAN) Checks**:
-   Since DuctTapeDB has multi-threaded operations in its storage engine (e.g., background compaction spawner), verify that no thread/concurrency issues are introduced:
+   Since DuctTapeDB has multi-threaded operations in its storage engine (e.g., background compaction spawner), if your work has possible concurrency errors, verify that no thread/concurrency issues are introduced:
 
    ```bash
    ./scripts/run_tsan.sh

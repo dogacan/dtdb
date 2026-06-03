@@ -409,9 +409,66 @@ impl Transaction {
         // 1. Resolve primary key bounds
         let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
 
-        // Construct composite key scan bounds for the index engine
-        let start_bound = DbKey::composite(vec![start_val.clone(), min_pk]);
-        let end_bound = DbKey::composite(vec![end_val.clone(), max_pk]);
+        let idx_def = table
+            .schema
+            .indexes
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .ok_or_else(|| {
+                RelationalError::SchemaMismatch(format!("Index '{}' not found", index_name))
+            })?;
+
+        // Unpack start_val and end_val to see if they are composite keys.
+        let mut start_parts = match start_val {
+            DbKey::Composite(parts) => (**parts).clone(),
+            other => vec![other.clone()],
+        };
+        let mut end_parts = match end_val {
+            DbKey::Composite(parts) => (**parts).clone(),
+            other => vec![other.clone()],
+        };
+
+        // Determine column min/max bounds for the columns that are not specified in start_val/end_val.
+        let prefix_len = start_parts.len();
+        for i in prefix_len..idx_def.columns.len() {
+            let col_name = &idx_def.columns[i];
+            let col_idx = table.schema.column_index(col_name).ok_or_else(|| {
+                RelationalError::SchemaMismatch(format!("Indexed column '{}' not found", col_name))
+            })?;
+            let col = &table.schema.columns[col_idx];
+            let (col_min, col_max) = match col.data_type {
+                crate::schema::DataType::Int => (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX)),
+                crate::schema::DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
+                crate::schema::DataType::Date => (
+                    DbKey::Date(chrono::NaiveDate::MIN),
+                    DbKey::Date(chrono::NaiveDate::MAX),
+                ),
+                crate::schema::DataType::Time => (
+                    DbKey::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
+                    DbKey::Time(
+                        chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap(),
+                    ),
+                ),
+                crate::schema::DataType::Timestamp => (
+                    DbKey::Timestamp(chrono::NaiveDateTime::MIN),
+                    DbKey::Timestamp(chrono::NaiveDateTime::MAX),
+                ),
+                crate::schema::DataType::Decimal => (
+                    DbKey::Decimal(rust_decimal::Decimal::MIN),
+                    DbKey::Decimal(rust_decimal::Decimal::MAX),
+                ),
+                _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
+            };
+            start_parts.push(col_min);
+            end_parts.push(col_max);
+        }
+
+        // Finally, append primary key bounds
+        start_parts.push(min_pk);
+        end_parts.push(max_pk);
+
+        let start_bound = DbKey::composite(start_parts);
+        let end_bound = DbKey::composite(end_parts);
 
         // Track the scan range for the index
         if self.isolation_level == IsolationLevel::SnapshotIsolation {
@@ -461,43 +518,71 @@ impl Transaction {
                         .indexes
                         .iter()
                         .find(|idx| idx.name == index_name)
-                    && let Some(col_name) = idx_def.columns.first()
-                    && let Some(col_idx) = table.schema.column_index(col_name)
-                    && let Some(val) = row.get_by_index(col_idx)
                 {
-                    if idx_def.index_type == crate::schema::IndexType::FullText {
-                        if let DbValue::String(s) = val {
-                            let tokenizer_name = idx_def.tokenizer.as_deref().unwrap_or("simple");
-                            if let Some(tokenizer) = crate::tokenizer::get_tokenizer(tokenizer_name)
-                            {
-                                let tokens = tokenizer.tokenize(s);
-                                let mut match_found = false;
-                                if let DbKey::String(query_token) = start_val
-                                    && tokens.iter().any(|t| t.as_str() == &**query_token)
+                    // Ensure all columns in the composite index are non-Null.
+                    // If any column is Null, get_index_keys would not have generated a key,
+                    // so it should not be returned by the index scan.
+                    let mut has_null = false;
+                    for col_name in &idx_def.columns {
+                        let col_idx = match table.schema.column_index(col_name) {
+                            Some(idx) => idx,
+                            None => {
+                                has_null = true;
+                                break;
+                            }
+                        };
+                        match row.get_by_index(col_idx) {
+                            Some(DbValue::Null) | None => {
+                                has_null = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if has_null {
+                        continue;
+                    }
+
+                    if let Some(col_name) = idx_def.columns.first()
+                        && let Some(col_idx) = table.schema.column_index(col_name)
+                        && let Some(val) = row.get_by_index(col_idx)
+                    {
+                        if idx_def.index_type == crate::schema::IndexType::FullText {
+                            if let DbValue::String(s) = val {
+                                let tokenizer_name =
+                                    idx_def.tokenizer.as_deref().unwrap_or("simple");
+                                if let Some(tokenizer) =
+                                    crate::tokenizer::get_tokenizer(tokenizer_name)
                                 {
-                                    match_found = true;
-                                }
-                                if match_found {
-                                    rows.push(row.clone());
+                                    let tokens = tokenizer.tokenize(s);
+                                    let mut match_found = false;
+                                    if let DbKey::String(query_token) = start_val
+                                        && tokens.iter().any(|t| t.as_str() == &**query_token)
+                                    {
+                                        match_found = true;
+                                    }
+                                    if match_found {
+                                        rows.push(row.clone());
+                                    }
                                 }
                             }
-                        }
-                    } else {
-                        let k = match val {
-                            DbValue::Int(v) => Some(DbKey::Int(*v)),
-                            DbValue::String(s) => Some(DbKey::String(s.clone())),
-                            DbValue::Bool(b) => Some(DbKey::Bool(*b)),
-                            DbValue::Date(d) => Some(DbKey::Date(*d)),
-                            DbValue::Time(t) => Some(DbKey::Time(*t)),
-                            DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
-                            DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
-                            _ => None,
-                        };
-                        if let Some(k) = k
-                            && &k >= start_val
-                            && &k <= end_val
-                        {
-                            rows.push(row.clone());
+                        } else {
+                            let k = match val {
+                                DbValue::Int(v) => Some(DbKey::Int(*v)),
+                                DbValue::String(s) => Some(DbKey::String(s.clone())),
+                                DbValue::Bool(b) => Some(DbKey::Bool(*b)),
+                                DbValue::Date(d) => Some(DbKey::Date(*d)),
+                                DbValue::Time(t) => Some(DbKey::Time(*t)),
+                                DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
+                                DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
+                                _ => None,
+                            };
+                            if let Some(k) = k
+                                && &k >= start_val
+                                && &k <= end_val
+                            {
+                                rows.push(row.clone());
+                            }
                         }
                     }
                 }
@@ -509,8 +594,6 @@ impl Transaction {
             .indexes
             .iter()
             .find(|idx| idx.name == index_name)
-            && let Some(col_name) = idx_def.columns.first()
-            && let Some(col_idx) = table.schema.column_index(col_name)
         {
             let row_val_to_key = |val: &DbValue| -> DbKey {
                 match val {
@@ -525,11 +608,26 @@ impl Transaction {
                 }
             };
 
+            let extract_index_key = |row: &Row| -> DbKey {
+                if idx_def.columns.len() == 1 {
+                    let col_name = &idx_def.columns[0];
+                    let col_idx = table.schema.column_index(col_name).unwrap();
+                    let val = row.get_by_index(col_idx).unwrap_or(&DbValue::Null);
+                    row_val_to_key(val)
+                } else {
+                    let mut parts = Vec::new();
+                    for col_name in &idx_def.columns {
+                        let col_idx = table.schema.column_index(col_name).unwrap();
+                        let val = row.get_by_index(col_idx).unwrap_or(&DbValue::Null);
+                        parts.push(row_val_to_key(val));
+                    }
+                    DbKey::composite(parts)
+                }
+            };
+
             rows.sort_by(|a, b| {
-                let a_val = a.get_by_index(col_idx).unwrap_or(&DbValue::Null);
-                let b_val = b.get_by_index(col_idx).unwrap_or(&DbValue::Null);
-                let a_key = row_val_to_key(a_val);
-                let b_key = row_val_to_key(b_val);
+                let a_key = extract_index_key(a);
+                let b_key = extract_index_key(b);
                 let ord = a_key.cmp(&b_key);
                 if ord != std::cmp::Ordering::Equal {
                     ord

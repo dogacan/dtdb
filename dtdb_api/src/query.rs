@@ -125,13 +125,11 @@ mod tests {
         let ts = NaiveDateTime::new(date, time);
         let dec = Decimal::from_str("1.50").unwrap();
 
-        let q = SqlQuery::new(
-            "INSERT INTO t VALUES (@d, @t, @ts, @dec)".to_string(),
-        )
-        .bind("d", date)
-        .bind("t", time)
-        .bind("ts", ts)
-        .bind("dec", dec);
+        let q = SqlQuery::new("INSERT INTO t VALUES (@d, @t, @ts, @dec)".to_string())
+            .bind("d", date)
+            .bind("t", time)
+            .bind("ts", ts)
+            .bind("dec", dec);
 
         // Date/Time/Timestamp render as typed SQL literals; Decimal renders as a
         // bare numeric literal preserving its scale.
@@ -161,8 +159,7 @@ mod tests {
 
     #[test]
     fn interpolate_renders_bytes_as_hex_literal() {
-        let q = SqlQuery::new("SELECT @raw".to_string())
-            .bind("raw", vec![0x01u8, 0x02, 0xff]);
+        let q = SqlQuery::new("SELECT @raw".to_string()).bind("raw", vec![0x01u8, 0x02, 0xff]);
         assert_eq!(q.interpolate().unwrap(), "SELECT x'0102ff'");
     }
 
@@ -172,10 +169,7 @@ mod tests {
         // the one outside is substituted.
         let q = SqlQuery::new("SELECT '@d' , @d".to_string())
             .bind("d", NaiveDate::from_ymd_opt(2026, 6, 3).unwrap());
-        assert_eq!(
-            q.interpolate().unwrap(),
-            "SELECT '@d' , DATE '2026-06-03'"
-        );
+        assert_eq!(q.interpolate().unwrap(), "SELECT '@d' , DATE '2026-06-03'");
     }
 
     #[test]

@@ -7291,3 +7291,81 @@ fn test_prepared_params_temporal_decimal_keys() {
         }
     }
 }
+
+#[test]
+fn test_composite_secondary_index_bugs() {
+    let (_temp, db, engine) = setup_engine();
+    let run = |sql: &str, id: u64| {
+        let tx = Transaction::new(id, db.clone());
+        engine.execute(sql, &tx).unwrap();
+        tx.commit().unwrap();
+    };
+
+    // 1. Create table with a composite secondary index and a String primary key.
+    // The string primary key will have min_pk = DbKey::String("") which is
+    // larger than any DbKey::Int(val) under Rust's enum variant ordering,
+    // thereby triggering the bounds vulnerability if not correctly handled.
+    run(
+        "CREATE TABLE composite_test (id STRING PRIMARY KEY, a INT, b INT)",
+        1,
+    );
+    run("CREATE INDEX idx_a_b ON composite_test (a, b)", 2);
+
+    // Insert some rows.
+    run(
+        "INSERT INTO composite_test (id, a, b) VALUES
+            ('pk1', 5, 20),
+            ('pk2', 5, 10),
+            ('pk3', 6, 30)",
+        3,
+    );
+
+    // Verify 1: The bounds bug fix.
+    // Querying with `a = 5` must return both rows.
+    let rows = select_rows(
+        &engine,
+        &db,
+        4,
+        "SELECT id, b FROM composite_test WHERE a = 5",
+    );
+    assert_eq!(rows.len(), 2, "Expected 2 rows for a=5, got: {:?}", rows);
+
+    // Verify 2: The sorting collapse bug fix.
+    // Since the index is on (a, b), a query ordered by index columns must return
+    // (5, 10) then (5, 20).
+    assert_eq!(rows[0].values[0], DbValue::string("pk2"));
+    assert_eq!(rows[0].values[1], DbValue::Int(10));
+    assert_eq!(rows[1].values[0], DbValue::string("pk1"));
+    assert_eq!(rows[1].values[1], DbValue::Int(20));
+
+    // Verify 3: Write Buffer Null-Checking Bug.
+    // In a new transaction, write a row that has a=5 but b=NULL.
+    // Since b is NULL, it will NOT generate an index entry on disk.
+    // The write buffer scanner must filter it out because it shouldn't be in the index.
+    {
+        let tx = Transaction::new(5, db.clone());
+        engine
+            .execute(
+                "INSERT INTO composite_test (id, a, b) VALUES ('pk4', 5, NULL)",
+                &tx,
+            )
+            .unwrap();
+        // Do the select inside the transaction before committing so it hits the write buffer
+        let res = engine
+            .execute("SELECT id FROM composite_test WHERE a = 5", &tx)
+            .unwrap();
+        if let ExecutionResult::Select { rows, .. } = res {
+            let ids: Vec<String> = rows
+                .iter()
+                .map(|r| match &r.values[0] {
+                    DbValue::String(s) => s.to_string(),
+                    other => panic!("expected string, got {:?}", other),
+                })
+                .collect();
+            assert_eq!(ids, vec!["pk2".to_string(), "pk1".to_string()]);
+        } else {
+            panic!("expected Select");
+        }
+        tx.commit().unwrap();
+    }
+}
