@@ -1242,40 +1242,14 @@ impl LogicalPlanner {
                 // legitimate shadowing, not recursion.
                 if let Some(cte_plan) = self.lookup_cte(&name_str) {
                     let qualifier = match alias {
-                        Some(a) => a.name.value.clone(),
-                        None => name_str.clone(),
+                        Some(a) => a.name.value.as_str(),
+                        None => name_str.as_str(),
                     };
                     let col_aliases: Vec<&str> = match alias {
                         Some(a) => a.columns.iter().map(|c| c.name.value.as_str()).collect(),
                         None => Vec::new(),
                     };
-                    let inner_schema = cte_plan.schema();
-                    if !col_aliases.is_empty() && col_aliases.len() != inner_schema.columns.len() {
-                        return Err(format!(
-                            "CTE '{}' yields {} column(s) but {} alias(es) were provided",
-                            qualifier,
-                            inner_schema.columns.len(),
-                            col_aliases.len()
-                        ));
-                    }
-
-                    let mut expressions = Vec::with_capacity(inner_schema.columns.len());
-                    let mut field_names = Vec::with_capacity(inner_schema.columns.len());
-                    for (i, col) in inner_schema.columns.iter().enumerate() {
-                        expressions.push(Expr::Column(col.name.clone(), Some(i)));
-                        let base = if col_aliases.is_empty() {
-                            col.name.rsplit('.').next().unwrap_or(&col.name)
-                        } else {
-                            col_aliases[i]
-                        };
-                        field_names.push(format!("{qualifier}.{base}"));
-                    }
-
-                    return Ok(LogicalPlan::new_projection(
-                        cte_plan,
-                        expressions,
-                        field_names,
-                    ));
+                    return qualified_projection(cte_plan, qualifier, &col_aliases, "CTE");
                 }
 
                 let table = self.database.get_table(&name_str).map_err(|e| {
@@ -1327,39 +1301,13 @@ impl LogicalPlanner {
                 // A non-LATERAL derived table cannot reference the enclosing
                 // query; reuse the correlation check to reject one that tries.
                 reject_if_correlated(&inner)?;
-                let inner_schema = inner.schema();
 
                 let col_aliases: Vec<&str> = alias
                     .columns
                     .iter()
                     .map(|c| c.name.value.as_str())
                     .collect();
-                if !col_aliases.is_empty() && col_aliases.len() != inner_schema.columns.len() {
-                    return Err(format!(
-                        "derived table '{}' yields {} column(s) but {} alias(es) were provided",
-                        qualifier,
-                        inner_schema.columns.len(),
-                        col_aliases.len()
-                    ));
-                }
-
-                // Re-alias every output column as `qualifier.name` so the
-                // enclosing query can reference `t.col` (or bare `col`). Columns
-                // are read positionally (`Some(i)`), so duplicate inner names do
-                // not make the wrapping projection ambiguous.
-                let mut expressions = Vec::with_capacity(inner_schema.columns.len());
-                let mut field_names = Vec::with_capacity(inner_schema.columns.len());
-                for (i, col) in inner_schema.columns.iter().enumerate() {
-                    expressions.push(Expr::Column(col.name.clone(), Some(i)));
-                    let base = if col_aliases.is_empty() {
-                        col.name.rsplit('.').next().unwrap_or(&col.name)
-                    } else {
-                        col_aliases[i]
-                    };
-                    field_names.push(format!("{qualifier}.{base}"));
-                }
-
-                Ok(LogicalPlan::new_projection(inner, expressions, field_names))
+                qualified_projection(inner, &qualifier, &col_aliases, "derived table")
             }
             other => Err(format!("Unsupported table factor in FROM: {:?}", other)),
         }
@@ -1984,6 +1932,43 @@ impl LogicalPlanner {
             _ => Ok(()),
         }
     }
+}
+
+/// Wraps `plan` in a projection that re-aliases every output column as
+/// `qualifier.name`, used by both CTE and derived-table scans so an enclosing
+/// query can reference `t.col` (or bare `col`). When `col_aliases` is non-empty
+/// it supplies the column names (and must match the column count); otherwise the
+/// unqualified tail of each existing column name is reused. Columns are read
+/// positionally (`Some(i)`), so duplicate inner names stay unambiguous. `what`
+/// labels the relation in the arity-mismatch error ("CTE" / "derived table").
+fn qualified_projection(
+    plan: LogicalPlan,
+    qualifier: &str,
+    col_aliases: &[&str],
+    what: &str,
+) -> Result<LogicalPlan, String> {
+    let schema = plan.schema();
+    if !col_aliases.is_empty() && col_aliases.len() != schema.columns.len() {
+        return Err(format!(
+            "{what} '{qualifier}' yields {} column(s) but {} alias(es) were provided",
+            schema.columns.len(),
+            col_aliases.len()
+        ));
+    }
+
+    let mut expressions = Vec::with_capacity(schema.columns.len());
+    let mut field_names = Vec::with_capacity(schema.columns.len());
+    for (i, col) in schema.columns.iter().enumerate() {
+        expressions.push(Expr::Column(col.name.clone(), Some(i)));
+        let base = if col_aliases.is_empty() {
+            col.name.rsplit('.').next().unwrap_or(&col.name)
+        } else {
+            col_aliases[i]
+        };
+        field_names.push(format!("{qualifier}.{base}"));
+    }
+
+    Ok(LogicalPlan::new_projection(plan, expressions, field_names))
 }
 
 /// Rejects correlated subqueries (ADR 0005). A subquery is *correlated* when it
