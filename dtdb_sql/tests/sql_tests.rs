@@ -6020,6 +6020,121 @@ fn test_spilling_parity_against_in_memory() {
     );
 }
 
+/// Spilling parity for SUM/AVG over non-integer numeric columns. The existing
+/// battery only aggregates an INT column, so the `Decimal`/`Float` accumulate
+/// and external-merge branches of `Accumulator` (combining partial sums from
+/// separate spilled runs of the same group) were never exercised. A `BIGINT`
+/// column with values near `i64::MAX` additionally drives the overflow ->
+/// float-promotion branch in both the accumulate and merge paths.
+#[test]
+fn test_spilling_parity_decimal_float_and_overflow() {
+    fn run_battery(memory_budget: Option<usize>) -> Vec<Vec<dtdb_relational::Row>> {
+        let (_temp, db, engine) = setup_engine_with_options(opts_with_budget(memory_budget));
+
+        let tx1 = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE m (id INT PRIMARY KEY, g TEXT, dec DECIMAL, f FLOAT, big BIGINT)",
+                &tx1,
+            )
+            .unwrap();
+        tx1.commit().unwrap();
+        drop(tx1);
+
+        // 120 rows across 4 groups (g cycles a..d), interleaved by id so the
+        // tiny budget spills each group's partial accumulator across several
+        // runs that must merge at finalize. `big` is ~4.6e18 so any group with
+        // 3+ rows overflows i64 and promotes to float.
+        let tx2 = Transaction::new(2, db.clone());
+        let mut vals = Vec::new();
+        for i in 0..120 {
+            let g = (b'a' + (i % 4) as u8) as char;
+            // Decimal with two fractional digits; varied magnitudes.
+            let dec = format!("DECIMAL '{}.{:02}'", i + 1, i % 100);
+            let f = (i as f64) * 1.25 + 0.5;
+            let big = 4_600_000_000_000_000_000i64 + i as i64;
+            // `{:.4}` keeps a fractional part so the literal parses as FLOAT
+            // (a bare `3.0` would format as `3` and be read as INT).
+            vals.push(format!("({i}, '{g}', {dec}, {f:.4}, {big})"));
+        }
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO m (id, g, dec, f, big) VALUES {}",
+                    vals.join(", ")
+                ),
+                &tx2,
+            )
+            .unwrap();
+        tx2.commit().unwrap();
+        drop(tx2);
+
+        let queries = [
+            "SELECT g, SUM(dec), AVG(dec) FROM m GROUP BY g ORDER BY g",
+            "SELECT g, SUM(f), AVG(f) FROM m GROUP BY g ORDER BY g",
+            "SELECT g, SUM(big) FROM m GROUP BY g ORDER BY g",
+            "SELECT SUM(dec), SUM(f), SUM(big) FROM m",
+        ];
+
+        let tx3 = Transaction::new(3, db.clone());
+        let mut results = Vec::new();
+        for q in queries {
+            match engine.execute(q, &tx3).unwrap() {
+                ExecutionResult::Select { rows, .. } => results.push(rows),
+                _ => panic!("Expected Select for query: {q}"),
+            }
+        }
+        drop(tx3);
+
+        assert_tmp_empty(&db);
+        results
+    }
+
+    let spilled = run_battery(Some(200)); // tiny budget -> heavy spilling + merges
+    let in_memory = run_battery(None); // fully in memory
+    assert_eq!(
+        spilled, in_memory,
+        "decimal/float/overflow spilling output diverged from the in-memory path"
+    );
+
+    // Sanity: the decimal sum of the single all-rows group is the exact sum of
+    // 1.00 + 2.01 + ... (no float rounding), confirming the decimal path stayed
+    // in Decimal rather than promoting to Float.
+    let expected_dec: rust_decimal::Decimal = (0..120)
+        .map(|i| {
+            rust_decimal::Decimal::from(i + 1) + rust_decimal::Decimal::new((i % 100) as i64, 2)
+        })
+        .sum();
+    let last = spilled.last().unwrap();
+    assert_eq!(last[0].values[0], DbValue::Decimal(expected_dec));
+    // The BIGINT group sum overflowed i64 and promoted to Float.
+    assert!(matches!(last[0].values[2], DbValue::Float(_)));
+}
+
+/// SUM over a non-numeric column is rejected with a clear error (the
+/// `Cannot compute SUM on non-numeric value` branch of the accumulator).
+#[test]
+fn test_sum_on_non_numeric_errors() {
+    let (_temp, db, engine) = setup_engine();
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, label TEXT)", &tx1)
+        .unwrap();
+    engine
+        .execute("INSERT INTO t (id, label) VALUES (1, 'a'), (2, 'b')", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    let err = engine
+        .execute("SELECT SUM(label) FROM t", &tx2)
+        .unwrap_err();
+    assert!(
+        err.contains("Cannot compute SUM on non-numeric"),
+        "got: {err}"
+    );
+}
+
 /// The parse cache keys on SQL text, so re-executing the same parameterized
 /// template reuses one parsed AST. This guards correctness: the cached AST keeps
 /// its symbolic placeholders (binding happens on a per-execution clone), so

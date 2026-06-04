@@ -1061,6 +1061,9 @@ enum Accumulator {
     Sum {
         int_sum: Option<i64>,
         float_sum: Option<f64>,
+        // Stringified for spill serialization: rust_decimal's default serde uses
+        // `deserialize_any`, which postcard (the spill format) cannot decode.
+        #[serde(with = "dtdb_storage::decimal_serde_option")]
         decimal_sum: Option<rust_decimal::Decimal>,
     },
     Min {
@@ -1072,6 +1075,7 @@ enum Accumulator {
     Avg {
         sum: f64,
         count: i64,
+        #[serde(with = "dtdb_storage::decimal_serde_option")]
         decimal_sum: Option<rust_decimal::Decimal>,
     },
     // DISTINCT aggregate (COUNT/SUM/AVG DISTINCT). Inputs are collected into

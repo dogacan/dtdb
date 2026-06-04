@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 
-mod decimal_serde {
+/// Serializes a [`rust_decimal::Decimal`] as its decimal string. `rust_decimal`'s
+/// default `Deserialize` relies on `deserialize_any`, which non-self-describing
+/// formats such as `postcard` reject; stringifying keeps the value portable
+/// across every serializer the engine uses (postcard spill files included).
+pub mod decimal_serde {
     use rust_decimal::Decimal;
     use serde::{Deserialize, Deserializer, Serializer};
     use std::str::FromStr;
@@ -20,6 +24,34 @@ mod decimal_serde {
     {
         let s = String::deserialize(deserializer)?;
         Decimal::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `Option<Decimal>` counterpart to [`decimal_serde`], for fields like the
+/// aggregate accumulators' partial decimal sums that are spilled to disk via
+/// postcard. Encodes as `Option<String>` so it never hits `deserialize_any`.
+pub mod decimal_serde_option {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.map(|d| d.to_string()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Option::<String>::deserialize(deserializer)? {
+            Some(s) => Decimal::from_str(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
     }
 }
 
