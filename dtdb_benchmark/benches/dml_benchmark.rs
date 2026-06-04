@@ -385,5 +385,165 @@ fn benchmark_dml(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_dml);
+fn load_shakespeare_data() -> Vec<(String, i32, String)> {
+    let paths = [
+        "text_data.txt",
+        "../text_data.txt",
+        "dtdb_benchmark/text_data.txt",
+    ];
+    let mut content = None;
+    for p in &paths {
+        if let Ok(c) = std::fs::read_to_string(p) {
+            content = Some(c);
+            break;
+        }
+    }
+    let content = content.expect("Could not find text_data.txt in any of the search paths");
+    let mut records = Vec::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(first_comma) = line.find(',') {
+            let speaker = &line[..first_comma];
+            let rest = &line[first_comma + 1..];
+            if let Some(second_comma) = rest.find(',') {
+                let id_str = &rest[..second_comma];
+                let mut text = &rest[second_comma + 1..];
+                if let Ok(id) = id_str.parse::<i32>() {
+                    if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
+                        text = &text[1..text.len() - 1];
+                    }
+                    let clean_body = text.replace(['\'', '"'], "");
+                    let clean_speaker = speaker.replace(['\'', '"'], "");
+                    records.push((clean_speaker, id, clean_body));
+                }
+            }
+        }
+    }
+    records
+}
+
+fn setup_shakespeare_unindexed(
+    data: &[(String, i32, String)],
+) -> (TempDir, Arc<Database>, SqlEngine) {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    let engine = SqlEngine::new(db.clone());
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE shakespeare (id INT PRIMARY KEY, speaker STRING, body STRING)",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    for (i, (speaker, _id, body)) in data.iter().enumerate() {
+        let sql = format!(
+            "INSERT INTO shakespeare (id, speaker, body) VALUES ({}, '{}', '{}')",
+            i, speaker, body
+        );
+        engine.execute(&sql, &tx2).unwrap();
+    }
+    tx2.commit().unwrap();
+
+    (temp_dir, db, engine)
+}
+
+fn setup_shakespeare_indexed(
+    data: &[(String, i32, String)],
+) -> (TempDir, Arc<Database>, SqlEngine) {
+    let (temp_dir, db, engine) = setup_shakespeare_unindexed(data);
+
+    let tx = Transaction::new(10, db.clone());
+    engine
+        .execute(
+            "CREATE FULLTEXT INDEX shake_body_fts ON shakespeare (body) USING trigram",
+            &tx,
+        )
+        .unwrap();
+    tx.commit().unwrap();
+
+    db.get_table("shakespeare")
+        .unwrap()
+        .flush_memtable()
+        .unwrap();
+
+    let tx_analyze = Transaction::new(11, db.clone());
+    engine
+        .execute("ANALYZE TABLE shakespeare", &tx_analyze)
+        .unwrap();
+    tx_analyze.commit().unwrap();
+
+    (temp_dir, db, engine)
+}
+
+fn setup_shakespeare_btree(data: &[(String, i32, String)]) -> (TempDir, Arc<Database>, SqlEngine) {
+    let (temp_dir, db, engine) = setup_shakespeare_unindexed(data);
+
+    let tx = Transaction::new(10, db.clone());
+    engine
+        .execute("CREATE INDEX shake_body_btree ON shakespeare (body)", &tx)
+        .unwrap();
+    tx.commit().unwrap();
+
+    (temp_dir, db, engine)
+}
+
+fn benchmark_like_queries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("LIKE Benchmarks");
+
+    let data = load_shakespeare_data();
+
+    let (_temp_unindexed, db_unindexed, engine_unindexed) = setup_shakespeare_unindexed(&data);
+    let (_temp_indexed, db_indexed, engine_indexed) = setup_shakespeare_indexed(&data);
+    let (_temp_btree, db_btree, engine_btree) = setup_shakespeare_btree(&data);
+
+    // 1. Infix LIKE without index (full sequential scan)
+    group.bench_function("Infix LIKE (No Index)", |b| {
+        let tx = Transaction::new(100, db_unindexed.clone());
+        b.iter(|| {
+            let sql = "SELECT COUNT(*) FROM shakespeare WHERE body LIKE '%speak%'";
+            let res = engine_unindexed.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    // 2. Infix LIKE with trigram fulltext index + ANALYZE (accelerated)
+    group.bench_function("Infix LIKE (Trigram Index + ANALYZE)", |b| {
+        let tx = Transaction::new(100, db_indexed.clone());
+        b.iter(|| {
+            let sql = "SELECT COUNT(*) FROM shakespeare WHERE body LIKE '%speak%'";
+            let res = engine_indexed.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    // 3. Prefix LIKE without index (full sequential scan)
+    group.bench_function("Prefix LIKE (No Index)", |b| {
+        let tx = Transaction::new(100, db_unindexed.clone());
+        b.iter(|| {
+            let sql = "SELECT COUNT(*) FROM shakespeare WHERE body LIKE 'Before%'";
+            let res = engine_unindexed.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    // 4. Prefix LIKE with B-tree index (range scan)
+    group.bench_function("Prefix LIKE (B-tree Index)", |b| {
+        let tx = Transaction::new(100, db_btree.clone());
+        b.iter(|| {
+            let sql = "SELECT COUNT(*) FROM shakespeare WHERE body LIKE 'Before%'";
+            let res = engine_btree.execute(sql, &tx).unwrap();
+            criterion::black_box(res);
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, benchmark_dml, benchmark_like_queries);
 criterion_main!(benches);
