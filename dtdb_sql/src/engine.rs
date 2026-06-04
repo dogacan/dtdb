@@ -2042,7 +2042,14 @@ fn preprocess_sql(sql: &str) -> String {
     let sql_trimmed = sql.trim();
     let sql_upper = sql_trimmed.to_ascii_uppercase();
     if sql_upper.starts_with("CREATE FULLTEXT INDEX") {
-        let rest = sql_trimmed["CREATE FULLTEXT INDEX".len()..].trim();
+        // This branch reconstructs the statement from scratch, so a trailing ';'
+        // (the in-process CLI forwards it verbatim) must be dropped first --
+        // otherwise it is captured into the tokenizer name or breaks the rewrite.
+        let body = sql_trimmed
+            .strip_suffix(';')
+            .unwrap_or(sql_trimmed)
+            .trim_end();
+        let rest = body["CREATE FULLTEXT INDEX".len()..].trim();
         let rest_upper = rest.to_ascii_uppercase();
         if let Some(on_idx) = rest_upper.find(" ON ") {
             let idx_name = rest[..on_idx].trim();

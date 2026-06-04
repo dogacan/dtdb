@@ -98,12 +98,14 @@ Creates a generalized inverted index (full-text index) on a single column of a t
     *   Creates a full-text secondary index. The indexed column must have a string-compatible data type (e.g. `TEXT`, `VARCHAR`, `STRING`). Full-text indexes on multiple columns are not supported.
     *   The optional `USING <tokenizer_name>` clause specifies which registered tokenizer to use. If omitted, the default `simple` tokenizer is used.
     *   During population, the index splits column string values into tokens using the specified tokenizer, and maps each unique token to the primary key(s) of matching rows.
+    *   **Built-in tokenizers**: `simple` (whitespace split + lowercase, for word-level `MATCH` search) and `trigram` (overlapping character 3-grams + lowercase). The tokenizer is the analog of a PostgreSQL operator class: it determines *which* queries this index can accelerate. A `trigram` index additionally accelerates substring `LIKE` (see [Pattern Matching](#pattern-matching)); a `simple` (word) index does not. Additional tokenizers can be registered through the relational API.
 *   **Transaction Restriction**:
     *   `CREATE FULLTEXT INDEX` is a DDL statement and is **not allowed** inside explicit transactions. It must be run as a single auto-committed statement.
 *   **Example**:
     ```sql
     CREATE FULLTEXT INDEX idx_content ON articles (content);
     CREATE FULLTEXT INDEX idx_tags ON items (tags) USING comma;
+    CREATE FULLTEXT INDEX idx_body ON docs (body) USING trigram;  -- accelerates LIKE '%substr%'
     ```
 
 #### `DROP INDEX`
@@ -330,9 +332,13 @@ Used to combine boolean expressions:
 *   `IN` / `NOT IN`: Checks if a value equals any value in a list of expressions or is returned by an uncorrelated subquery (e.g. `col IN (val1, val2)` or `col NOT IN (SELECT y FROM t2)`). See [Subqueries](#6-subqueries) for details.
 
 ### Pattern Matching
-*   `LIKE` / `NOT LIKE`: Performs wildcard string matching using `%`.
+*   `LIKE` / `NOT LIKE`: Performs wildcard string matching. Matching is **case-sensitive**, and there is no `ESCAPE` clause (`%` and `_` are always wildcards).
     *   `%`: Matches zero or more characters.
+    *   `_`: Matches exactly one character.
     *   *Example*: `WHERE name LIKE 'A%'` (starts with 'A'), `WHERE name NOT LIKE '%b%'` (does not contain 'b').
+    *   *Acceleration*: The optimizer can replace the default sequential scan with an index access path, while always re-applying the full `LIKE` predicate as a residual filter for exactness:
+        *   **Prefix patterns** (`LIKE 'abc%'`) compile to a bounded range scan over the primary key or any ordinary B-tree index on the column — no full-text index required.
+        *   **Substring patterns** (`LIKE '%abc%'`) can use a `trigram` `FULLTEXT` index on the column: the pattern's trigrams are intersected over the inverted index, then rechecked. This path is chosen only when the column has been `ANALYZE`d and the substring's rarest trigram is estimated to be selective; common substrings (and un-analyzed columns) fall back to a full scan. `EXPLAIN` shows `PhysicalFullTextScan` when the trigram path is used.
 
 ### Full-Text Search
 *   `MATCH(<column_name>) AGAINST('<query_string>')`: Evaluates to `TRUE` if the string in `<column_name>` matches the boolean expression `<query_string>`.

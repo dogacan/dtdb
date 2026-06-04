@@ -473,16 +473,20 @@ fn setup_trigram_docs(analyze: bool) -> (tempfile::TempDir, Arc<Database>) {
         .execute("CREATE TABLE docs (id INT PRIMARY KEY, body STRING)", &tx)
         .unwrap();
     tx.commit().unwrap();
-    db.create_index(
-        "docs",
-        "docs_body_fts",
-        vec!["body".to_string()],
-        IndexType::FullText,
-        Some("trigram".to_string()),
-    )
-    .unwrap();
 
+    // Declare the trigram tokenizer through the SQL surface, not the relational
+    // create_index API: this is what proves `CREATE FULLTEXT INDEX ... USING
+    // trigram` is what drives the optimizer's trigram-intersection plan below.
     let tx = dtdb_relational::Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "CREATE FULLTEXT INDEX docs_body_fts ON docs (body) USING trigram",
+            &tx,
+        )
+        .unwrap();
+    tx.commit().unwrap();
+
+    let tx = dtdb_relational::Transaction::new(3, db.clone());
     for i in 0..60 {
         let body = if i == 0 {
             "common filler wxyzq".to_string()
@@ -500,7 +504,7 @@ fn setup_trigram_docs(analyze: bool) -> (tempfile::TempDir, Arc<Database>) {
     db.get_table("docs").unwrap().flush_memtable().unwrap();
 
     if analyze {
-        let tx = dtdb_relational::Transaction::new(3, db.clone());
+        let tx = dtdb_relational::Transaction::new(4, db.clone());
         db.analyze_table("docs", &tx).unwrap();
         drop(tx);
     }
