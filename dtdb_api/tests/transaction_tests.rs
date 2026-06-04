@@ -837,11 +837,43 @@ async fn test_grpc_transaction_with_isolation_options() {
 
     assert_eq!(tx_res.unwrap(), "read_committed_done");
 
+    // Run transaction under ReadUncommitted isolation
+    let options_ru = dtdb_api::client::TransactionOptions {
+        isolation_level: dtdb_api::client::IsolationLevel::ReadUncommitted,
+    };
+    let tx_res_ru = client
+        .run_in_transaction_with_options("test_db", options_ru, |tx| async move {
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (101, 'Frank');"
+            ))
+            .await?;
+            Ok("read_uncommitted_done")
+        })
+        .await;
+
+    assert_eq!(tx_res_ru.unwrap(), "read_uncommitted_done");
+
+    // Run transaction under RepeatableRead isolation
+    let options_rr = dtdb_api::client::TransactionOptions {
+        isolation_level: dtdb_api::client::IsolationLevel::RepeatableRead,
+    };
+    let tx_res_rr = client
+        .run_in_transaction_with_options("test_db", options_rr, |tx| async move {
+            tx.execute_query(dtdb_api::sql_query!(
+                "INSERT INTO Users (id, name) VALUES (102, 'Grace');"
+            ))
+            .await?;
+            Ok("repeatable_read_done")
+        })
+        .await;
+
+    assert_eq!(tx_res_rr.unwrap(), "repeatable_read_done");
+
     // Verify row exists
     let mut stream = client
         .execute_query(
             "test_db",
-            dtdb_api::sql_query!("SELECT id, name FROM Users WHERE id = 100;"),
+            dtdb_api::sql_query!("SELECT id, name FROM Users WHERE id >= 100 ORDER BY id ASC;"),
         )
         .await
         .unwrap();
@@ -854,8 +886,10 @@ async fn test_grpc_transaction_with_isolation_options() {
         }
     }
 
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec!["100", "Eve"]);
+    assert_eq!(rows[1], vec!["101", "Frank"]);
+    assert_eq!(rows[2], vec!["102", "Grace"]);
 
     server_handle.abort();
 }

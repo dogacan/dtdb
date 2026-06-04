@@ -178,4 +178,20 @@ mod tests {
         let err = q.interpolate().unwrap_err();
         assert!(err.contains("missing"), "unexpected error: {err}");
     }
+
+    #[test]
+    fn interpolate_skips_placeholders_inside_double_quotes() {
+        let q = SqlQuery::new("SELECT \"@d\" , @d".to_string())
+            .bind("d", NaiveDate::from_ymd_opt(2026, 6, 3).unwrap());
+        assert_eq!(
+            q.interpolate().unwrap(),
+            "SELECT \"@d\" , DATE '2026-06-03'"
+        );
+    }
+
+    #[test]
+    fn interpolate_empty_placeholder_name() {
+        let q = SqlQuery::new("SELECT @ , @name".to_string()).bind("name", "val");
+        assert_eq!(q.interpolate().unwrap(), "SELECT @ , 'val'");
+    }
 }

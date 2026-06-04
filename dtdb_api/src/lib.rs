@@ -60,3 +60,15 @@ pub fn validate_bind_security(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_bind_security_invalid_addr() {
+        let res = validate_bind_security("invalid_address", false, false);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Failed to parse bind address"));
+    }
+}

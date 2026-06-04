@@ -392,3 +392,155 @@ fn db_params_to_proto_params(bindings: &[(String, DbValue)]) -> Vec<crate::proto
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_db_params_to_proto_params_all_variants() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 3).unwrap();
+        let time = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+        let ts = NaiveDateTime::new(date, time);
+        let dec = Decimal::from_str("123.45").unwrap();
+
+        let bindings = vec![
+            ("i".to_string(), DbValue::Int(42)),
+            ("f".to_string(), DbValue::Float(1.23)),
+            ("b".to_string(), DbValue::Bool(true)),
+            ("s".to_string(), DbValue::string("hello")),
+            ("raw".to_string(), DbValue::bytes(vec![1, 2, 3])),
+            ("nul".to_string(), DbValue::Null),
+            ("d".to_string(), DbValue::Date(date)),
+            ("t".to_string(), DbValue::Time(time)),
+            ("ts".to_string(), DbValue::Timestamp(ts)),
+            ("dec".to_string(), DbValue::Decimal(dec)),
+        ];
+
+        let proto_params = db_params_to_proto_params(&bindings);
+        assert_eq!(proto_params.len(), 10);
+
+        assert_eq!(proto_params[0].name, "i");
+        assert_eq!(
+            proto_params[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::IntVal(42)
+        );
+
+        assert_eq!(proto_params[1].name, "f");
+        assert_eq!(
+            proto_params[1]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::FloatVal(1.23)
+        );
+
+        assert_eq!(proto_params[2].name, "b");
+        assert_eq!(
+            proto_params[2]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::BoolVal(true)
+        );
+
+        assert_eq!(proto_params[3].name, "s");
+        assert_eq!(
+            proto_params[3]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::StringVal("hello".to_string())
+        );
+
+        assert_eq!(proto_params[4].name, "raw");
+        assert_eq!(
+            proto_params[4]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::BytesVal(vec![1, 2, 3])
+        );
+
+        assert_eq!(proto_params[5].name, "nul");
+        assert_eq!(
+            proto_params[5]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::NullVal(true)
+        );
+
+        assert_eq!(proto_params[6].name, "d");
+        assert_eq!(
+            proto_params[6]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::StringVal("2026-06-03".to_string())
+        );
+
+        assert_eq!(proto_params[7].name, "t");
+        assert_eq!(
+            proto_params[7]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::StringVal("14:30:00".to_string())
+        );
+
+        assert_eq!(proto_params[8].name, "ts");
+        assert_eq!(
+            proto_params[8]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::StringVal("2026-06-03 14:30:00".to_string())
+        );
+
+        assert_eq!(proto_params[9].name, "dec");
+        assert_eq!(
+            proto_params[9]
+                .value
+                .as_ref()
+                .unwrap()
+                .val
+                .as_ref()
+                .unwrap(),
+            &crate::proto::param_value::Val::StringVal("123.45".to_string())
+        );
+    }
+}

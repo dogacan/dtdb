@@ -1079,12 +1079,20 @@ mod tests {
             default_value: None,
             is_auto_increment: false,
         }]);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 3).unwrap();
+        let time = chrono::NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+        let ts = chrono::NaiveDateTime::new(date, time);
+        let dec = <rust_decimal::Decimal as std::str::FromStr>::from_str("123.45").unwrap();
         let rows = vec![
             dtdb_relational::Row::new(vec![DbValue::Int(10)]),
             dtdb_relational::Row::new(vec![DbValue::Float(1.5)]),
             dtdb_relational::Row::new(vec![DbValue::bytes(vec![0xAA, 0xBB])]),
             dtdb_relational::Row::new(vec![DbValue::Bool(true)]),
             dtdb_relational::Row::new(vec![DbValue::Null]),
+            dtdb_relational::Row::new(vec![DbValue::Date(date)]),
+            dtdb_relational::Row::new(vec![DbValue::Time(time)]),
+            dtdb_relational::Row::new(vec![DbValue::Timestamp(ts)]),
+            dtdb_relational::Row::new(vec![DbValue::Decimal(dec)]),
         ];
         let r = map_res(ExecutionResult::Select { schema, rows });
         // Response 0: Header
@@ -1110,6 +1118,22 @@ mod tests {
         // Response 5: Null Row
         assert!(
             matches!(r[5].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "NULL")
+        );
+        // Response 6: Date Row
+        assert!(
+            matches!(r[6].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "2026-06-03")
+        );
+        // Response 7: Time Row
+        assert!(
+            matches!(r[7].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "14:30:00")
+        );
+        // Response 8: Timestamp Row
+        assert!(
+            matches!(r[8].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "2026-06-03 14:30:00")
+        );
+        // Response 9: Decimal Row
+        assert!(
+            matches!(r[9].payload, Some(crate::proto::execute_query_response::Payload::Row(ref row)) if row.values[0] == "123.45")
         );
     }
 
