@@ -238,6 +238,144 @@ fn test_param_conversions_fallback() {
 }
 
 #[test]
+fn test_temporal_and_decimal_value_formatting() {
+    // Exercises the DbValue -> String formatting in handle_in_process_query_result
+    // for Date, Time, Timestamp and Decimal, which the other tests never produce
+    // (they only round-trip Int/Float/Bool/String/Null). Bytes cannot be produced
+    // through the SQL surface (the engine rejects Bytes output values), so that
+    // formatting arm is not reachable here.
+    let tmp = TempDir::new().unwrap();
+    let client = new_in_process_client(tmp.path().to_str().unwrap()).unwrap();
+    client.create_db("db").unwrap();
+    client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "CREATE TABLE t (id INT PRIMARY KEY);".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "INSERT INTO t (id) VALUES (1);".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let res = client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "SELECT \
+                    CAST('2026-06-03' AS DATE), \
+                    CAST('13:45:00' AS TIME), \
+                    CAST('2026-06-03 13:45:00' AS TIMESTAMP), \
+                    CAST('678.90' AS DECIMAL) \
+                 FROM t WHERE id = 1;"
+                    .to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    assert!(res.success);
+    assert_eq!(res.rows.len(), 4);
+    assert_eq!(res.rows[0], "2026-06-03");
+    assert_eq!(res.rows[1], "13:45:00");
+    assert_eq!(res.rows[2], "2026-06-03 13:45:00");
+    assert_eq!(res.rows[3], "678.90");
+}
+
+#[test]
+fn test_streaming_row_error_surfaces_in_result() {
+    // A runtime error that only occurs while streaming individual rows (here a
+    // per-row division by zero, which constant folding cannot reject up front)
+    // must be reported as a failed QueryResult from the row-iteration error arm,
+    // not as a top-level Err from execute_query.
+    let tmp = TempDir::new().unwrap();
+    let client = new_in_process_client(tmp.path().to_str().unwrap()).unwrap();
+    client.create_db("db").unwrap();
+    client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "CREATE TABLE t (id INT PRIMARY KEY);".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "INSERT INTO t (id) VALUES (1);".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    // `id - id` is always zero but depends on the column, so it is evaluated
+    // per row at stream time rather than folded away during planning.
+    let res = client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "SELECT 1 / (id - id) FROM t;".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(!res.success);
+    assert!(res.error_message.contains("Division by zero"));
+    assert!(res.rows.is_empty());
+    assert!(res.headers.is_empty());
+}
+
+#[test]
+fn test_transaction_calls_after_worker_exits() {
+    // Starting a transaction against a non-existent database makes the worker's
+    // run_in_transaction fail immediately (the db lookup happens before the
+    // request loop is entered), so it returns and drops the request receiver.
+    // Subsequent execute/commit/rollback calls must surface the "worker is no
+    // longer running" send-failure errors rather than hang or panic.
+    let tmp = TempDir::new().unwrap();
+    let client = new_in_process_client(tmp.path().to_str().unwrap()).unwrap();
+
+    let wait_for_worker_exit = || std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // execute_tx_query after the worker has exited.
+    let tx = client.start_transaction("missing").unwrap();
+    wait_for_worker_exit();
+    let exec_err = match client.execute_tx_query(
+        &tx,
+        ffi::CxxSqlQuery {
+            text: "SELECT 1;".to_string(),
+            params: Vec::new(),
+        },
+    ) {
+        Err(e) => e,
+        Ok(_) => panic!("expected send failure after worker exit"),
+    };
+    assert!(exec_err.contains("transaction worker is no longer running"));
+
+    // commit_tx after the worker has exited.
+    let tx_commit = client.start_transaction("missing").unwrap();
+    wait_for_worker_exit();
+    let commit_err = client.commit_tx(tx_commit).unwrap_err();
+    assert!(commit_err.contains("commit not applied"));
+
+    // rollback_tx after the worker has exited.
+    let tx_rollback = client.start_transaction("missing").unwrap();
+    wait_for_worker_exit();
+    let rollback_err = client.rollback_tx(tx_rollback).unwrap_err();
+    assert!(rollback_err.contains("rollback not applied"));
+}
+
+#[test]
 fn test_database_operations_and_query_errors() {
     let tmp = TempDir::new().unwrap();
     let client = new_in_process_client(tmp.path().to_str().unwrap()).unwrap();
@@ -415,6 +553,37 @@ fn test_remote_client_integration() {
             },
         )
         .unwrap();
+    // A SELECT inside the transaction exercises the remote-tx header/row payload
+    // handling (the INSERTs above only return an info message).
+    let tx_select = client
+        .execute_tx_query(
+            &tx2,
+            ffi::CxxSqlQuery {
+                text: "SELECT id, name FROM remote_t ORDER BY id;".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(tx_select.success);
+    assert_eq!(tx_select.headers, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(
+        tx_select.rows,
+        vec![
+            "1".to_string(),
+            "Alice".to_string(),
+            "3".to_string(),
+            "Charlie".to_string()
+        ]
+    );
+    // A failing query inside the transaction exercises the remote-tx error path.
+    let tx_err = client.execute_tx_query(
+        &tx2,
+        ffi::CxxSqlQuery {
+            text: "SELECT * FROM no_such_table;".to_string(),
+            params: Vec::new(),
+        },
+    );
+    assert!(tx_err.is_err());
     client.commit_tx(tx2).unwrap();
 
     // Verify Charlie is there
@@ -436,6 +605,35 @@ fn test_remote_client_integration() {
             "Charlie".to_string()
         ]
     );
+
+    // Start a transaction and drop the handle without committing or rolling
+    // back. The remote worker's request stream then ends, so it returns the
+    // "Transaction handle dropped" abort and tears down cleanly.
+    let tx3 = client.start_transaction("remote_db").unwrap();
+    client
+        .execute_tx_query(
+            &tx3,
+            ffi::CxxSqlQuery {
+                text: "INSERT INTO remote_t (id, name) VALUES (4, 'Dropped');".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    drop(tx3);
+    // Give the worker a moment to observe the closed channel and abort.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // The implicitly-aborted transaction must not have persisted its insert.
+    let select_res3 = client
+        .execute_query(
+            "remote_db",
+            ffi::CxxSqlQuery {
+                text: "SELECT id FROM remote_t WHERE id = 4;".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(select_res3.rows.is_empty());
 
     // Drop database
     client.drop_db("remote_db").unwrap();
