@@ -565,7 +565,10 @@ fn test_remote_client_integration() {
         )
         .unwrap();
     assert!(tx_select.success);
-    assert_eq!(tx_select.headers, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(
+        tx_select.headers,
+        vec!["id".to_string(), "name".to_string()]
+    );
     assert_eq!(
         tx_select.rows,
         vec![
