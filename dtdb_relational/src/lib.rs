@@ -7,8 +7,8 @@ pub mod tokenizer;
 pub mod transaction;
 
 pub use database::{
-    Database, DatabaseOptions, GroupStats, IndexStats, RelationalMutation, TXN_LOG_FORMAT, Table,
-    TableScanIterator, TableStatistics, TransactionRecord,
+    Database, DatabaseOptions, GroupStats, IndexStats, McvEntry, RelationalMutation,
+    TXN_LOG_FORMAT, Table, TableScanIterator, TableStatistics, TransactionRecord,
 };
 pub use error::{RelationalError, Result};
 pub use fts_parser::FullTextQuery;
