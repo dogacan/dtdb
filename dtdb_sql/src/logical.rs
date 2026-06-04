@@ -97,8 +97,12 @@ pub enum LogicalPlan {
     },
     Limit {
         source: Box<LogicalPlan>,
-        limit: Option<usize>,
-        offset: usize,
+        /// Row count expression (`None` = no limit). Kept symbolic so a
+        /// parameter placeholder survives planning and is resolved to a
+        /// `usize` during physical compilation.
+        limit: Option<Expr>,
+        /// Rows to skip (`None` = 0), resolved the same way as `limit`.
+        offset: Option<Expr>,
     },
     SetOp {
         left: Box<LogicalPlan>,
@@ -207,9 +211,21 @@ impl LogicalPlan {
                 }
                 Ok(())
             }
-            LogicalPlan::Limit { source, .. } | LogicalPlan::Distinct { source } => {
-                source.substitute_params(params)
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => {
+                source.substitute_params(params)?;
+                if let Some(l) = limit {
+                    l.substitute_params(params)?;
+                }
+                if let Some(o) = offset {
+                    o.substitute_params(params)?;
+                }
+                Ok(())
             }
+            LogicalPlan::Distinct { source } => source.substitute_params(params),
             LogicalPlan::SetOp { left, right, .. } => {
                 left.substitute_params(params)?;
                 right.substitute_params(params)
@@ -536,12 +552,16 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
             offset,
         } => {
             let limit_str = match limit {
-                Some(lim) => lim.to_string(),
+                Some(lim) => format!("{:?}", lim),
                 None => "none".to_string(),
+            };
+            let offset_str = match offset {
+                Some(off) => format!("{:?}", off),
+                None => "0".to_string(),
             };
             out.push_str(&format!(
                 "{}- Limit: count={}, offset={}\n",
-                indent_str, limit_str, offset
+                indent_str, limit_str, offset_str
             ));
             format_logical_node(source, indent + 1, out);
         }
@@ -833,8 +853,8 @@ mod tests {
         // Limit
         let mut limit = LogicalPlan::Limit {
             source: Box::new(child.clone()),
-            limit: Some(10),
-            offset: 0,
+            limit: Some(Expr::Literal(DbValue::Int(10))),
+            offset: None,
         };
         // Distinct
         let mut distinct = LogicalPlan::Distinct {
@@ -1032,10 +1052,10 @@ mod tests {
         let limit = LogicalPlan::Limit {
             source: Box::new(child),
             limit: None,
-            offset: 5,
+            offset: Some(Expr::Literal(DbValue::Int(5))),
         };
         let formatted_limit = format_logical_plan(&limit);
-        assert!(formatted_limit.contains("Limit: count=none, offset=5"));
+        assert!(formatted_limit.contains("Limit: count=none, offset=Literal(Int(5))"));
         assert_eq!(limit.schema().columns.len(), 0);
     }
 }

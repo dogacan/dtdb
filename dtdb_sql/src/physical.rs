@@ -28,13 +28,6 @@ pub struct PhysicalSeqScan {
 }
 
 impl PhysicalSeqScan {
-    pub fn new(schema: Schema, rows: Vec<Row>) -> Self {
-        Self {
-            schema,
-            source: Box::new(rows.into_iter().map(Ok)),
-        }
-    }
-
     pub fn from_iter(
         schema: Schema,
         source: Box<dyn Iterator<Item = Result<Row, String>>>,
@@ -75,13 +68,6 @@ impl PhysicalIndexScan {
             schema,
             source: Box::new(rows.into_iter().map(Ok)),
         }
-    }
-
-    pub fn from_iter(
-        schema: Schema,
-        source: Box<dyn Iterator<Item = Result<Row, String>>>,
-    ) -> Self {
-        Self { schema, source }
     }
 }
 

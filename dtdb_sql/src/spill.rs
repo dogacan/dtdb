@@ -504,6 +504,52 @@ mod tests {
             total_compare(&DbValue::bytes(vec![1, 2]), &DbValue::bytes(vec![1, 2])),
             Ordering::Equal
         );
+
+        // Temporal / decimal variants: ranks Date (6) < Time (7) < Timestamp (8)
+        // < Decimal (9), and same-variant ordering delegates to the inner type.
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+        let time_a = chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let time_b = chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let ts_a = date.and_hms_opt(8, 0, 0).unwrap();
+        let ts_b = date.and_hms_opt(9, 0, 0).unwrap();
+        let dec_a = rust_decimal::Decimal::new(100, 2);
+        let dec_b = rust_decimal::Decimal::new(200, 2);
+
+        assert_eq!(type_rank(&DbValue::Time(time_a)), 7);
+        assert_eq!(type_rank(&DbValue::Timestamp(ts_a)), 8);
+        assert_eq!(type_rank(&DbValue::Decimal(dec_a)), 9);
+
+        // Cross-variant ordering follows the rank order.
+        assert_eq!(
+            total_compare(&DbValue::Date(date), &DbValue::Time(time_a)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Time(time_a), &DbValue::Timestamp(ts_a)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Timestamp(ts_a), &DbValue::Decimal(dec_a)),
+            Ordering::Less
+        );
+
+        // Same-variant ordering - Time / Timestamp / Decimal.
+        assert_eq!(
+            total_compare(&DbValue::Time(time_a), &DbValue::Time(time_b)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Timestamp(ts_a), &DbValue::Timestamp(ts_b)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Decimal(dec_a), &DbValue::Decimal(dec_b)),
+            Ordering::Less
+        );
+        assert_eq!(
+            total_compare(&DbValue::Decimal(dec_a), &DbValue::Decimal(dec_a)),
+            Ordering::Equal
+        );
     }
 
     #[test]

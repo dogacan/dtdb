@@ -96,7 +96,7 @@ fn test_param_conversions_and_hex_decoding() {
 }
 
 #[test]
-fn test_bytes_param_error_path() {
+fn test_bytes_param_round_trips() {
     let tmp = TempDir::new().unwrap();
     let client = new_in_process_client(tmp.path().to_str().unwrap()).unwrap();
 
@@ -105,31 +105,42 @@ fn test_bytes_param_error_path() {
         .execute_query(
             "db",
             ffi::CxxSqlQuery {
-                text: "CREATE TABLE t (id INT PRIMARY KEY, val STRING);".to_string(),
+                text: "CREATE TABLE t (id INT PRIMARY KEY, val BLOB);".to_string(),
                 params: Vec::new(),
             },
         )
         .unwrap();
 
-    // Binding a valid hex bytes param. It should be decoded to Bytes and then converted to
-    // HexStringLiteral in SQL, which returns a query compilation/execution error.
-    let res = client.execute_query(
-        "db",
-        ffi::CxxSqlQuery {
-            text: "INSERT INTO t (id, val) VALUES (1, :v);".to_string(),
-            params: vec![ffi::QueryParam {
-                name: "v".to_string(),
-                value: "414243".to_string(),
-                kind: ffi::ParamKind::Bytes,
-            }],
-        },
-    );
-    assert!(res.is_err());
-    let err_msg = match res {
-        Err(e) => e,
-        Ok(_) => panic!("expected error"),
-    };
-    assert!(err_msg.contains("Unsupported SQL value type") || err_msg.contains("HexStringLiteral"));
+    // A hex bytes param is decoded to Bytes and bound symbolically; it no longer
+    // needs a SQL literal form, so it inserts into a BLOB column successfully
+    // (previously this failed because the value could not be rendered as SQL).
+    let res = client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "INSERT INTO t (id, val) VALUES (1, :v);".to_string(),
+                params: vec![ffi::QueryParam {
+                    name: "v".to_string(),
+                    value: "414243".to_string(),
+                    kind: ffi::ParamKind::Bytes,
+                }],
+            },
+        )
+        .unwrap();
+    assert!(res.success);
+
+    // The row is retrievable, confirming the bytes value was stored.
+    let res = client
+        .execute_query(
+            "db",
+            ffi::CxxSqlQuery {
+                text: "SELECT id FROM t WHERE id = 1;".to_string(),
+                params: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(res.success);
+    assert_eq!(res.rows, vec!["1".to_string()]);
 }
 
 #[test]

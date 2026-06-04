@@ -1905,8 +1905,8 @@ mod tests {
         // Limit propagation
         let limit = LogicalPlan::Limit {
             source: Box::new(scan.clone()),
-            limit: Some(10),
-            offset: 0,
+            limit: Some(Expr::Literal(DbValue::Int(10))),
+            offset: None,
         };
         let limit_promoted = opt.try_promote_to_index_scan(limit, "val");
         assert!(limit_promoted.is_some());

@@ -749,15 +749,49 @@ async fn test_parameter_types_coverage() {
         }),
     };
 
+    // Parameters of every value type (int/float/bool/string/bytes) are kept
+    // symbolic through planning and bound at execution, so all of them — even
+    // bytes, which has no SQL literal form — round-trip through a parameterized
+    // INSERT.
     let insert_req = tonic::Request::new(dtdb_api::proto::ExecuteQueryRequest {
         db_name: "param_db".to_string(),
         sql_query: "INSERT INTO ValuesTable (id, f_val, b_val, s_val, bytes_val) VALUES (:id, :f, :b, :s, :bytes);".to_string(),
         parameters: vec![p_id, p_float, p_bool, p_str, p_bytes, p_null],
     });
-    let err = service.execute_query(insert_req).await.err().unwrap();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(
-        err.message().contains("Unsupported SQL value type")
-            || err.message().contains("HexStringLiteral")
-    );
+    let mut insert_stream = service
+        .execute_query(insert_req)
+        .await
+        .unwrap()
+        .into_inner();
+    while let Some(res) = insert_stream.next().await {
+        res.unwrap();
+    }
+
+    // Read the row back and confirm each typed value was stored.
+    let select_req = tonic::Request::new(dtdb_api::proto::ExecuteQueryRequest {
+        db_name: "param_db".to_string(),
+        sql_query: "SELECT id, f_val, b_val, s_val, bytes_val FROM ValuesTable WHERE id = 100;"
+            .to_string(),
+        parameters: Vec::new(),
+    });
+    let mut select_stream = service
+        .execute_query(select_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut payloads = Vec::new();
+    while let Some(res) = select_stream.next().await {
+        payloads.push(res.unwrap());
+    }
+    // Header + exactly one data row.
+    assert_eq!(payloads.len(), 2);
+    match payloads[1].payload.as_ref().unwrap() {
+        dtdb_api::proto::execute_query_response::Payload::Row(row) => {
+            assert_eq!(row.values[0], "100");
+            assert_eq!(row.values[1], "1.23");
+            assert_eq!(row.values[2], "true");
+            assert_eq!(row.values[3], "hello");
+        }
+        other => panic!("Expected row payload, got {other:?}"),
+    }
 }

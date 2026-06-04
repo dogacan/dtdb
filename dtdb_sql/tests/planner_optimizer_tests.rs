@@ -104,6 +104,15 @@ fn plan_sql(db: Arc<Database>, sql: &str) -> Result<SqlStatement, String> {
     planner.plan(&statements.remove(0))
 }
 
+/// Executes `sql` end to end. `LIMIT`/`OFFSET` value expressions are now kept
+/// symbolic through planning and only resolved during physical compilation, so
+/// type errors there surface at execution rather than planning time.
+fn exec_sql(db: Arc<Database>, sql: &str) -> Result<dtdb_sql::ExecutionResult, String> {
+    let engine = dtdb_sql::SqlEngine::new(db.clone());
+    let tx = dtdb_relational::Transaction::new(1, db);
+    engine.execute(sql, &tx)
+}
+
 fn optimize_plan(db: Arc<Database>, sql: &str) -> Result<LogicalPlan, String> {
     let stmt = plan_sql(db.clone(), sql)?;
     if let SqlStatement::Query(plan) = stmt {
@@ -654,62 +663,63 @@ fn test_optimizer_sort_elimination_and_index_scan_promotions() {
 fn test_additional_planner_edge_cases() {
     let (_tmp, db) = setup_db();
 
-    // 1. LIMIT & OFFSET expression errors (select level)
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT 'abc';").is_err());
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT val;").is_err());
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT 5 OFFSET 'abc';").is_err());
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT 5 OFFSET val;").is_err());
+    // 1. LIMIT & OFFSET expression errors (select level). These now plan fine
+    //    (the value is kept symbolic) and fail when resolved at execution.
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT 'abc';").is_err());
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT val;").is_err());
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT 5 OFFSET 'abc';").is_err());
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT 5 OFFSET val;").is_err());
 
     // OffsetCommaLimit (offset, limit) errors and valid
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT 5, 10;").is_ok());
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT 5, 'abc';").is_err());
-    assert!(plan_sql(db.clone(), "SELECT val FROM t1 LIMIT 'abc', 5;").is_err());
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT 5, 10;").is_ok());
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT 5, 'abc';").is_err());
+    assert!(exec_sql(db.clone(), "SELECT val FROM t1 LIMIT 'abc', 5;").is_err());
 
     // 2. LIMIT & OFFSET expression errors (query level - e.g. after UNION)
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT 'abc';"
         )
         .is_err()
     );
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT val;"
         )
         .is_err()
     );
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT 5 OFFSET 'abc';"
         )
         .is_err()
     );
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT 5 OFFSET val;"
         )
         .is_err()
     );
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT 5, 10;"
         )
         .is_ok()
     );
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT 5, 'abc';"
         )
         .is_err()
     );
     assert!(
-        plan_sql(
+        exec_sql(
             db.clone(),
             "SELECT val FROM t1 UNION SELECT val FROM t1 LIMIT 'abc', 5;"
         )
@@ -759,8 +769,9 @@ fn test_additional_planner_edge_cases() {
     // 8. Qualified Wildcard in GROUP BY projection
     assert!(plan_sql(db.clone(), "SELECT t1.* FROM t1 GROUP BY val;").is_err());
 
-    // 9. INSERT edge cases: non-literal value inside INSERT values
-    assert!(plan_sql(db.clone(), "INSERT INTO t1 (id, val) VALUES (1, val);").is_err());
+    // 9. INSERT edge cases: a column reference inside INSERT VALUES is kept
+    //    symbolic at planning and rejected when evaluated at execution.
+    assert!(exec_sql(db.clone(), "INSERT INTO t1 (id, val) VALUES (1, val);").is_err());
 
     // 10. Negation of columns (-val) and plus unary (+val)
     assert!(plan_sql(db.clone(), "SELECT -val, +val FROM t1;").is_ok());
@@ -937,8 +948,8 @@ fn test_additional_optimizer_edge_cases() {
     };
     let limit_plan = LogicalPlan::Limit {
         source: Box::new(limit_scan),
-        limit: Some(10),
-        offset: 0,
+        limit: Some(Expr::Literal(DbValue::Int(10))),
+        offset: None,
     };
     let limit_filter = LogicalPlan::Filter {
         source: Box::new(limit_plan),

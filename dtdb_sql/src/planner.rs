@@ -23,7 +23,11 @@ pub enum SqlStatement {
     Insert {
         table_name: String,
         columns: Vec<String>,
-        rows: Vec<Vec<DbValue>>,
+        /// One expression per value. Placeholders are kept symbolic
+        /// (`Expr::Parameter`) and bound per execution via
+        /// [`Expr::substitute_params`], so a parameterized `INSERT ... VALUES`
+        /// is planned once like any other statement (no AST-rebinding pass).
+        rows: Vec<Vec<Expr>>,
     },
     InsertSelect {
         table_name: String,
@@ -523,15 +527,11 @@ impl LogicalPlanner {
                             }
                             let mut row_vals = Vec::new();
                             for expr in &row_exprs.content {
-                                match self.plan_expr(expr)? {
-                                    Expr::Literal(val) => row_vals.push(val),
-                                    other => {
-                                        return Err(format!(
-                                            "INSERT expects literal values, got expression {:?}",
-                                            other
-                                        ));
-                                    }
-                                }
+                                // Keep the expression symbolic; placeholders stay
+                                // as `Expr::Parameter` and are resolved at
+                                // execution time (constant value expressions are
+                                // evaluated there too).
+                                row_vals.push(self.plan_expr(expr)?);
                             }
                             rows.push(row_vals);
                         }
@@ -757,96 +757,8 @@ impl LogicalPlanner {
                 }
 
                 // Plan LIMIT and OFFSET at the query level
-                let (limit, offset) = match &query.limit_clause {
-                    Some(sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. }) => {
-                        let l = if let Some(limit_expr) = limit {
-                            let l_val = match limit_expr {
-                                SqlExpr::Value(val) => match &**val {
-                                    SqlValue::Number(s, _) => {
-                                        s.parse::<usize>().map_err(|e| e.to_string())?
-                                    }
-                                    other => {
-                                        return Err(format!(
-                                            "Unsupported limit expression value: {:?}",
-                                            other
-                                        ));
-                                    }
-                                },
-                                other => {
-                                    return Err(format!(
-                                        "Unsupported limit expression: {:?}",
-                                        other
-                                    ));
-                                }
-                            };
-                            Some(l_val)
-                        } else {
-                            None
-                        };
-                        let o = if let Some(offset_val) = offset {
-                            match &offset_val.value {
-                                SqlExpr::Value(val) => match &**val {
-                                    SqlValue::Number(s, _) => {
-                                        s.parse::<usize>().map_err(|e| e.to_string())?
-                                    }
-                                    other => {
-                                        return Err(format!(
-                                            "Unsupported offset expression value: {:?}",
-                                            other
-                                        ));
-                                    }
-                                },
-                                other => {
-                                    return Err(format!(
-                                        "Unsupported offset expression: {:?}",
-                                        other
-                                    ));
-                                }
-                            }
-                        } else {
-                            0
-                        };
-                        (l, o)
-                    }
-                    Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
-                        let l_val = match limit {
-                            SqlExpr::Value(val) => match &**val {
-                                SqlValue::Number(s, _) => {
-                                    s.parse::<usize>().map_err(|e| e.to_string())?
-                                }
-                                other => {
-                                    return Err(format!(
-                                        "Unsupported limit expression value: {:?}",
-                                        other
-                                    ));
-                                }
-                            },
-                            other => {
-                                return Err(format!("Unsupported limit expression: {:?}", other));
-                            }
-                        };
-                        let o_val = match offset {
-                            SqlExpr::Value(val) => match &**val {
-                                SqlValue::Number(s, _) => {
-                                    s.parse::<usize>().map_err(|e| e.to_string())?
-                                }
-                                other => {
-                                    return Err(format!(
-                                        "Unsupported offset expression value: {:?}",
-                                        other
-                                    ));
-                                }
-                            },
-                            other => {
-                                return Err(format!("Unsupported offset expression: {:?}", other));
-                            }
-                        };
-                        (Some(l_val), o_val)
-                    }
-                    None => (None, 0),
-                };
-
-                if limit.is_some() || offset > 0 {
+                let (limit, offset) = self.plan_limit_clause(&query.limit_clause)?;
+                if limit.is_some() || offset.is_some() {
                     plan = LogicalPlan::Limit {
                         source: Box::new(plan),
                         limit,
@@ -856,6 +768,31 @@ impl LogicalPlanner {
 
                 Ok(plan)
             }
+        }
+    }
+
+    /// Plans a `LIMIT` / `OFFSET` clause into symbolic row-count and skip
+    /// expressions (`None` when absent). Placeholders are preserved as
+    /// `Expr::Parameter` and resolved to concrete counts during physical
+    /// compilation, so a parameterized `LIMIT`/`OFFSET` needs no AST rebinding.
+    fn plan_limit_clause(
+        &self,
+        limit_clause: &Option<sqlparser::ast::LimitClause>,
+    ) -> Result<(Option<Expr>, Option<Expr>), String> {
+        use sqlparser::ast::LimitClause;
+        match limit_clause {
+            Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+                let l = limit.as_ref().map(|e| self.plan_expr(e)).transpose()?;
+                let o = offset
+                    .as_ref()
+                    .map(|o| self.plan_expr(&o.value))
+                    .transpose()?;
+                Ok((l, o))
+            }
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                Ok((Some(self.plan_expr(limit)?), Some(self.plan_expr(offset)?)))
+            }
+            None => Ok((None, None)),
         }
     }
 
@@ -1141,75 +1078,8 @@ impl LogicalPlanner {
         }
 
         // 7. Plan LIMIT and OFFSET
-        let (limit, offset) = match &query.limit_clause {
-            Some(sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. }) => {
-                let l = if let Some(limit_expr) = limit {
-                    let l_val = match limit_expr {
-                        SqlExpr::Value(val) => match &**val {
-                            SqlValue::Number(s, _) => {
-                                s.parse::<usize>().map_err(|e| e.to_string())?
-                            }
-                            other => {
-                                return Err(format!(
-                                    "Unsupported limit expression value: {:?}",
-                                    other
-                                ));
-                            }
-                        },
-                        other => return Err(format!("Unsupported limit expression: {:?}", other)),
-                    };
-                    Some(l_val)
-                } else {
-                    None
-                };
-                let o = if let Some(offset_val) = offset {
-                    match &offset_val.value {
-                        SqlExpr::Value(val) => match &**val {
-                            SqlValue::Number(s, _) => {
-                                s.parse::<usize>().map_err(|e| e.to_string())?
-                            }
-                            other => {
-                                return Err(format!(
-                                    "Unsupported offset expression value: {:?}",
-                                    other
-                                ));
-                            }
-                        },
-                        other => return Err(format!("Unsupported offset expression: {:?}", other)),
-                    }
-                } else {
-                    0
-                };
-                (l, o)
-            }
-            Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
-                let l_val = match limit {
-                    SqlExpr::Value(val) => match &**val {
-                        SqlValue::Number(s, _) => s.parse::<usize>().map_err(|e| e.to_string())?,
-                        other => {
-                            return Err(format!("Unsupported limit expression value: {:?}", other));
-                        }
-                    },
-                    other => return Err(format!("Unsupported limit expression: {:?}", other)),
-                };
-                let o_val = match offset {
-                    SqlExpr::Value(val) => match &**val {
-                        SqlValue::Number(s, _) => s.parse::<usize>().map_err(|e| e.to_string())?,
-                        other => {
-                            return Err(format!(
-                                "Unsupported offset expression value: {:?}",
-                                other
-                            ));
-                        }
-                    },
-                    other => return Err(format!("Unsupported offset expression: {:?}", other)),
-                };
-                (Some(l_val), o_val)
-            }
-            None => (None, 0),
-        };
-
-        if limit.is_some() || offset > 0 {
+        let (limit, offset) = self.plan_limit_clause(&query.limit_clause)?;
+        if limit.is_some() || offset.is_some() {
             plan = LogicalPlan::Limit {
                 source: Box::new(plan),
                 limit,

@@ -158,6 +158,22 @@ fn resolve_plan_key(
     }
 }
 
+/// Binds parameters in a `LIMIT`/`OFFSET` count expression and evaluates it to
+/// a non-negative `usize`. The expression references no columns, so it is
+/// evaluated against an empty row/schema.
+fn resolve_count_expr(
+    expr: &Expr,
+    params: &std::collections::HashMap<String, DbValue>,
+) -> Result<usize, String> {
+    let mut expr = expr.clone();
+    expr.substitute_params(params)?;
+    match expr.eval(&Row::new(Vec::new()), &Schema::new(Vec::new()))? {
+        DbValue::Int(v) if v >= 0 => Ok(v as usize),
+        DbValue::Int(v) => Err(format!("LIMIT/OFFSET must be non-negative, got {v}")),
+        other => Err(format!("LIMIT/OFFSET must be an integer, got {other:?}")),
+    }
+}
+
 /// How a [`PreparedStatement`]'s work is cached.
 #[derive(Debug, Clone)]
 enum PreparedPlan {
@@ -235,6 +251,30 @@ impl SqlEngine {
         self.plan_cache.read().unwrap().is_empty()
     }
 
+    /// Optimizes a freshly planned statement, optimizing the embedded query for
+    /// the `Query` and `InsertSelect` variants and passing every other
+    /// statement (DDL, plain `Insert`, etc.) through unchanged. Shared by every
+    /// plan-then-optimize site (`prepare`, `refreshed_plan`, and the two
+    /// `execute_statement` entry points) so the optimization behavior is
+    /// identical regardless of how the statement reached execution.
+    fn optimize_planned(&self, planned: SqlStatement) -> SqlStatement {
+        match planned {
+            SqlStatement::Query(q) => {
+                SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
+            }
+            SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query,
+            } => SqlStatement::InsertSelect {
+                table_name,
+                columns,
+                query: Optimizer::new(self.database.clone()).optimize(query),
+            },
+            other => other,
+        }
+    }
+
     /// Returns the parsed AST for `preprocessed`, reusing a cached parse when
     /// available. On a miss, parses (outside the lock) and caches the result.
     /// Validates the single-statement constraint exactly as the uncached path.
@@ -308,24 +348,7 @@ impl SqlEngine {
         // placeholders in INSERT ... VALUES, which the planner materializes to
         // values), fall back to caching the AST and binding on each execution.
         let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-            Ok(planned) => {
-                let optimized = match planned {
-                    SqlStatement::Query(q) => {
-                        SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
-                    }
-                    SqlStatement::InsertSelect {
-                        table_name,
-                        columns,
-                        query,
-                    } => SqlStatement::InsertSelect {
-                        table_name,
-                        columns,
-                        query: Optimizer::new(self.database.clone()).optimize(query),
-                    },
-                    other => other,
-                };
-                PreparedPlan::Planned(Box::new(optimized))
-            }
+            Ok(planned) => PreparedPlan::Planned(Box::new(self.optimize_planned(planned))),
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
@@ -381,24 +404,7 @@ impl SqlEngine {
             .ok_or_else(|| "No SQL statements found".to_string())?;
 
         let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-            Ok(planned) => {
-                let optimized = match planned {
-                    SqlStatement::Query(q) => {
-                        SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
-                    }
-                    SqlStatement::InsertSelect {
-                        table_name,
-                        columns,
-                        query,
-                    } => SqlStatement::InsertSelect {
-                        table_name,
-                        columns,
-                        query: Optimizer::new(self.database.clone()).optimize(query),
-                    },
-                    other => other,
-                };
-                PreparedPlan::Planned(Box::new(optimized))
-            }
+            Ok(planned) => PreparedPlan::Planned(Box::new(self.optimize_planned(planned))),
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
@@ -555,60 +561,30 @@ impl SqlEngine {
         self.execute_statement_streaming((*statement).clone(), tx, params)
     }
 
-    /// Binds parameters into an already-parsed statement, then plans,
-    /// optimizes, and executes it. Shared by `execute_with_params` (which
-    /// parses fresh each call) and `execute_prepared` (which reuses a cached
-    /// parse), so the parameter/plan/execute behavior is identical either way.
+    /// Plans, optimizes, and executes an already-parsed statement. Parameter
+    /// placeholders are left symbolic in the plan and bound during execution by
+    /// [`Expr::substitute_params`], so the parameter/plan/execute behavior is
+    /// identical to the cached-plan path taken by `execute_prepared`.
     fn execute_statement(
         &self,
-        mut statement: Statement,
+        statement: Statement,
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
-        crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
-        let optimized = match planned_stmt {
-            SqlStatement::Query(q) => {
-                SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
-            }
-            SqlStatement::InsertSelect {
-                table_name,
-                columns,
-                query,
-            } => SqlStatement::InsertSelect {
-                table_name,
-                columns,
-                query: Optimizer::new(self.database.clone()).optimize(query),
-            },
-            other => other,
-        };
+        let optimized = self.optimize_planned(planned_stmt);
         self.execute_planned(&optimized, tx, params)
     }
 
     /// Streaming counterpart to `execute_statement`.
     fn execute_statement_streaming(
         &self,
-        mut statement: Statement,
+        statement: Statement,
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionStreamingResult, String> {
-        crate::parameters::bind_statement(&mut statement, params)?;
         let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
-        let optimized = match planned_stmt {
-            SqlStatement::Query(q) => {
-                SqlStatement::Query(Optimizer::new(self.database.clone()).optimize(q))
-            }
-            SqlStatement::InsertSelect {
-                table_name,
-                columns,
-                query,
-            } => SqlStatement::InsertSelect {
-                table_name,
-                columns,
-                query: Optimizer::new(self.database.clone()).optimize(query),
-            },
-            other => other,
-        };
+        let optimized = self.optimize_planned(planned_stmt);
         self.execute_planned_streaming(&optimized, tx, params)
     }
 
@@ -739,19 +715,27 @@ impl SqlEngine {
                 let schema = table.schema.clone();
                 let mut insert_count = 0;
 
-                for row_vals in rows {
+                // VALUES expressions reference no columns, so they evaluate
+                // against an empty row/schema once parameters are bound.
+                let empty_schema = Schema::new(Vec::new());
+                let empty_row = Row::new(Vec::new());
+
+                for row_exprs in rows {
                     // Start with default values for each column.
                     let mut aligned_vals = Vec::with_capacity(schema.columns.len());
                     for col in &schema.columns {
                         aligned_vals.push(col.default_value.clone().unwrap_or(DbValue::Null));
                     }
 
-                    // Map provided row values to the correct column indices.
+                    // Map provided row values to the correct column indices,
+                    // binding parameters and evaluating each value expression.
                     for (col_idx, col_name) in columns.iter().enumerate() {
                         let schema_idx = schema
                             .column_index(col_name)
                             .ok_or_else(|| format!("Column '{}' not found in schema", col_name))?;
-                        aligned_vals[schema_idx] = row_vals[col_idx].clone();
+                        let mut value_expr = row_exprs[col_idx].clone();
+                        value_expr.substitute_params(params)?;
+                        aligned_vals[schema_idx] = value_expr.eval(&empty_row, &empty_schema)?;
                     }
 
                     // Handle auto-increment columns.
@@ -1628,7 +1612,16 @@ impl SqlEngine {
                 offset,
             } => {
                 let src_op = self.compile_physical(source, tx, columns, params)?;
-                Ok(Box::new(PhysicalLimit::new(src_op, *limit, *offset)))
+                let limit = limit
+                    .as_ref()
+                    .map(|e| resolve_count_expr(e, params))
+                    .transpose()?;
+                let offset = offset
+                    .as_ref()
+                    .map(|e| resolve_count_expr(e, params))
+                    .transpose()?
+                    .unwrap_or(0);
+                Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
             LogicalPlan::Sort { source, keys } => {
                 let mut keys = keys.clone();
