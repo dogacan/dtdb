@@ -12,7 +12,7 @@ pub use database::{
 };
 pub use error::{RelationalError, Result};
 pub use fts_parser::FullTextQuery;
-pub use row::Row;
+pub use row::{Row, db_value_to_key};
 pub use schema::{
     Column, DataType, IndexDefinition, IndexType, LocalityGroupOptions, Schema, column_names_match,
 };

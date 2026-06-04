@@ -542,46 +542,29 @@ impl Schema {
         }
         if indices.len() == 1 {
             let val = &row.values[indices[0]];
-            match val {
-                DbValue::Int(v) => Ok(DbKey::Int(*v)),
-                DbValue::String(s) => Ok(DbKey::String(s.clone())),
-                DbValue::Bool(b) => Ok(DbKey::Bool(*b)),
-                DbValue::Date(d) => Ok(DbKey::Date(*d)),
-                DbValue::Time(t) => Ok(DbKey::Time(*t)),
-                DbValue::Timestamp(ts) => Ok(DbKey::Timestamp(*ts)),
-                DbValue::Decimal(dec) => Ok(DbKey::Decimal(*dec)),
-                DbValue::Null => Err(RelationalError::SchemaMismatch(
+            if matches!(val, DbValue::Null) {
+                return Err(RelationalError::SchemaMismatch(
                     "Primary key cannot be NULL".to_string(),
-                )),
-                other => Err(RelationalError::SchemaMismatch(format!(
-                    "Unsupported primary key type: {:?}",
-                    other
-                ))),
+                ));
             }
+            crate::row::db_value_to_key(val).ok_or_else(|| {
+                RelationalError::SchemaMismatch(format!("Unsupported primary key type: {:?}", val))
+            })
         } else {
             let mut keys = Vec::new();
             for &idx in &indices {
                 let val = &row.values[idx];
-                let k = match val {
-                    DbValue::Int(v) => DbKey::Int(*v),
-                    DbValue::String(s) => DbKey::String(s.clone()),
-                    DbValue::Bool(b) => DbKey::Bool(*b),
-                    DbValue::Date(d) => DbKey::Date(*d),
-                    DbValue::Time(t) => DbKey::Time(*t),
-                    DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                    DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                    DbValue::Null => {
-                        return Err(RelationalError::SchemaMismatch(
-                            "Primary key cannot be NULL".to_string(),
-                        ));
-                    }
-                    other => {
-                        return Err(RelationalError::SchemaMismatch(format!(
-                            "Unsupported primary key type in composite: {:?}",
-                            other
-                        )));
-                    }
-                };
+                if matches!(val, DbValue::Null) {
+                    return Err(RelationalError::SchemaMismatch(
+                        "Primary key cannot be NULL".to_string(),
+                    ));
+                }
+                let k = crate::row::db_value_to_key(val).ok_or_else(|| {
+                    RelationalError::SchemaMismatch(format!(
+                        "Unsupported primary key type in composite: {:?}",
+                        val
+                    ))
+                })?;
                 keys.push(k);
             }
             Ok(DbKey::composite(keys))

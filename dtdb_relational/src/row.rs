@@ -1,6 +1,6 @@
 use crate::error::{RelationalError, Result};
 use crate::schema::Schema;
-use dtdb_storage::DbValue;
+use dtdb_storage::{DbKey, DbValue};
 use serde::{Deserialize, Serialize};
 
 /// Row represents a tuple/record in a relational table.
@@ -136,6 +136,20 @@ impl Row {
 /// Builds a corruption error for a malformed row buffer.
 fn corruption(msg: impl Into<String>) -> RelationalError {
     RelationalError::Storage(dtdb_storage::StorageError::Corruption(msg.into()))
+}
+
+/// Converts a `DbValue` reference to a `DbKey` if the type is supported as a key.
+pub fn db_value_to_key(val: &DbValue) -> Option<DbKey> {
+    match val {
+        DbValue::Int(v) => Some(DbKey::Int(*v)),
+        DbValue::String(s) => Some(DbKey::String(s.clone())),
+        DbValue::Bool(b) => Some(DbKey::Bool(*b)),
+        DbValue::Date(d) => Some(DbKey::Date(*d)),
+        DbValue::Time(t) => Some(DbKey::Time(*t)),
+        DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
+        DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
+        _ => None,
+    }
 }
 
 /// Reads one postcard LEB128 varint (unsigned), advancing `cursor` past it.

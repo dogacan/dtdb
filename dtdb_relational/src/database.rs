@@ -147,15 +147,8 @@ impl Table {
                 // `create_index`: an omission here silently drops index entries
                 // for the affected type at INSERT time, so a post-insert index
                 // lookup finds nothing even though the row exists.
-                let k = match col_val {
-                    DbValue::Int(v) => DbKey::Int(*v),
-                    DbValue::String(s) => DbKey::String(s.clone()),
-                    DbValue::Bool(b) => DbKey::Bool(*b),
-                    DbValue::Date(d) => DbKey::Date(*d),
-                    DbValue::Time(t) => DbKey::Time(*t),
-                    DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                    DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                    _ => continue,
+                let Some(k) = crate::row::db_value_to_key(col_val) else {
+                    continue;
                 };
                 col_keys.push(k);
             }
@@ -267,15 +260,8 @@ impl Table {
                                         if matches!(col_val, DbValue::Null) {
                                             continue;
                                         }
-                                        let k = match col_val {
-                                            DbValue::Int(v) => DbKey::Int(*v),
-                                            DbValue::String(s) => DbKey::String(s.clone()),
-                                            DbValue::Bool(b) => DbKey::Bool(*b),
-                                            DbValue::Date(d) => DbKey::Date(*d),
-                                            DbValue::Time(t) => DbKey::Time(*t),
-                                            DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                                            DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                                            _ => continue,
+                                        let Some(k) = crate::row::db_value_to_key(col_val) else {
+                                            continue;
                                         };
                                         old_keys.push(k);
                                     }
@@ -342,15 +328,8 @@ impl Table {
                                     // and the backfill in `create_index`: a
                                     // missing arm drops index entries for that
                                     // type at write time.
-                                    let k = match col_val {
-                                        DbValue::Int(v) => DbKey::Int(*v),
-                                        DbValue::String(s) => DbKey::String(s.clone()),
-                                        DbValue::Bool(b) => DbKey::Bool(*b),
-                                        DbValue::Date(d) => DbKey::Date(*d),
-                                        DbValue::Time(t) => DbKey::Time(*t),
-                                        DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                                        DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                                        _ => continue,
+                                    let Some(k) = crate::row::db_value_to_key(col_val) else {
+                                        continue;
                                     };
                                     new_keys.push(k);
                                 }
@@ -429,15 +408,8 @@ impl Table {
                                         if matches!(col_val, DbValue::Null) {
                                             continue;
                                         }
-                                        let k = match col_val {
-                                            DbValue::Int(v) => DbKey::Int(*v),
-                                            DbValue::String(s) => DbKey::String(s.clone()),
-                                            DbValue::Bool(b) => DbKey::Bool(*b),
-                                            DbValue::Date(d) => DbKey::Date(*d),
-                                            DbValue::Time(t) => DbKey::Time(*t),
-                                            DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                                            DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                                            _ => continue,
+                                        let Some(k) = crate::row::db_value_to_key(col_val) else {
+                                            continue;
                                         };
                                         old_keys.push(k);
                                     }
@@ -2505,20 +2477,11 @@ impl Database {
                         // Skip indexing rows with Null values for simplification
                         continue;
                     }
-                    let k = match col_val {
-                        DbValue::Int(v) => DbKey::Int(*v),
-                        DbValue::String(s) => DbKey::String(s.clone()),
-                        DbValue::Bool(b) => DbKey::Bool(*b),
-                        DbValue::Date(d) => DbKey::Date(*d),
-                        DbValue::Time(t) => DbKey::Time(*t),
-                        DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                        DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                        other => {
-                            return Err(RelationalError::SchemaMismatch(format!(
-                                "Cannot index non-indexable value type {:?}",
-                                other
-                            )));
-                        }
+                    let Some(k) = crate::row::db_value_to_key(col_val) else {
+                        return Err(RelationalError::SchemaMismatch(format!(
+                            "Cannot index non-indexable value type {:?}",
+                            col_val
+                        )));
                     };
                     keys.push(k);
                 }

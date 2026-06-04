@@ -574,18 +574,8 @@ impl Transaction {
         // Sort the final rows by the index columns to maintain sorted order even
         // with write buffer insertions. `idx_def` was resolved at the top of this
         // method, so it is always present here.
-        let row_val_to_key = |val: &DbValue| -> DbKey {
-            match val {
-                DbValue::Int(v) => DbKey::Int(*v),
-                DbValue::String(s) => DbKey::String(s.clone()),
-                DbValue::Bool(b) => DbKey::Bool(*b),
-                DbValue::Date(d) => DbKey::Date(*d),
-                DbValue::Time(t) => DbKey::Time(*t),
-                DbValue::Timestamp(ts) => DbKey::Timestamp(*ts),
-                DbValue::Decimal(dec) => DbKey::Decimal(*dec),
-                _ => DbKey::Int(0),
-            }
-        };
+        let row_val_to_key =
+            |val: &DbValue| -> DbKey { crate::row::db_value_to_key(val).unwrap_or(DbKey::Int(0)) };
 
         let extract_index_key = |row: &Row| -> DbKey {
             if idx_def.columns.len() == 1 {
