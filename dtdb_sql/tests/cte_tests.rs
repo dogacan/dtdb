@@ -190,14 +190,15 @@ fn cte_recursive_rejections() {
         "got: {err2}"
     );
 
-    // 3. Mutual recursion rejection
+    // 3. Mutual recursion cannot be expressed as a non-recursive WITH: `cte1`
+    //    would have to forward-reference `cte2`, which is defined later in the
+    //    same clause and so is not yet in scope. It is therefore rejected as an
+    //    unknown table (by name resolution) rather than by the self-reference
+    //    detector — either way, a mutually-recursive attempt does not plan.
     let err3 = h
         .run("WITH cte1 AS (SELECT * FROM cte2), cte2 AS (SELECT * FROM cte1) SELECT * FROM cte1")
         .unwrap_err();
-    assert!(
-        err3.contains("recursive CTEs are not supported") || err3.contains("Table not found: cte2"),
-        "got: {err3}"
-    );
+    assert!(err3.contains("Table not found: cte2"), "got: {err3}");
 }
 
 #[test]
@@ -215,4 +216,41 @@ fn cte_in_subquery() {
     // CTE is defined within a subquery in expression position
     let rows = h.select("SELECT id FROM t1 WHERE id = (WITH cte AS (SELECT id FROM t2 WHERE y = 20) SELECT id FROM cte)");
     assert_eq!(rows, vec![vec![int(2)]]);
+}
+
+#[test]
+fn cte_shadows_base_table() {
+    let h = setup();
+    // A non-recursive CTE name is not visible within its own body, so `FROM t1`
+    // inside the definition refers to the base table `t1`, not the CTE. This is a
+    // common idiom (e.g. `WITH t AS (SELECT ... FROM t WHERE ...)`) and must not be
+    // mistaken for recursion.
+    let rows = h.select("WITH t1 AS (SELECT id FROM t1 WHERE id = 2) SELECT id FROM t1");
+    assert_eq!(rows, vec![vec![int(2)]]);
+}
+
+#[test]
+fn cte_nested_redefines_outer_name() {
+    let h = setup();
+    // An inner CTE independently reuses an enclosing CTE's name. The inner
+    // definition is a fresh, non-recursive CTE and must not be rejected as
+    // recursive just because an ancestor of the same name is mid-planning.
+    let rows = h.select(
+        "WITH cte AS (WITH cte AS (SELECT id FROM t1 WHERE id = 3) SELECT id FROM cte) \
+         SELECT id FROM cte",
+    );
+    assert_eq!(rows, vec![vec![int(3)]]);
+}
+
+#[test]
+fn cte_inner_shadow_references_outer_scope() {
+    let h = setup();
+    // Inner CTE `cte` references `cte` in its own body. The inner name is not yet
+    // visible there (non-recursive), so the reference resolves to the OUTER `cte`
+    // (id = 1) rather than being flagged as a self-reference.
+    let rows = h.select(
+        "WITH cte AS (SELECT id FROM t1 WHERE id = 1) \
+         SELECT id FROM (WITH cte AS (SELECT id FROM cte) SELECT id FROM cte) sub",
+    );
+    assert_eq!(rows, vec![vec![int(1)]]);
 }

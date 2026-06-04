@@ -4,9 +4,10 @@ use dtdb_relational::{Column, DataType, Database, Schema};
 use dtdb_storage::DbValue;
 use sqlparser::ast::{
     BinaryOperator, ColumnOption, DataType as SqlDataType, Expr as SqlExpr, FunctionArg,
-    FunctionArgExpr, Query, SelectItem, Statement, TableFactor, Value as SqlValue,
+    FunctionArgExpr, Query, SelectItem, Statement, TableFactor, Value as SqlValue, With,
 };
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Represents a parsed and planned SQL statement.
@@ -68,9 +69,6 @@ pub enum AlterOp {
     RenameColumn { old_name: String, new_name: String },
     DropColumn(String),
 }
-
-use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
 pub struct LogicalPlanner {
@@ -653,77 +651,78 @@ impl LogicalPlanner {
 
     /// Plans a SELECT query into a LogicalPlan.
     fn plan_query(&self, query: &Query) -> Result<LogicalPlan, String> {
-        let has_with = if let Some(with) = &query.with {
-            if with.recursive {
-                return Err("recursive CTEs are not supported".to_string());
-            }
-
-            // Push an empty scope to the CTE stack first, so planned CTEs can reference earlier CTEs in the same WITH clause
-            self.cte_stack.borrow_mut().push(HashMap::new());
-
-            for cte in &with.cte_tables {
-                let cte_name = cte.alias.name.value.clone();
-                if self.is_cte_planning(&cte_name) {
-                    return Err("recursive CTEs are not supported".to_string());
-                }
-
-                // Check if the CTE name is already defined in the current scope
-                let duplicate = self
-                    .cte_stack
-                    .borrow()
-                    .last()
-                    .unwrap()
-                    .contains_key(&cte_name);
-                if duplicate {
-                    return Err(format!("duplicate CTE name '{}'", cte_name));
-                }
-
-                // Push to planning set to prevent self-reference recursion
-                self.planning_ctes.borrow_mut().insert(cte_name.clone());
-                let planned_res = self.plan_query(&cte.query);
-                self.planning_ctes.borrow_mut().remove(&cte_name);
-
-                let mut cte_plan = planned_res?;
-
-                // Apply derived column aliases defined on the CTE if present, e.g. `WITH cte(a, b) AS`
-                let col_aliases = &cte.alias.columns;
-                if !col_aliases.is_empty() {
-                    let schema = cte_plan.schema();
-                    if col_aliases.len() != schema.columns.len() {
-                        return Err(format!(
-                            "CTE '{}' yields {} column(s) but {} alias(es) were provided",
-                            cte_name,
-                            schema.columns.len(),
-                            col_aliases.len()
-                        ));
-                    }
-                    let mut expressions = Vec::with_capacity(schema.columns.len());
-                    let mut field_names = Vec::with_capacity(schema.columns.len());
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        expressions.push(Expr::Column(col.name.clone(), Some(i)));
-                        field_names.push(col_aliases[i].name.value.clone());
-                    }
-                    cte_plan = LogicalPlan::new_projection(cte_plan, expressions, field_names);
-                }
-
-                self.cte_stack
-                    .borrow_mut()
-                    .last_mut()
-                    .unwrap()
-                    .insert(cte_name, cte_plan);
-            }
-            true
-        } else {
-            false
+        let with = match &query.with {
+            Some(with) => with,
+            None => return self.plan_query_inner(query),
         };
-
-        let res = self.plan_query_inner(query);
-
-        if has_with {
-            self.cte_stack.borrow_mut().pop();
+        if with.recursive {
+            return Err("recursive CTEs are not supported".to_string());
         }
 
+        // Push a fresh CTE scope, then pop it unconditionally once the body is
+        // planned. All fallible work lives in `plan_with_clause`, so an error
+        // there cannot leave a dangling scope on the stack.
+        self.cte_stack.borrow_mut().push(HashMap::new());
+        let res = self.plan_with_clause(with, query);
+        self.cte_stack.borrow_mut().pop();
         res
+    }
+
+    /// Plans every CTE in `with` into the current (already-pushed) top scope, then
+    /// plans the query body against it. CTEs are inserted as they are planned so a
+    /// later CTE can reference earlier ones in the same `WITH` clause. The caller
+    /// owns the scope's lifecycle (push before, pop after — see `plan_query`).
+    fn plan_with_clause(&self, with: &With, query: &Query) -> Result<LogicalPlan, String> {
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.clone();
+
+            // Check if the CTE name is already defined in the current scope
+            let duplicate = self
+                .cte_stack
+                .borrow()
+                .last()
+                .unwrap()
+                .contains_key(&cte_name);
+            if duplicate {
+                return Err(format!("duplicate CTE name '{}'", cte_name));
+            }
+
+            // Push to planning set to prevent self-reference recursion
+            self.planning_ctes.borrow_mut().insert(cte_name.clone());
+            let planned_res = self.plan_query(&cte.query);
+            self.planning_ctes.borrow_mut().remove(&cte_name);
+
+            let mut cte_plan = planned_res?;
+
+            // Apply derived column aliases defined on the CTE if present, e.g. `WITH cte(a, b) AS`
+            let col_aliases = &cte.alias.columns;
+            if !col_aliases.is_empty() {
+                let schema = cte_plan.schema();
+                if col_aliases.len() != schema.columns.len() {
+                    return Err(format!(
+                        "CTE '{}' yields {} column(s) but {} alias(es) were provided",
+                        cte_name,
+                        schema.columns.len(),
+                        col_aliases.len()
+                    ));
+                }
+                let mut expressions = Vec::with_capacity(schema.columns.len());
+                let mut field_names = Vec::with_capacity(schema.columns.len());
+                for (i, col) in schema.columns.iter().enumerate() {
+                    expressions.push(Expr::Column(col.name.clone(), Some(i)));
+                    field_names.push(col_aliases[i].name.value.clone());
+                }
+                cte_plan = LogicalPlan::new_projection(cte_plan, expressions, field_names);
+            }
+
+            self.cte_stack
+                .borrow_mut()
+                .last_mut()
+                .unwrap()
+                .insert(cte_name, cte_plan);
+        }
+
+        self.plan_query_inner(query)
     }
 
     /// Inner helper to plan the SELECT query body.
@@ -1235,9 +1234,12 @@ impl LogicalPlanner {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let name_str = name.to_string();
-                if self.is_cte_planning(&name_str) {
-                    return Err("recursive CTEs are not supported".to_string());
-                }
+                // Resolve the name as a CTE first, then a base table. A name that
+                // matches neither but is currently being planned is a genuine
+                // self-reference (e.g. `WITH cte AS (SELECT * FROM cte)`); a
+                // non-recursive CTE name is not visible within its own body, so a
+                // reference that resolves to an outer CTE or a base table above is
+                // legitimate shadowing, not recursion.
                 if let Some(cte_plan) = self.lookup_cte(&name_str) {
                     let qualifier = match alias {
                         Some(a) => a.name.value.clone(),
@@ -1276,10 +1278,13 @@ impl LogicalPlanner {
                     ));
                 }
 
-                let table = self
-                    .database
-                    .get_table(&name_str)
-                    .map_err(|e| e.to_string())?;
+                let table = self.database.get_table(&name_str).map_err(|e| {
+                    if self.is_cte_planning(&name_str) {
+                        "recursive CTEs are not supported".to_string()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
 
                 let qualifier = match alias {
                     Some(a) => a.name.value.clone(),
