@@ -1106,20 +1106,7 @@ impl EngineInner {
                 current_writer_uncompressed_bytes = 0;
             }
 
-            let entry_sz = k.byte_size()
-                + match &v {
-                    Some(DbValue::Int(_)) => 8,
-                    Some(DbValue::Float(_)) => 8,
-                    Some(DbValue::String(s)) => s.len(),
-                    Some(DbValue::Bytes(b)) => b.len(),
-                    Some(DbValue::Bool(_)) => 1,
-                    Some(DbValue::Null) => 1,
-                    Some(DbValue::Date(_)) => 4,
-                    Some(DbValue::Time(_)) => 8,
-                    Some(DbValue::Timestamp(_)) => 8,
-                    Some(DbValue::Decimal(_)) => 16,
-                    None => 1,
-                };
+            let entry_sz = k.byte_size() + v.as_ref().map_or(1, DbValue::byte_size);
             current_writer_uncompressed_bytes += entry_sz;
 
             let writer = current_writer.as_mut().unwrap();

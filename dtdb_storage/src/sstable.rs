@@ -119,19 +119,7 @@ impl SstableWriter {
     pub fn append(&mut self, key: &DbKey, value: Option<&DbValue>) -> Result<()> {
         // Simple heuristic for estimated uncompressed size in memory.
         let key_sz = key.byte_size();
-        let val_sz = match &value {
-            Some(DbValue::Int(_)) => 8,
-            Some(DbValue::Float(_)) => 8,
-            Some(DbValue::String(s)) => s.len(),
-            Some(DbValue::Bytes(b)) => b.len(),
-            Some(DbValue::Null) => 1,
-            Some(DbValue::Bool(_)) => 1,
-            Some(DbValue::Date(_)) => 4,
-            Some(DbValue::Time(_)) => 8,
-            Some(DbValue::Timestamp(_)) => 8,
-            Some(DbValue::Decimal(_)) => 16,
-            None => 1,
-        };
+        let val_sz = value.map_or(1, DbValue::byte_size);
 
         // Update stats
         if let Some(ref mut filter) = self.bloom_filter {

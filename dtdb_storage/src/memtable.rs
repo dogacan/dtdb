@@ -23,26 +23,10 @@ impl Default for MemTable {
     }
 }
 
-fn value_byte_size(val: &DbValue) -> usize {
-    match val {
-        DbValue::Int(_) => 8,
-        DbValue::Float(_) => 8,
-        DbValue::String(s) => s.len(),
-        DbValue::Bytes(b) => b.len(),
-        DbValue::Bool(_) => 1,
-        DbValue::Null => 1,
-        DbValue::Date(_) => 4,
-        DbValue::Time(_) => 8,
-        DbValue::Timestamp(_) => 8,
-        DbValue::Decimal(_) => 16,
-    }
-}
-
+/// Byte size of a stored slot, treating a tombstone (`None`) as 1 byte of
+/// overhead. The value's own size comes from the shared [`DbValue::byte_size`].
 fn option_value_byte_size(val: &Option<DbValue>) -> usize {
-    match val {
-        Some(v) => value_byte_size(v),
-        None => 1, // Tombstone overhead
-    }
+    val.as_ref().map_or(1, DbValue::byte_size)
 }
 
 impl MemTable {
@@ -57,7 +41,7 @@ impl MemTable {
     /// Inserts a key-value pair into the MemTable.
     pub fn put(&self, key: DbKey, value: DbValue) {
         let key_size = key.byte_size();
-        let new_val_size = value_byte_size(&value);
+        let new_val_size = value.byte_size();
         let mut map = self.map.write().unwrap();
         let old = map.insert(key, Some(value));
         match old {

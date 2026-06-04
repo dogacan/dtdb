@@ -165,6 +165,24 @@ impl DbValue {
     pub fn bytes(b: impl Into<Arc<[u8]>>) -> Self {
         DbValue::Bytes(b.into())
     }
+
+    /// Estimated uncompressed byte size of the value's payload. Used as the
+    /// common heuristic behind memtable flush thresholds, block-cache
+    /// accounting, and SSTable target sizing, so all those sites agree.
+    pub fn byte_size(&self) -> usize {
+        match self {
+            DbValue::Int(_) => 8,
+            DbValue::Float(_) => 8,
+            DbValue::String(s) => s.len(),
+            DbValue::Bytes(b) => b.len(),
+            DbValue::Bool(_) => 1,
+            DbValue::Null => 1,
+            DbValue::Date(_) => 4,
+            DbValue::Time(_) => 8,
+            DbValue::Timestamp(_) => 8,
+            DbValue::Decimal(_) => 16,
+        }
+    }
 }
 
 impl PartialEq for DbValue {
@@ -561,6 +579,40 @@ mod tests {
     }
 
     #[test]
+    fn test_dbvalue_byte_size_all_variants() {
+        // The single source of truth for value byte accounting, shared by the
+        // memtable, block cache, SSTable writer, and compaction loop.
+        use chrono::{NaiveDate, NaiveTime};
+        use rust_decimal::Decimal;
+
+        assert_eq!(DbValue::Int(0).byte_size(), 8);
+        assert_eq!(DbValue::Float(1.0).byte_size(), 8);
+        assert_eq!(DbValue::string("abcde").byte_size(), 5);
+        assert_eq!(DbValue::bytes(vec![0u8; 7]).byte_size(), 7);
+        assert_eq!(DbValue::Bool(true).byte_size(), 1);
+        assert_eq!(DbValue::Null.byte_size(), 1);
+        assert_eq!(
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 4).unwrap()).byte_size(),
+            4
+        );
+        assert_eq!(
+            DbValue::Time(NaiveTime::from_hms_opt(1, 2, 3).unwrap()).byte_size(),
+            8
+        );
+        assert_eq!(
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 4)
+                    .unwrap()
+                    .and_hms_opt(1, 2, 3)
+                    .unwrap()
+            )
+            .byte_size(),
+            8
+        );
+        assert_eq!(DbValue::Decimal(Decimal::new(150, 2)).byte_size(), 16);
+    }
+
+    #[test]
     fn test_dbvalue_partial_eq_variants() {
         // Matching variants compare their inner data.
         assert_eq!(DbValue::Int(7), DbValue::Int(7));
@@ -611,6 +663,23 @@ mod tests {
 
         // A non-zero, non-NaN float hashes by its bit pattern.
         assert_eq!(hash_of(&DbValue::Float(3.5)), hash_of(&DbValue::Float(3.5)));
+
+        // Temporal and decimal variants hash equal to themselves and carry a
+        // distinct variant tag so they don't collide with each other.
+        let date = DbValue::Date(chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap());
+        let time = DbValue::Time(chrono::NaiveTime::from_hms_opt(1, 2, 3).unwrap());
+        let ts = DbValue::Timestamp(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 4)
+                .unwrap()
+                .and_hms_opt(1, 2, 3)
+                .unwrap(),
+        );
+        let dec = DbValue::Decimal(rust_decimal::Decimal::new(150, 2));
+        for v in [&date, &time, &ts, &dec] {
+            assert_eq!(hash_of(v), hash_of(v));
+        }
+        assert_ne!(hash_of(&date), hash_of(&time));
+        assert_ne!(hash_of(&ts), hash_of(&dec));
     }
 
     #[test]
@@ -629,6 +698,28 @@ mod tests {
         );
         let bytes: &[u8] = &[7, 8];
         assert_eq!(DbValue::from(bytes), DbValue::bytes(vec![7, 8]));
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+        assert_eq!(DbValue::from(date), DbValue::Date(date));
+        let time = chrono::NaiveTime::from_hms_opt(1, 2, 3).unwrap();
+        assert_eq!(DbValue::from(time), DbValue::Time(time));
+        let ts = date.and_hms_opt(1, 2, 3).unwrap();
+        assert_eq!(DbValue::from(ts), DbValue::Timestamp(ts));
+        let dec = rust_decimal::Decimal::new(150, 2);
+        assert_eq!(DbValue::from(dec), DbValue::Decimal(dec));
+    }
+
+    #[test]
+    fn test_passthrough_rewriter_returns_value_unchanged() {
+        // The default rewriter ignores both layouts and returns the value
+        // verbatim — even when the layouts differ.
+        let rw = PassthroughValueRewriter;
+        let v = DbValue::string("payload");
+        assert_eq!(rw.rewrite(&[], &[1, 2], &v).unwrap(), v);
+        assert_eq!(
+            rw.rewrite(&[3], &[3], &DbValue::Int(7)).unwrap(),
+            DbValue::Int(7)
+        );
     }
 
     #[test]

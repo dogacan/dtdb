@@ -387,6 +387,79 @@ fn test_memtable_size_tracking() {
 }
 
 #[test]
+fn test_memtable_size_tracking_grow_and_typed_values() {
+    let mem = MemTable::new();
+    assert!(mem.is_empty());
+    assert_eq!(mem.len(), 0);
+
+    // Overwrite with a LARGER value: the delta is positive, exercising the
+    // grow branch of `put` (the existing test only shrinks).
+    mem.put(k_int(1), v_str("ab")); // key=8 + value=2 = 10
+    assert_eq!(mem.byte_size(), 10);
+    mem.put(k_int(1), v_str("abcdef")); // value grows 2 -> 6, delta +4
+    assert_eq!(mem.byte_size(), 14);
+
+    // Delete a key whose old value is a 1-byte value: tombstone overhead (1)
+    // minus old size (1) is a non-negative delta, exercising delete's add arm.
+    mem.put(k_str("b"), DbValue::Bool(true)); // key=1 + value=1 = 2; total 16
+    assert_eq!(mem.byte_size(), 16);
+    mem.delete(k_str("b")); // 1 - 1 = 0 delta
+    assert_eq!(mem.byte_size(), 16);
+
+    assert_eq!(mem.len(), 2);
+    assert!(!mem.is_empty());
+}
+
+#[test]
+fn test_memtable_byte_size_all_value_types() {
+    use chrono::{NaiveDate, NaiveTime};
+    use rust_decimal::Decimal;
+
+    // Each variant's accounted byte size, isolated in its own memtable so the
+    // running total equals key (8) + the value's contribution.
+    let cases: Vec<(DbValue, usize)> = vec![
+        (DbValue::Float(1.5), 8),
+        (
+            DbValue::Date(NaiveDate::from_ymd_opt(2026, 6, 4).unwrap()),
+            4,
+        ),
+        (
+            DbValue::Time(NaiveTime::from_hms_opt(12, 30, 0).unwrap()),
+            8,
+        ),
+        (
+            DbValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 6, 4)
+                    .unwrap()
+                    .and_hms_opt(1, 2, 3)
+                    .unwrap(),
+            ),
+            8,
+        ),
+        (DbValue::Decimal(Decimal::new(12345, 2)), 16),
+        (DbValue::Null, 1),
+    ];
+
+    for (value, expected_value_bytes) in cases {
+        let mem = MemTable::new();
+        mem.put(k_int(1), value.clone());
+        assert_eq!(
+            mem.byte_size(),
+            8 + expected_value_bytes,
+            "unexpected byte size for {value:?}"
+        );
+    }
+}
+
+#[test]
+fn test_memtable_default_matches_new() {
+    let mem = MemTable::default();
+    assert!(mem.is_empty());
+    mem.put(k_int(1), v_int(1));
+    assert_eq!(mem.get(&k_int(1)), Some(Some(v_int(1))));
+}
+
+#[test]
 fn test_engine_multi_get() {
     let temp_dir = TempDir::new().unwrap();
     let options = EngineOptions {
@@ -774,6 +847,41 @@ fn test_scan_iter_merges_memtable_over_sstable_with_tombstones() {
             (k_int(30), v_int(30)),
             // 40 deleted — absent
             (k_int(50), v_int(50)),
+        ]
+    );
+}
+
+#[test]
+fn test_scan_iter_newer_l0_file_shadows_older_for_same_key() {
+    // Two L0 SSTables both contain key 20. During a scan their iterators sit in
+    // the merge heap with equal keys, so the heap's priority tie-break must
+    // surface the newer file's value (and suppress the older duplicate).
+    let temp_dir = TempDir::new().unwrap();
+    let engine = StorageEngine::open(temp_dir.path(), merge_test_options()).unwrap();
+
+    // Older L0 file: keys 10, 20(old), 30.
+    engine.put(k_int(10), v_int(10)).unwrap();
+    engine.put(k_int(20), v_int(200)).unwrap();
+    engine.put(k_int(30), v_int(30)).unwrap();
+    engine.flush_memtable().unwrap();
+
+    // Newer L0 file: re-writes 20 and deletes 30.
+    engine.put(k_int(20), v_int(999)).unwrap();
+    engine.delete(k_int(30)).unwrap();
+    engine.flush_memtable().unwrap();
+
+    let mut iter = engine.scan_iter(&k_int(0), &k_int(100)).unwrap();
+    let mut results = Vec::new();
+    while let Some(entry) = iter.next().unwrap() {
+        results.push(entry);
+    }
+
+    assert_eq!(
+        results,
+        vec![
+            (k_int(10), v_int(10)),
+            (k_int(20), v_int(999)), // newer L0 file wins the tie
+                                     // 30 deleted by the newer file's tombstone
         ]
     );
 }
@@ -1256,4 +1364,157 @@ fn test_sstable_corruption_handling() {
             "expected 'block extent outside file', got: {err_msg}"
         );
     }
+}
+
+#[test]
+fn test_compaction_preserves_all_value_types() {
+    // Compaction recomputes each entry's byte size (to honor
+    // `sstable_target_size`) with a per-variant match. Feed it one value of
+    // every type so every arm of that match is exercised, and confirm the
+    // values round-trip through the compacted SSTable unchanged.
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let options = EngineOptions {
+        compression: CompressionType::Uncompressed,
+        memtable_size_limit: 1024 * 1024,
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 10,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 10 * 1024 * 1024,
+        level_size_multiplier: 10,
+        max_level: 7,
+        block_cache_capacity: 0,
+        wal_sync_interval_ms: None,
+        ..Default::default()
+    };
+    let engine = StorageEngine::open(&db_path, options).unwrap();
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+    let time = chrono::NaiveTime::from_hms_opt(1, 2, 3).unwrap();
+    let ts = date.and_hms_opt(1, 2, 3).unwrap();
+    let dec = rust_decimal::Decimal::new(150, 2);
+
+    let entries: Vec<(DbKey, DbValue)> = vec![
+        (k_int(1), v_int(10)),
+        (k_int(2), DbValue::Float(1.5)),
+        (k_int(3), v_str("text")),
+        (k_int(4), DbValue::bytes(vec![1, 2, 3, 4])),
+        (k_int(5), DbValue::Bool(true)),
+        (k_int(6), DbValue::Null),
+        (k_int(7), DbValue::Date(date)),
+        (k_int(8), DbValue::Time(time)),
+        (k_int(9), DbValue::Timestamp(ts)),
+        (k_int(10), DbValue::Decimal(dec)),
+    ];
+    for (k, v) in &entries {
+        engine.put(k.clone(), v.clone()).unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    // Drop the L0 file into L1 via the compaction merge path.
+    engine.compact().unwrap();
+
+    for (k, v) in &entries {
+        assert_eq!(
+            engine.get(k).unwrap(),
+            Some(v.clone()),
+            "mismatch for {k:?}"
+        );
+    }
+}
+
+#[test]
+fn test_sstable_empty_reads_return_nothing() {
+    let temp_dir = TempDir::new().unwrap();
+    let sst_path = temp_dir.path().join("empty.sst");
+
+    // Finish a writer without appending anything: the index ends up empty.
+    {
+        let writer =
+            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 0, vec![]).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+    // An empty SSTable reports no first key.
+    assert_eq!(reader.first_key(), None);
+    // Point lookups and scans over an empty index short-circuit to "nothing".
+    assert_eq!(reader.get(&k_int(1)).unwrap(), None);
+    assert!(
+        reader
+            .scan(&k_int(0), &k_int(100), |_, _| true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(reader.scan_raw(&k_int(0), &k_int(100)).unwrap().is_empty());
+}
+
+#[test]
+fn test_sstable_get_key_below_first_block_misses() {
+    let temp_dir = TempDir::new().unwrap();
+    let sst_path = temp_dir.path().join("below.sst");
+
+    {
+        let mut writer =
+            SstableWriter::create(&sst_path, 4096, CompressionType::Uncompressed, 3, vec![])
+                .unwrap();
+        writer.append(&k_int(10), Some(&v_int(100))).unwrap();
+        writer.append(&k_int(20), Some(&v_int(200))).unwrap();
+        writer.append(&k_int(30), Some(&v_int(300))).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+    // A key smaller than the first block's first key takes the `idx == 0` miss
+    // branch of the index binary search.
+    assert_eq!(reader.get(&k_int(5)).unwrap(), None);
+    assert_eq!(reader.get(&k_int(20)).unwrap(), Some(Some(v_int(200))));
+}
+
+#[test]
+fn test_sstable_create_path_without_extension() {
+    let temp_dir = TempDir::new().unwrap();
+    // No file extension: the writer must still derive a temp path (".tmp")
+    // and rename it into place on finish.
+    let sst_path = temp_dir.path().join("no_extension");
+
+    {
+        let mut writer =
+            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 1, vec![]).unwrap();
+        writer.append(&k_int(1), Some(&v_int(42))).unwrap();
+        writer.finish().unwrap();
+    }
+
+    assert!(sst_path.exists(), "final file should exist after finish");
+    let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+    assert_eq!(reader.get(&k_int(1)).unwrap(), Some(Some(v_int(42))));
+}
+
+#[test]
+fn test_sstable_scan_stops_before_blocks_past_end() {
+    let temp_dir = TempDir::new().unwrap();
+    let sst_path = temp_dir.path().join("multi_block.sst");
+
+    // Tiny block size forces one entry per block, so an `end` in an early
+    // block leaves later blocks whose first_key exceeds `end` — exercising the
+    // early `break` in the scan loop.
+    {
+        let mut writer =
+            SstableWriter::create(&sst_path, 1, CompressionType::Uncompressed, 5, vec![]).unwrap();
+        for i in 1..=5 {
+            writer.append(&k_int(i * 10), Some(&v_int(i * 10))).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+    let res = reader.scan(&k_int(10), &k_int(25), |_, _| true).unwrap();
+    assert_eq!(res, vec![(k_int(10), v_int(10)), (k_int(20), v_int(20))]);
+
+    let raw = reader.scan_raw(&k_int(10), &k_int(25)).unwrap();
+    assert_eq!(
+        raw,
+        vec![(k_int(10), Some(v_int(10))), (k_int(20), Some(v_int(20)))]
+    );
 }
