@@ -1060,3 +1060,58 @@ fn test_compaction_at_max_level_drops_tombstones() {
     assert_eq!(stats.sstable_entries, 0);
     assert_eq!(stats.sstable_tombstones, 0);
 }
+
+#[test]
+fn test_sstable_write_read_various_types() {
+    let temp_dir = TempDir::new().unwrap();
+    let sst_path = temp_dir.path().join("types.sst");
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap();
+    let time = chrono::NaiveTime::from_hms_opt(12, 34, 56).unwrap();
+    let ts = date.and_hms_opt(12, 34, 56).unwrap();
+    let dec = rust_decimal::Decimal::new(12345, 2);
+
+    {
+        let mut writer =
+            SstableWriter::create(&sst_path, 1024, CompressionType::Uncompressed, 5, vec![])
+                .unwrap();
+        writer
+            .append(&k_int(1), Some(&DbValue::Bool(true)))
+            .unwrap();
+        writer
+            .append(&k_int(2), Some(&DbValue::Date(date)))
+            .unwrap();
+        writer
+            .append(&k_int(3), Some(&DbValue::Time(time)))
+            .unwrap();
+        writer
+            .append(&k_int(4), Some(&DbValue::Timestamp(ts)))
+            .unwrap();
+        writer
+            .append(&k_int(5), Some(&DbValue::Decimal(dec)))
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+    assert_eq!(
+        reader.get(&k_int(1)).unwrap(),
+        Some(Some(DbValue::Bool(true)))
+    );
+    assert_eq!(
+        reader.get(&k_int(2)).unwrap(),
+        Some(Some(DbValue::Date(date)))
+    );
+    assert_eq!(
+        reader.get(&k_int(3)).unwrap(),
+        Some(Some(DbValue::Time(time)))
+    );
+    assert_eq!(
+        reader.get(&k_int(4)).unwrap(),
+        Some(Some(DbValue::Timestamp(ts)))
+    );
+    assert_eq!(
+        reader.get(&k_int(5)).unwrap(),
+        Some(Some(DbValue::Decimal(dec)))
+    );
+}
