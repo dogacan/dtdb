@@ -271,3 +271,56 @@ fn shutdown_joins_cleanly_and_drains() {
         "all queued work should run before shutdown completes"
     );
 }
+
+#[test]
+fn test_inline_executor() {
+    use dtdb_storage::InlineExecutor;
+
+    let executor = InlineExecutor;
+    // Test submit
+    let counter = Arc::new(AtomicUsize::new(0));
+    let latch = Latch::new();
+    {
+        let counter = counter.clone();
+        let latch = latch.clone();
+        executor.submit(
+            Priority::Normal,
+            None,
+            Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                latch.signal();
+            }),
+        );
+    }
+    latch.wait_for(1);
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+    // Test submit_periodic
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let handle = {
+        let ticks = ticks.clone();
+        executor.submit_periodic(
+            Duration::from_millis(10),
+            Priority::Normal,
+            Box::new(move || {
+                ticks.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ticks.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected ticks for InlineExecutor, got {}",
+            ticks.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    drop(handle);
+    std::thread::sleep(Duration::from_millis(50));
+    let after_cancel = ticks.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(ticks.load(Ordering::SeqCst), after_cancel);
+}
