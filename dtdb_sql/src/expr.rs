@@ -1763,6 +1763,28 @@ mod tests {
             eval(&func("UPPER", vec![DbValue::Null])).unwrap(),
             DbValue::Null
         );
+        // NULL propagation through LOWER, SUBSTR (first arg), and CONCAT.
+        assert_eq!(
+            eval(&func("LOWER", vec![DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
+        assert_eq!(
+            eval(&func("SUBSTR", vec![DbValue::Null, DbValue::Int(1)])).unwrap(),
+            DbValue::Null
+        );
+        assert_eq!(
+            eval(&func("CONCAT", vec![DbValue::string("a"), DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
+        // ABS/ROUND propagate NULL.
+        assert_eq!(
+            eval(&func("ABS", vec![DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
+        assert_eq!(
+            eval(&func("ROUND", vec![DbValue::Null])).unwrap(),
+            DbValue::Null
+        );
         // ABS/ROUND on non-numeric error.
         assert!(eval(&func("ABS", vec![DbValue::string("x")])).is_err());
         assert!(eval(&func("ROUND", vec![DbValue::string("x")])).is_err());
@@ -1771,8 +1793,24 @@ mod tests {
         assert!(eval(&func("CONCAT", vec![])).is_err());
         // unknown function.
         assert!(eval(&func("NOPE", vec![DbValue::Int(1)])).is_err());
-        // wrong arity.
+        // wrong arity across every scalar function that checks it.
         assert!(eval(&func("UPPER", vec![DbValue::Int(1), DbValue::Int(2)])).is_err());
+        assert!(eval(&func("LENGTH", vec![])).is_err());
+        assert!(eval(&func("LOWER", vec![DbValue::Int(1), DbValue::Int(2)])).is_err());
+        assert!(eval(&func("ABS", vec![DbValue::Int(1), DbValue::Int(2)])).is_err());
+        assert!(eval(&func("ROUND", vec![DbValue::Int(1), DbValue::Int(2)])).is_err());
+        // SUBSTR length must be an integer.
+        assert!(
+            eval(&func(
+                "SUBSTR",
+                vec![
+                    DbValue::string("hello"),
+                    DbValue::Int(1),
+                    DbValue::string("x")
+                ]
+            ))
+            .is_err()
+        );
     }
 
     // ----- MATCH (full-text) -----

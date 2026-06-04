@@ -109,25 +109,10 @@ fn match_point_get<'a>(
             schema,
             range: Some((start, end)),
         } => {
-            let resolve = |key: &PlanKey| -> Option<DbKey> {
-                match key {
-                    PlanKey::Value(v) => Some(v.clone()),
-                    PlanKey::Parameter(name) => {
-                        let val = params.get(name)?;
-                        match val {
-                            DbValue::Int(v) => Some(DbKey::Int(*v)),
-                            DbValue::String(s) => Some(DbKey::String(s.clone())),
-                            DbValue::Date(d) => Some(DbKey::Date(*d)),
-                            DbValue::Time(t) => Some(DbKey::Time(*t)),
-                            DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
-                            DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
-                            _ => None,
-                        }
-                    }
-                }
-            };
-            let start_key = resolve(start)?;
-            let end_key = resolve(end)?;
+            // A non-key parameter type (or an unbound one) means this is not a
+            // point-get; decline so the caller falls back to the general path.
+            let start_key = resolve_plan_key(start, params).ok()?;
+            let end_key = resolve_plan_key(end, params).ok()?;
             if start_key == end_key {
                 Some(PointGetPlan {
                     projection,
@@ -141,6 +126,35 @@ fn match_point_get<'a>(
             }
         }
         _ => None,
+    }
+}
+
+/// Resolves a [`PlanKey`] — a pushed-down literal value or a still-symbolic
+/// parameter reference — to a concrete [`DbKey`] for scan-range and point-get
+/// bounds. Shared by the point-get matcher and the `Scan`/`IndexScan` range
+/// compilers so the set of key-eligible parameter types (and the rejection of
+/// non-key types such as `Float`/`Bool`/`Bytes`/`Null`) stays identical across
+/// all three sites.
+fn resolve_plan_key(
+    key: &PlanKey,
+    params: &std::collections::HashMap<String, DbValue>,
+) -> Result<DbKey, String> {
+    match key {
+        PlanKey::Value(v) => Ok(v.clone()),
+        PlanKey::Parameter(name) => {
+            let val = params
+                .get(name)
+                .ok_or_else(|| format!("Unbound parameter: {}", name))?;
+            match val {
+                DbValue::Int(v) => Ok(DbKey::Int(*v)),
+                DbValue::String(s) => Ok(DbKey::String(s.clone())),
+                DbValue::Date(d) => Ok(DbKey::Date(*d)),
+                DbValue::Time(t) => Ok(DbKey::Time(*t)),
+                DbValue::Timestamp(ts) => Ok(DbKey::Timestamp(*ts)),
+                DbValue::Decimal(dec) => Ok(DbKey::Decimal(*dec)),
+                _ => Err(format!("Unsupported key parameter type for {}", name)),
+            }
+        }
     }
 }
 
@@ -1450,31 +1464,10 @@ impl SqlEngine {
             } => {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
-                    Some((start_key, end_key)) => {
-                        let resolve = |key: &PlanKey| -> Result<DbKey, String> {
-                            match key {
-                                PlanKey::Value(v) => Ok(v.clone()),
-                                PlanKey::Parameter(name) => {
-                                    let val = params
-                                        .get(name)
-                                        .ok_or_else(|| format!("Unbound parameter: {}", name))?;
-                                    match val {
-                                        DbValue::Int(v) => Ok(DbKey::Int(*v)),
-                                        DbValue::String(s) => Ok(DbKey::String(s.clone())),
-                                        DbValue::Date(d) => Ok(DbKey::Date(*d)),
-                                        DbValue::Time(t) => Ok(DbKey::Time(*t)),
-                                        DbValue::Timestamp(ts) => Ok(DbKey::Timestamp(*ts)),
-                                        DbValue::Decimal(dec) => Ok(DbKey::Decimal(*dec)),
-                                        _ => Err(format!(
-                                            "Unsupported key parameter type for {}",
-                                            name
-                                        )),
-                                    }
-                                }
-                            }
-                        };
-                        (resolve(start_key)?, resolve(end_key)?)
-                    }
+                    Some((start_key, end_key)) => (
+                        resolve_plan_key(start_key, params)?,
+                        resolve_plan_key(end_key, params)?,
+                    ),
                     None => {
                         let idx_def = schema
                             .indexes
@@ -1548,31 +1541,10 @@ impl SqlEngine {
             } => {
                 // Calculate scan range bounds.
                 let (start, end) = match range {
-                    Some((start_key, end_key)) => {
-                        let resolve = |key: &PlanKey| -> Result<DbKey, String> {
-                            match key {
-                                PlanKey::Value(v) => Ok(v.clone()),
-                                PlanKey::Parameter(name) => {
-                                    let val = params
-                                        .get(name)
-                                        .ok_or_else(|| format!("Unbound parameter: {}", name))?;
-                                    match val {
-                                        DbValue::Int(v) => Ok(DbKey::Int(*v)),
-                                        DbValue::String(s) => Ok(DbKey::String(s.clone())),
-                                        DbValue::Date(d) => Ok(DbKey::Date(*d)),
-                                        DbValue::Time(t) => Ok(DbKey::Time(*t)),
-                                        DbValue::Timestamp(ts) => Ok(DbKey::Timestamp(*ts)),
-                                        DbValue::Decimal(dec) => Ok(DbKey::Decimal(*dec)),
-                                        _ => Err(format!(
-                                            "Unsupported key parameter type for {}",
-                                            name
-                                        )),
-                                    }
-                                }
-                            }
-                        };
-                        (resolve(start_key)?, resolve(end_key)?)
-                    }
+                    Some((start_key, end_key)) => (
+                        resolve_plan_key(start_key, params)?,
+                        resolve_plan_key(end_key, params)?,
+                    ),
                     None => schema.primary_key_bounds().map_err(|e| e.to_string())?,
                 };
 
@@ -2075,4 +2047,54 @@ fn preprocess_sql(sql: &str) -> String {
         }
     }
     sql.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_plan_key_passes_through_literal_values() {
+        let params = std::collections::HashMap::new();
+        let key = PlanKey::Value(DbKey::Int(7));
+        assert_eq!(resolve_plan_key(&key, &params).unwrap(), DbKey::Int(7));
+    }
+
+    #[test]
+    fn resolve_plan_key_binds_each_supported_parameter_type() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+        let time = chrono::NaiveTime::from_hms_opt(8, 15, 0).unwrap();
+        let ts = date.and_hms_opt(8, 15, 0).unwrap();
+        let dec = rust_decimal::Decimal::new(725, 2);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("i".to_string(), DbValue::Int(1));
+        params.insert("s".to_string(), DbValue::string("k"));
+        params.insert("d".to_string(), DbValue::Date(date));
+        params.insert("t".to_string(), DbValue::Time(time));
+        params.insert("ts".to_string(), DbValue::Timestamp(ts));
+        params.insert("dec".to_string(), DbValue::Decimal(dec));
+
+        let resolve = |name: &str| resolve_plan_key(&PlanKey::Parameter(name.into()), &params);
+        assert_eq!(resolve("i").unwrap(), DbKey::Int(1));
+        assert_eq!(resolve("s").unwrap(), DbKey::string("k"));
+        assert_eq!(resolve("d").unwrap(), DbKey::Date(date));
+        assert_eq!(resolve("t").unwrap(), DbKey::Time(time));
+        assert_eq!(resolve("ts").unwrap(), DbKey::Timestamp(ts));
+        assert_eq!(resolve("dec").unwrap(), DbKey::Decimal(dec));
+    }
+
+    #[test]
+    fn resolve_plan_key_rejects_unbound_and_non_key_types() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("f".to_string(), DbValue::Float(1.5));
+
+        // Missing binding.
+        let err = resolve_plan_key(&PlanKey::Parameter("missing".into()), &params).unwrap_err();
+        assert!(err.contains("Unbound parameter"), "got: {err}");
+
+        // A bound parameter whose type cannot be a key.
+        let err = resolve_plan_key(&PlanKey::Parameter("f".into()), &params).unwrap_err();
+        assert!(err.contains("Unsupported key parameter type"), "got: {err}");
+    }
 }
