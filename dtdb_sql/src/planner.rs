@@ -1553,7 +1553,15 @@ fn map_sql_data_type(sql_dt: &SqlDataType) -> Result<DataType, String> {
         {
             Ok(DataType::Int)
         }
-        SqlDataType::Custom(name, _) if name.to_string().to_uppercase() == "BOOL" => {
+        SqlDataType::Custom(name, _)
+            if name.0.len() == 1
+                && match &name.0[0] {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        ident.value.to_uppercase() == "BOOL"
+                    }
+                    _ => false,
+                } =>
+        {
             Ok(DataType::Bool)
         }
         SqlDataType::Float(_) | SqlDataType::Double(_) | SqlDataType::Real => Ok(DataType::Float),
