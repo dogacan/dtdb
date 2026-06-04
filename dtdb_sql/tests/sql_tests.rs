@@ -1,4 +1,4 @@
-use dtdb_relational::{Database, IndexType, Table, Transaction};
+use dtdb_relational::{Database, Table, Transaction};
 use dtdb_sql::{ExecutionResult, SqlEngine};
 use dtdb_storage::DbValue;
 use std::sync::Arc;
@@ -120,15 +120,16 @@ fn test_infix_like_on_trigram_index_is_correct() {
     engine
         .execute("CREATE TABLE docs (id INT PRIMARY KEY, body STRING)", &tx1)
         .unwrap();
+    // Declare the trigram index entirely through SQL DDL -- this exercises the
+    // `CREATE FULLTEXT INDEX ... USING <tokenizer>` surface end to end, rather
+    // than reaching past it to the relational create_index API.
+    engine
+        .execute(
+            "CREATE FULLTEXT INDEX docs_body_fts ON docs (body) USING trigram",
+            &tx1,
+        )
+        .unwrap();
     tx1.commit().unwrap();
-    db.create_index(
-        "docs",
-        "docs_body_fts",
-        vec!["body".to_string()],
-        IndexType::FullText,
-        Some("trigram".to_string()),
-    )
-    .unwrap();
 
     // For substring "quick" (trigrams qui/uic/ick):
     //   id1 genuine match; id2 has all three trigrams but not contiguous
@@ -144,12 +145,14 @@ fn test_infix_like_on_trigram_index_is_correct() {
         .unwrap();
     tx2.commit().unwrap();
 
-    // Flush + analyze so the trigram plan is eligible and costed against real
-    // statistics; correctness holds regardless of which plan is chosen.
+    // Flush, then ANALYZE via SQL so the trigram plan is eligible and costed
+    // against real statistics; correctness holds regardless of which plan is
+    // chosen. (flush_memtable is an internal physical operation with no SQL
+    // surface, so it stays on the relational API.)
     db.get_table("docs").unwrap().flush_memtable().unwrap();
     let tx3 = Transaction::new(3, db.clone());
-    db.analyze_table("docs", &tx3).unwrap();
-    drop(tx3);
+    engine.execute("ANALYZE TABLE docs", &tx3).unwrap();
+    tx3.commit().unwrap();
 
     // Only the genuine match survives: the trigram candidate set also includes
     // the false positive (id2) and case-mismatch (id3), both dropped by the
@@ -180,6 +183,48 @@ fn test_infix_like_on_trigram_index_is_correct() {
         .unwrap();
     assert_eq!(select_ids(res), vec![1, 5]);
     tx5.commit().unwrap();
+}
+
+#[test]
+fn test_create_fulltext_index_surface_is_robust() {
+    // The in-process SQL CLI hands `engine.execute` the statement with its
+    // trailing ';' still attached and keywords in whatever case the user typed.
+    // `CREATE FULLTEXT INDEX` is rewritten before sqlparser sees it, so this
+    // guards that the rewrite survives a trailing ';' and mixed-case keywords
+    // and still yields a working trigram index that LIKE can use.
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE docs (id INT PRIMARY KEY, body STRING)", &tx1)
+        .unwrap();
+    engine
+        .execute(
+            "create FullText Index docs_body_fts on docs (body) Using trigram;",
+            &tx1,
+        )
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO docs (id, body) VALUES (1, 'the quick fox'), (2, 'slow turtle')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    db.get_table("docs").unwrap().flush_memtable().unwrap();
+    let tx3 = Transaction::new(3, db.clone());
+    engine.execute("ANALYZE TABLE docs;", &tx3).unwrap();
+    tx3.commit().unwrap();
+
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine
+        .execute("SELECT id FROM docs WHERE body LIKE '%quick%';", &tx4)
+        .unwrap();
+    assert_eq!(select_ids(res), vec![1]);
 }
 
 #[test]
