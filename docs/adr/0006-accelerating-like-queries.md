@@ -236,6 +236,53 @@ Old stats files fail to decode and are silently skipped, then recomputed — no
 shim. No SSTable or `schema.bin` format change. dtdb is pre-release and drops
 backwards compatibility by policy (ADR 0001).
 
+## Prior art
+
+The question "should a full-text index accelerate `LIKE`?" has two defensible
+answers in the wild, and this ADR consciously picks one.
+
+- **PostgreSQL — keep them strictly separate (three mechanisms).**
+  - Prefix `LIKE 'ab%'` is served by a **B-tree with the `text_pattern_ops`
+    operator class** (or any B-tree under the `C` locale), which sorts by raw
+    bytes so the prefix is a contiguous range.
+  - Infix `LIKE '%ab%'` (and `ILIKE`, regex, similarity) is served by
+    **`pg_trgm`** — a *separate* extension exposing a **trigram GIN/GiST index**
+    (`gin_trgm_ops`). For patterns too short to yield a trigram, pg_trgm declines
+    and the planner falls back to a scan.
+  - Linguistic search (`tsvector` + `@@`, with stemming and stop-words) is a
+    **third** mechanism that does **not** help `LIKE` at all.
+
+  The split is not arbitrary: `tsvector` is **lossy** (stemming, stop-words, case
+  folding), so it physically cannot answer a substring `LIKE` soundly — which is
+  exactly why pg_trgm had to be a separate, faithful index.
+
+- **MySQL — `FULLTEXT` is `MATCH … AGAINST` only.** It never accelerates `LIKE`;
+  prefix `LIKE` rides an ordinary B-tree leftmost-prefix, and there is no native
+  infix-`LIKE` index.
+
+- **SQLite FTS5 — one full-text index, specialized by tokenizer (the model dtdb
+  follows).** FTS5 with the **`trigram` tokenizer** supports substring matching
+  and lets the `LIKE` / `GLOB` operators use the index directly, while FTS5 with a
+  word tokenizer serves `MATCH`. Same physical inverted index; the tokenizer
+  decides what it can answer.
+
+dtdb takes SQLite's unification, not PostgreSQL's separation: one
+`IndexType::FullText` structure parameterized by a tokenizer. The mapping onto
+PostgreSQL's vocabulary is exact — **`IndexType` is the access method, and the
+tokenizer is the operator class** — and `plan_like` (Decision §2) is the
+planner's operator-class match: "can this index answer a `LIKE`?". This keeps the
+single index type sound precisely because the **lossiness boundary that forced
+PostgreSQL to split** is enforced one level down, at the tokenizer: a faithful
+n-gram tokenizer returns `Some(LikePlan)` and behaves like pg_trgm; a lossy /
+word tokenizer keeps the `None` default and behaves like `tsvector`. The cost
+model's "no stats ⇒ don't pick the trigram plan" rule (Decision §4) also mirrors
+pg_trgm's behavior when its statistics are absent.
+
+The one inherited cost is PostgreSQL's "wrong operator class" footgun: a
+`FULLTEXT` index built with a word tokenizer is *correct* for `LIKE` but silently
+falls back to a scan, so the tokenizer requirement must be documented and made
+visible through `EXPLAIN`.
+
 ## Rejected alternatives
 
 - **Use a trigram index for the prefix case** (the original framing). A plain
