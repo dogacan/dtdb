@@ -1115,3 +1115,145 @@ fn test_sstable_write_read_various_types() {
         Some(Some(DbValue::Decimal(dec)))
     );
 }
+
+#[test]
+fn test_sstable_corruption_handling() {
+    use dtdb_storage::sstable::{IndexBlock, IndexEntry, StatsBlock};
+    use std::io::Write;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // 1. File size too small to contain footer.
+    {
+        let sst_path = temp_dir.path().join("too_small.sst");
+        std::fs::write(&sst_path, b"too short").unwrap();
+        let res = SstableReader::open(&sst_path, 1, 0, None);
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("too small to contain footer"),
+            "expected 'too small to contain footer', got: {err_msg}"
+        );
+    }
+
+    // 2. Invalid SSTable magic number.
+    {
+        let sst_path = temp_dir.path().join("invalid_magic.sst");
+        let mut data = vec![0u8; 24];
+        data[16..24].copy_from_slice(b"BADMAGIC");
+        std::fs::write(&sst_path, &data).unwrap();
+        let res = SstableReader::open(&sst_path, 1, 0, None);
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Invalid SSTable magic number"),
+            "expected 'Invalid SSTable magic number', got: {err_msg}"
+        );
+    }
+
+    // 3. SSTable footer points outside file.
+    {
+        let sst_path = temp_dir.path().join("outside_file.sst");
+        let mut data = vec![0u8; 24];
+        data[0..8].copy_from_slice(&100u64.to_le_bytes());
+        data[8..16].copy_from_slice(&10u64.to_le_bytes());
+        data[16..24].copy_from_slice(b"DTDB_SST");
+        std::fs::write(&sst_path, &data).unwrap();
+        let res = SstableReader::open(&sst_path, 1, 0, None);
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("points outside file"),
+            "expected 'points outside file', got: {err_msg}"
+        );
+    }
+
+    // 4. SSTable index is non-empty but stats.max_key is missing.
+    {
+        let sst_path = temp_dir.path().join("missing_max_key.sst");
+        let mut file = std::fs::File::create(&sst_path).unwrap();
+        file.write_all(&[0u8; 10]).unwrap();
+        let index_offset = 10u64;
+
+        let index_block = IndexBlock {
+            entries: vec![IndexEntry {
+                first_key: DbKey::Int(1),
+                offset: 0,
+                size: 10,
+                checksum: 0,
+            }],
+            compression: CompressionType::Uncompressed,
+            stats: StatsBlock {
+                num_entries: 1,
+                num_tombstones: 0,
+                total_uncompressed_bytes: 10,
+                min_key: None,
+                max_key: None, // Missing!
+            },
+            bloom_filter: None,
+            layout: vec![],
+        };
+        let index_bytes = postcard::to_allocvec(&index_block).unwrap();
+        file.write_all(&index_bytes).unwrap();
+        let index_len = index_bytes.len() as u64;
+
+        file.write_all(&index_offset.to_le_bytes()).unwrap();
+        file.write_all(&index_len.to_le_bytes()).unwrap();
+        file.write_all(b"DTDB_SST").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let res = SstableReader::open(&sst_path, 1, 0, None);
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("stats.max_key is missing"),
+            "expected 'stats.max_key is missing', got: {err_msg}"
+        );
+    }
+
+    // 5. Block offset/size out of file boundaries.
+    {
+        let sst_path = temp_dir.path().join("block_outside_file.sst");
+        let mut file = std::fs::File::create(&sst_path).unwrap();
+        file.write_all(&[0u8; 10]).unwrap();
+        let index_offset = 10u64;
+
+        let index_block = IndexBlock {
+            entries: vec![IndexEntry {
+                first_key: DbKey::Int(1),
+                offset: 0,
+                size: 100, // Outside file boundaries!
+                checksum: 0,
+            }],
+            compression: CompressionType::Uncompressed,
+            stats: StatsBlock {
+                num_entries: 1,
+                num_tombstones: 0,
+                total_uncompressed_bytes: 10,
+                min_key: Some(DbKey::Int(1)),
+                max_key: Some(DbKey::Int(1)),
+            },
+            bloom_filter: None,
+            layout: vec![],
+        };
+        let index_bytes = postcard::to_allocvec(&index_block).unwrap();
+        file.write_all(&index_bytes).unwrap();
+        let index_len = index_bytes.len() as u64;
+
+        file.write_all(&index_offset.to_le_bytes()).unwrap();
+        file.write_all(&index_len.to_le_bytes()).unwrap();
+        file.write_all(b"DTDB_SST").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reader = SstableReader::open(&sst_path, 1, 0, None).unwrap();
+        let res = reader.get(&DbKey::Int(1));
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("block extent outside file"),
+            "expected 'block extent outside file', got: {err_msg}"
+        );
+    }
+}
