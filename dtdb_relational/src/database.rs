@@ -2971,7 +2971,7 @@ mod tests {
         let mut saturated_entries: Vec<McvEntry> = (0..MCV_LIST_CAP)
             .map(|i| token_entry(&format!("t{i:04}"), (MCV_LIST_CAP - i) as u64))
             .collect();
-        saturated_entries.sort_by(|a, b| b.count.cmp(&a.count));
+        saturated_entries.sort_by_key(|e| std::cmp::Reverse(e.count));
         let saturated = IndexStats {
             entry_count: 10_000,
             unique_values: MCV_LIST_CAP as u64 + 100,

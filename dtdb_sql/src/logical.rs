@@ -17,6 +17,19 @@ pub enum PlanKey {
     Parameter(String),
 }
 
+/// The query a [`LogicalPlan::FullTextScan`] resolves against a FULLTEXT index.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum FtsQuery {
+    /// A raw MATCH query string, tokenized and parsed with the index's
+    /// tokenizer at execution time.
+    Match(String),
+    /// A pre-compiled conjunction of tokens (e.g. the trigrams of a LIKE
+    /// pattern's literal runs), intersected without re-parsing. Avoids the FTS
+    /// grammar mangling tokens that contain spaces, quotes, or parentheses, and
+    /// is paired with a residual LIKE Filter that re-checks each candidate.
+    AllTokens(Vec<String>),
+}
+
 /// AggregateExpr represents aggregate functions (COUNT, SUM, MIN, MAX, AVG).
 ///
 /// `distinct` records whether the call used the `DISTINCT` quantifier
@@ -52,7 +65,7 @@ pub enum LogicalPlan {
         table_name: String,
         index_name: String,
         schema: Schema,
-        query_str: String,
+        query: FtsQuery,
     },
     Filter {
         source: Box<LogicalPlan>,
@@ -550,12 +563,12 @@ fn format_logical_node(node: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::FullTextScan {
             table_name,
             index_name,
-            query_str,
+            query,
             ..
         } => {
             out.push_str(&format!(
                 "{}- FullTextScan: table={}, index={}, query={:?}\n",
-                indent_str, table_name, index_name, query_str
+                indent_str, table_name, index_name, query
             ));
         }
         LogicalPlan::SetOp {

@@ -460,6 +460,95 @@ fn test_prefix_like_becomes_range_scan() {
     );
 }
 
+/// Builds a `docs(id, body)` table with a trigram FULLTEXT index, populated so
+/// that the substring "common" appears in every row and "wxyzq" in exactly one,
+/// then flushes and (optionally) analyzes it.
+fn setup_trigram_docs(analyze: bool) -> (tempfile::TempDir, Arc<Database>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let engine = dtdb_sql::SqlEngine::new(db.clone());
+
+    let tx = dtdb_relational::Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE docs (id INT PRIMARY KEY, body STRING)", &tx)
+        .unwrap();
+    tx.commit().unwrap();
+    db.create_index(
+        "docs",
+        "docs_body_fts",
+        vec!["body".to_string()],
+        IndexType::FullText,
+        Some("trigram".to_string()),
+    )
+    .unwrap();
+
+    let tx = dtdb_relational::Transaction::new(2, db.clone());
+    for i in 0..60 {
+        let body = if i == 0 {
+            "common filler wxyzq".to_string()
+        } else {
+            format!("common filler text {i}")
+        };
+        engine
+            .execute(
+                &format!("INSERT INTO docs (id, body) VALUES ({i}, '{body}')"),
+                &tx,
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    db.get_table("docs").unwrap().flush_memtable().unwrap();
+
+    if analyze {
+        let tx = dtdb_relational::Transaction::new(3, db.clone());
+        db.analyze_table("docs", &tx).unwrap();
+        drop(tx);
+    }
+    (tmp, db)
+}
+
+#[test]
+fn test_infix_like_uses_trigram_plan_only_when_selective() {
+    let (_tmp, db) = setup_trigram_docs(true);
+
+    // A rare substring: the token intersection is tiny, so the optimizer picks
+    // the trigram FullTextScan (a typed AllTokens query, not a MATCH string).
+    let plan = optimize_plan(db.clone(), "SELECT id FROM docs WHERE body LIKE '%wxyzq%';").unwrap();
+    let plan_str = dtdb_sql::logical::format_logical_plan(&plan);
+    assert!(
+        plan_str.contains("FullTextScan") && plan_str.contains("AllTokens"),
+        "rare substring should use the trigram intersection: {plan_str}"
+    );
+    // The LIKE predicate is retained above it for the mandatory recheck.
+    assert!(
+        plan_str.contains("Filter"),
+        "recheck Filter must be retained: {plan_str}"
+    );
+
+    // A substring in every row: the intersection is no smaller than the table,
+    // so the cost model keeps the full scan instead.
+    let plan = optimize_plan(db, "SELECT id FROM docs WHERE body LIKE '%common%';").unwrap();
+    let plan_str = dtdb_sql::logical::format_logical_plan(&plan);
+    assert!(
+        !plan_str.contains("AllTokens"),
+        "common substring should not use the trigram intersection: {plan_str}"
+    );
+}
+
+#[test]
+fn test_infix_like_declines_trigram_plan_without_stats() {
+    // Same rare substring, but the table was never analyzed: with no statistics
+    // the optimizer cannot tell a selective token from a common one, so it
+    // conservatively declines the trigram plan and full-scans.
+    let (_tmp, db) = setup_trigram_docs(false);
+    let plan = optimize_plan(db, "SELECT id FROM docs WHERE body LIKE '%wxyzq%';").unwrap();
+    let plan_str = dtdb_sql::logical::format_logical_plan(&plan);
+    assert!(
+        !plan_str.contains("AllTokens"),
+        "without statistics there should be no trigram plan: {plan_str}"
+    );
+}
+
 #[test]
 fn test_optimizer_sort_elimination_and_index_scan_promotions() {
     let (_tmp, db) = setup_db();

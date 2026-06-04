@@ -1,4 +1,4 @@
-use dtdb_relational::{Database, Table, Transaction};
+use dtdb_relational::{Database, IndexType, Table, Transaction};
 use dtdb_sql::{ExecutionResult, SqlEngine};
 use dtdb_storage::DbValue;
 use std::sync::Arc;
@@ -97,6 +97,89 @@ fn test_sql_ddl_and_crud() {
     } else {
         panic!("Expected ExecutionResult::Select");
     }
+}
+
+fn select_ids(res: ExecutionResult) -> Vec<i64> {
+    if let ExecutionResult::Select { rows, .. } = res {
+        rows.iter()
+            .map(|r| match r.values[0] {
+                DbValue::Int(v) => v,
+                ref other => panic!("expected Int id, got {other:?}"),
+            })
+            .collect()
+    } else {
+        panic!("Expected ExecutionResult::Select");
+    }
+}
+
+#[test]
+fn test_infix_like_on_trigram_index_is_correct() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute("CREATE TABLE docs (id INT PRIMARY KEY, body STRING)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+    db.create_index(
+        "docs",
+        "docs_body_fts",
+        vec!["body".to_string()],
+        IndexType::FullText,
+        Some("trigram".to_string()),
+    )
+    .unwrap();
+
+    // For substring "quick" (trigrams qui/uic/ick):
+    //   id1 genuine match; id2 has all three trigrams but not contiguous
+    //   "quick" (false positive); id3 only differs in case (LIKE is
+    //   case-sensitive); id4 unrelated.
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO docs (id, body) VALUES \
+             (1, 'the quick fox'), (2, 'uick qui'), (3, 'QUICK START'), (4, 'nothing here')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // Flush + analyze so the trigram plan is eligible and costed against real
+    // statistics; correctness holds regardless of which plan is chosen.
+    db.get_table("docs").unwrap().flush_memtable().unwrap();
+    let tx3 = Transaction::new(3, db.clone());
+    db.analyze_table("docs", &tx3).unwrap();
+    drop(tx3);
+
+    // Only the genuine match survives: the trigram candidate set also includes
+    // the false positive (id2) and case-mismatch (id3), both dropped by the
+    // residual, case-sensitive LIKE recheck.
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine
+        .execute(
+            "SELECT id FROM docs WHERE body LIKE '%quick%' ORDER BY id",
+            &tx4,
+        )
+        .unwrap();
+    assert_eq!(select_ids(res), vec![1]);
+
+    // A row inserted but not yet committed in the same transaction is found via
+    // the write-buffer path and rechecked identically.
+    let tx5 = Transaction::new(5, db.clone());
+    engine
+        .execute(
+            "INSERT INTO docs (id, body) VALUES (5, 'be quick now')",
+            &tx5,
+        )
+        .unwrap();
+    let res = engine
+        .execute(
+            "SELECT id FROM docs WHERE body LIKE '%quick%' ORDER BY id",
+            &tx5,
+        )
+        .unwrap();
+    assert_eq!(select_ids(res), vec![1, 5]);
+    tx5.commit().unwrap();
 }
 
 #[test]
