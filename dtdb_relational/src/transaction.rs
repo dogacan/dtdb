@@ -633,10 +633,6 @@ impl Transaction {
         columns: Option<&[String]>,
     ) -> Result<Vec<Row>> {
         let table = self.get_table(table_name)?;
-        let index_engine = table.index_engines.get(index_name).ok_or_else(|| {
-            RelationalError::SchemaMismatch(format!("Index '{}' not found", index_name))
-        })?;
-
         let index_def = table
             .schema
             .indexes
@@ -656,13 +652,66 @@ impl Transaction {
         let query = crate::fts_parser::FullTextQuery::parse(query_str, tokenizer.as_ref())
             .map_err(RelationalError::SchemaMismatch)?;
 
+        self.fulltext_scan_with_query(table_name, index_name, &query, columns)
+    }
+
+    /// Resolve the rows whose indexed text contains ALL of `tokens` — i.e. the
+    /// conjunction of the given tokens — without parsing a query string. Used
+    /// to accelerate substring LIKE via a trigram index: the optimizer compiles
+    /// the pattern's literal runs into trigrams and intersects their posting
+    /// lists here. Token membership is necessary but not sufficient, so callers
+    /// MUST re-check the original LIKE predicate on the returned candidate rows
+    /// (the optimizer keeps that Filter above this scan). Returns no rows for an
+    /// empty token list.
+    pub fn token_intersection_scan(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        tokens: &[String],
+        columns: Option<&[String]>,
+    ) -> Result<Vec<Row>> {
+        let Some(query) = Self::and_of_tokens(tokens) else {
+            return Ok(Vec::new());
+        };
+        self.fulltext_scan_with_query(table_name, index_name, &query, columns)
+    }
+
+    /// Build a left-deep AND of the given tokens, or `None` if empty.
+    fn and_of_tokens(tokens: &[String]) -> Option<crate::fts_parser::FullTextQuery> {
+        let mut iter = tokens.iter();
+        let first = iter.next()?;
+        let mut query = crate::fts_parser::FullTextQuery::Token(first.clone());
+        for token in iter {
+            query = crate::fts_parser::FullTextQuery::And(
+                Box::new(query),
+                Box::new(crate::fts_parser::FullTextQuery::Token(token.clone())),
+            );
+        }
+        Some(query)
+    }
+
+    /// Resolve an already-built FULLTEXT query (parsed from a MATCH string or
+    /// compiled from a LIKE pattern) to its matching rows, including uncommitted
+    /// write-buffer rows.
+    pub fn fulltext_scan_with_query(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        query: &crate::fts_parser::FullTextQuery,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<Row>> {
+        let table = self.get_table(table_name)?;
+        let index_engine = table.index_engines.get(index_name).ok_or_else(|| {
+            RelationalError::SchemaMismatch(format!("Index '{}' not found", index_name))
+        })?;
+
         // 1. Recursively resolve primary key set matching the query from the index engine
         let (min_pk, max_pk) = table.schema.primary_key_bounds()?;
         let matched_pks = self.eval_fulltext_query(
             table_name,
             index_name,
             index_engine,
-            &query,
+            query,
             &min_pk,
             &max_pk,
         )?;
@@ -712,7 +761,7 @@ impl Transaction {
                             continue;
                         }
                         if let Some(row) = row_opt
-                            && self.eval_row_fts_query(&query, row, col_idx, tokenizer.as_ref())
+                            && self.eval_row_fts_query(query, row, col_idx, tokenizer.as_ref())
                         {
                             rows.push(row.clone());
                         }

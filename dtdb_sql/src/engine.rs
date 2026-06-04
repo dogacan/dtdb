@@ -1,5 +1,7 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{AggregateExpr, JoinType, LogicalPlan, PlanKey, format_logical_plan};
+use crate::logical::{
+    AggregateExpr, FtsQuery, JoinType, LogicalPlan, PlanKey, format_logical_plan,
+};
 use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
@@ -1514,15 +1516,28 @@ impl SqlEngine {
                 table_name,
                 index_name,
                 schema,
-                query_str,
+                query,
             } => {
-                let rows = tx
-                    .fulltext_scan(table_name, index_name, query_str, columns)
-                    .map_err(|e| e.to_string())?;
+                // A MATCH query is parsed with the index tokenizer; a compiled
+                // AllTokens query (from a LIKE pattern) intersects its tokens
+                // directly. Either way the candidate rows are re-checked by the
+                // residual Filter the optimizer keeps above this scan.
+                let (rows, query_label) = match query {
+                    FtsQuery::Match(query_str) => (
+                        tx.fulltext_scan(table_name, index_name, query_str, columns)
+                            .map_err(|e| e.to_string())?,
+                        query_str.clone(),
+                    ),
+                    FtsQuery::AllTokens(tokens) => (
+                        tx.token_intersection_scan(table_name, index_name, tokens, columns)
+                            .map_err(|e| e.to_string())?,
+                        format!("AllTokens({tokens:?})"),
+                    ),
+                };
 
                 Ok(Box::new(PhysicalFullTextScan::new(
                     schema.clone(),
-                    query_str.clone(),
+                    query_label,
                     rows,
                 )))
             }

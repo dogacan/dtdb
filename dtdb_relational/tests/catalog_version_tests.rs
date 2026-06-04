@@ -163,6 +163,60 @@ fn test_stats_version_bumps_only_on_change() {
 }
 
 #[test]
+fn test_token_intersection_scan_returns_candidate_superset() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    db.create_index(
+        "users",
+        "users_name_fts",
+        vec!["name".to_string()],
+        IndexType::FullText,
+        Some("trigram".to_string()),
+    )
+    .unwrap();
+
+    let tx = Transaction::new(1, db.clone());
+    // "abcd"     -> trigrams {abc, bcd}: a true match for %abcd%.
+    // "abcxbcd"  -> trigrams {abc, bcx, cxb, xbc, bcd}: has both abc and bcd
+    //               but NOT the contiguous "abcd" -> a false positive.
+    // "zzzz"     -> neither trigram -> not a candidate at all.
+    tx.put("users", DbKey::Int(1), user_row(1, "abcd")).unwrap();
+    tx.put("users", DbKey::Int(2), user_row(2, "abcxbcd"))
+        .unwrap();
+    tx.put("users", DbKey::Int(3), user_row(3, "zzzz")).unwrap();
+    tx.commit().unwrap();
+
+    // The AND of trigrams {abc, bcd} returns the candidate superset: both the
+    // true match and the false positive, but not the unrelated row. The false
+    // positive is what the residual LIKE filter exists to drop.
+    let tx = Transaction::new(2, db.clone());
+    let rows = tx
+        .token_intersection_scan(
+            "users",
+            "users_name_fts",
+            &["abc".to_string(), "bcd".to_string()],
+            None,
+        )
+        .unwrap();
+    let mut names: Vec<String> = rows
+        .iter()
+        .map(|r| match &r.values[1] {
+            DbValue::String(s) => s.to_string(),
+            other => panic!("expected string name, got {other:?}"),
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["abcd".to_string(), "abcxbcd".to_string()]);
+
+    // An empty token list matches nothing.
+    let empty = tx
+        .token_intersection_scan("users", "users_name_fts", &[], None)
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn test_analyze_populates_most_common_values() {
     let temp_dir = TempDir::new().unwrap();
     let db = Arc::new(Database::open(temp_dir.path()).unwrap());

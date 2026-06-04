@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{JoinType, LogicalPlan, PlanKey, SetOpType};
+use crate::logical::{FtsQuery, JoinType, LogicalPlan, PlanKey, SetOpType};
 use chrono;
 use dtdb_relational::{DataType, Database, Schema};
 use dtdb_storage::DbKey;
@@ -217,7 +217,7 @@ impl Optimizer {
                 table_name,
                 index_name,
                 schema,
-                query_str,
+                query,
             } => {
                 if let Some(pred) = combine_conjuncts(conjuncts) {
                     let best_source =
@@ -231,7 +231,7 @@ impl Optimizer {
                         table_name,
                         index_name,
                         schema,
-                        query_str,
+                        query,
                     }
                 }
             }
@@ -466,53 +466,66 @@ impl Optimizer {
             if let Some(col_name) = index.columns.first()
                 && let Some(col) = schema.columns.iter().find(|c| c.matches_name(col_name))
             {
-                // Verify index type match
                 let is_fulltext = index.index_type == dtdb_relational::IndexType::FullText;
                 let has_match = Self::has_match_predicate_for_col(predicate, &col.name);
-                if is_fulltext != has_match {
-                    continue;
-                }
 
                 if is_fulltext {
-                    if let Some(query_str) =
-                        Self::extract_fulltext_query_str_for_col(predicate, &col.name)
-                    {
-                        let fts_plan = LogicalPlan::FullTextScan {
-                            table_name: table_name.to_string(),
-                            index_name: index.name.clone(),
-                            schema: schema.clone(),
-                            query_str,
-                        };
-                        // FullTextScan has a very low cost as it resolves boolean terms using index set operations
-                        let cost = 5.0;
+                    if has_match {
+                        // A MATCH predicate resolves as a boolean FULLTEXT query.
+                        if let Some(query_str) =
+                            Self::extract_fulltext_query_str_for_col(predicate, &col.name)
+                        {
+                            let fts_plan = LogicalPlan::FullTextScan {
+                                table_name: table_name.to_string(),
+                                index_name: index.name.clone(),
+                                schema: schema.clone(),
+                                query: FtsQuery::Match(query_str),
+                            };
+                            // FullTextScan has a very low cost as it resolves boolean terms using index set operations
+                            let cost = 5.0;
+                            if cost < min_cost {
+                                min_cost = cost;
+                                best_plan = fts_plan;
+                            }
+                        }
+                    } else if let Some((plan, cost)) = self.try_trigram_like_plan(
+                        table_name,
+                        schema,
+                        index,
+                        &col.name,
+                        predicate,
+                        stats_opt.as_ref(),
+                        query_columns,
+                    ) {
+                        // A substring LIKE on a fulltext index whose tokenizer
+                        // can compile the pattern into intersectable tokens.
                         if cost < min_cost {
                             min_cost = cost;
-                            best_plan = fts_plan;
+                            best_plan = plan;
                         }
                     }
-                } else {
-                    if let Some((start, end)) =
+                } else if !has_match
+                    && let Some((start, end)) =
                         extract_bounds_for_column(predicate, &col.name, &col.data_type)
-                    {
-                        let idx_plan = LogicalPlan::IndexScan {
-                            table_name: table_name.to_string(),
-                            index_name: index.name.clone(),
-                            schema: schema.clone(),
-                            range: Some((start.clone(), end.clone())),
-                        };
-                        let cost = self.estimate_index_scan_cost(
-                            table_name,
-                            &index.name,
-                            schema,
-                            stats_opt.as_ref(),
-                            &start,
-                            &end,
-                            query_columns,
-                        );
-                        if cost < min_cost {
-                            min_cost = cost;
-                            best_plan = idx_plan;
-                        }
+                {
+                    let idx_plan = LogicalPlan::IndexScan {
+                        table_name: table_name.to_string(),
+                        index_name: index.name.clone(),
+                        schema: schema.clone(),
+                        range: Some((start.clone(), end.clone())),
+                    };
+                    let cost = self.estimate_index_scan_cost(
+                        table_name,
+                        &index.name,
+                        schema,
+                        stats_opt.as_ref(),
+                        &start,
+                        &end,
+                        query_columns,
+                    );
+                    if cost < min_cost {
+                        min_cost = cost;
+                        best_plan = idx_plan;
                     }
                 }
             }
@@ -557,6 +570,105 @@ impl Optimizer {
             Expr::Not(inner) => Self::extract_fulltext_query_str_for_col(inner, col_name),
             _ => None,
         }
+    }
+
+    /// Find a `col LIKE 'literal'` predicate for `col_name` and return its
+    /// pattern. Recurses through AND but deliberately not through NOT: a
+    /// negated LIKE cannot be served by a token-intersection (superset) plan.
+    fn extract_like_pattern_for_col(predicate: &Expr, col_name: &str) -> Option<String> {
+        match predicate {
+            Expr::BinaryOp {
+                left,
+                op: Operator::Like,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(name, _), Expr::Literal(DbValue::String(pattern)))
+                    if dtdb_relational::column_names_match(name, col_name) =>
+                {
+                    Some(pattern.to_string())
+                }
+                _ => None,
+            },
+            Expr::BinaryOp {
+                left,
+                op: Operator::And,
+                right,
+            } => Self::extract_like_pattern_for_col(left, col_name)
+                .or_else(|| Self::extract_like_pattern_for_col(right, col_name)),
+            _ => None,
+        }
+    }
+
+    /// Build a token-intersection plan for a substring LIKE on a fulltext index,
+    /// when the index's tokenizer can compile the pattern (e.g. trigrams) and
+    /// up-to-date statistics exist to cost it. Returns `(plan, cost)`, or `None`
+    /// to fall back to a full scan + filter.
+    ///
+    /// Cost is keyed off the most-common-value statistics: the candidate set is
+    /// bounded by the *rarest* required token's posting list (an intersection
+    /// cannot exceed its smallest input), so a selective token makes the plan
+    /// cheap while an all-common pattern (e.g. `%the%`) estimates near a full
+    /// scan and loses. Without statistics we decline rather than risk that
+    /// footgun. The residual LIKE filter the caller wraps around this plan
+    /// performs the mandatory recheck.
+    #[allow(clippy::too_many_arguments)]
+    fn try_trigram_like_plan(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        index: &dtdb_relational::IndexDefinition,
+        col_name: &str,
+        predicate: &Expr,
+        stats_opt: Option<&dtdb_relational::TableStatistics>,
+        query_columns: &HashSet<String>,
+    ) -> Option<(LogicalPlan, f64)> {
+        // No statistics -> cannot tell a selective token from a common one, so
+        // decline and let the full scan + filter handle it.
+        let stats = stats_opt?;
+        let idx_stats = stats.index_stats.get(&index.name)?;
+
+        let pattern = Self::extract_like_pattern_for_col(predicate, col_name)?;
+        let tokenizer_name = index.tokenizer.as_deref().unwrap_or("simple");
+        let tokenizer = dtdb_relational::get_tokenizer(tokenizer_name)?;
+        let required = tokenizer.plan_like(&pattern)?.required;
+        if required.is_empty() {
+            return None;
+        }
+
+        let posting_len = |token: &str| idx_stats.posting_len_upper_bound(&[DbKey::string(token)]);
+        // Intersection size is bounded by the rarest token; we still walk every
+        // required token's posting list.
+        let candidate_rows = required
+            .iter()
+            .map(|t| posting_len(t))
+            .min()
+            .unwrap_or(stats.row_count);
+        let postings_touched: u64 = required.iter().map(|t| posting_len(t)).sum();
+
+        // Mirror estimate_index_scan_cost so the plan competes on equal footing:
+        // posting-list scan + random-I/O row fetches + recheck CPU.
+        let row_count = stats.row_count;
+        let index_io = (postings_touched as f64 * 16.0).max(10.0);
+        let needed_groups = self.get_needed_locality_groups(schema, query_columns);
+        let mut table_io = 0.0;
+        for group in &needed_groups {
+            if let Some(g_stats) = stats.locality_group_stats.get(group) {
+                let random_factor = 10.0
+                    * (g_stats.total_sstable_size as f64 / (row_count.max(1) as f64)).max(10.0);
+                table_io += candidate_rows as f64 * random_factor;
+            } else {
+                table_io += candidate_rows as f64 * 100.0;
+            }
+        }
+        let cost = index_io + table_io + candidate_rows as f64 * 0.1;
+
+        let plan = LogicalPlan::FullTextScan {
+            table_name: table_name.to_string(),
+            index_name: index.name.clone(),
+            schema: schema.clone(),
+            query: FtsQuery::AllTokens(required),
+        };
+        Some((plan, cost))
     }
 
     fn get_needed_locality_groups(
