@@ -983,11 +983,57 @@ pub struct GroupStats {
     pub tombstone_count: u64,
 }
 
+/// A single entry in an index's most-common-values list: a key prefix (the
+/// index key minus its trailing primary key — exactly what [`IndexStats`]
+/// counts as a distinct value) and how many index entries share it. For a
+/// single-column FULLTEXT index the prefix is a one-element `[String(token)]`,
+/// so the list is a token→frequency table; for a B-tree index it is the
+/// indexed value(s). See ADR 0006.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct McvEntry {
+    pub prefix: Vec<DbKey>,
+    pub count: u64,
+}
+
+/// Maximum number of entries retained in [`IndexStats::most_common`]. Bounds
+/// the stats blob and the per-ANALYZE top-K pass; large enough to capture the
+/// high-frequency tail (e.g. common trigrams) that dominates query cost.
+const MCV_LIST_CAP: usize = 256;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct IndexStats {
     pub entry_count: u64,
     pub unique_values: u64,
     pub avg_rows_per_value: f64,
+    /// Most-common key prefixes, ordered by descending `count` (ties broken by
+    /// prefix for determinism) and capped at [`MCV_LIST_CAP`]. Lets the planner
+    /// estimate the selectivity of a specific value/token instead of relying on
+    /// `avg_rows_per_value`, which averages away the frequency skew that decides
+    /// whether a token-intersection plan is a win. Empty for indexes whose stats
+    /// predate this field: old `statistics.bin` blobs fail to decode and are
+    /// recomputed by the next ANALYZE (see the `if let Ok` loader). See ADR 0006.
+    #[serde(default)]
+    pub most_common: Vec<McvEntry>,
+}
+
+impl IndexStats {
+    /// Upper bound on the posting-list length (number of index entries) for a
+    /// key `prefix`. Exact when the prefix is in [`Self::most_common`];
+    /// otherwise bounded by the least-frequent retained entry when the list is
+    /// saturated — a more frequent prefix would have made the list — and by
+    /// `avg_rows_per_value` when the list is short or empty.
+    pub fn posting_len_upper_bound(&self, prefix: &[DbKey]) -> u64 {
+        if let Some(entry) = self.most_common.iter().find(|e| e.prefix == prefix) {
+            return entry.count;
+        }
+        match self.most_common.last() {
+            // `most_common` is sorted by descending count, so `last` is the
+            // least frequent retained prefix — the ceiling for anything that did
+            // not make a saturated list.
+            Some(least_frequent) if self.most_common.len() >= MCV_LIST_CAP => least_frequent.count,
+            _ => self.avg_rows_per_value.ceil() as u64,
+        }
+    }
 }
 
 /// DatabaseOptions defines the configuration parameters for a Database.
@@ -2719,17 +2765,20 @@ impl Database {
 
                 let mut scan_iter = index_engine.scan_iter(&start_bound, &end_bound)?;
                 let mut entry_count = 0;
-                let mut unique_prefixes = HashSet::new();
+                // Count entries per distinct key-prefix. Same cardinality as the
+                // previous dedup `HashSet`, so no extra memory pressure — but it
+                // also yields the per-prefix frequencies for the MCV list.
+                let mut prefix_counts: HashMap<Vec<DbKey>, u64> = HashMap::new();
                 while let Some((idx_key, _)) = scan_iter.next()? {
                     entry_count += 1;
                     if let DbKey::Composite(parts) = idx_key
                         && !parts.is_empty()
                     {
                         let prefix = parts[0..parts.len() - 1].to_vec();
-                        unique_prefixes.insert(prefix);
+                        *prefix_counts.entry(prefix).or_insert(0) += 1;
                     }
                 }
-                let unique_values = unique_prefixes.len() as u64;
+                let unique_values = prefix_counts.len() as u64;
 
                 let avg_rows_per_value = if unique_values > 0 {
                     entry_count as f64 / unique_values as f64
@@ -2737,12 +2786,31 @@ impl Database {
                     0.0
                 };
 
+                // Retain the MCV_LIST_CAP most frequent prefixes. Order entries
+                // by descending count, ties broken by prefix so the kept set and
+                // its order are deterministic across runs on identical data
+                // (avoids spurious stats-version bumps). `select_nth_unstable`
+                // avoids fully sorting a large distinct-prefix set.
+                let by_freq = |a: &McvEntry, b: &McvEntry| {
+                    b.count.cmp(&a.count).then_with(|| a.prefix.cmp(&b.prefix))
+                };
+                let mut most_common: Vec<McvEntry> = prefix_counts
+                    .into_iter()
+                    .map(|(prefix, count)| McvEntry { prefix, count })
+                    .collect();
+                if most_common.len() > MCV_LIST_CAP {
+                    most_common.select_nth_unstable_by(MCV_LIST_CAP, by_freq);
+                    most_common.truncate(MCV_LIST_CAP);
+                }
+                most_common.sort_unstable_by(by_freq);
+
                 index_stats.insert(
                     idx_def.name.clone(),
                     IndexStats {
                         entry_count,
                         unique_values,
                         avg_rows_per_value,
+                        most_common,
                     },
                 );
             }
@@ -2863,3 +2931,54 @@ impl dtdb_storage::ValueRewriter for RelationalValueRewriter {
 // Background ANALYZE and periodic-flush schedules are cancelled automatically
 // when the `PeriodicHandle`s stored on `Database` are dropped, so no explicit
 // `Drop` impl is required.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_entry(token: &str, count: u64) -> McvEntry {
+        McvEntry {
+            prefix: vec![DbKey::string(token)],
+            count,
+        }
+    }
+
+    #[test]
+    fn posting_len_upper_bound_uses_mcv_then_floor_then_avg() {
+        let probe = |stats: &IndexStats, token: &str| {
+            stats.posting_len_upper_bound(&[DbKey::string(token)])
+        };
+
+        // Short (non-saturated) list: an exact match returns its recorded count;
+        // a miss falls back to the average (ceiled).
+        let short = IndexStats {
+            entry_count: 100,
+            unique_values: 3,
+            avg_rows_per_value: 10.0,
+            most_common: vec![
+                token_entry("foo", 50),
+                token_entry("bar", 30),
+                token_entry("baz", 20),
+            ],
+        };
+        assert_eq!(probe(&short, "foo"), 50);
+        assert_eq!(probe(&short, "absent"), 10);
+
+        // Saturated list (len == MCV_LIST_CAP): a miss is bounded by the
+        // least-frequent retained entry — here the minimum count of 1 — rather
+        // than the (much larger) average, since anything more frequent than the
+        // floor would itself be in the list.
+        let mut saturated_entries: Vec<McvEntry> = (0..MCV_LIST_CAP)
+            .map(|i| token_entry(&format!("t{i:04}"), (MCV_LIST_CAP - i) as u64))
+            .collect();
+        saturated_entries.sort_by(|a, b| b.count.cmp(&a.count));
+        let saturated = IndexStats {
+            entry_count: 10_000,
+            unique_values: MCV_LIST_CAP as u64 + 100,
+            avg_rows_per_value: 99.0,
+            most_common: saturated_entries,
+        };
+        assert_eq!(probe(&saturated, "t0000"), MCV_LIST_CAP as u64);
+        assert_eq!(probe(&saturated, "absent"), 1);
+    }
+}

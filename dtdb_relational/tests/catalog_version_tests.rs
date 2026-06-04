@@ -163,6 +163,64 @@ fn test_stats_version_bumps_only_on_change() {
 }
 
 #[test]
+fn test_analyze_populates_most_common_values() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_test_schema()).unwrap();
+    db.create_index(
+        "users",
+        "users_name_idx",
+        vec!["name".to_string()],
+        IndexType::BTree,
+        None,
+    )
+    .unwrap();
+
+    // Skewed "name" distribution: 3x alice, 2x bob, 1x carol.
+    let tx = Transaction::new(1, db.clone());
+    for (i, name) in ["alice", "alice", "alice", "bob", "bob", "carol"]
+        .into_iter()
+        .enumerate()
+    {
+        tx.put("users", DbKey::Int(i as i64), user_row(i as i64, name))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = Transaction::new(2, db.clone());
+    db.analyze_table("users", &tx).unwrap();
+    drop(tx);
+
+    let stats = db.get_table_statistics("users").unwrap();
+    let idx = stats.index_stats.get("users_name_idx").unwrap();
+    assert_eq!(idx.entry_count, 6);
+    assert_eq!(idx.unique_values, 3);
+
+    // most_common is ordered by descending count and records per-value
+    // frequencies (the secondary-index prefix is the single indexed value).
+    let observed: Vec<(String, u64)> = idx
+        .most_common
+        .iter()
+        .map(|e| match e.prefix.as_slice() {
+            [DbKey::String(s)] => (s.to_string(), e.count),
+            other => panic!("expected single string prefix, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            ("alice".to_string(), 3),
+            ("bob".to_string(), 2),
+            ("carol".to_string(), 1),
+        ]
+    );
+
+    // The MCV list sharpens per-value selectivity beyond the 2.0 average.
+    assert_eq!(idx.posting_len_upper_bound(&[DbKey::string("alice")]), 3);
+    assert_eq!(idx.posting_len_upper_bound(&[DbKey::string("carol")]), 1);
+}
+
+#[test]
 fn test_stats_version_reset_on_drop() {
     let temp_dir = TempDir::new().unwrap();
     let db = Arc::new(Database::open(temp_dir.path()).unwrap());
