@@ -1230,4 +1230,163 @@ mod tests {
         let full = Row::new(vec![DbValue::Int(1), DbValue::Null]);
         assert_eq!(schema.reconcile_row(full.clone()), full);
     }
+
+    #[test]
+    fn test_schema_additional_coverage() {
+        use chrono::{NaiveDate, NaiveTime};
+        use rust_decimal::Decimal;
+
+        // 1. DataType::key_bounds
+        let _ = DataType::Date.key_bounds();
+        let _ = DataType::Time.key_bounds();
+        let _ = DataType::Timestamp.key_bounds();
+        let _ = DataType::Decimal.key_bounds();
+
+        // 2. Empty columns in locality_groups
+        let empty_schema = Schema::new(vec![]);
+        let groups = empty_schema.locality_groups();
+        assert!(groups.contains(""));
+
+        // 3. validate_row for Date, Time, Timestamp, Decimal
+        let col_date = col("d", DataType::Date, false);
+        let col_time = col("t", DataType::Time, false);
+        let col_ts = col("ts", DataType::Timestamp, false);
+        let col_dec = col("dec", DataType::Decimal, false);
+
+        let schema = Schema::new_with_options(
+            vec![
+                col("id", DataType::Int, true),
+                col_date.clone(),
+                col_time.clone(),
+                col_ts.clone(),
+                col_dec.clone(),
+            ],
+            HashMap::new(),
+        );
+
+        let date = NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+        let time = NaiveTime::from_hms_opt(1, 2, 3).unwrap();
+        let ts = date.and_hms_opt(1, 2, 3).unwrap();
+        let dec = Decimal::new(150, 2);
+
+        let valid_row = Row::new(vec![
+            DbValue::Int(1),
+            DbValue::Date(date),
+            DbValue::Time(time),
+            DbValue::Timestamp(ts),
+            DbValue::Decimal(dec),
+        ]);
+        assert!(schema.validate_row(&valid_row).is_ok());
+
+        // 4. validate_key and validate_key_only for Date, Time, Timestamp, Decimal (as single PK)
+        let schema_pk_date = Schema::new(vec![col("id", DataType::Date, true)]);
+        assert!(schema_pk_date.validate_key_only(&DbKey::Date(date)).is_ok());
+        assert!(
+            schema_pk_date
+                .validate_key(&DbKey::Date(date), &Row::new(vec![DbValue::Date(date)]))
+                .is_ok()
+        );
+
+        let schema_pk_time = Schema::new(vec![col("id", DataType::Time, true)]);
+        assert!(schema_pk_time.validate_key_only(&DbKey::Time(time)).is_ok());
+        assert!(
+            schema_pk_time
+                .validate_key(&DbKey::Time(time), &Row::new(vec![DbValue::Time(time)]))
+                .is_ok()
+        );
+
+        let schema_pk_ts = Schema::new(vec![col("id", DataType::Timestamp, true)]);
+        assert!(
+            schema_pk_ts
+                .validate_key_only(&DbKey::Timestamp(ts))
+                .is_ok()
+        );
+        assert!(
+            schema_pk_ts
+                .validate_key(
+                    &DbKey::Timestamp(ts),
+                    &Row::new(vec![DbValue::Timestamp(ts)])
+                )
+                .is_ok()
+        );
+
+        let schema_pk_dec = Schema::new(vec![col("id", DataType::Decimal, true)]);
+        assert!(
+            schema_pk_dec
+                .validate_key_only(&DbKey::Decimal(dec))
+                .is_ok()
+        );
+        assert!(
+            schema_pk_dec
+                .validate_key(&DbKey::Decimal(dec), &Row::new(vec![DbValue::Decimal(dec)]))
+                .is_ok()
+        );
+
+        // 5. extract_primary_key for Date, Time, Timestamp, Decimal (as single PK)
+        assert_eq!(
+            schema_pk_date
+                .extract_primary_key(&Row::new(vec![DbValue::Date(date)]))
+                .unwrap(),
+            DbKey::Date(date)
+        );
+        assert_eq!(
+            schema_pk_time
+                .extract_primary_key(&Row::new(vec![DbValue::Time(time)]))
+                .unwrap(),
+            DbKey::Time(time)
+        );
+        assert_eq!(
+            schema_pk_ts
+                .extract_primary_key(&Row::new(vec![DbValue::Timestamp(ts)]))
+                .unwrap(),
+            DbKey::Timestamp(ts)
+        );
+        assert_eq!(
+            schema_pk_dec
+                .extract_primary_key(&Row::new(vec![DbValue::Decimal(dec)]))
+                .unwrap(),
+            DbKey::Decimal(dec)
+        );
+
+        // 6. Composite extract_primary_key for all types
+        let comp_schema = Schema::new(vec![
+            col("id1", DataType::Int, true),
+            col("id2", DataType::String, true),
+            col("id3", DataType::Bool, true),
+            col("id4", DataType::Date, true),
+            col("id5", DataType::Time, true),
+            col("id6", DataType::Timestamp, true),
+            col("id7", DataType::Decimal, true),
+        ]);
+        let comp_row = Row::new(vec![
+            DbValue::Int(42),
+            DbValue::string("key"),
+            DbValue::Bool(true),
+            DbValue::Date(date),
+            DbValue::Time(time),
+            DbValue::Timestamp(ts),
+            DbValue::Decimal(dec),
+        ]);
+        let extracted = comp_schema.extract_primary_key(&comp_row).unwrap();
+        let expected_key = DbKey::composite(vec![
+            DbKey::Int(42),
+            DbKey::string("key"),
+            DbKey::Bool(true),
+            DbKey::Date(date),
+            DbKey::Time(time),
+            DbKey::Timestamp(ts),
+            DbKey::Decimal(dec),
+        ]);
+        assert_eq!(extracted, expected_key);
+
+        // 7. Cover default_nullable
+        let col_json = r#"{"id":0,"name":"col","data_type":"Int","is_primary_key":false,"locality_group":null,"default_value":null,"is_auto_increment":false}"#;
+        let deserialized_col: Column = serde_json::from_str(col_json).unwrap();
+        assert!(deserialized_col.is_nullable);
+
+        // 8. Cover default_index_type
+        let idx_json = r#"{"name":"idx","columns":["col"],"tokenizer":null}"#;
+        let deserialized_idx: IndexDefinition = serde_json::from_str(idx_json).unwrap();
+        assert_eq!(deserialized_idx.index_type, IndexType::BTree);
+    }
 }

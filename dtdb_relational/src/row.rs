@@ -224,4 +224,63 @@ mod tests {
         let parsed = Row::from_bytes_projected(&bytes, Some(&[0, 1, 2])).unwrap();
         assert_eq!(parsed, row);
     }
+
+    #[test]
+    fn test_from_bytes_projected_edge_cases() {
+        use chrono::{NaiveDate, NaiveTime};
+        use rust_decimal::Decimal;
+
+        // Cover String/Bytes not kept
+        let row = Row::new(vec![
+            DbValue::string("hello"),
+            DbValue::bytes(vec![1, 2, 3]),
+        ]);
+        let bytes = row.to_bytes().unwrap();
+        // Project to nothing (i.e. keep none)
+        let parsed = Row::from_bytes_projected(&bytes, Some(&[])).unwrap();
+        assert_eq!(parsed.values[0], DbValue::Null);
+        assert_eq!(parsed.values[1], DbValue::Null);
+
+        // Cover Date, Time, Timestamp, Decimal (tags 6..=9) both kept and not kept
+        let date = NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+        let time = NaiveTime::from_hms_opt(1, 2, 3).unwrap();
+        let ts = date.and_hms_opt(1, 2, 3).unwrap();
+        let dec = Decimal::new(150, 2);
+        let row2 = Row::new(vec![
+            DbValue::Date(date),
+            DbValue::Time(time),
+            DbValue::Timestamp(ts),
+            DbValue::Decimal(dec),
+        ]);
+        let bytes2 = row2.to_bytes().unwrap();
+
+        // Keep index 0 and 2, but not 1 and 3
+        let parsed2 = Row::from_bytes_projected(&bytes2, Some(&[0, 2])).unwrap();
+        assert_eq!(parsed2.values[0], DbValue::Date(date));
+        assert_eq!(parsed2.values[1], DbValue::Null);
+        assert_eq!(parsed2.values[2], DbValue::Timestamp(ts));
+        assert_eq!(parsed2.values[3], DbValue::Null);
+
+        // Invalid variant tag (tag 10)
+        let invalid_tag_bytes = &[1, 10];
+        let err = Row::from_bytes_projected(invalid_tag_bytes, Some(&[0])).unwrap_err();
+        assert!(err.to_string().contains("Unknown DbValue variant tag"));
+
+        // Varint too long (> 10 bytes)
+        let too_long_varint = &[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+        ];
+        let err = Row::from_bytes_projected(too_long_varint, Some(&[])).unwrap_err();
+        assert!(err.to_string().contains("varint too long"));
+
+        // Truncated varint
+        let truncated_varint = &[0x80];
+        let err = Row::from_bytes_projected(truncated_varint, Some(&[])).unwrap_err();
+        assert!(err.to_string().contains("truncated varint"));
+
+        // Truncated row payload (String length mismatch)
+        let truncated_payload = &[1, 2, 10, 0x41, 0x42];
+        let err = Row::from_bytes_projected(truncated_payload, Some(&[0])).unwrap_err();
+        assert!(err.to_string().contains("truncated row payload"));
+    }
 }
