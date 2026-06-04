@@ -728,6 +728,272 @@ mod imp {
         g.finish();
     }
 
+    fn load_shakespeare_data() -> Vec<(String, i32, String)> {
+        let paths = [
+            "text_data.txt",
+            "../text_data.txt",
+            "dtdb_benchmark/text_data.txt",
+        ];
+        let mut content = None;
+        for p in &paths {
+            if let Ok(c) = std::fs::read_to_string(p) {
+                content = Some(c);
+                break;
+            }
+        }
+        let content = content.expect("Could not find text_data.txt in any of the search paths");
+        let mut records = Vec::new();
+        for line in content.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(first_comma) = line.find(',') {
+                let speaker = &line[..first_comma];
+                let rest = &line[first_comma + 1..];
+                if let Some(second_comma) = rest.find(',') {
+                    let id_str = &rest[..second_comma];
+                    let mut text = &rest[second_comma + 1..];
+                    if let Ok(id) = id_str.parse::<i32>() {
+                        if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
+                            text = &text[1..text.len() - 1];
+                        }
+                        let clean_body = text.replace(['\'', '"'], "");
+                        let clean_speaker = speaker.replace(['\'', '"'], "");
+                        records.push((clean_speaker, id, clean_body));
+                    }
+                }
+            }
+        }
+        records
+    }
+
+    fn bench_infix_like(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
+        let mut g = c.benchmark_group("dml/infix_like");
+
+        let data = load_shakespeare_data();
+
+        // Setup dtdb once
+        let dtdb_tmp = TempDir::new().unwrap();
+        let dtdb_client = InProcessClient::open(dtdb_tmp.path()).unwrap();
+        dtdb_client
+            .create_db("bench", CompressionType::Lz4)
+            .unwrap();
+
+        let results = dtdb_client
+            .execute_query(
+                "bench",
+                sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, speaker STRING, body STRING)"),
+            )
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
+
+        // Create fulltext index on dtdb
+        let results = dtdb_client
+            .execute_query(
+                "bench",
+                sql_query!("CREATE FULLTEXT INDEX shake_body_fts ON bench (body) USING trigram"),
+            )
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
+
+        // Populate dtdb
+        dtdb_client
+            .run_in_transaction("bench", |tx| {
+                for (i, (speaker, _id, body)) in data.iter().enumerate() {
+                    let results = tx.execute_query(
+                        sql_query!(
+                            "INSERT INTO bench (id, speaker, body) VALUES (@id, @speaker, @body)"
+                        )
+                        .bind("id", i as i64)
+                        .bind("speaker", speaker.clone())
+                        .bind("body", body.clone()),
+                    )?;
+                    for r in results {
+                        r?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // Flush and Analyze dtdb
+        dtdb_client.flush_db("bench").unwrap();
+        let results = dtdb_client
+            .execute_query("bench", sql_query!("ANALYZE TABLE bench"))
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
+
+        g.bench_function("dtdb_trigram_fts", |b| {
+            b.iter(|| {
+                let results = dtdb_client
+                    .execute_query(
+                        "bench",
+                        sql_query!("SELECT COUNT(*) FROM bench WHERE body LIKE @pattern")
+                            .bind("pattern", "%speak%".to_string()),
+                    )
+                    .unwrap();
+                for r in results {
+                    let _resp = r.unwrap();
+                }
+            });
+        });
+
+        // Setup SQLite once (with FTS5 trigram virtual table)
+        let sqlite_tmp = TempDir::new().unwrap();
+        let mut sqlite_conn =
+            rusqlite::Connection::open(sqlite_tmp.path().join("bench.sqlite")).unwrap();
+        sqlite_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                 CREATE VIRTUAL TABLE bench USING fts5(speaker, body, tokenize='trigram');",
+            )
+            .unwrap();
+
+        // Populate SQLite
+        let txn = sqlite_conn.transaction().unwrap();
+        {
+            let mut stmt = txn
+                .prepare("INSERT INTO bench (rowid, speaker, body) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for (i, (speaker, _id, body)) in data.iter().enumerate() {
+                stmt.execute(rusqlite::params![i as i64, speaker, body])
+                    .unwrap();
+            }
+        }
+        txn.commit().unwrap();
+
+        g.bench_function("sqlite_fts5_trigram", |b| {
+            let mut stmt = sqlite_conn
+                .prepare("SELECT COUNT(*) FROM bench WHERE body LIKE ?1")
+                .unwrap();
+            b.iter(|| {
+                let mut rows = stmt.query(rusqlite::params!["%speak%"]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            });
+        });
+
+        g.finish();
+    }
+
+    fn bench_prefix_like(c: &mut Criterion) {
+        use dtdb_api::sql_query;
+        use dtdb_storage::CompressionType;
+
+        let mut g = c.benchmark_group("dml/prefix_like");
+
+        let data = load_shakespeare_data();
+
+        // Setup dtdb once
+        let dtdb_tmp = TempDir::new().unwrap();
+        let dtdb_client = InProcessClient::open(dtdb_tmp.path()).unwrap();
+        dtdb_client
+            .create_db("bench", CompressionType::Lz4)
+            .unwrap();
+
+        let results = dtdb_client
+            .execute_query(
+                "bench",
+                sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, speaker STRING, body STRING)"),
+            )
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
+
+        // Create B-tree index on body column for dtdb
+        let results = dtdb_client
+            .execute_query(
+                "bench",
+                sql_query!("CREATE INDEX shake_body_btree ON bench (body)"),
+            )
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
+
+        // Populate dtdb
+        dtdb_client
+            .run_in_transaction("bench", |tx| {
+                for (i, (speaker, _id, body)) in data.iter().enumerate() {
+                    let results = tx.execute_query(
+                        sql_query!(
+                            "INSERT INTO bench (id, speaker, body) VALUES (@id, @speaker, @body)"
+                        )
+                        .bind("id", i as i64)
+                        .bind("speaker", speaker.clone())
+                        .bind("body", body.clone()),
+                    )?;
+                    for r in results {
+                        r?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        g.bench_function("dtdb_btree_range", |b| {
+            b.iter(|| {
+                let results = dtdb_client
+                    .execute_query(
+                        "bench",
+                        sql_query!("SELECT COUNT(*) FROM bench WHERE body LIKE @pattern")
+                            .bind("pattern", "Before%".to_string()),
+                    )
+                    .unwrap();
+                for r in results {
+                    let _resp = r.unwrap();
+                }
+            });
+        });
+
+        // Setup SQLite once (with PRAGMA case_sensitive_like = ON and B-tree index)
+        let sqlite_tmp = TempDir::new().unwrap();
+        let mut sqlite_conn =
+            rusqlite::Connection::open(sqlite_tmp.path().join("bench.sqlite")).unwrap();
+        sqlite_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+                 PRAGMA case_sensitive_like = ON; \
+                 CREATE TABLE bench (id INTEGER PRIMARY KEY, speaker TEXT, body TEXT); \
+                 CREATE INDEX shake_body_btree ON bench (body);",
+            )
+            .unwrap();
+
+        // Populate SQLite
+        let txn = sqlite_conn.transaction().unwrap();
+        {
+            let mut stmt = txn
+                .prepare("INSERT INTO bench (id, speaker, body) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for (i, (speaker, _id, body)) in data.iter().enumerate() {
+                stmt.execute(rusqlite::params![i as i64, speaker, body])
+                    .unwrap();
+            }
+        }
+        txn.commit().unwrap();
+
+        g.bench_function("sqlite_btree_range", |b| {
+            let mut stmt = sqlite_conn
+                .prepare("SELECT COUNT(*) FROM bench WHERE body LIKE ?1")
+                .unwrap();
+            b.iter(|| {
+                let mut rows = stmt.query(rusqlite::params!["Before%"]).unwrap();
+                while rows.next().unwrap().is_some() {}
+            });
+        });
+
+        g.finish();
+    }
+
     pub fn run() {
         let mut c = Criterion::default().configure_from_args();
         bench_insert_autocommit(&mut c);
@@ -738,6 +1004,8 @@ mod imp {
         bench_update_point(&mut c);
         bench_delete_range(&mut c);
         bench_concurrent_inserts(&mut c);
+        bench_infix_like(&mut c);
+        bench_prefix_like(&mut c);
         c.final_summary();
     }
 }
