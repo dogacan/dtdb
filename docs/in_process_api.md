@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Two things to notice up front:
 
-- **No `async`.** `InProcessClient` is fully synchronous. There is no Tokio runtime, no `.await`, and no network hop — `execute_query` calls straight into the local `SqlEngine`.
+- **Synchronous, but not single-threaded.** `InProcessClient` is fully synchronous — there's no Tokio runtime, no `.await`, and no network hop; `execute_query` calls straight into the local `SqlEngine`. That's about *call style* (blocking calls instead of futures), not concurrency: the client is `Clone + Send + Sync`, so you run operations in parallel by calling it from multiple threads. Each transaction gets its own snapshot and conflicts are reconciled by OCC at commit — see [§6](#6-cloning-and-the-concurrency-model).
 - **You never allocate transaction IDs or manage `Database` handles.** The client owns a catalog that maps each database name to its single `Database`/`SqlEngine` pair and hands out transaction IDs from an internal counter.
 
 ### `sql_query!` and parameter binding
