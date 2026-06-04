@@ -4,15 +4,22 @@
 //! them side by side, so the relative cost of core DML operations can be
 //! tracked. It is loosely modeled on SQLite's classic "Database Speed
 //! Comparison" / `speedtest1` test cases, restricted to the DML core (INSERT /
-//! SELECT / UPDATE / DELETE) that both engines support. Schema creation (DDL)
-//! is performed identically on both but is *not* timed.
+//! SELECT / UPDATE / DELETE) that both engines support, plus indexed LIKE
+//! queries (trigram fulltext for infix, B-tree range for prefix). Schema
+//! creation (DDL) is performed on both but is *not* timed; index DDL is
+//! necessarily engine-specific (e.g. dtdb's trigram fulltext index vs. SQLite's
+//! FTS5 virtual table), tuned so each side serves the LIKE from its index.
 //!
 //! Both engines run in-process (dtdb via [`SqlEngine`], SQLite via `rusqlite`),
 //! so there is no IPC/network skew. For an apples-to-apples, power-loss-durable
 //! comparison both are configured to fsync at every commit: SQLite uses WAL +
 //! `synchronous=FULL`, and dtdb fsyncs one transaction-log record per commit by
-//! default. Data is generated host-side and emitted as literal SQL, so every
-//! statement stays within the dialect subset common to both engines.
+//! default. Most workloads generate data host-side and emit it as literal SQL,
+//! staying within the dialect subset common to both engines; the LIKE benches
+//! instead load the bundled `text_data.txt` (Tiny Shakespeare) and bind it via
+//! parameters. Matching LIKE semantics across engines matters there: dtdb's LIKE
+//! is case-sensitive, so the SQLite side forces the same via `case_sensitive 1`
+//! (FTS5) and `PRAGMA case_sensitive_like = ON` (B-tree).
 //!
 //! This bench is only built with `--features compare-sqlite` (which pulls in a
 //! bundled SQLite, requiring a C compiler). Without it, the binary is a stub.
@@ -785,7 +792,9 @@ mod imp {
         let results = dtdb_client
             .execute_query(
                 "bench",
-                sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, speaker STRING, body STRING)"),
+                sql_query!(
+                    "CREATE TABLE bench (id INT PRIMARY KEY, line_id INT, speaker STRING, body STRING)"
+                ),
             )
             .unwrap();
         for r in results {
@@ -806,12 +815,14 @@ mod imp {
         // Populate dtdb
         dtdb_client
             .run_in_transaction("bench", |tx| {
-                for (i, (speaker, _id, body)) in data.iter().enumerate() {
+                for (i, (speaker, line_id, body)) in data.iter().enumerate() {
                     let results = tx.execute_query(
                         sql_query!(
-                            "INSERT INTO bench (id, speaker, body) VALUES (@id, @speaker, @body)"
+                            "INSERT INTO bench (id, line_id, speaker, body) \
+                             VALUES (@id, @line_id, @speaker, @body)"
                         )
                         .bind("id", i as i64)
+                        .bind("line_id", *line_id as i64)
                         .bind("speaker", speaker.clone())
                         .bind("body", body.clone()),
                     )?;
@@ -854,7 +865,8 @@ mod imp {
         sqlite_conn
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
-                 CREATE VIRTUAL TABLE bench USING fts5(speaker, body, tokenize='trigram');",
+                 CREATE VIRTUAL TABLE bench USING \
+                 fts5(line_id UNINDEXED, speaker, body, tokenize='trigram case_sensitive 1');",
             )
             .unwrap();
 
@@ -862,10 +874,12 @@ mod imp {
         let txn = sqlite_conn.transaction().unwrap();
         {
             let mut stmt = txn
-                .prepare("INSERT INTO bench (rowid, speaker, body) VALUES (?1, ?2, ?3)")
+                .prepare(
+                    "INSERT INTO bench (rowid, line_id, speaker, body) VALUES (?1, ?2, ?3, ?4)",
+                )
                 .unwrap();
-            for (i, (speaker, _id, body)) in data.iter().enumerate() {
-                stmt.execute(rusqlite::params![i as i64, speaker, body])
+            for (i, (speaker, line_id, body)) in data.iter().enumerate() {
+                stmt.execute(rusqlite::params![i as i64, line_id, speaker, body])
                     .unwrap();
             }
         }
@@ -902,7 +916,9 @@ mod imp {
         let results = dtdb_client
             .execute_query(
                 "bench",
-                sql_query!("CREATE TABLE bench (id INT PRIMARY KEY, speaker STRING, body STRING)"),
+                sql_query!(
+                    "CREATE TABLE bench (id INT PRIMARY KEY, line_id INT, speaker STRING, body STRING)"
+                ),
             )
             .unwrap();
         for r in results {
@@ -923,12 +939,14 @@ mod imp {
         // Populate dtdb
         dtdb_client
             .run_in_transaction("bench", |tx| {
-                for (i, (speaker, _id, body)) in data.iter().enumerate() {
+                for (i, (speaker, line_id, body)) in data.iter().enumerate() {
                     let results = tx.execute_query(
                         sql_query!(
-                            "INSERT INTO bench (id, speaker, body) VALUES (@id, @speaker, @body)"
+                            "INSERT INTO bench (id, line_id, speaker, body) \
+                             VALUES (@id, @line_id, @speaker, @body)"
                         )
                         .bind("id", i as i64)
+                        .bind("line_id", *line_id as i64)
                         .bind("speaker", speaker.clone())
                         .bind("body", body.clone()),
                     )?;
@@ -939,6 +957,17 @@ mod imp {
                 Ok(())
             })
             .unwrap();
+
+        // Flush and Analyze dtdb so the range scan runs against on-disk SSTables
+        // with up-to-date statistics, matching the infix bench and SQLite's
+        // committed file.
+        dtdb_client.flush_db("bench").unwrap();
+        let results = dtdb_client
+            .execute_query("bench", sql_query!("ANALYZE TABLE bench"))
+            .unwrap();
+        for r in results {
+            r.unwrap();
+        }
 
         g.bench_function("dtdb_btree_range", |b| {
             b.iter(|| {
@@ -963,7 +992,7 @@ mod imp {
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
                  PRAGMA case_sensitive_like = ON; \
-                 CREATE TABLE bench (id INTEGER PRIMARY KEY, speaker TEXT, body TEXT); \
+                 CREATE TABLE bench (id INTEGER PRIMARY KEY, line_id INTEGER, speaker TEXT, body TEXT); \
                  CREATE INDEX shake_body_btree ON bench (body);",
             )
             .unwrap();
@@ -972,10 +1001,10 @@ mod imp {
         let txn = sqlite_conn.transaction().unwrap();
         {
             let mut stmt = txn
-                .prepare("INSERT INTO bench (id, speaker, body) VALUES (?1, ?2, ?3)")
+                .prepare("INSERT INTO bench (id, line_id, speaker, body) VALUES (?1, ?2, ?3, ?4)")
                 .unwrap();
-            for (i, (speaker, _id, body)) in data.iter().enumerate() {
-                stmt.execute(rusqlite::params![i as i64, speaker, body])
+            for (i, (speaker, line_id, body)) in data.iter().enumerate() {
+                stmt.execute(rusqlite::params![i as i64, line_id, speaker, body])
                     .unwrap();
             }
         }
