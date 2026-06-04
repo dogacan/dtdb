@@ -16,5 +16,8 @@ pub use row::Row;
 pub use schema::{
     Column, DataType, IndexDefinition, IndexType, LocalityGroupOptions, Schema, column_names_match,
 };
-pub use tokenizer::{SimpleTokenizer, Tokenizer, get_tokenizer, register_global_tokenizer};
+pub use tokenizer::{
+    LikePlan, SimpleTokenizer, Tokenizer, TrigramTokenizer, get_tokenizer,
+    register_global_tokenizer,
+};
 pub use transaction::{IsolationLevel, Transaction, TransactionOptions, TransactionScanIterator};
