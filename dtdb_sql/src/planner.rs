@@ -69,14 +69,42 @@ pub enum AlterOp {
     DropColumn(String),
 }
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 /// LogicalPlanner translates sqlparser AST Statements into SqlStatements.
 pub struct LogicalPlanner {
     database: Arc<Database>,
+    /// Stack of CTE scopes to support nested query definitions and lexical shadowing.
+    cte_stack: RefCell<Vec<HashMap<String, LogicalPlan>>>,
+    /// Set of CTE names currently being planned to detect and reject recursive/self-referencing CTEs.
+    planning_ctes: RefCell<HashSet<String>>,
 }
 
 impl LogicalPlanner {
     pub fn new(database: Arc<Database>) -> Self {
-        Self { database }
+        Self {
+            database,
+            cte_stack: RefCell::new(Vec::new()),
+            planning_ctes: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Returns a cloned logical plan of a CTE if it exists in the active stack.
+    /// Walks the stack from top (innermost scope) to bottom (outermost scope).
+    fn lookup_cte(&self, name: &str) -> Option<LogicalPlan> {
+        let stack = self.cte_stack.borrow();
+        for scope in stack.iter().rev() {
+            if let Some(plan) = scope.get(name) {
+                return Some(plan.clone());
+            }
+        }
+        None
+    }
+
+    /// Checks if a CTE with the given name is currently being planned.
+    fn is_cte_planning(&self, name: &str) -> bool {
+        self.planning_ctes.borrow().contains(name)
     }
 
     /// Plans a parsed sqlparser AST Statement.
@@ -625,6 +653,81 @@ impl LogicalPlanner {
 
     /// Plans a SELECT query into a LogicalPlan.
     fn plan_query(&self, query: &Query) -> Result<LogicalPlan, String> {
+        let has_with = if let Some(with) = &query.with {
+            if with.recursive {
+                return Err("recursive CTEs are not supported".to_string());
+            }
+
+            // Push an empty scope to the CTE stack first, so planned CTEs can reference earlier CTEs in the same WITH clause
+            self.cte_stack.borrow_mut().push(HashMap::new());
+
+            for cte in &with.cte_tables {
+                let cte_name = cte.alias.name.value.clone();
+                if self.is_cte_planning(&cte_name) {
+                    return Err("recursive CTEs are not supported".to_string());
+                }
+
+                // Check if the CTE name is already defined in the current scope
+                let duplicate = self
+                    .cte_stack
+                    .borrow()
+                    .last()
+                    .unwrap()
+                    .contains_key(&cte_name);
+                if duplicate {
+                    return Err(format!("duplicate CTE name '{}'", cte_name));
+                }
+
+                // Push to planning set to prevent self-reference recursion
+                self.planning_ctes.borrow_mut().insert(cte_name.clone());
+                let planned_res = self.plan_query(&cte.query);
+                self.planning_ctes.borrow_mut().remove(&cte_name);
+
+                let mut cte_plan = planned_res?;
+
+                // Apply derived column aliases defined on the CTE if present, e.g. `WITH cte(a, b) AS`
+                let col_aliases = &cte.alias.columns;
+                if !col_aliases.is_empty() {
+                    let schema = cte_plan.schema();
+                    if col_aliases.len() != schema.columns.len() {
+                        return Err(format!(
+                            "CTE '{}' yields {} column(s) but {} alias(es) were provided",
+                            cte_name,
+                            schema.columns.len(),
+                            col_aliases.len()
+                        ));
+                    }
+                    let mut expressions = Vec::with_capacity(schema.columns.len());
+                    let mut field_names = Vec::with_capacity(schema.columns.len());
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        expressions.push(Expr::Column(col.name.clone(), Some(i)));
+                        field_names.push(col_aliases[i].name.value.clone());
+                    }
+                    cte_plan = LogicalPlan::new_projection(cte_plan, expressions, field_names);
+                }
+
+                self.cte_stack
+                    .borrow_mut()
+                    .last_mut()
+                    .unwrap()
+                    .insert(cte_name, cte_plan);
+            }
+            true
+        } else {
+            false
+        };
+
+        let res = self.plan_query_inner(query);
+
+        if has_with {
+            self.cte_stack.borrow_mut().pop();
+        }
+
+        res
+    }
+
+    /// Inner helper to plan the SELECT query body.
+    fn plan_query_inner(&self, query: &Query) -> Result<LogicalPlan, String> {
         use sqlparser::ast::SetExpr;
         match &*query.body {
             SetExpr::Select(select) => self.plan_select_query(select, query),
@@ -1132,6 +1235,47 @@ impl LogicalPlanner {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let name_str = name.to_string();
+                if self.is_cte_planning(&name_str) {
+                    return Err("recursive CTEs are not supported".to_string());
+                }
+                if let Some(cte_plan) = self.lookup_cte(&name_str) {
+                    let qualifier = match alias {
+                        Some(a) => a.name.value.clone(),
+                        None => name_str.clone(),
+                    };
+                    let col_aliases: Vec<&str> = match alias {
+                        Some(a) => a.columns.iter().map(|c| c.name.value.as_str()).collect(),
+                        None => Vec::new(),
+                    };
+                    let inner_schema = cte_plan.schema();
+                    if !col_aliases.is_empty() && col_aliases.len() != inner_schema.columns.len() {
+                        return Err(format!(
+                            "CTE '{}' yields {} column(s) but {} alias(es) were provided",
+                            qualifier,
+                            inner_schema.columns.len(),
+                            col_aliases.len()
+                        ));
+                    }
+
+                    let mut expressions = Vec::with_capacity(inner_schema.columns.len());
+                    let mut field_names = Vec::with_capacity(inner_schema.columns.len());
+                    for (i, col) in inner_schema.columns.iter().enumerate() {
+                        expressions.push(Expr::Column(col.name.clone(), Some(i)));
+                        let base = if col_aliases.is_empty() {
+                            col.name.rsplit('.').next().unwrap_or(&col.name)
+                        } else {
+                            col_aliases[i]
+                        };
+                        field_names.push(format!("{qualifier}.{base}"));
+                    }
+
+                    return Ok(LogicalPlan::new_projection(
+                        cte_plan,
+                        expressions,
+                        field_names,
+                    ));
+                }
+
                 let table = self
                     .database
                     .get_table(&name_str)
