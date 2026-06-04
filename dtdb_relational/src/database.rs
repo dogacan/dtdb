@@ -2944,4 +2944,226 @@ mod tests {
         assert_eq!(probe(&saturated, "t0000"), MCV_LIST_CAP as u64);
         assert_eq!(probe(&saturated, "absent"), 1);
     }
+
+    #[test]
+    fn test_validation_phase1_conflicts() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = Database::open(temp_dir.path()).unwrap();
+
+        let t1 = "t1".to_string();
+        let k1 = DbKey::Int(1);
+
+        // 1. Initially, commit a write record to establish a baseline in history
+        let mut write_keys = HashMap::new();
+        write_keys.insert(t1.clone(), [k1.clone()].into_iter().collect());
+
+        let commit_res = db.validate_and_commit(
+            1,               // tx_id
+            0,               // start_version
+            &HashMap::new(), // read_set
+            &HashMap::new(), // scan_ranges
+            &write_keys,
+            || Ok(()),
+        );
+        assert!(commit_res.is_ok());
+
+        // Now history contains one commit record: version 1, writing key 1 in table t1.
+
+        // 2. Read-Write Conflict (Phase 1)
+        // Tx starts at version 0, reads key 1, tries to commit with write keys.
+        let mut read_set = HashMap::new();
+        read_set.insert(t1.clone(), [k1.clone()].into_iter().collect());
+        let res = db.validate_and_commit(
+            2,
+            0, // start_version 0 (conflict because committed version is 1)
+            &read_set,
+            &HashMap::new(),
+            &write_keys,
+            || Ok(()),
+        );
+        assert!(matches!(res, Err(RelationalError::TransactionConflict(_))));
+
+        // 3. Phantom Conflict (Phase 1)
+        // Tx starts at version 0, scans range [0, 5], tries to commit with write keys.
+        let mut scan_ranges = HashMap::new();
+        scan_ranges.insert(t1.clone(), vec![(DbKey::Int(0), DbKey::Int(5))]);
+        let res =
+            db.validate_and_commit(3, 0, &HashMap::new(), &scan_ranges, &write_keys, || Ok(()));
+        assert!(matches!(res, Err(RelationalError::TransactionConflict(_))));
+
+        // 4. Write-Write Conflict (Phase 1)
+        // Tx starts at version 0, writes key 1.
+        let res =
+            db.validate_and_commit(4, 0, &HashMap::new(), &HashMap::new(), &write_keys, || {
+                Ok(())
+            });
+        assert!(matches!(res, Err(RelationalError::TransactionConflict(_))));
+
+        // 5. validate_read_only: Read-Write Conflict
+        let res = db.validate_read_only(5, 0, &read_set, &HashMap::new());
+        assert!(matches!(res, Err(RelationalError::TransactionConflict(_))));
+
+        // 6. validate_read_only: Phantom Conflict
+        let res = db.validate_read_only(6, 0, &HashMap::new(), &scan_ranges);
+        assert!(matches!(res, Err(RelationalError::TransactionConflict(_))));
+    }
+
+    #[test]
+    fn test_validation_phase2_conflicts() {
+        let t1 = "t1".to_string();
+        let k1 = DbKey::Int(1);
+        let k2 = DbKey::Int(2);
+
+        // --- Hitting Phase 2 Write-Write Conflict ---
+        {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+            // Acquire lock in main thread so Thread A blocks at min_start_version calculation
+            let occ_guard = db.occ_active_transactions.lock().unwrap();
+
+            let db_clone = db.clone();
+            let t1_clone = t1.clone();
+            let k1_clone = k1.clone();
+            let handle_a = std::thread::spawn(move || {
+                let mut write_keys = HashMap::new();
+                write_keys.insert(t1_clone, [k1_clone].into_iter().collect());
+
+                db_clone.validate_and_commit(
+                    10,
+                    0,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &write_keys,
+                    || Ok(()),
+                )
+            });
+
+            // Ensure Thread A enters validate_and_commit and blocks on occ_active_transactions
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // Main thread appends conflicting record directly to history
+            {
+                let mut history = db.commit_history.write().unwrap();
+                let commit_version = db
+                    .global_commit_version
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let mut keys = HashMap::new();
+                keys.insert(t1.clone(), [k1.clone()].into_iter().collect());
+                history.push(CommitRecord {
+                    commit_version,
+                    keys,
+                });
+            }
+
+            // Drop occ_guard to let Thread A proceed
+            drop(occ_guard);
+
+            let res_a = handle_a.join().unwrap();
+            assert!(matches!(
+                res_a,
+                Err(RelationalError::TransactionConflict(_))
+            ));
+        }
+
+        // --- Hitting Phase 2 Read-Write Conflict ---
+        {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+            let occ_guard = db.occ_active_transactions.lock().unwrap();
+
+            let db_clone = db.clone();
+            let t1_clone = t1.clone();
+            let k2_clone = k2.clone();
+            let handle_a = std::thread::spawn(move || {
+                // Thread A reads key 2, writes key 1
+                let mut read_set = HashMap::new();
+                read_set.insert(t1_clone.clone(), [k2_clone].into_iter().collect());
+                let mut write_keys = HashMap::new();
+                write_keys.insert(t1_clone, [DbKey::Int(1)].into_iter().collect());
+
+                db_clone
+                    .validate_and_commit(30, 0, &read_set, &HashMap::new(), &write_keys, || Ok(()))
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // Main thread appends conflicting record (writing key 2) directly to history
+            {
+                let mut history = db.commit_history.write().unwrap();
+                let commit_version = db
+                    .global_commit_version
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let mut keys = HashMap::new();
+                keys.insert(t1.clone(), [k2.clone()].into_iter().collect());
+                history.push(CommitRecord {
+                    commit_version,
+                    keys,
+                });
+            }
+
+            drop(occ_guard);
+
+            let res_a = handle_a.join().unwrap();
+            assert!(matches!(
+                res_a,
+                Err(RelationalError::TransactionConflict(_))
+            ));
+        }
+
+        // --- Hitting Phase 2 Phantom Conflict ---
+        {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+            let occ_guard = db.occ_active_transactions.lock().unwrap();
+
+            let db_clone = db.clone();
+            let t1_clone = t1.clone();
+            let handle_a = std::thread::spawn(move || {
+                // Thread A scans range [1, 10], writes key 100
+                let mut scan_ranges = HashMap::new();
+                scan_ranges.insert(t1_clone.clone(), vec![(DbKey::Int(1), DbKey::Int(10))]);
+                let mut write_keys = HashMap::new();
+                write_keys.insert(t1_clone, [DbKey::Int(100)].into_iter().collect());
+
+                db_clone.validate_and_commit(
+                    50,
+                    0,
+                    &HashMap::new(),
+                    &scan_ranges,
+                    &write_keys,
+                    || Ok(()),
+                )
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // Main thread appends conflicting record (writing key 5 inside range [1, 10]) directly to history
+            {
+                let mut history = db.commit_history.write().unwrap();
+                let commit_version = db
+                    .global_commit_version
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let mut keys = HashMap::new();
+                keys.insert(t1.clone(), [DbKey::Int(5)].into_iter().collect());
+                history.push(CommitRecord {
+                    commit_version,
+                    keys,
+                });
+            }
+
+            drop(occ_guard);
+
+            let res_a = handle_a.join().unwrap();
+            assert!(matches!(
+                res_a,
+                Err(RelationalError::TransactionConflict(_))
+            ));
+        }
+    }
 }

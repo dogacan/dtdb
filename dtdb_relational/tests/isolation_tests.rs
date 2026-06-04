@@ -780,3 +780,42 @@ fn test_occ_phantom_read_fts_scan() {
         commit_res
     );
 }
+
+#[test]
+fn test_occ_phantom_read_conflict_with_writes() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+    db.create_table("users", create_user_schema()).unwrap();
+
+    // Setup initial rows
+    {
+        let tx = Transaction::new(1, db.clone());
+        tx.put("users", k_int(5), r_user(5, "Five")).unwrap();
+        tx.put("users", k_int(15), r_user(15, "Fifteen")).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 1. Tx1 performs range scan over [1, 10] and performs a write to key 100
+    let tx1 = Transaction::new(2, db.clone());
+    let scan1 = tx1
+        .filtered_scan("users", &k_int(1), &k_int(10), |_| true)
+        .unwrap();
+    assert_eq!(scan1.len(), 1);
+    assert_eq!(scan1[0], r_user(5, "Five"));
+
+    tx1.put("users", k_int(100), r_user(100, "One Hundred"))
+        .unwrap();
+
+    // 2. Tx2 inserts a new row at id = 7 (falls within scanned range [1, 10]) and commits
+    let tx2 = Transaction::new(3, db.clone());
+    tx2.put("users", k_int(7), r_user(7, "Seven")).unwrap();
+    tx2.commit().unwrap();
+
+    // 3. Tx1 attempts to commit. Must fail due to phantom insert detection under validate_and_commit.
+    let commit_res = tx1.commit();
+    assert!(
+        matches!(commit_res, Err(RelationalError::TransactionConflict(_))),
+        "Expected TransactionConflict, got {:?}",
+        commit_res
+    );
+}
