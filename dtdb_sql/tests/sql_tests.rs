@@ -3115,6 +3115,79 @@ fn test_sql_optimizer_join_order_reordering() {
     }
 }
 
+/// An inner join with a MATCH predicate on one side compiles that side to a
+/// `FullTextScan`. Join-order optimization then estimates each child's row
+/// count to decide whether to swap build/probe sides, which exercises the
+/// `FullTextScan` arm of `estimate_plan_rows` — otherwise unreached, since a
+/// full-text scan only appears as a join input in this shape.
+#[test]
+fn test_sql_join_order_estimates_fulltext_scan_child() {
+    let (_temp, db, engine) = setup_engine();
+
+    let tx1 = Transaction::new(1, db.clone());
+    engine
+        .execute(
+            "CREATE TABLE posts (id INT PRIMARY KEY, content STRING)",
+            &tx1,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE authors (id INT PRIMARY KEY, name STRING)",
+            &tx1,
+        )
+        .unwrap();
+    engine
+        .execute("CREATE FULLTEXT INDEX idx_content ON posts (content)", &tx1)
+        .unwrap();
+    tx1.commit().unwrap();
+
+    let tx2 = Transaction::new(2, db.clone());
+    engine
+        .execute(
+            "INSERT INTO posts (id, content) VALUES \
+             (1, 'rust systems programming'), \
+             (2, 'python scripting'), \
+             (3, 'rust web services')",
+            &tx2,
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO authors (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+            &tx2,
+        )
+        .unwrap();
+    tx2.commit().unwrap();
+
+    let tx4 = Transaction::new(4, db.clone());
+    let res = engine
+        .execute(
+            "SELECT posts.id, authors.name \
+             FROM posts JOIN authors ON posts.id = authors.id \
+             WHERE MATCH(posts.content) AGAINST('rust') \
+             ORDER BY posts.id ASC",
+            &tx4,
+        )
+        .unwrap();
+
+    if let ExecutionResult::Select { rows, .. } = res {
+        // Posts 1 and 3 match 'rust' and join to authors 1 (alice) and 3 (carol);
+        // post 2 ('python') is filtered out by the full-text scan.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::Int(1), DbValue::string("alice")]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::Int(3), DbValue::string("carol")]
+        );
+    } else {
+        panic!("Expected Select result");
+    }
+}
+
 #[test]
 fn test_sql_cross_join_lazy_and_correctness() {
     let (_temp, db, engine) = setup_engine();
