@@ -743,6 +743,56 @@ fn test_sstable_block_checksum_detects_bitrot() {
 }
 
 #[test]
+fn test_sstable_index_checksum_detects_corruption() {
+    use std::io::{Seek, SeekFrom, Write};
+    let temp_dir = TempDir::new().unwrap();
+    let sst_path = temp_dir.path().join("00001.sst");
+
+    {
+        let mut writer =
+            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![]).unwrap();
+        for i in 0..16 {
+            writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    // Sanity: a clean file opens fine.
+    SstableReader::open(&sst_path, 1, 0, None).unwrap();
+
+    // The footer's first 8 bytes (28 bytes from EOF) hold the index offset.
+    // Flip a byte inside the index block so its checksum no longer matches.
+    let data = std::fs::read(&sst_path).unwrap();
+    let footer_start = data.len() - 28;
+    let index_offset =
+        u64::from_le_bytes(data[footer_start..footer_start + 8].try_into().unwrap());
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(index_offset)).unwrap();
+        let mut b = [0u8; 1];
+        std::io::Read::read_exact(&mut f, &mut b).unwrap();
+        b[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(index_offset)).unwrap();
+        f.write_all(&b).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Open must fail at the checksum check, before deserializing the index.
+    let err = SstableReader::open(&sst_path, 1, 0, None)
+        .err()
+        .expect("corrupt index block must be detected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("checksum") || msg.contains("Corruption"),
+        "expected corruption-flavored error, got: {msg}"
+    );
+}
+
+#[test]
 fn test_scan_iter_stops_loading_blocks_past_end() {
     // Regression: scanning a tiny window of a large SSTable used to drain every
     // remaining block of every above-range source. The iterator must drop the
@@ -1247,8 +1297,8 @@ fn test_sstable_corruption_handling() {
     // 2. Invalid SSTable magic number.
     {
         let sst_path = temp_dir.path().join("invalid_magic.sst");
-        let mut data = vec![0u8; 24];
-        data[16..24].copy_from_slice(b"BADMAGIC");
+        let mut data = vec![0u8; 28];
+        data[20..28].copy_from_slice(b"BADMAGIC");
         std::fs::write(&sst_path, &data).unwrap();
         let res = SstableReader::open(&sst_path, 1, 0, None);
         assert!(res.is_err());
@@ -1262,10 +1312,12 @@ fn test_sstable_corruption_handling() {
     // 3. SSTable footer points outside file.
     {
         let sst_path = temp_dir.path().join("outside_file.sst");
-        let mut data = vec![0u8; 24];
+        let mut data = vec![0u8; 28];
         data[0..8].copy_from_slice(&100u64.to_le_bytes());
         data[8..16].copy_from_slice(&10u64.to_le_bytes());
-        data[16..24].copy_from_slice(b"DTDB_SST");
+        // bytes [16..20] are the index checksum; the footer-bounds check fires
+        // before it is consulted, so its value is irrelevant here.
+        data[20..28].copy_from_slice(b"DTDB_SST");
         std::fs::write(&sst_path, &data).unwrap();
         let res = SstableReader::open(&sst_path, 1, 0, None);
         assert!(res.is_err());
@@ -1304,9 +1356,11 @@ fn test_sstable_corruption_handling() {
         let index_bytes = postcard::to_allocvec(&index_block).unwrap();
         file.write_all(&index_bytes).unwrap();
         let index_len = index_bytes.len() as u64;
+        let index_checksum = xxhash_rust::xxh32::xxh32(&index_bytes, 0);
 
         file.write_all(&index_offset.to_le_bytes()).unwrap();
         file.write_all(&index_len.to_le_bytes()).unwrap();
+        file.write_all(&index_checksum.to_le_bytes()).unwrap();
         file.write_all(b"DTDB_SST").unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1348,9 +1402,11 @@ fn test_sstable_corruption_handling() {
         let index_bytes = postcard::to_allocvec(&index_block).unwrap();
         file.write_all(&index_bytes).unwrap();
         let index_len = index_bytes.len() as u64;
+        let index_checksum = xxhash_rust::xxh32::xxh32(&index_bytes, 0);
 
         file.write_all(&index_offset.to_le_bytes()).unwrap();
         file.write_all(&index_len.to_le_bytes()).unwrap();
+        file.write_all(&index_checksum.to_le_bytes()).unwrap();
         file.write_all(b"DTDB_SST").unwrap();
         file.sync_all().unwrap();
         drop(file);

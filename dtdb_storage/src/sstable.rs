@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC_NUMBER: &[u8; 8] = b"DTDB_SST";
-const FOOTER_SIZE: u64 = 24; // 8 bytes index_offset + 8 bytes index_len + 8 bytes magic number
+// 8 bytes index_offset + 8 bytes index_len + 4 bytes index xxh32 checksum +
+// 8 bytes magic number.
+const FOOTER_SIZE: u64 = 28;
 
 /// IndexEntry represents metadata for a compressed block in the SSTable file.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -229,13 +231,16 @@ impl SstableWriter {
         };
         let index_bytes = postcard::to_allocvec(&index_block)?;
         let index_len = index_bytes.len() as u64;
+        let index_checksum = xxhash_rust::xxh32::xxh32(&index_bytes, 0);
 
         file.write_all(&index_bytes)?;
         self.offset += index_len;
 
-        // Write Footer: [index_offset (u64)][index_len (u64)][magic (8 bytes)]
+        // Write Footer:
+        // [index_offset (u64)][index_len (u64)][index_checksum (u32)][magic (8 bytes)]
         file.write_all(&index_offset.to_le_bytes())?;
         file.write_all(&index_len.to_le_bytes())?;
+        file.write_all(&index_checksum.to_le_bytes())?;
         file.write_all(MAGIC_NUMBER)?;
 
         file.sync_all()?;
@@ -286,12 +291,13 @@ impl SstableReader {
         // 1. Read the Footer at the end of the file.
         file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))?;
 
-        let mut footer_bytes = [0u8; 24];
+        let mut footer_bytes = [0u8; FOOTER_SIZE as usize];
         file.read_exact(&mut footer_bytes)?;
 
         let index_offset = u64::from_le_bytes(footer_bytes[0..8].try_into().unwrap());
         let index_len = u64::from_le_bytes(footer_bytes[8..16].try_into().unwrap());
-        let magic = &footer_bytes[16..24];
+        let index_checksum = u32::from_le_bytes(footer_bytes[16..20].try_into().unwrap());
+        let magic = &footer_bytes[20..28];
 
         if magic != MAGIC_NUMBER {
             return Err(StorageError::Corruption(
@@ -308,10 +314,20 @@ impl SstableReader {
             )));
         }
 
-        // 2. Read and deserialize the Index block.
+        // 2. Read the Index block and verify its checksum before deserializing.
+        // The index block is unchecksummed-by-content otherwise, so a corrupt
+        // index could deserialize into garbage (e.g. an absurd bloom
+        // num_hashes, or a wrong stats.max_key) and silently misbehave.
         file.seek(SeekFrom::Start(index_offset))?;
         let mut index_bytes = vec![0u8; index_len as usize];
         file.read_exact(&mut index_bytes)?;
+
+        let actual_index_checksum = xxhash_rust::xxh32::xxh32(&index_bytes, 0);
+        if actual_index_checksum != index_checksum {
+            return Err(StorageError::Corruption(format!(
+                "SSTable index block checksum mismatch (expected {index_checksum:#010x}, actual {actual_index_checksum:#010x})"
+            )));
+        }
 
         let index_block: IndexBlock = postcard::from_bytes(&index_bytes)?;
 

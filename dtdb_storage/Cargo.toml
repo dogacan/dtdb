@@ -17,6 +17,7 @@ rust_decimal = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [[bench]]
 name = "storage_benchmark"
