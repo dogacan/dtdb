@@ -185,14 +185,21 @@ impl EngineInner {
             let bytes = fs::read(&options_path)?;
             postcard::from_bytes::<EngineOptions>(&bytes)?
         } else {
+            // Reject invalid options before persisting them to disk.
+            options.validate()?;
             let bytes = postcard::to_allocvec(&options)?;
             crate::atomic_write(&options_path, &bytes, options.fsync_method)?;
             options
         };
+        // Re-validate the options actually in effect; this also guards against a
+        // corrupted or legacy `options.bin` carrying panic-inducing values.
+        active_options.validate()?;
 
         let block_cache = if active_options.block_cache_capacity > 0 {
             Some(Arc::new(crate::BlockCache::new(
-                active_options.block_cache_capacity * active_options.block_size_limit,
+                active_options
+                    .block_cache_capacity
+                    .saturating_mul(active_options.block_size_limit),
             )))
         } else {
             None
@@ -927,8 +934,9 @@ impl EngineInner {
         if level == 0 {
             0
         } else {
-            self.options.base_level_size_limit as u64
-                * (self.options.level_size_multiplier.pow((level - 1) as u32) as u64)
+            let multiplier =
+                (self.options.level_size_multiplier as u64).saturating_pow((level - 1) as u32);
+            (self.options.base_level_size_limit as u64).saturating_mul(multiplier)
         }
     }
 
@@ -1333,9 +1341,14 @@ mod tests {
     /// invariant the read paths rely on.
     fn open_empty_index_sstable(dir: &std::path::Path) -> Arc<SstableReader> {
         let sst_path = dir.join("empty.sst");
-        let writer =
-            SstableWriter::create(&sst_path, 4096, CompressionType::Uncompressed, 0, Vec::new())
-                .unwrap();
+        let writer = SstableWriter::create(
+            &sst_path,
+            4096,
+            CompressionType::Uncompressed,
+            0,
+            Vec::new(),
+        )
+        .unwrap();
         writer.finish().unwrap();
         let reader = SstableReader::open(&sst_path, 999, 1, None).unwrap();
         assert!(
