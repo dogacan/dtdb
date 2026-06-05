@@ -764,8 +764,7 @@ fn test_sstable_index_checksum_detects_corruption() {
     // Flip a byte inside the index block so its checksum no longer matches.
     let data = std::fs::read(&sst_path).unwrap();
     let footer_start = data.len() - 28;
-    let index_offset =
-        u64::from_le_bytes(data[footer_start..footer_start + 8].try_into().unwrap());
+    let index_offset = u64::from_le_bytes(data[footer_start..footer_start + 8].try_into().unwrap());
     {
         let mut f = std::fs::OpenOptions::new()
             .read(true)
