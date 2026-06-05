@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 
+/// Hard ceiling on the number of probe hashes. The constructor never derives a
+/// value above this, so it doubles as a defensive bound at use sites: a filter
+/// deserialized from a corrupt (and unchecksummed) SSTable index block could
+/// otherwise carry a garbage `num_hashes` and make every lookup loop billions
+/// of times — a silent hang rather than a crash.
+const MAX_NUM_HASHES: usize = 30;
+
 /// A simple, self-contained Bloom Filter for checking set membership probabilistically.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BloomFilter {
@@ -27,7 +34,7 @@ impl BloomFilter {
 
         // Optimal hash count k = (m / n) * ln(2)
         let k_float = ((bits_count as f64) / (num_items as f64)) * 2.0f64.ln();
-        let num_hashes = (k_float.round() as usize).clamp(1, 30);
+        let num_hashes = (k_float.round() as usize).clamp(1, MAX_NUM_HASHES);
 
         // Round bits_count to be a multiple of 8 to simplify bit_vec sizing
         let bytes_count = bits_count.div_ceil(8);
@@ -50,7 +57,7 @@ impl BloomFilter {
             return;
         }
         let (hash1, hash2) = self.get_hashes(key);
-        for i in 0..self.num_hashes {
+        for i in 0..self.num_hashes.min(MAX_NUM_HASHES) {
             let hash_i = hash1.wrapping_add((i as u64).wrapping_mul(hash2)) % bits;
             let bit_idx = hash_i as usize;
             let byte_idx = bit_idx / 8;
@@ -69,7 +76,7 @@ impl BloomFilter {
             return false;
         }
         let (hash1, hash2) = self.get_hashes(key);
-        for i in 0..self.num_hashes {
+        for i in 0..self.num_hashes.min(MAX_NUM_HASHES) {
             let hash_i = hash1.wrapping_add((i as u64).wrapping_mul(hash2)) % bits;
             let bit_idx = hash_i as usize;
             let byte_idx = bit_idx / 8;
@@ -111,6 +118,28 @@ mod tests {
         assert!(bloom.contains(&"key_a"));
         assert!(bloom.contains(&"key_b"));
         assert!(!bloom.contains(&"key_c"));
+    }
+
+    #[test]
+    fn test_constructed_filter_never_exceeds_max_hashes() {
+        // Even with a huge item count the derived probe count stays bounded.
+        let bloom = BloomFilter::new(1_000_000_000, 0.0001);
+        assert!(bloom.num_hashes <= MAX_NUM_HASHES);
+    }
+
+    #[test]
+    fn test_corrupt_num_hashes_does_not_hang() {
+        // Simulate a filter deserialized from a corrupt (unchecksummed) index
+        // block whose `num_hashes` is garbage. The probe loop must stay bounded
+        // by MAX_NUM_HASHES instead of iterating billions of times. Without the
+        // clamp this call would effectively hang the test.
+        let mut bloom = BloomFilter::new(10, 0.01);
+        bloom.insert(&"key_a");
+        bloom.num_hashes = usize::MAX;
+
+        // Both paths must return promptly rather than spinning.
+        let _ = bloom.contains(&"key_a");
+        bloom.insert(&"key_b");
     }
 
     #[test]
