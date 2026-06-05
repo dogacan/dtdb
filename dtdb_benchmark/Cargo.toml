@@ -22,8 +22,16 @@ dtdb_api = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"], optional = true }
 futures-util = { workspace = true, optional = true }
 
+# Optional: only pulled in for the dtdb-vs-RocksDB comparison bench.
+# Gated behind the `compare-rocksdb` feature to avoid compiler toolchain dependencies by default.
+# postcard is the byte serializer the bench feeds to RocksDB (which stores raw bytes),
+# mirroring the serialization dtdb_storage does internally.
+rocksdb = { version = "0.21.0", default-features = false, features = ["lz4"], optional = true }
+postcard = { workspace = true, optional = true }
+
 [features]
 compare-sqlite = ["dep:rusqlite", "dep:dtdb_api", "dep:tokio", "dep:futures-util"]
+compare-rocksdb = ["dep:rocksdb", "dep:postcard"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -39,4 +47,8 @@ harness = false
 
 [[bench]]
 name = "dtdb_vs_sqlite"
+harness = false
+
+[[bench]]
+name = "dtdb_vs_rocksdb"
 harness = false
