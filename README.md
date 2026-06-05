@@ -33,7 +33,7 @@ An Log-Structured Merge-tree (LSM-tree) key-value engine handling raw byte persi
 Bridges the gap between raw key-values and structured schemas.
 
 * **Relational Schema**: Columns typed as `Int`, `Float`, `String`, or `Bytes` with primary key support.
-* **Row Serialization**: Uses `bincode` to convert tabular rows into serialized bytes stored in Layer 1.
+* **Row Serialization**: Uses `postcard` to convert tabular rows into serialized bytes stored in Layer 1.
 * **Transactions**: Implements buffered, isolated writes (Read-Your-Own-Writes) that can be committed atomically or rolled back completely.
 * **Table & Index Statistics**: Tracks row count, index entry count, and key distribution details. Statistics are cached and persisted in `statistics.bin` subdirectories.
 * **Background Statistics Collector**: Spawns an asynchronous background thread configured via `analyze_frequency_ms` to periodically refresh stats under `ReadUncommitted` isolation.

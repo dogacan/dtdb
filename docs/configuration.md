@@ -178,11 +178,11 @@ For reference, a database directory looks like:
 ```
 <data_dir>/
   <db_name>/
-    db_options.bin             # bincode-serialized DatabaseOptions, persisted on first open
+    db_options.bin             # postcard-serialized DatabaseOptions, persisted on first open
     transactions.log           # global write-ahead transaction log (prepare/commit records)
     <table_name>/
-      schema.bin               # bincode-serialized Schema
-      statistics.bin           # bincode-serialized TableStatistics
+      schema.bin               # postcard-serialized Schema
+      statistics.bin           # postcard-serialized TableStatistics
       MANIFEST                 # storage-engine LSM manifest (current SSTables per level)
       wal_*.log                # one or more WAL segments
       *.sst                    # SSTable files

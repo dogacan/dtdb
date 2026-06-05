@@ -29,7 +29,6 @@ dtdb_api = { path = "dtdb_api" }
 # rely on (Arc<str>, Arc<[u8]>, Arc<Vec<DbKey>>). Without it the derives on
 # those enums won't compile. Note: deserialization does not dedup Arcs.
 serde = { version = "1.0", features = ["derive", "rc"] }
-# Binary serialization. Replaced the unmaintained `bincode` (RUSTSEC-2025-0141).
 # `use-std` pulls in `alloc` (for `to_allocvec`) plus std error impls.
 postcard = { version = "1", features = ["use-std"] }
 thiserror = "1.0"
