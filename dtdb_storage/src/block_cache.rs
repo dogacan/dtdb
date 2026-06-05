@@ -291,7 +291,11 @@ mod tests {
         // "big" is size 5 > capacity 3: skipped entirely.
         cache.insert("big", 99, 5);
 
-        assert_eq!(cache.get(&"big"), None, "oversized entry must not be cached");
+        assert_eq!(
+            cache.get(&"big"),
+            None,
+            "oversized entry must not be cached"
+        );
         assert_eq!(cache.get(&"a"), Some(&1), "existing entry must survive");
         assert_eq!(cache.get(&"b"), Some(&2), "existing entry must survive");
         assert_eq!(cache.len(), 2);
