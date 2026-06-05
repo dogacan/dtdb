@@ -91,6 +91,17 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     }
 
     pub fn insert(&mut self, key: K, value: V, size: usize) {
+        // An entry larger than the whole cache can never be retained: admitting
+        // it would evict every other entry and then itself, churning the cache
+        // for no benefit. Skip admission and leave existing contents intact,
+        // but drop any stale mapping for this key so we never serve old data.
+        if size > self.capacity_bytes {
+            if let Some(&idx) = self.map.get(&key) {
+                self.remove_node(idx);
+            }
+            return;
+        }
+
         if let Some(&idx) = self.map.get(&key) {
             let old_size = self.nodes[idx].size;
             self.current_bytes = self
@@ -131,20 +142,24 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     }
 
     fn evict_if_needed(&mut self) {
-        while self.current_bytes > self.capacity_bytes && self.tail.is_some() {
-            let tail_idx = self.tail.unwrap();
-            let node_size = self.nodes[tail_idx].size;
-            self.current_bytes = self.current_bytes.saturating_sub(node_size);
-
-            self.detach(tail_idx);
-            if let Some(ref old_key) = self.nodes[tail_idx].key {
-                self.map.remove(old_key);
-            }
-            self.nodes[tail_idx].key = None;
-            self.nodes[tail_idx].value = None;
-            self.nodes[tail_idx].size = 0;
-            self.free.push(tail_idx);
+        while self.current_bytes > self.capacity_bytes {
+            let Some(tail_idx) = self.tail else { break };
+            self.remove_node(tail_idx);
         }
+    }
+
+    /// Detaches the node at `idx` from the list, removes its key mapping,
+    /// reclaims its byte accounting, and pushes the slot onto the free list.
+    fn remove_node(&mut self, idx: usize) {
+        self.current_bytes = self.current_bytes.saturating_sub(self.nodes[idx].size);
+        self.detach(idx);
+        if let Some(ref old_key) = self.nodes[idx].key {
+            self.map.remove(old_key);
+        }
+        self.nodes[idx].key = None;
+        self.nodes[idx].value = None;
+        self.nodes[idx].size = 0;
+        self.free.push(idx);
     }
 
     fn detach(&mut self, idx: usize) {
@@ -263,6 +278,39 @@ mod tests {
         assert_eq!(cache.get(&"d"), Some(&4));
         assert_eq!(cache.get(&"e"), Some(&5));
         assert_eq!(cache.get(&"a"), None);
+    }
+
+    #[test]
+    fn test_lru_cache_oversized_entry_not_admitted_and_keeps_existing() {
+        // An entry larger than the cache must not be admitted, and must not
+        // evict the existing contents on its way out.
+        let mut cache = LruCache::new(3);
+        cache.insert("a", 1, 1);
+        cache.insert("b", 2, 1);
+
+        // "big" is size 5 > capacity 3: skipped entirely.
+        cache.insert("big", 99, 5);
+
+        assert_eq!(cache.get(&"big"), None, "oversized entry must not be cached");
+        assert_eq!(cache.get(&"a"), Some(&1), "existing entry must survive");
+        assert_eq!(cache.get(&"b"), Some(&2), "existing entry must survive");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.current_bytes, 2, "byte accounting must stay correct");
+    }
+
+    #[test]
+    fn test_lru_cache_oversized_update_drops_stale_value() {
+        // If a key already cached is re-inserted with an oversized value, the
+        // stale (now-invalid) entry must be evicted rather than left behind.
+        let mut cache = LruCache::new(3);
+        cache.insert("a", 1, 1);
+        assert_eq!(cache.get(&"a"), Some(&1));
+
+        cache.insert("a", 2, 5); // size 5 > capacity 3
+
+        assert_eq!(cache.get(&"a"), None, "stale value must be dropped");
+        assert!(cache.is_empty());
+        assert_eq!(cache.current_bytes, 0);
     }
 
     #[test]
