@@ -320,16 +320,20 @@ impl Transaction {
 
         // 2. Scan underlying storage engine.
         let engine_entries = table.filtered_scan(start, end, columns)?;
+
+        // Track read keys in our read set. Acquire the lock and resolve the
+        // per-table entry once for the whole scan rather than re-locking the
+        // mutex (and re-hashing the table name) on every row.
+        let track_reads = self.isolation_level == IsolationLevel::SnapshotIsolation
+            || self.isolation_level == IsolationLevel::RepeatableRead;
+        let mut read_set_guard = track_reads.then(|| self.read_set.lock().unwrap());
+        let mut table_reads = read_set_guard
+            .as_mut()
+            .map(|rs| rs.entry(table_name.to_string()).or_default());
+
         for (k, row) in engine_entries {
-            // Track the read key in our read set.
-            if self.isolation_level == IsolationLevel::SnapshotIsolation
-                || self.isolation_level == IsolationLevel::RepeatableRead
-            {
-                let mut read_set = self.read_set.lock().unwrap();
-                read_set
-                    .entry(table_name.to_string())
-                    .or_default()
-                    .insert(k.clone());
+            if let Some(table_reads) = table_reads.as_deref_mut() {
+                table_reads.insert(k.clone());
             }
 
             // Only add if not overridden by the active transaction write buffer.
