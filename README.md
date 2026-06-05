@@ -89,7 +89,7 @@ Exposes database resources over a client API supporting both embedded (in-proces
 
 ### Prerequisites
 
-Make sure you have [Rust](https://www.rust-lang.org/) installed (cargo 1.70+ recommended).
+Make sure you have [Rust](https://www.rust-lang.org/) installed (cargo 1.95+ recommended).
 
 ### Running Tests
 
