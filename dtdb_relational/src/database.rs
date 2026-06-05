@@ -478,6 +478,33 @@ impl Table {
         Ok(())
     }
 
+    /// Scans the table for the largest value currently stored in its
+    /// auto-increment column, returning `None` if the table has no
+    /// auto-increment column. An empty (but auto-increment) table yields
+    /// `Some(0)`, so the next allocated id is 1. Scan errors (e.g. a missing
+    /// primary key, which cannot happen for a real table) are treated as "no
+    /// rows seen", matching the seeding done at database open.
+    fn max_auto_increment_value(&self) -> Option<i64> {
+        let col_idx = self
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.is_auto_increment)?;
+        let mut max_val = 0i64;
+        if let Ok((start, end)) = self.schema.primary_key_bounds()
+            && let Ok(rows) = self.filtered_scan(&start, &end, None)
+        {
+            for (_, row) in rows {
+                if let Some(DbValue::Int(v)) = row.get_by_index(col_idx)
+                    && *v > max_val
+                {
+                    max_val = *v;
+                }
+            }
+        }
+        Some(max_val)
+    }
+
     /// Fetches a row by primary key, reading only the necessary locality group engines.
     pub fn get(&self, key: &DbKey, columns: Option<&[String]>) -> Result<Option<Row>> {
         let mut needed_groups = HashSet::new();
@@ -1366,24 +1393,7 @@ impl Database {
             let mut seqs = db.auto_increment_sequences.lock().unwrap();
             let tables_guard = db.tables.read().unwrap();
             for (name, table) in tables_guard.iter() {
-                if let Some(col_idx) = table
-                    .schema
-                    .columns
-                    .iter()
-                    .position(|c| c.is_auto_increment)
-                {
-                    let mut max_val = 0i64;
-                    if let Ok((start, end)) = table.schema.primary_key_bounds()
-                        && let Ok(rows) = table.filtered_scan(&start, &end, None)
-                    {
-                        for (_, row) in rows {
-                            if let Some(DbValue::Int(v)) = row.get_by_index(col_idx)
-                                && *v > max_val
-                            {
-                                max_val = *v;
-                            }
-                        }
-                    }
+                if let Some(max_val) = table.max_auto_increment_value() {
                     seqs.insert(name.clone(), max_val + 1);
                 }
             }
@@ -1839,24 +1849,7 @@ impl Database {
             Ok(next)
         } else {
             let table = self.get_table(table_name)?;
-            let mut max_val = 0i64;
-            if let Some(col_idx) = table
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.is_auto_increment)
-            {
-                let (start, end) = table.schema.primary_key_bounds()?;
-                if let Ok(rows) = table.filtered_scan(&start, &end, None) {
-                    for (_, row) in rows {
-                        if let Some(DbValue::Int(v)) = row.get_by_index(col_idx)
-                            && *v > max_val
-                        {
-                            max_val = *v;
-                        }
-                    }
-                }
-            }
+            let max_val = table.max_auto_increment_value().unwrap_or(0);
             let next = max_val + 1;
             seqs.insert(table_name.to_string(), next + 1);
             Ok(next)
@@ -2692,32 +2685,7 @@ impl Database {
                 for col_name in &idx_def.columns {
                     let col_idx = table.schema.column_index(col_name).unwrap();
                     let col = &table.schema.columns[col_idx];
-                    let (min_val, max_val) = match col.data_type {
-                        crate::schema::DataType::Int => {
-                            (DbKey::Int(i64::MIN), DbKey::Int(i64::MAX))
-                        }
-                        crate::schema::DataType::Bool => (DbKey::Bool(false), DbKey::Bool(true)),
-                        crate::schema::DataType::Date => (
-                            DbKey::Date(chrono::NaiveDate::MIN),
-                            DbKey::Date(chrono::NaiveDate::MAX),
-                        ),
-                        crate::schema::DataType::Time => (
-                            DbKey::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()),
-                            DbKey::Time(
-                                chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999)
-                                    .unwrap(),
-                            ),
-                        ),
-                        crate::schema::DataType::Timestamp => (
-                            DbKey::Timestamp(chrono::NaiveDateTime::MIN),
-                            DbKey::Timestamp(chrono::NaiveDateTime::MAX),
-                        ),
-                        crate::schema::DataType::Decimal => (
-                            DbKey::Decimal(rust_decimal::Decimal::MIN),
-                            DbKey::Decimal(rust_decimal::Decimal::MAX),
-                        ),
-                        _ => (DbKey::string(""), DbKey::string("\u{10ffff}")),
-                    };
+                    let (min_val, max_val) = col.data_type.key_bounds();
                     min_idx_keys.push(min_val);
                     max_idx_keys.push(max_val);
                 }
