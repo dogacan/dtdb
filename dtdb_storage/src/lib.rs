@@ -113,6 +113,9 @@ pub enum StorageError {
 
     #[error("Table directory already exists: {0}")]
     AlreadyExists(String),
+
+    #[error("Invalid engine options: {0}")]
+    InvalidOptions(String),
 }
 
 /// DbKey represents strongly typed keys in the database.
@@ -345,6 +348,64 @@ impl Default for EngineOptions {
     }
 }
 
+/// Upper bounds for sanity-checking level configuration. These are far above
+/// any reasonable value; they exist to reject absurd configs that would
+/// otherwise produce pathological compaction behavior or arithmetic overflow.
+const MAX_LEVELS: usize = 64;
+const MAX_LEVEL_SIZE_MULTIPLIER: usize = 1024;
+
+impl EngineOptions {
+    /// Rejects option values that would lead to panics or degenerate behavior:
+    /// a zero-capacity block cache (`block_size_limit == 0` with caching on),
+    /// zero-sized blocks/memtable/WAL, compaction that never makes progress, or
+    /// level sizing that overflows. Called when a `StorageEngine` is opened.
+    pub fn validate(&self) -> Result<()> {
+        fn require(cond: bool, msg: impl Into<String>) -> Result<()> {
+            if cond {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidOptions(msg.into()))
+            }
+        }
+
+        // Positive lower bounds. A zero `block_size_limit` is the panic the
+        // block cache hits (LruCache requires capacity > 0); the rest avoid
+        // degenerate "flush/compact on every write" behavior.
+        require(
+            self.memtable_size_limit > 0,
+            "memtable_size_limit must be > 0",
+        )?;
+        require(self.block_size_limit > 0, "block_size_limit must be > 0")?;
+        require(self.wal_size_limit > 0, "wal_size_limit must be > 0")?;
+        require(
+            self.sstable_target_size > 0,
+            "sstable_target_size must be > 0",
+        )?;
+        require(
+            self.base_level_size_limit > 0,
+            "base_level_size_limit must be > 0",
+        )?;
+        require(
+            self.l0_compaction_threshold > 0,
+            "l0_compaction_threshold must be > 0",
+        )?;
+
+        // Level sizing bounds. `level_size_multiplier` feeds a `pow()` over the
+        // levels, so both it and `max_level` are bounded to keep the result
+        // sane and overflow-free.
+        require(
+            (1..=MAX_LEVELS).contains(&self.max_level),
+            format!("max_level must be between 1 and {MAX_LEVELS}"),
+        )?;
+        require(
+            (1..=MAX_LEVEL_SIZE_MULTIPLIER).contains(&self.level_size_multiplier),
+            format!("level_size_multiplier must be between 1 and {MAX_LEVEL_SIZE_MULTIPLIER}"),
+        )?;
+
+        Ok(())
+    }
+}
+
 impl From<i64> for DbValue {
     fn from(v: i64) -> Self {
         DbValue::Int(v)
@@ -541,6 +602,109 @@ pub fn get_physical_blocks_read() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_options_validate() {
+        EngineOptions::default()
+            .validate()
+            .expect("default options must be valid");
+    }
+
+    #[test]
+    fn test_validate_rejects_panic_inducing_options() {
+        // The original panic: caching enabled with zero-sized blocks drives the
+        // block cache to a zero capacity and trips an assert in LruCache::new.
+        let reject = |name: &str, opts: EngineOptions| match opts.validate() {
+            Err(StorageError::InvalidOptions(_)) => {}
+            other => panic!("expected InvalidOptions for {name}, got {other:?}"),
+        };
+        let base = EngineOptions::default;
+
+        reject(
+            "block_size_limit",
+            EngineOptions {
+                block_size_limit: 0,
+                ..base()
+            },
+        );
+        reject(
+            "memtable_size_limit",
+            EngineOptions {
+                memtable_size_limit: 0,
+                ..base()
+            },
+        );
+        reject(
+            "wal_size_limit",
+            EngineOptions {
+                wal_size_limit: 0,
+                ..base()
+            },
+        );
+        reject(
+            "sstable_target_size",
+            EngineOptions {
+                sstable_target_size: 0,
+                ..base()
+            },
+        );
+        reject(
+            "base_level_size_limit",
+            EngineOptions {
+                base_level_size_limit: 0,
+                ..base()
+            },
+        );
+        reject(
+            "l0_compaction_threshold",
+            EngineOptions {
+                l0_compaction_threshold: 0,
+                ..base()
+            },
+        );
+        reject(
+            "max_level=0",
+            EngineOptions {
+                max_level: 0,
+                ..base()
+            },
+        );
+        reject(
+            "max_level too large",
+            EngineOptions {
+                max_level: MAX_LEVELS + 1,
+                ..base()
+            },
+        );
+        reject(
+            "multiplier=0",
+            EngineOptions {
+                level_size_multiplier: 0,
+                ..base()
+            },
+        );
+        reject(
+            "multiplier too large",
+            EngineOptions {
+                level_size_multiplier: MAX_LEVEL_SIZE_MULTIPLIER + 1,
+                ..base()
+            },
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_invalid_options_without_panicking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let opts = EngineOptions {
+            block_size_limit: 0, // would panic the block cache without validation
+            ..EngineOptions::default()
+        };
+        match StorageEngine::open(dir.path(), opts) {
+            Err(StorageError::InvalidOptions(_)) => {}
+            Err(other) => panic!("expected InvalidOptions, got {other:?}"),
+            Ok(_) => panic!("expected InvalidOptions, got Ok"),
+        }
+    }
 
     #[test]
     fn test_fsync_parent_dir_succeeds_on_existing_file() {
