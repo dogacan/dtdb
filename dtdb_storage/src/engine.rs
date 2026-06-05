@@ -4,7 +4,7 @@ use crate::memtable::MemTable;
 use crate::snapshot_log::SnapshotLog;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
-use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, ValueRewriter};
+use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, StorageError, ValueRewriter};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -506,10 +506,12 @@ impl EngineInner {
                 continue;
             }
 
+            let mut corruption: Option<u64> = None;
             let idx_res = ssts.binary_search_by(|sstable| {
-                let f_key = sstable
-                    .first_key()
-                    .expect("Level 1+ SSTable must not be empty");
+                let Some(f_key) = sstable.first_key() else {
+                    corruption = Some(sstable.id);
+                    return std::cmp::Ordering::Equal;
+                };
                 let l_key = sstable.last_key();
                 if key < f_key {
                     std::cmp::Ordering::Greater
@@ -519,6 +521,11 @@ impl EngineInner {
                     std::cmp::Ordering::Equal
                 }
             });
+            if let Some(id) = corruption {
+                return Err(StorageError::Corruption(format!(
+                    "Level {level} SSTable {id} has an empty index"
+                )));
+            }
 
             if let Ok(idx) = idx_res
                 && let Some(res) = ssts[idx].get(key)?
@@ -610,10 +617,12 @@ impl EngineInner {
                 let idx = remaining_indices[i];
                 let key = &keys[idx];
 
+                let mut corruption: Option<u64> = None;
                 let idx_res = ssts.binary_search_by(|sstable| {
-                    let f_key = sstable
-                        .first_key()
-                        .expect("Level 1+ SSTable must not be empty");
+                    let Some(f_key) = sstable.first_key() else {
+                        corruption = Some(sstable.id);
+                        return std::cmp::Ordering::Equal;
+                    };
                     let l_key = sstable.last_key();
                     if key < f_key {
                         std::cmp::Ordering::Greater
@@ -623,6 +632,11 @@ impl EngineInner {
                         std::cmp::Ordering::Equal
                     }
                 });
+                if let Some(id) = corruption {
+                    return Err(StorageError::Corruption(format!(
+                        "Level {level} SSTable {id} has an empty index"
+                    )));
+                }
 
                 if let Ok(sst_idx) = idx_res
                     && let Some(res) = ssts[sst_idx].get(key)?
@@ -687,9 +701,12 @@ impl EngineInner {
             // file beyond `end` instead of scanning the whole level.
             let start_idx = ssts.partition_point(|s| s.last_key() < start);
             for sstable in ssts[start_idx..].iter() {
-                let Some(fk) = sstable.first_key() else {
-                    continue;
-                };
+                let fk = sstable.first_key().ok_or_else(|| {
+                    StorageError::Corruption(format!(
+                        "Level {level} SSTable {} has an empty index",
+                        sstable.id
+                    ))
+                })?;
                 if fk > end {
                     break;
                 }
@@ -772,9 +789,12 @@ impl EngineInner {
             // first file that can contain `start`, then stop once past `end`.
             let start_idx = ssts.partition_point(|s| s.last_key() < start);
             for sstable in ssts[start_idx..].iter() {
-                let f_key = sstable
-                    .first_key()
-                    .expect("Level 1+ SSTable must not be empty");
+                let f_key = sstable.first_key().ok_or_else(|| {
+                    StorageError::Corruption(format!(
+                        "Level {level} SSTable {} has an empty index",
+                        sstable.id
+                    ))
+                })?;
                 if f_key > end {
                     break;
                 }
@@ -978,9 +998,12 @@ impl EngineInner {
                 for sstable in target_list {
                     let overlaps = {
                         let reader = sstable;
-                        let fk = reader
-                            .first_key()
-                            .expect("Target SSTable must not be empty");
+                        let fk = reader.first_key().ok_or_else(|| {
+                            StorageError::Corruption(format!(
+                                "Level {target_level} SSTable {} has an empty index",
+                                reader.id
+                            ))
+                        })?;
                         let lk = reader.last_key();
                         fk <= &max_k && lk >= &min_k
                     };
@@ -1296,5 +1319,67 @@ impl EngineInner {
 
     pub fn target_layout(&self) -> Vec<u8> {
         self.target_layout.read().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CompressionType;
+
+    /// Writes a valid-on-disk SSTable whose index has zero entries (so
+    /// `first_key()` returns `None`). This passes the magic/footer/checksum
+    /// checks at open time but violates the "L1+ SSTable is non-empty"
+    /// invariant the read paths rely on.
+    fn open_empty_index_sstable(dir: &std::path::Path) -> Arc<SstableReader> {
+        let sst_path = dir.join("empty.sst");
+        let writer =
+            SstableWriter::create(&sst_path, 4096, CompressionType::Uncompressed, 0, Vec::new())
+                .unwrap();
+        writer.finish().unwrap();
+        let reader = SstableReader::open(&sst_path, 999, 1, None).unwrap();
+        assert!(
+            reader.first_key().is_none(),
+            "test fixture should produce an empty-index SSTable"
+        );
+        Arc::new(reader)
+    }
+
+    fn assert_corruption<T: std::fmt::Debug>(res: Result<T>) {
+        match res {
+            Err(StorageError::Corruption(_)) => {}
+            other => panic!("expected Corruption error, got {other:?}"),
+        }
+    }
+
+    /// A corrupted empty-index SSTable promoted to L1+ must surface a
+    /// `Corruption` error from every read path instead of panicking.
+    #[test]
+    fn empty_l1_sstable_yields_corruption_not_panic() {
+        let engine_dir = tempfile::TempDir::new().unwrap();
+        let sst_dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(engine_dir.path(), EngineOptions::default()).unwrap();
+
+        // Inject the empty-index SSTable at level 1.
+        engine
+            .inner
+            .sstables
+            .write()
+            .unwrap()
+            .insert(1, vec![open_empty_index_sstable(sst_dir.path())]);
+
+        let key = DbKey::Int(42);
+        assert_corruption(engine.get(&key));
+        assert_corruption(engine.multi_get(std::slice::from_ref(&key)));
+        assert_corruption(engine.inner.filtered_scan(
+            &DbKey::Int(i64::MIN),
+            &DbKey::Int(i64::MAX),
+            |_, _| true,
+        ));
+        assert_corruption(
+            engine
+                .scan_iter(&DbKey::Int(i64::MIN), &DbKey::Int(i64::MAX))
+                .map(|_| ()),
+        );
     }
 }
