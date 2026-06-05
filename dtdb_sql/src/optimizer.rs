@@ -23,7 +23,115 @@ impl Optimizer {
         plan.collect_columns(&mut query_columns);
         let plan = self.push_down_predicate(plan, Vec::new(), &query_columns);
         let plan = self.optimize_join_order(plan);
+        let plan = self.push_limit_through_projection(plan);
         self.eliminate_sorts(plan)
+    }
+
+    /// Pushes a `Limit` down through a row-count-preserving `Projection` so it sits
+    /// directly above the operator it bounds. A bare projection maps one input row
+    /// to exactly one output row, so `Limit(Projection(x)) == Projection(Limit(x))`.
+    ///
+    /// The motivating shape is `SELECT cols FROM t ORDER BY k LIMIT n`, which plans
+    /// as `Limit -> Projection -> Sort`: moving the limit below the projection makes
+    /// it adjacent to the sort, which is what lets physical compilation fuse the two
+    /// into a bounded top-k heap instead of a full external sort.
+    fn push_limit_through_projection(&self, plan: LogicalPlan) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Limit {
+                source,
+                limit,
+                offset,
+            } => {
+                let source = self.push_limit_through_projection(*source);
+                match source {
+                    LogicalPlan::Projection {
+                        source: proj_source,
+                        expressions,
+                        field_names,
+                        schema,
+                    } => {
+                        // Swap, then recurse so the limit keeps descending through
+                        // any further stacked projections toward the sort.
+                        let pushed = self.push_limit_through_projection(LogicalPlan::Limit {
+                            source: proj_source,
+                            limit,
+                            offset,
+                        });
+                        LogicalPlan::Projection {
+                            source: Box::new(pushed),
+                            expressions,
+                            field_names,
+                            schema,
+                        }
+                    }
+                    other => LogicalPlan::Limit {
+                        source: Box::new(other),
+                        limit,
+                        offset,
+                    },
+                }
+            }
+            LogicalPlan::Filter { source, predicate } => LogicalPlan::Filter {
+                source: Box::new(self.push_limit_through_projection(*source)),
+                predicate,
+            },
+            LogicalPlan::Projection {
+                source,
+                expressions,
+                field_names,
+                schema,
+            } => LogicalPlan::Projection {
+                source: Box::new(self.push_limit_through_projection(*source)),
+                expressions,
+                field_names,
+                schema,
+            },
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                join_type,
+                schema,
+            } => LogicalPlan::Join {
+                left: Box::new(self.push_limit_through_projection(*left)),
+                right: Box::new(self.push_limit_through_projection(*right)),
+                condition,
+                join_type,
+                schema,
+            },
+            LogicalPlan::Aggregate {
+                source,
+                group_by,
+                aggrs,
+                field_names,
+                schema,
+            } => LogicalPlan::Aggregate {
+                source: Box::new(self.push_limit_through_projection(*source)),
+                group_by,
+                aggrs,
+                field_names,
+                schema,
+            },
+            LogicalPlan::Sort { source, keys } => LogicalPlan::Sort {
+                source: Box::new(self.push_limit_through_projection(*source)),
+                keys,
+            },
+            LogicalPlan::Distinct { source } => LogicalPlan::Distinct {
+                source: Box::new(self.push_limit_through_projection(*source)),
+            },
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => LogicalPlan::SetOp {
+                left: Box::new(self.push_limit_through_projection(*left)),
+                right: Box::new(self.push_limit_through_projection(*right)),
+                op,
+                all,
+            },
+            other => other,
+        }
     }
 
     fn push_down_predicate(

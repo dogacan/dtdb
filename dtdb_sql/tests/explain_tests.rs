@@ -94,6 +94,12 @@ fn explain_exercises_every_physical_operator() {
             "SELECT id FROM t ORDER BY cat",
             &["PhysicalSort", "PhysicalSeqScan"],
         ),
+        (
+            // Bounded LIMIT over a non-indexed ORDER BY fuses to a top-k heap,
+            // with the outer PhysicalLimit applying the slice.
+            "SELECT id FROM t ORDER BY cat LIMIT 3",
+            &["PhysicalLimit", "PhysicalTopN", "PhysicalSeqScan"],
+        ),
         ("SELECT id FROM t ORDER BY v", &["PhysicalIndexScan"]),
         (
             "SELECT id FROM t WHERE MATCH(body) AGAINST('zebra')",
@@ -125,6 +131,7 @@ fn explain_exercises_every_physical_operator() {
         "PhysicalProjection",
         "PhysicalLimit",
         "PhysicalSort",
+        "PhysicalTopN",
         "PhysicalSortMergeJoin",
         "PhysicalCrossJoin",
         "PhysicalHashAggregate",

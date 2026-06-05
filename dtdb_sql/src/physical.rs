@@ -390,6 +390,137 @@ impl PhysicalOperator for PhysicalSort {
 }
 
 // ==========================================
+// 5.5. Top-N Physical Operator (Sort + Limit fusion)
+// ==========================================
+/// One retained row plus its evaluated sort key. `Ord` is the *natural* sort
+/// order (per `directions`), so a `BinaryHeap<TopNEntry>` is a max-heap whose top
+/// is the worst retained row — the one evicted when a better row arrives.
+struct TopNEntry {
+    keys: Vec<DbValue>,
+    row: Row,
+    directions: std::rc::Rc<Vec<bool>>,
+}
+
+impl Ord for TopNEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        spill::compare_keys(&self.keys, &other.keys, &self.directions)
+    }
+}
+
+impl PartialOrd for TopNEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TopNEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for TopNEntry {}
+
+/// Bounded top-k: where [`PhysicalSort`] materializes and sorts its entire input
+/// (spilling to disk) only for an outer `LIMIT` to discard all but the first
+/// rows, `PhysicalTopN` retains just the `k` best rows in a bounded max-heap of
+/// capacity `k` — turning an O(n log n) external sort into an O(n log k) in-memory
+/// pass with no spilling. It is produced by fusing a `LIMIT` with an
+/// immediately-underlying `ORDER BY` during physical compilation, with
+/// `k = OFFSET + LIMIT`; the outer [`PhysicalLimit`] still applies the actual
+/// offset/limit slice over the rows emitted here (in sorted order).
+///
+/// Only used when `k` is small enough to stay within the memory budget — deeper
+/// limits keep the spilling `PhysicalSort` + `PhysicalLimit` path instead.
+pub struct PhysicalTopN {
+    source: Box<dyn PhysicalOperator>,
+    keys: Vec<(Expr, bool)>, // (expression, asc)
+    k: usize,
+    output: Option<std::vec::IntoIter<Row>>,
+}
+
+impl PhysicalTopN {
+    pub fn new(source: Box<dyn PhysicalOperator>, keys: Vec<(Expr, bool)>, k: usize) -> Self {
+        Self {
+            source,
+            keys,
+            k,
+            output: None,
+        }
+    }
+
+    fn directions(&self) -> std::rc::Rc<Vec<bool>> {
+        std::rc::Rc::new(self.keys.iter().map(|(_, asc)| *asc).collect())
+    }
+}
+
+impl PhysicalOperator for PhysicalTopN {
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        if self.output.is_none() {
+            let source_schema = self.source.schema().clone();
+            let directions = self.directions();
+            let mut heap: std::collections::BinaryHeap<TopNEntry> =
+                std::collections::BinaryHeap::with_capacity(self.k);
+
+            // k == 0 retains nothing; skip draining the source entirely.
+            while self.k > 0 {
+                let Some(row) = self.source.next()? else {
+                    break;
+                };
+                let mut keys = Vec::with_capacity(self.keys.len());
+                for (expr, _) in &self.keys {
+                    keys.push(expr.eval(&row, &source_schema)?);
+                }
+                let entry = TopNEntry {
+                    keys,
+                    row,
+                    directions: std::rc::Rc::clone(&directions),
+                };
+
+                if heap.len() < self.k {
+                    heap.push(entry);
+                } else if let Some(mut worst) = heap.peek_mut() {
+                    // Replace the worst retained row only if this one is better,
+                    // re-sifting once on drop of the `PeekMut` guard.
+                    if entry < *worst {
+                        *worst = entry;
+                    }
+                }
+            }
+
+            // Popping a max-heap yields worst-to-best; reverse for ascending order.
+            let mut sorted: Vec<Row> = Vec::with_capacity(heap.len());
+            while let Some(entry) = heap.pop() {
+                sorted.push(entry.row);
+            }
+            sorted.reverse();
+            self.output = Some(sorted.into_iter());
+        }
+
+        Ok(self.output.as_mut().unwrap().next())
+    }
+
+    fn schema(&self) -> &Schema {
+        self.source.schema()
+    }
+
+    fn explain(&self, indent: usize, out: &mut String) {
+        let keys_str: Vec<String> = self
+            .keys
+            .iter()
+            .map(|(expr, asc)| format!("{:?} {}", expr, if *asc { "ASC" } else { "DESC" }))
+            .collect();
+        out.push_str(&format!(
+            "{}- PhysicalTopN: k={}, keys={:?}\n",
+            "  ".repeat(indent),
+            self.k,
+            keys_str
+        ));
+        self.source.explain(indent + 1, out);
+    }
+}
+
+// ==========================================
 // 6. SortMergeJoin Physical Operator (Bounded-memory)
 // ==========================================
 /// A sorted stream of `(key, row)` pairs keyed on a single join expression, used as

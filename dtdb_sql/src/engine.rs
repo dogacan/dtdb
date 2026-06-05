@@ -7,6 +7,7 @@ use crate::physical::{
     PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
     PhysicalHashAggregate, PhysicalIndexScan, PhysicalLimit, PhysicalOperator, PhysicalProjection,
     PhysicalSeqScan, PhysicalSetOp, PhysicalSort, PhysicalSortMergeJoin, PhysicalSortedAggregate,
+    PhysicalTopN,
 };
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
@@ -465,6 +466,55 @@ impl SqlEngine {
             .options
             .memory_budget
             .unwrap_or(8 * 1024 * 1024)
+    }
+
+    /// Upper bound on `k` for which a `LIMIT` over `ORDER BY` is fused into an
+    /// in-memory bounded top-k ([`PhysicalTopN`]) rather than a spilling sort.
+    /// Derived from the memory budget assuming a conservative nominal row size, so
+    /// the retained heap stays roughly within budget; beyond this (e.g. deep
+    /// `OFFSET` pagination) the spilling `PhysicalSort` + `PhysicalLimit` path runs.
+    fn topn_max_rows(&self) -> usize {
+        /// Nominal per-row footprint (key + payload) assumed when sizing the heap.
+        const NOMINAL_ROW_BYTES: usize = 128;
+        (self.memory_budget() / NOMINAL_ROW_BYTES).max(1)
+    }
+
+    /// Compiles an `ORDER BY` into either a full external [`PhysicalSort`]
+    /// (`fetch == None`) or a bounded [`PhysicalTopN`] retaining the `fetch.unwrap()`
+    /// best rows. Shared so the key parameter-substitution, column-pushdown, and
+    /// binding logic stays identical across the plain-sort and top-k-fused paths.
+    fn compile_sort(
+        &self,
+        source: &LogicalPlan,
+        keys: &[(Expr, bool)],
+        tx: &Transaction,
+        columns: Option<&[String]>,
+        params: &std::collections::HashMap<String, DbValue>,
+        fetch: Option<usize>,
+    ) -> Result<Box<dyn PhysicalOperator>, String> {
+        let mut keys = keys.to_vec();
+        for (expr, _) in &mut keys {
+            expr.substitute_params(params)?;
+        }
+        let mut key_cols = HashSet::new();
+        for (expr, _) in &keys {
+            expr.collect_columns(&mut key_cols);
+        }
+        let child_cols = parent_cols_union(columns, &key_cols);
+        let src_op = self.compile_physical(source, tx, child_cols.as_deref(), params)?;
+        for (expr, _) in &mut keys {
+            expr.bind_columns(src_op.schema())
+                .map_err(|e| e.to_string())?;
+        }
+        match fetch {
+            Some(k) => Ok(Box::new(PhysicalTopN::new(src_op, keys, k))),
+            None => Ok(Box::new(PhysicalSort::new(
+                src_op,
+                keys,
+                self.temp_dir(),
+                self.memory_budget(),
+            ))),
+        }
     }
 
     /// Checks if the SQL string contains a DDL statement (CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX).
@@ -1611,7 +1661,6 @@ impl SqlEngine {
                 limit,
                 offset,
             } => {
-                let src_op = self.compile_physical(source, tx, columns, params)?;
                 let limit = limit
                     .as_ref()
                     .map(|e| resolve_count_expr(e, params))
@@ -1621,29 +1670,30 @@ impl SqlEngine {
                     .map(|e| resolve_count_expr(e, params))
                     .transpose()?
                     .unwrap_or(0);
+
+                // Top-k fusion: a bounded `LIMIT` directly over an `ORDER BY` only
+                // needs the `offset + limit` best rows, so retain those in a heap
+                // instead of sorting (and spilling) the whole input. `k` must fit
+                // the memory budget — deeper limits keep the spilling sort path.
+                let src_op = match (limit, source.as_ref()) {
+                    (
+                        Some(lim),
+                        LogicalPlan::Sort {
+                            source: sort_src,
+                            keys,
+                        },
+                    ) if lim
+                        .checked_add(offset)
+                        .is_some_and(|k| k > 0 && k <= self.topn_max_rows()) =>
+                    {
+                        self.compile_sort(sort_src, keys, tx, columns, params, Some(lim + offset))?
+                    }
+                    _ => self.compile_physical(source, tx, columns, params)?,
+                };
                 Ok(Box::new(PhysicalLimit::new(src_op, limit, offset)))
             }
             LogicalPlan::Sort { source, keys } => {
-                let mut keys = keys.clone();
-                for (expr, _) in &mut keys {
-                    expr.substitute_params(params)?;
-                }
-                let mut key_cols = HashSet::new();
-                for (expr, _) in &keys {
-                    expr.collect_columns(&mut key_cols);
-                }
-                let child_cols = parent_cols_union(columns, &key_cols);
-                let src_op = self.compile_physical(source, tx, child_cols.as_deref(), params)?;
-                for (expr, _) in &mut keys {
-                    expr.bind_columns(src_op.schema())
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(Box::new(PhysicalSort::new(
-                    src_op,
-                    keys,
-                    self.temp_dir(),
-                    self.memory_budget(),
-                )))
+                self.compile_sort(source, keys, tx, columns, params, None)
             }
             LogicalPlan::Join {
                 left,

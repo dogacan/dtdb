@@ -98,7 +98,10 @@ pub fn sort_entries<P>(buffer: &mut [(Vec<DbValue>, P)], directions: &[bool]) {
     buffer.sort_by(|a, b| compare_keys(&a.0, &b.0, directions));
 }
 
-fn compare_keys(a: &[DbValue], b: &[DbValue], directions: &[bool]) -> Ordering {
+/// Compares two sort keys under per-column directions (`true` = ascending),
+/// returning `Equal` only when every column ties. Shared by the in-memory sort,
+/// the k-way merge heap, and the bounded top-k heap.
+pub fn compare_keys(a: &[DbValue], b: &[DbValue], directions: &[bool]) -> Ordering {
     for (idx, &asc) in directions.iter().enumerate() {
         let ord = total_compare(&a[idx], &b[idx]);
         if ord != Ordering::Equal {
