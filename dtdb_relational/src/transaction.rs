@@ -526,47 +526,18 @@ impl Transaction {
                         continue;
                     }
 
+                    // `index_scan` only serves ordered (non-FullText) indexes; the
+                    // optimizer routes FULLTEXT predicates to `fulltext_scan`
+                    // instead. So treat the leading index column as an ordered key
+                    // and range-check it against the scan bounds.
                     if let Some(col_name) = idx_def.columns.first()
                         && let Some(col_idx) = table.schema.column_index(col_name)
                         && let Some(val) = row.get_by_index(col_idx)
+                        && let Some(k) = crate::row::db_value_to_key(val)
+                        && &k >= start_val
+                        && &k <= end_val
                     {
-                        if idx_def.index_type == crate::schema::IndexType::FullText {
-                            if let DbValue::String(s) = val {
-                                let tokenizer_name =
-                                    idx_def.tokenizer.as_deref().unwrap_or("simple");
-                                if let Some(tokenizer) =
-                                    crate::tokenizer::get_tokenizer(tokenizer_name)
-                                {
-                                    let tokens = tokenizer.tokenize(s);
-                                    let mut match_found = false;
-                                    if let DbKey::String(query_token) = start_val
-                                        && tokens.iter().any(|t| t.as_str() == &**query_token)
-                                    {
-                                        match_found = true;
-                                    }
-                                    if match_found {
-                                        rows.push(row.clone());
-                                    }
-                                }
-                            }
-                        } else {
-                            let k = match val {
-                                DbValue::Int(v) => Some(DbKey::Int(*v)),
-                                DbValue::String(s) => Some(DbKey::String(s.clone())),
-                                DbValue::Bool(b) => Some(DbKey::Bool(*b)),
-                                DbValue::Date(d) => Some(DbKey::Date(*d)),
-                                DbValue::Time(t) => Some(DbKey::Time(*t)),
-                                DbValue::Timestamp(ts) => Some(DbKey::Timestamp(*ts)),
-                                DbValue::Decimal(dec) => Some(DbKey::Decimal(*dec)),
-                                _ => None,
-                            };
-                            if let Some(k) = k
-                                && &k >= start_val
-                                && &k <= end_val
-                            {
-                                rows.push(row.clone());
-                            }
-                        }
+                        rows.push(row.clone());
                     }
                 }
             }

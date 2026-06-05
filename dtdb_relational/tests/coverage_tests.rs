@@ -419,6 +419,19 @@ fn string_col(name: &str, nullable: bool) -> Column {
     }
 }
 
+fn bool_col(name: &str, nullable: bool) -> Column {
+    Column {
+        id: 0,
+        name: name.to_string(),
+        data_type: DataType::Bool,
+        is_primary_key: false,
+        is_nullable: nullable,
+        locality_group: None,
+        default_value: None,
+        is_auto_increment: false,
+    }
+}
+
 /// Exercises full-text inverted-index maintenance when a previously committed,
 /// FTS-indexed row is updated and then deleted. Both paths run read-before-write
 /// during commit: the update must purge the old document's tokens before adding
@@ -617,6 +630,117 @@ fn test_index_scan_reads_uncommitted_single_column_write_buffer() {
     // val=30 is out of range; remaining sorted by val: 10 then 20.
     let ids: Vec<_> = res.iter().map(|r| r.values[0].clone()).collect();
     assert_eq!(ids, vec![DbValue::Int(2), DbValue::Int(3)]);
+}
+
+/// String-keyed variant of the uncommitted write-buffer scan. Besides covering
+/// the `DbValue::String` arm of the write-buffer bound check, this exercises the
+/// secondary sort tie-break: two buffered rows share the same indexed value, so
+/// they must come back ordered by primary key.
+#[test]
+fn test_index_scan_write_buffer_string_index_pk_tiebreak() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    let mut schema = Schema::new(vec![int_col("id", true, false), string_col("name", true)]);
+    schema.indexes.push(IndexDefinition {
+        name: "idx_name".to_string(),
+        columns: vec!["name".to_string()],
+        index_type: dtdb_relational::IndexType::BTree,
+        tokenizer: None,
+    });
+    db.create_table("t", schema).unwrap();
+
+    // All rows stay buffered (no commit) so the scan must resolve them from the
+    // write buffer. ids 1 and 3 share name "alice" to drive the PK tie-break.
+    let tx = Transaction::new(1, db.clone());
+    tx.put(
+        "t",
+        DbKey::Int(3),
+        Row::new(vec![DbValue::Int(3), DbValue::string("alice")]),
+    )
+    .unwrap();
+    tx.put(
+        "t",
+        DbKey::Int(1),
+        Row::new(vec![DbValue::Int(1), DbValue::string("alice")]),
+    )
+    .unwrap();
+    tx.put(
+        "t",
+        DbKey::Int(2),
+        Row::new(vec![DbValue::Int(2), DbValue::string("bob")]),
+    )
+    .unwrap();
+    // NULL indexed column: skipped, like the integer-keyed cases above.
+    tx.put(
+        "t",
+        DbKey::Int(4),
+        Row::new(vec![DbValue::Int(4), DbValue::Null]),
+    )
+    .unwrap();
+
+    let res = tx
+        .index_scan(
+            "t",
+            "idx_name",
+            &DbKey::string("alice"),
+            &DbKey::string("bob"),
+            None,
+        )
+        .unwrap();
+    // Sorted by name, then by PK for the "alice" tie: (alice,1), (alice,3), (bob,2).
+    let ids: Vec<_> = res.iter().map(|r| r.values[0].clone()).collect();
+    assert_eq!(ids, vec![DbValue::Int(1), DbValue::Int(3), DbValue::Int(2)]);
+}
+
+/// Bool-keyed variant of the uncommitted write-buffer scan, covering the
+/// `DbValue::Bool` arm of the write-buffer bound check.
+#[test]
+fn test_index_scan_write_buffer_bool_index() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open(temp_dir.path()).unwrap());
+
+    let mut schema = Schema::new(vec![int_col("id", true, false), bool_col("active", true)]);
+    schema.indexes.push(IndexDefinition {
+        name: "idx_active".to_string(),
+        columns: vec!["active".to_string()],
+        index_type: dtdb_relational::IndexType::BTree,
+        tokenizer: None,
+    });
+    db.create_table("t", schema).unwrap();
+
+    let tx = Transaction::new(1, db.clone());
+    tx.put(
+        "t",
+        DbKey::Int(1),
+        Row::new(vec![DbValue::Int(1), DbValue::Bool(true)]),
+    )
+    .unwrap();
+    tx.put(
+        "t",
+        DbKey::Int(2),
+        Row::new(vec![DbValue::Int(2), DbValue::Bool(false)]),
+    )
+    .unwrap();
+    tx.put(
+        "t",
+        DbKey::Int(3),
+        Row::new(vec![DbValue::Int(3), DbValue::Bool(true)]),
+    )
+    .unwrap();
+
+    let res = tx
+        .index_scan(
+            "t",
+            "idx_active",
+            &DbKey::Bool(false),
+            &DbKey::Bool(true),
+            None,
+        )
+        .unwrap();
+    // Sorted by active (false < true), then PK: (false,2), (true,1), (true,3).
+    let ids: Vec<_> = res.iter().map(|r| r.values[0].clone()).collect();
+    assert_eq!(ids, vec![DbValue::Int(2), DbValue::Int(1), DbValue::Int(3)]);
 }
 
 fn fts_docs_db() -> (Arc<Database>, TempDir) {
