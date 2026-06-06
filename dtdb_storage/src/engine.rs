@@ -28,6 +28,31 @@ pub struct StorageEngineStatistics {
 /// compacting too eagerly.
 const MANIFEST_COMPACT_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
+/// Pre-segmentation single-WAL filename. Still recovered on open (replayed
+/// before any numbered segment) so older directories migrate transparently.
+const LEGACY_WAL_NAME: &str = "active.wal";
+
+/// On-disk name of WAL segment `id`. Each memtable (currently just the active
+/// one; an immutable queue lands with background flush) owns exactly one
+/// segment; the segment is retired once its memtable is durably flushed. The
+/// zero-padded id keeps directory listings sorted lexicographically.
+fn wal_segment_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("wal_{id:020}.wal"))
+}
+
+/// Parses a WAL segment id out of a path named `wal_<id>.wal`, or `None` if the
+/// path is not a numbered segment (e.g. the legacy `active.wal`).
+fn parse_wal_segment_id(path: &Path) -> Option<u64> {
+    if path.extension()? != "wal" {
+        return None;
+    }
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("wal_")?
+        .parse::<u64>()
+        .ok()
+}
+
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
@@ -36,6 +61,13 @@ struct EngineInner {
     dir_path: PathBuf,
     memtable: RwLock<Arc<MemTable>>,
     wal: Mutex<Wal>,
+    /// Id of the WAL segment that currently backs the active memtable. Updated
+    /// under `write_mutex` when a flush rotates to a fresh segment.
+    active_wal_id: AtomicU64,
+    /// Allocates WAL segment ids. Independent of `next_sst_id` so the two
+    /// lifecycles don't entangle. Initialized past the highest segment id seen
+    /// on disk at open.
+    next_wal_id: AtomicU64,
     sstables: RwLock<BTreeMap<usize, Vec<Arc<SstableReader>>>>,
     options: EngineOptions,
     write_mutex: Mutex<()>,
@@ -397,72 +429,109 @@ impl EngineInner {
             }
         }
 
-        // 2. Perform recovery from WAL if it exists.
-        let wal_path = dir_path.join("active.wal");
-        let memtable = Arc::new(MemTable::new());
-
-        if wal_path.exists() {
-            fn apply_entry(mem: &MemTable, ent: WalEntry) {
-                match ent {
-                    WalEntry::Put { key, value } => mem.put(key, value),
-                    WalEntry::Delete { key } => mem.delete(key),
-                    WalEntry::Batch(sub) => {
-                        for e in sub {
-                            apply_entry(mem, e);
-                        }
+        // 2. Recover from the WAL. Data lives in numbered segments
+        // (`wal_<id>.wal`), one per memtable, plus an optional pre-segmentation
+        // `active.wal`. Replay them oldest-first into a single memtable so the
+        // newest write of each key wins, then flush the result to one SSTable.
+        fn apply_entry(mem: &MemTable, ent: WalEntry) {
+            match ent {
+                WalEntry::Put { key, value } => mem.put(key, value),
+                WalEntry::Delete { key } => mem.delete(key),
+                WalEntry::Batch(sub) => {
+                    for e in sub {
+                        apply_entry(mem, e);
                     }
                 }
             }
-
-            let entries = Wal::recover(&wal_path)?;
-            for entry in entries {
-                apply_entry(&memtable, entry);
-            }
-
-            if memtable.byte_size() > 0 {
-                let next_id = max_id + 1;
-                max_id = next_id;
-                let sst_path = dir_path.join(format!("L0_{:05}.sst", next_id));
-                let mut writer = SstableWriter::create(
-                    &sst_path,
-                    active_options.block_size_limit,
-                    active_options.compression,
-                    memtable.len(),
-                    vec![],
-                    active_options.fsync_method,
-                )?;
-                for (key, val) in memtable.entries() {
-                    writer.append(&key, val.as_ref())?;
-                }
-                writer.finish()?;
-
-                // Record the recovered SSTable in the manifest.
-                manifest.append(ManifestEdit::AddSstable {
-                    level: 0,
-                    id: next_id,
-                })?;
-
-                let reader = SstableReader::open(&sst_path, next_id, 0, block_cache.clone())?;
-                sstables_map
-                    .entry(0)
-                    .or_default()
-                    .insert(0, Arc::new(reader));
-                memtable.clear();
-            }
-
-            fs::remove_file(&wal_path)?;
         }
 
+        let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+        let mut max_wal_id: Option<u64> = None;
+        for entry in fs::read_dir(&dir_path)? {
+            let path = entry?.path();
+            if let Some(id) = parse_wal_segment_id(&path) {
+                max_wal_id = Some(max_wal_id.map_or(id, |m| m.max(id)));
+                segments.push((id, path));
+            }
+        }
+        segments.sort_by_key(|(id, _)| *id);
+
+        // The legacy single-file WAL predates every numbered segment, so it
+        // replays first.
+        let mut replay_paths: Vec<PathBuf> = Vec::new();
+        let legacy_wal = dir_path.join(LEGACY_WAL_NAME);
+        if legacy_wal.exists() {
+            replay_paths.push(legacy_wal);
+        }
+        replay_paths.extend(segments.into_iter().map(|(_, p)| p));
+
+        let memtable = Arc::new(MemTable::new());
+        for path in &replay_paths {
+            for entry in Wal::recover(path)? {
+                apply_entry(&memtable, entry);
+            }
+        }
+
+        if memtable.byte_size() > 0 {
+            let next_id = max_id + 1;
+            max_id = next_id;
+            let sst_path = dir_path.join(format!("L0_{:05}.sst", next_id));
+            let mut writer = SstableWriter::create(
+                &sst_path,
+                active_options.block_size_limit,
+                active_options.compression,
+                memtable.len(),
+                vec![],
+                active_options.fsync_method,
+            )?;
+            for (key, val) in memtable.entries() {
+                writer.append(&key, val.as_ref())?;
+            }
+            writer.finish()?;
+
+            // Record the recovered SSTable in the manifest.
+            manifest.append(ManifestEdit::AddSstable {
+                level: 0,
+                id: next_id,
+            })?;
+
+            let reader = SstableReader::open(&sst_path, next_id, 0, block_cache.clone())?;
+            sstables_map
+                .entry(0)
+                .or_default()
+                .insert(0, Arc::new(reader));
+            memtable.clear();
+        }
+
+        // The recovered data is now durably in an SSTable, so the segments that
+        // held it can be retired. Done after the flush above to preserve the
+        // "data durable before WAL discarded" ordering.
+        for path in &replay_paths {
+            fs::remove_file(path)?;
+        }
+        // `fsync_parent_dir` fsyncs the *parent* of the path it's given, so pass
+        // a segment path (a child of `dir_path`) to make the deletions durable.
+        if let Some(first) = replay_paths.first() {
+            crate::fsync_parent_dir(first, active_options.fsync_method)?;
+        }
+
+        // Open a fresh active segment past every id seen on disk.
+        let active_wal_id = max_wal_id.map_or(0, |m| m + 1);
+        let next_wal_id = active_wal_id + 1;
+        let active_wal_path = wal_segment_path(&dir_path, active_wal_id);
         let wal = Wal::open(
-            &wal_path,
+            &active_wal_path,
             active_options.wal_sync_interval_ms,
             active_options.fsync_method,
         )?;
+        crate::fsync_parent_dir(&active_wal_path, active_options.fsync_method)?;
 
         Ok(Self {
             dir_path,
             memtable: RwLock::new(memtable),
             wal: Mutex::new(wal),
+            active_wal_id: AtomicU64::new(active_wal_id),
+            next_wal_id: AtomicU64::new(next_wal_id),
             sstables: RwLock::new(sstables_map),
             options: active_options,
             write_mutex: Mutex::new(()),
@@ -1036,6 +1105,10 @@ impl EngineInner {
         self.next_sst_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    fn get_next_wal_id(&self) -> u64 {
+        self.next_wal_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     fn compact_level(&self, source_level: usize) -> Result<()> {
         let target_level = source_level + 1;
         if target_level > self.options.max_level {
@@ -1369,21 +1442,32 @@ impl EngineInner {
             ssts.entry(0).or_default().insert(0, Arc::new(reader));
         }
 
-        let temp_wal_path = self.dir_path.join("active.wal.tmp");
+        // Rotate the WAL: the flushed memtable's data is now durably in the
+        // SSTable above, so its segment can be retired. Open a fresh segment for
+        // subsequent writes, swap it in, then delete the old one. Crash between
+        // the two leaves the (now-redundant) old segment on disk; recovery
+        // replays it idempotently into a new SSTable, so no data is lost.
+        let old_wal_id = self.active_wal_id.load(Ordering::SeqCst);
+        let new_wal_id = self.get_next_wal_id();
+        let new_wal_path = wal_segment_path(&self.dir_path, new_wal_id);
         let new_wal = Wal::open(
-            &temp_wal_path,
+            &new_wal_path,
             self.options.wal_sync_interval_ms,
             self.options.fsync_method,
         )?;
 
-        let wal_path = self.dir_path.join("active.wal");
         {
             let mut wal_guard = self.wal.lock().unwrap();
             *wal_guard = new_wal;
         }
+        self.active_wal_id.store(new_wal_id, Ordering::SeqCst);
 
-        fs::rename(&temp_wal_path, &wal_path)?;
-        crate::fsync_parent_dir(&wal_path, self.options.fsync_method)?;
+        let old_wal_path = wal_segment_path(&self.dir_path, old_wal_id);
+        fs::remove_file(&old_wal_path)?;
+        // One directory fsync makes both the new segment's creation and the old
+        // segment's removal durable before any new write reaches the new
+        // segment (the caller still holds `write_mutex`).
+        crate::fsync_parent_dir(&new_wal_path, self.options.fsync_method)?;
         mem.clear();
 
         Ok(())

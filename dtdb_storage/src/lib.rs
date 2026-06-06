@@ -767,8 +767,11 @@ mod tests {
         // A bare filename has an empty ("") parent, which the helper maps to
         // ".". This exercises the empty-parent branch without a crash test.
         // The current directory always exists, so the fsync should succeed.
-        fsync_parent_dir(std::path::Path::new("some_relative_file.bin"), FsyncMethod::Fsync)
-            .expect("relative path should fsync the current directory");
+        fsync_parent_dir(
+            std::path::Path::new("some_relative_file.bin"),
+            FsyncMethod::Fsync,
+        )
+        .expect("relative path should fsync the current directory");
     }
 
     #[test]

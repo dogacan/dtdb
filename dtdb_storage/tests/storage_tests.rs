@@ -90,9 +90,15 @@ fn test_sstable_write_read() {
 
     // Write to SSTable with small block size (e.g. 50 bytes) to force block splitting
     {
-        let mut writer =
-            SstableWriter::create(&sst_path, 50, CompressionType::Lz4, 4, vec![], FsyncMethod::Fsync)
-                .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            50,
+            CompressionType::Lz4,
+            4,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer.append(&k_int(1), Some(&v_int(10))).unwrap();
         writer.append(&k_int(2), Some(&v_int(20))).unwrap();
         writer.append(&k_int(3), None).unwrap(); // Tombstone
@@ -219,10 +225,23 @@ fn test_engine_crash_recovery() {
         assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_str("two"))); // Retained
 
         // The WAL should have been cleared/flushed into a .sst file during
-        // recovery: it holds no pending records (an empty log is still a few
-        // header bytes on disk, so check the records, not the byte length).
-        let wal_path = db_path.join("active.wal");
-        let pending = dtdb_storage::wal::Wal::recover(&wal_path).unwrap();
+        // recovery: the freshly-opened active segment holds no pending records
+        // (an empty log is still a few header bytes on disk, so check the
+        // records, not the byte length). Recovery retires the segments it
+        // replayed and opens exactly one fresh `wal_<id>.wal`.
+        let mut wal_segments: Vec<std::path::PathBuf> = fs::read_dir(&db_path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "wal")
+                    && p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.starts_with("wal_"))
+            })
+            .collect();
+        wal_segments.sort();
+        assert_eq!(wal_segments.len(), 1, "expected one active WAL segment");
+        let pending = dtdb_storage::wal::Wal::recover(&wal_segments[0]).unwrap();
         assert!(
             pending.is_empty(),
             "WAL should hold no records after recovery flushed it"
@@ -700,9 +719,15 @@ fn test_sstable_block_checksum_detects_bitrot() {
     let sst_path = temp_dir.path().join("00001.sst");
 
     {
-        let mut writer =
-            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![], FsyncMethod::Fsync)
-                .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            64,
+            CompressionType::Lz4,
+            4,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         for i in 0..16 {
             writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
         }
@@ -751,9 +776,15 @@ fn test_sstable_index_checksum_detects_corruption() {
     let sst_path = temp_dir.path().join("00001.sst");
 
     {
-        let mut writer =
-            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![], FsyncMethod::Fsync)
-                .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            64,
+            CompressionType::Lz4,
+            4,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         for i in 0..16 {
             writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
         }
@@ -1232,16 +1263,15 @@ fn test_sstable_write_read_various_types() {
     let dec = rust_decimal::Decimal::new(12345, 2);
 
     {
-        let mut writer =
-            SstableWriter::create(
-                &sst_path,
-                1024,
-                CompressionType::Uncompressed,
-                5,
-                vec![],
-                FsyncMethod::Fsync,
-            )
-            .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            1024,
+            CompressionType::Uncompressed,
+            5,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer
             .append(&k_int(1), Some(&DbValue::Bool(true)))
             .unwrap();
@@ -1496,9 +1526,15 @@ fn test_sstable_empty_reads_return_nothing() {
 
     // Finish a writer without appending anything: the index ends up empty.
     {
-        let writer =
-            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 0, vec![], FsyncMethod::Fsync)
-                .unwrap();
+        let writer = SstableWriter::create(
+            &sst_path,
+            4096,
+            CompressionType::Lz4,
+            0,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer.finish().unwrap();
     }
 
@@ -1522,16 +1558,15 @@ fn test_sstable_get_key_below_first_block_misses() {
     let sst_path = temp_dir.path().join("below.sst");
 
     {
-        let mut writer =
-            SstableWriter::create(
-                &sst_path,
-                4096,
-                CompressionType::Uncompressed,
-                3,
-                vec![],
-                FsyncMethod::Fsync,
-            )
-            .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            4096,
+            CompressionType::Uncompressed,
+            3,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer.append(&k_int(10), Some(&v_int(100))).unwrap();
         writer.append(&k_int(20), Some(&v_int(200))).unwrap();
         writer.append(&k_int(30), Some(&v_int(300))).unwrap();
@@ -1553,9 +1588,15 @@ fn test_sstable_create_path_without_extension() {
     let sst_path = temp_dir.path().join("no_extension");
 
     {
-        let mut writer =
-            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 1, vec![], FsyncMethod::Fsync)
-                .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            4096,
+            CompressionType::Lz4,
+            1,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer.append(&k_int(1), Some(&v_int(42))).unwrap();
         writer.finish().unwrap();
     }
@@ -1574,9 +1615,15 @@ fn test_sstable_scan_stops_before_blocks_past_end() {
     // block leaves later blocks whose first_key exceeds `end` — exercising the
     // early `break` in the scan loop.
     {
-        let mut writer =
-            SstableWriter::create(&sst_path, 1, CompressionType::Uncompressed, 5, vec![], FsyncMethod::Fsync)
-                .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            1,
+            CompressionType::Uncompressed,
+            5,
+            vec![],
+            FsyncMethod::Fsync,
+        )
+        .unwrap();
         for i in 1..=5 {
             writer.append(&k_int(i * 10), Some(&v_int(i * 10))).unwrap();
         }
