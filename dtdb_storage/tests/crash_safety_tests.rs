@@ -227,6 +227,20 @@ impl ManualExecutor {
             task();
         }
     }
+
+    /// Run (and remove) the task at `index`, leaving the rest queued. Lets a test
+    /// complete a *newer* flush while an older one stays pending — the
+    /// out-of-order completion concurrent flush allows. Indexing by position is
+    /// stable here because flush tasks are submitted in seal order and each
+    /// flush's follow-up compaction task is appended at the end.
+    fn run_at(&self, index: usize) {
+        let task = {
+            let mut tasks = self.tasks.lock().unwrap();
+            assert!(index < tasks.len(), "no task at index {index}");
+            tasks.remove(index)
+        };
+        task();
+    }
 }
 
 impl Executor for ManualExecutor {
@@ -506,4 +520,67 @@ fn test_recovery_migrates_legacy_active_wal() {
     // Legacy file retired; a numbered active segment now exists.
     assert!(!temp_dir.path().join("active.wal").exists());
     assert_eq!(list_wal_segments(temp_dir.path()).len(), 1);
+}
+
+/// Concurrent flush can write a newer memtable's SSTable before an older one's.
+/// WAL retirement, however, is strictly oldest-first, so a crash after such an
+/// out-of-order flush leaves *every* not-yet-retired segment on disk — a
+/// contiguous newest-suffix. Recovery replays them oldest-first, so the newest
+/// value of each key wins.
+///
+/// Were retirement done per-flush (retiring the newer segment as soon as it
+/// flushed), the older segment would survive alone and recovery would replay its
+/// stale value into the highest-id SSTable, shadowing the newer flushed value.
+#[test]
+fn out_of_order_flush_then_crash_recovers_newest_values() {
+    let temp_dir = TempDir::new().unwrap();
+    // Tiny memtable so every write seals; room for several immutables.
+    let options = EngineOptions {
+        memtable_size_limit: 1,
+        max_write_buffer_number: 6,
+        ..get_test_options()
+    };
+
+    {
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = StorageEngine::open_with_executor(
+            temp_dir.path(),
+            options,
+            exec.clone(),
+            Arc::new(PassthroughValueRewriter),
+        )
+        .unwrap();
+
+        // Three seals: imm0 = {1: old}, imm1 = {2: keep}, imm2 = {1: new}.
+        engine.put(k_int(1), v_str("v1-old")).unwrap();
+        engine.put(k_int(2), v_str("keep")).unwrap();
+        engine.put(k_int(1), v_str("v1-new")).unwrap();
+        assert_eq!(list_wal_segments(temp_dir.path()).len(), 4); // 3 sealed + 1 active
+
+        // Complete the two newer flushes out of order, leaving the oldest
+        // (imm0, holding the stale value of key 1) un-flushed. Flush tasks are
+        // queued in seal order [imm0, imm1, imm2]; run imm2 then imm1.
+        exec.run_at(2); // imm2's SSTable
+        exec.run_at(1); // imm1's SSTable
+
+        // Both newer SSTables are durable, but oldest-first retirement is blocked
+        // behind imm0, so no WAL segment has been retired yet.
+        assert_eq!(list_sst_files(temp_dir.path()).len(), 2);
+        assert_eq!(
+            list_wal_segments(temp_dir.path()).len(),
+            4,
+            "no segment may retire while the oldest flush is pending"
+        );
+
+        // Crash: drop the engine and executor without running imm0's flush. The
+        // queued task is dropped un-run; all four segments remain on disk.
+        drop(engine);
+        drop(exec);
+    }
+
+    // Recover. Replaying all surviving segments oldest-first yields the newest
+    // value of key 1 (v1-new), not the stale v1-old that imm0's segment holds.
+    let reopened = StorageEngine::open(temp_dir.path(), options).unwrap();
+    assert_eq!(reopened.get(&k_int(1)).unwrap(), Some(v_str("v1-new")));
+    assert_eq!(reopened.get(&k_int(2)).unwrap(), Some(v_str("keep")));
 }

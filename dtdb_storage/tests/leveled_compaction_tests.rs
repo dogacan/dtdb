@@ -277,3 +277,86 @@ fn test_deep_stress_and_consistency() {
         }
     }
 }
+
+/// Catch-all for the concurrent-flush machinery: many writer threads on disjoint
+/// key ranges (so the expected final state is deterministic) plus a compactor,
+/// with a tiny memtable and `max_write_buffer_number > 2` to force many flushes
+/// running in parallel on the real thread pool. Every key must read back with its
+/// exact value, both live and after a reopen (which exercises recovery of any
+/// WAL segments still un-retired at shutdown).
+#[test]
+fn concurrent_writers_and_flushes_stay_consistent() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+
+    let options = EngineOptions {
+        compression: CompressionType::Uncompressed,
+        memtable_size_limit: 64, // tiny: most writes seal a memtable
+        block_size_limit: 4096,
+        wal_size_limit: 32 * 1024 * 1024,
+        l0_compaction_threshold: 4,
+        sstable_target_size: 2 * 1024 * 1024,
+        base_level_size_limit: 16 * 1024,
+        level_size_multiplier: 4,
+        max_level: 7,
+        block_cache_capacity: 1000,
+        wal_sync_interval_ms: None,
+        max_write_buffer_number: 4, // up to 3 immutables flushing at once
+        ..Default::default()
+    };
+
+    const THREADS: i64 = 4;
+    const PER_THREAD: i64 = 250;
+    // Disjoint, well-separated key ranges per thread keep the final value of
+    // every key deterministic regardless of interleaving.
+    let key = |t: i64, i: i64| k_int(t * 1_000_000 + i);
+
+    {
+        let engine = Arc::new(StorageEngine::open(&db_path, options).unwrap());
+
+        thread::scope(|s| {
+            for t in 0..THREADS {
+                let engine = &engine;
+                s.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        engine.put(key(t, i), v_int(t * 1_000_000 + i)).unwrap();
+                    }
+                });
+            }
+            // A compactor running alongside the writers, exercising flush/compact
+            // overlap.
+            let engine = &engine;
+            s.spawn(move || {
+                for _ in 0..30 {
+                    engine.compact().unwrap();
+                    thread::sleep(std::time::Duration::from_millis(2));
+                }
+            });
+        });
+
+        // Settle everything, then verify every key is present with its value.
+        engine.compact().unwrap();
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                assert_eq!(
+                    engine.get(&key(t, i)).unwrap(),
+                    Some(v_int(t * 1_000_000 + i)),
+                    "live read mismatch for thread {t} index {i}"
+                );
+            }
+        }
+    }
+
+    // Reopen: any immutables still queued at shutdown live only in un-retired WAL
+    // segments, so a correct read here proves recovery handles them.
+    let reopened = StorageEngine::open(&db_path, options).unwrap();
+    for t in 0..THREADS {
+        for i in 0..PER_THREAD {
+            assert_eq!(
+                reopened.get(&key(t, i)).unwrap(),
+                Some(v_int(t * 1_000_000 + i)),
+                "post-reopen read mismatch for thread {t} index {i}"
+            );
+        }
+    }
+}

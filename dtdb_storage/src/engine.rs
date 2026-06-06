@@ -53,18 +53,69 @@ fn parse_wal_segment_id(path: &Path) -> Option<u64> {
         .ok()
 }
 
+/// Insert an L0 SSTable reader into `list`, keeping it sorted by id descending
+/// (newest first) — the order the read paths rely on to resolve precedence.
+///
+/// Flushes pre-allocate ids in seal order but run concurrently and may finish
+/// out of order, so ids no longer arrive monotonically and the reader can't
+/// simply be pushed to the front. `partition_point` finds the slot just past
+/// every higher id, preserving the descending invariant regardless of
+/// completion order.
+fn insert_l0_sorted(list: &mut Vec<Arc<SstableReader>>, reader: Arc<SstableReader>) {
+    let pos = list.partition_point(|r| r.id > reader.id);
+    list.insert(pos, reader);
+}
+
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
 
 /// A sealed memtable awaiting (or undergoing) flush to L0, paired with the id of
 /// the WAL segment that holds its writes. The segment is retired once the
-/// memtable's data is durable in an SSTable. Cheap to clone (an `Arc` and a
-/// `u64`), so a copy can sit in the queue while another is handed to the flush.
+/// memtable's data is durable in an SSTable. Cheap to clone (a few `Arc`s and
+/// `u64`s), so a copy can sit in the queue while another is handed to the flush.
+///
+/// `sst_id` is pre-allocated at seal time (under `write_mutex`, so in seal
+/// order: older memtable → smaller id). Flushes then run concurrently and may
+/// complete out of order, but the id — not the completion order — fixes L0
+/// precedence (the level is kept sorted by id descending, newest first).
+///
+/// `flush` guards the flush itself: concurrent flushers (a background task and a
+/// synchronous `flush`/`compact` draining the same queue) claim it so the L0
+/// write, manifest edit, and WAL retirement happen exactly once per memtable.
 #[derive(Clone)]
 struct ImmMemtable {
     table: Arc<MemTable>,
     wal_id: u64,
+    sst_id: u64,
+    flush: Arc<FlushSlot>,
+}
+
+/// One-shot claim guarding the flush of a single [`ImmMemtable`]. The first
+/// caller to find it `Pending` transitions it to `InFlight` and performs the
+/// I/O; concurrent callers wait on `done` and observe `Completed` (returning
+/// without redoing the work). On error the owner resets it to `Pending` so a
+/// later drain retries — matching the pre-concurrency behavior where a failed
+/// flush left the memtable queued.
+struct FlushSlot {
+    state: Mutex<SlotState>,
+    done: Condvar,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Pending,
+    InFlight,
+    Completed,
+}
+
+impl FlushSlot {
+    fn new() -> Self {
+        FlushSlot {
+            state: Mutex::new(SlotState::Pending),
+            done: Condvar::new(),
+        }
+    }
 }
 
 /// The in-memory write buffers: one mutable `active` memtable plus a queue of
@@ -98,12 +149,16 @@ struct EngineInner {
     sstables: RwLock<BTreeMap<usize, Vec<Arc<SstableReader>>>>,
     options: EngineOptions,
     write_mutex: Mutex<()>,
-    /// Serializes flushing the immutable queue to L0. Held for the whole drain,
-    /// so at most one flusher runs at a time: flushes complete in seal order
-    /// (keeping L0 newest-first under front-insert) and a background drain can't
-    /// double-flush an immutable that a synchronous `flush`/`compact` is also
-    /// draining.
-    flush_lock: Mutex<()>,
+    /// Serializes WAL-segment retirement so it happens strictly oldest-first.
+    ///
+    /// Concurrent flushers write SSTables in parallel and may finish out of
+    /// order, but a segment may only be retired once it *and every older
+    /// segment* is durable. This keeps the WAL segments surviving a crash a
+    /// contiguous newest-suffix of the seal order — the invariant recovery
+    /// relies on when it replays them into a single highest-id SSTable. Retiring
+    /// a newer segment while an older one is still live would let recovery
+    /// resurrect the older (stale) value over the newer flushed one.
+    retire_mutex: Mutex<()>,
     /// Backpressure gate stalling writers when the immutable queue is full.
     flush_gate: FlushGate,
     compaction_mutex: Mutex<()>,
@@ -567,10 +622,7 @@ impl EngineInner {
             })?;
 
             let reader = SstableReader::open(&sst_path, next_id, 0, block_cache.clone())?;
-            sstables_map
-                .entry(0)
-                .or_default()
-                .insert(0, Arc::new(reader));
+            insert_l0_sorted(sstables_map.entry(0).or_default(), Arc::new(reader));
             memtable.clear();
         }
 
@@ -609,7 +661,7 @@ impl EngineInner {
             sstables: RwLock::new(sstables_map),
             options: active_options,
             write_mutex: Mutex::new(()),
-            flush_lock: Mutex::new(()),
+            retire_mutex: Mutex::new(()),
             flush_gate: FlushGate::new(),
             compaction_mutex: Mutex::new(()),
             manifest: Mutex::new(manifest),
@@ -1524,11 +1576,12 @@ impl EngineInner {
         // Block (still holding `write_mutex`, so all writers stall together)
         // until the immutable queue has a free slot.
         self.await_flush_slot();
-        // Seal the active memtable into the queue, then kick a background drain.
-        // `seal_active` returns `None` only if the active memtable was empty,
-        // which a just-triggered flush won't be — guard anyway.
-        if self.seal_active()?.is_some() {
-            self.schedule_flush();
+        // Seal the active memtable into the queue, then schedule a background
+        // flush for *this* memtable. `seal_active` returns `None` only if the
+        // active memtable was empty, which a just-triggered flush won't be —
+        // guard anyway.
+        if let Some(imm) = self.seal_active()? {
+            self.schedule_flush_imm(imm);
         }
         Ok(())
     }
@@ -1557,13 +1610,13 @@ impl EngineInner {
 
     /// Drain the immutable queue to L0, oldest first, until it is empty.
     ///
-    /// Holds [`Self::flush_lock`] for the whole drain, so flushes are serialized:
-    /// they complete in seal order (keeping L0 newest-first under front-insert)
-    /// and a background drain never races a synchronous `flush`/`compact` into
-    /// double-flushing the same immutable. Shared by both the background flush
-    /// task and the synchronous `flush_memtable`/`compact` paths.
+    /// Each memtable's flush is guarded by its own [`FlushSlot`], so this is safe
+    /// to run concurrently with the background flush tasks: a memtable already
+    /// being flushed by a background task is awaited (not re-flushed), and one
+    /// not yet started is claimed and flushed here. Used by the synchronous
+    /// `flush_memtable`/`compact` paths, which must guarantee the queue is on
+    /// disk by the time they return.
     fn flush_pending(&self) -> Result<()> {
-        let _flush_lock = self.flush_lock.lock().unwrap();
         loop {
             // Re-read the back (oldest) each iteration: a concurrent seal may have
             // appended a newer memtable to the front while we flushed.
@@ -1574,16 +1627,19 @@ impl EngineInner {
         Ok(())
     }
 
-    /// Schedule a background task to drain the immutable queue, then kick
-    /// compaction (L0 will have grown). Coalesced per engine, like compaction, so
-    /// overlapping triggers collapse into at most one running drain plus one
-    /// trailing re-run.
-    fn schedule_flush(self: &Arc<Self>) {
+    /// Schedule a background task to flush a single sealed memtable, then kick
+    /// compaction (L0 will have grown).
+    ///
+    /// Keyed per memtable (by WAL id), so distinct memtables flush concurrently
+    /// on separate executor workers; a duplicate submit for the *same* memtable
+    /// coalesces. The [`FlushSlot`] is the real guard against double I/O — the
+    /// coalesce key only avoids a redundant queued task.
+    fn schedule_flush_imm(self: &Arc<Self>, imm: ImmMemtable) {
         if self.background.state.lock().unwrap().shutting_down {
             return;
         }
         let inner = self.clone();
-        let key = CoalesceKey::new(format!("flush:{}", self.dir_path.display()));
+        let key = CoalesceKey::new(format!("flush:{}:{}", self.dir_path.display(), imm.wal_id));
         self.executor.submit(
             Priority::High,
             Some(key),
@@ -1593,7 +1649,7 @@ impl EngineInner {
                 let Some(_bg) = inner.enter_background() else {
                     return;
                 };
-                if let Err(e) = inner.flush_pending() {
+                if let Err(e) = inner.flush_immutable(&imm) {
                     tracing::error!(error = ?e, "background flush failed");
                 }
                 inner.trigger_compaction();
@@ -1617,6 +1673,10 @@ impl EngineInner {
         }
 
         let sealed_wal_id = self.active_wal_id.load(Ordering::SeqCst);
+        // Allocate the L0 id now, under `write_mutex`, so ids follow seal order
+        // (older memtable → smaller id). Flushes run concurrently and may finish
+        // out of order, but this id — not completion order — fixes L0 precedence.
+        let sst_id = self.get_next_id();
         let new_wal_id = self.get_next_wal_id();
         let new_wal_path = wal_segment_path(&self.dir_path, new_wal_id);
         let new_wal = Wal::open(
@@ -1647,6 +1707,8 @@ impl EngineInner {
             let imm = ImmMemtable {
                 table,
                 wal_id: sealed_wal_id,
+                sst_id,
+                flush: Arc::new(FlushSlot::new()),
             };
             // The queue keeps its own handle (front = newest) so readers merge
             // over the sealed memtable until the flush removes it; the returned
@@ -1659,21 +1721,74 @@ impl EngineInner {
         Ok(Some(sealed))
     }
 
-    /// Flush a sealed memtable to a new L0 SSTable, record it in the manifest,
-    /// retire the WAL segment that backed it, and drop it from the immutable
-    /// queue.
+    /// Flush a sealed memtable to L0, claiming its [`FlushSlot`] so the work runs
+    /// exactly once even when a background task and a synchronous
+    /// `flush`/`compact` target the same memtable concurrently.
     ///
-    /// Crash-safe by ordering: the SSTable and its manifest edit are made durable
-    /// before the WAL segment is deleted, so a crash mid-flush leaves the segment
-    /// on disk and recovery replays it idempotently into a fresh SSTable.
-    ///
-    /// Run only via [`Self::flush_pending`], which holds [`Self::flush_lock`], so
-    /// flushes are serialized and never double-flush an immutable.
+    /// The first caller to find the slot `Pending` performs the flush; others
+    /// wait until it is `Completed` and return. On error the slot resets to
+    /// `Pending` so a later drain retries, and any waiters are woken to take
+    /// over — matching the pre-concurrency behavior where a failed flush left the
+    /// memtable queued.
     fn flush_immutable(&self, imm: &ImmMemtable) -> Result<()> {
+        // Claim the SSTable write, or wait for whoever owns it. `Completed` means
+        // the SSTable is durable and registered — but the memtable may still be
+        // in the queue awaiting in-order WAL retirement, so even a waiter falls
+        // through to `retire_durable_prefix` below to help the queue drain.
+        let we_own = {
+            let mut state = imm.flush.state.lock().unwrap();
+            loop {
+                match *state {
+                    SlotState::Completed => break false,
+                    SlotState::InFlight => {
+                        state = imm.flush.done.wait(state).unwrap();
+                    }
+                    SlotState::Pending => {
+                        *state = SlotState::InFlight;
+                        break true;
+                    }
+                }
+            }
+        };
+
+        if we_own {
+            // Write the SSTable (the expensive, parallelizable part). Publish the
+            // outcome and wake waiters: `Completed` on success, `Pending` on
+            // error so a waiter — or a later drain — retries. On error, skip
+            // retirement: nothing new became durable.
+            let result = self.write_immutable_sstable(imm);
+            {
+                let mut state = imm.flush.state.lock().unwrap();
+                *state = if result.is_ok() {
+                    SlotState::Completed
+                } else {
+                    SlotState::Pending
+                };
+            }
+            imm.flush.done.notify_all();
+            result?;
+        }
+
+        // This memtable's SSTable is durable. Retire WAL segments for the
+        // contiguous run of oldest immutables whose SSTables are now durable.
+        self.retire_durable_prefix()
+    }
+
+    /// Write a sealed memtable to its pre-allocated L0 SSTable and register it
+    /// (manifest + in-memory level). Caller owns the [`FlushSlot`] (see
+    /// [`Self::flush_immutable`]), so this never runs concurrently for the same
+    /// memtable, but distinct memtables run it in parallel.
+    ///
+    /// This does *not* retire the WAL segment or dequeue the memtable; that is
+    /// [`Self::retire_durable_prefix`]'s job, kept separate so retirement stays
+    /// ordered even though SSTable writes finish out of order.
+    fn write_immutable_sstable(&self, imm: &ImmMemtable) -> Result<()> {
         let entries = imm.table.entries();
 
-        let next_id = self.get_next_id();
-        let sst_path = self.dir_path.join(format!("L0_{:05}.sst", next_id));
+        // The L0 id was pre-allocated at seal time (in seal order); use it so L0
+        // precedence is fixed regardless of which flush finishes first.
+        let sst_id = imm.sst_id;
+        let sst_path = self.dir_path.join(format!("L0_{:05}.sst", sst_id));
 
         let target_layout = self.target_layout();
         let mut writer = SstableWriter::create(
@@ -1689,46 +1804,81 @@ impl EngineInner {
         }
         writer.finish()?;
 
-        // Record the newly flushed SSTable in the manifest.
+        // Record the newly flushed SSTable in the manifest. AddSstable edits form
+        // a set, so recording them out of id order across concurrent flushers is
+        // fine.
         self.manifest
             .lock()
             .unwrap()
             .append(ManifestEdit::AddSstable {
                 level: 0,
-                id: next_id,
+                id: sst_id,
             })?;
 
-        let reader = SstableReader::open(&sst_path, next_id, 0, self.block_cache.clone())?;
+        let reader = SstableReader::open(&sst_path, sst_id, 0, self.block_cache.clone())?;
         {
             let mut ssts = self.sstables.write().unwrap();
-            ssts.entry(0).or_default().insert(0, Arc::new(reader));
+            // Concurrent flushers finish out of order, so keep L0 sorted by id
+            // (newest first) rather than assuming this is the newest.
+            insert_l0_sorted(ssts.entry(0).or_default(), Arc::new(reader));
         }
 
-        // The sealed memtable's data is now durably in the SSTable above, so its
-        // WAL segment can be retired. A crash before this point leaves the
-        // segment on disk; recovery replays it idempotently into a new SSTable.
-        let old_wal_path = wal_segment_path(&self.dir_path, imm.wal_id);
-        fs::remove_file(&old_wal_path)?;
-        // Make the segment's removal durable. (The new segment's creation was
-        // already fsynced in `seal_active`.)
-        crate::fsync_parent_dir(&old_wal_path, self.options.fsync_method)?;
+        Ok(())
+    }
 
-        // Drop the flushed memtable from the immutable queue. Matching on the WAL
-        // id (unique and monotonic) removes exactly this entry.
-        {
-            let mut memset = self.memset.write().unwrap();
-            memset.immutable.retain(|m| m.wal_id != imm.wal_id);
+    /// Retire WAL segments for the longest run of *oldest* immutable memtables
+    /// whose SSTables are durable, dropping each from the queue and freeing its
+    /// backpressure slot.
+    ///
+    /// Retirement is strictly oldest-first (and serialized by `retire_mutex`), so
+    /// the segments left on disk are always a contiguous newest-suffix of the
+    /// seal order — the invariant recovery relies on. A memtable whose SSTable is
+    /// durable but which sits behind an older, not-yet-flushed one stays queued
+    /// until that gap fills; whichever flush closes the gap cascades the retire.
+    ///
+    /// Crash-safe by ordering: each SSTable and its manifest edit are durable
+    /// (via [`Self::write_immutable_sstable`]) before its segment is deleted here,
+    /// so a crash mid-retire leaves the segment on disk and recovery replays it.
+    fn retire_durable_prefix(&self) -> Result<()> {
+        let _retire_lock = self.retire_mutex.lock().unwrap();
+        loop {
+            // The oldest immutable is at the back. Peek it without holding the
+            // write lock across the (slow) fsync below.
+            let oldest = self.memset.read().unwrap().immutable.back().cloned();
+            let Some(oldest) = oldest else { break };
+
+            // Stop at the first immutable whose SSTable is not yet durable: we
+            // must not retire past it, or a crash would strand an older live
+            // segment behind a retired newer one.
+            let durable =
+                matches!(*oldest.flush.state.lock().unwrap(), SlotState::Completed);
+            if !durable {
+                break;
+            }
+
+            // The data is durably in an SSTable, so retire the segment. A crash
+            // before this completes leaves the segment on disk; recovery replays
+            // it idempotently into a new SSTable.
+            let seg_path = wal_segment_path(&self.dir_path, oldest.wal_id);
+            fs::remove_file(&seg_path)?;
+            crate::fsync_parent_dir(&seg_path, self.options.fsync_method)?;
+
+            // Drop it from the queue (still the back — only this method pops, and
+            // it is serialized; seals only push to the front).
+            {
+                let mut memset = self.memset.write().unwrap();
+                memset.immutable.pop_back();
+            }
+
+            // Free the slot and wake any writer stalled on backpressure. Done
+            // after the dequeue so a woken writer never observes more immutables
+            // than the count claims.
+            {
+                let mut st = self.flush_gate.state.lock().unwrap();
+                st.immutable_count = st.immutable_count.saturating_sub(1);
+            }
+            self.flush_gate.slot_freed.notify_all();
         }
-
-        // Free the immutable slot and wake any writer stalled on backpressure.
-        // Done after the dequeue above so a woken writer never observes more
-        // immutables than the count claims.
-        {
-            let mut st = self.flush_gate.state.lock().unwrap();
-            st.immutable_count = st.immutable_count.saturating_sub(1);
-        }
-        self.flush_gate.slot_freed.notify_all();
-
         Ok(())
     }
 
@@ -2088,6 +2238,36 @@ mod tests {
                 task();
             }
         }
+
+        /// Run every currently-stored task in reverse submission order. With one
+        /// flush task queued per seal (newest submitted last), this drives the
+        /// flushes to *complete* newest-first — the out-of-order case that the L0
+        /// id ordering must tolerate. Tasks submitted during the run are left for
+        /// later.
+        fn run_reversed(&self) {
+            let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+            tasks.reverse();
+            for task in tasks {
+                task();
+            }
+        }
+
+        /// Run just the oldest queued task (the first submitted). With one flush
+        /// task per seal, this completes the oldest immutable's flush — the one
+        /// whose retirement frees a backpressure slot.
+        fn run_one(&self) {
+            let task = {
+                let mut tasks = self.tasks.lock().unwrap();
+                if tasks.is_empty() {
+                    None
+                } else {
+                    Some(tasks.remove(0))
+                }
+            };
+            if let Some(task) = task {
+                task();
+            }
+        }
     }
 
     impl Executor for ManualExecutor {
@@ -2146,6 +2326,19 @@ mod tests {
             .lock()
             .unwrap()
             .immutable_count
+    }
+
+    /// The ids of the L0 SSTables in list order. The read paths require this to be
+    /// sorted descending (newest first), so tests assert on it directly.
+    fn l0_ids(engine: &StorageEngine) -> Vec<u64> {
+        engine
+            .inner
+            .sstables
+            .read()
+            .unwrap()
+            .get(&0)
+            .map(|list| list.iter().map(|r| r.id).collect())
+            .unwrap_or_default()
     }
 
     /// A write-path flush is deferred to a background task: the active memtable is
@@ -2296,5 +2489,304 @@ mod tests {
         for (k, v) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
             assert_eq!(engine.get(&DbKey::Int(k)).unwrap(), Some(DbValue::Int(v)));
         }
+    }
+
+    // --- Concurrent flush: out-of-order completion (test set #1) ---------------
+
+    /// Two seals of the *same* key flushed newest-first must still read the
+    /// newest value. L0 precedence is fixed by the id pre-allocated at seal time
+    /// (older seal → smaller id), not by which flush finishes first, and the
+    /// level is kept sorted by id descending so the newer SSTable is consulted
+    /// first.
+    #[test]
+    fn newest_seal_flushed_first_still_reads_newest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        // cap = 2 so both seals fit without stalling.
+        let engine = open_manual(dir.path(), exec.clone(), 3);
+
+        // Each write overflows the tiny memtable, sealing a single-key memtable
+        // and queuing its own flush task. The second overwrites key 1.
+        engine.put(DbKey::Int(1), DbValue::Int(100)).unwrap();
+        engine.put(DbKey::Int(1), DbValue::Int(200)).unwrap();
+        assert_eq!(immutable_count(&engine), 2, "both seals should be queued");
+        // Newest value already wins from the immutable queue (front = newest).
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(200)));
+
+        // Flush newest-first (reverse submission order): the newer memtable's
+        // SSTable lands on disk before the older one's.
+        exec.run_reversed();
+
+        assert_eq!(immutable_count(&engine), 0, "queue should be drained");
+        let ids = l0_ids(&engine);
+        assert_eq!(ids.len(), 2, "two L0 SSTables expected");
+        assert!(
+            ids[0] > ids[1],
+            "L0 must stay sorted newest-first by id, got {ids:?}"
+        );
+        // The newest write wins even though its flush completed first.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(200)));
+    }
+
+    /// As above, but the newer write is a tombstone: flushing it out of order
+    /// (before the older put) must still shadow the put, yielding `None`.
+    #[test]
+    fn newer_tombstone_flushed_first_still_shadows_older_put() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone(), 3);
+
+        engine.put(DbKey::Int(1), DbValue::Int(100)).unwrap();
+        engine.delete(DbKey::Int(1)).unwrap();
+        assert_eq!(immutable_count(&engine), 2);
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), None);
+
+        // Flush the tombstone's memtable before the put's.
+        exec.run_reversed();
+
+        assert_eq!(immutable_count(&engine), 0);
+        let ids = l0_ids(&engine);
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] > ids[1], "L0 must stay newest-first, got {ids:?}");
+        // Tombstone (newer) still wins over the older put.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), None);
+    }
+
+    // --- Concurrent flush: FlushSlot claim protocol (test set #2) --------------
+
+    /// Flushing the same sealed memtable twice is idempotent: the second call
+    /// observes the slot already `Completed` and does no I/O — no duplicate
+    /// SSTable, no double WAL removal (which would error), no double slot
+    /// decrement.
+    #[test]
+    fn double_flush_of_same_immutable_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(dir.path(), no_autoflush_options()).unwrap();
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        let imm = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
+        assert_eq!(immutable_count(&engine), 1);
+
+        engine.inner.flush_immutable(&imm).unwrap();
+        assert_eq!(immutable_count(&engine), 0);
+        assert_eq!(l0_ids(&engine).len(), 1);
+
+        // Second flush must be a clean no-op rather than re-running the I/O (the
+        // WAL segment is already gone, so a re-run would fail on remove_file).
+        engine.inner.flush_immutable(&imm).unwrap();
+        assert_eq!(immutable_count(&engine), 0, "count must not go negative");
+        assert_eq!(l0_ids(&engine).len(), 1, "no duplicate SSTable");
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+    }
+
+    /// Two threads flushing the same sealed memtable concurrently: the slot lets
+    /// exactly one perform the I/O while the other waits and observes
+    /// completion. Both return `Ok`, and the engine shows a single SSTable and a
+    /// single slot decrement.
+    #[test]
+    fn concurrent_flush_of_same_immutable_runs_io_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(dir.path(), no_autoflush_options()).unwrap();
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        let imm = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
+        assert_eq!(immutable_count(&engine), 1);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                let engine = &engine;
+                let imm = imm.clone();
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    // Maximize the race: both claim at the same instant.
+                    barrier.wait();
+                    engine.inner.flush_immutable(&imm).unwrap();
+                });
+            }
+        });
+
+        // I/O ran exactly once: one SSTable, one decrement, segment retired.
+        assert_eq!(immutable_count(&engine), 0);
+        assert_eq!(l0_ids(&engine).len(), 1, "exactly one SSTable written");
+        assert!(
+            !wal_segment_path(dir.path(), imm.wal_id).exists(),
+            "WAL segment should be retired once"
+        );
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+        assert_eq!(engine.get(&DbKey::Int(2)).unwrap(), Some(DbValue::Int(20)));
+    }
+
+    // --- Concurrent flush: synchronous + background coexistence (test set #3) --
+
+    /// A synchronous `compact()` draining the queue while a background flush task
+    /// for the same memtable is still pending: `compact` claims the slot and does
+    /// the flush, and the later background task observes `Completed` and no-ops.
+    /// No duplicate SSTable, no error, slot freed exactly once.
+    #[test]
+    fn compact_drains_queue_then_pending_background_task_noops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone(), 3);
+
+        // Seal a memtable; its flush task is queued but not run.
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        assert_eq!(immutable_count(&engine), 1);
+        assert!(exec.pending() >= 1, "a background flush should be queued");
+
+        // Synchronous compaction flushes the queue itself (claiming the slot),
+        // then compacts. The data is durable when it returns.
+        engine.inner.compact().unwrap();
+        assert_eq!(immutable_count(&engine), 0, "compact drained the queue");
+        assert!(engine.inner.memset.read().unwrap().immutable.is_empty());
+        let sstables_after_compact = engine.get_statistics().unwrap().num_sstables;
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+
+        // The still-queued background flush task now runs: it must see the slot
+        // already Completed and do nothing — no second SSTable, no panic.
+        exec.run_all();
+        assert_eq!(immutable_count(&engine), 0, "no double decrement");
+        assert_eq!(
+            engine.get_statistics().unwrap().num_sstables,
+            sstables_after_compact,
+            "stale background task must not add an SSTable"
+        );
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+    }
+
+    // --- Concurrent flush: backpressure per slot (test set #5) -----------------
+
+    /// With concurrent per-memtable flush tasks, completing a *single* flush
+    /// frees exactly one backpressure slot (not the whole queue) and wakes one
+    /// stalled writer. Running the oldest immutable's task is what frees a slot,
+    /// since retirement is strictly oldest-first.
+    #[test]
+    fn one_flush_frees_one_slot_and_wakes_one_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        // max_write_buffer_number = 4 -> cap = 3.
+        let engine = open_manual(dir.path(), exec.clone(), 4);
+
+        // Fill all three slots; three flush tasks queued, none run.
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
+        assert_eq!(immutable_count(&engine), 3);
+
+        std::thread::scope(|s| {
+            // Fourth write exceeds the cap and stalls.
+            let writer = s.spawn(|| {
+                engine.put(DbKey::Int(4), DbValue::Int(40)).unwrap();
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!writer.is_finished(), "fourth write should stall at the cap");
+
+            // Completing just the oldest flush frees one slot — enough to admit
+            // the stalled writer, which then seals its own memtable (back to 3).
+            exec.run_one();
+            writer.join().unwrap();
+        });
+
+        // One SSTable on disk (the one flush we ran); the queue is full again
+        // because the woken writer sealed a fresh immutable.
+        assert_eq!(l0_ids(&engine).len(), 1, "only one flush should have run");
+        assert_eq!(immutable_count(&engine), 3, "woken writer refilled the slot");
+
+        for (k, v) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            assert_eq!(engine.get(&DbKey::Int(k)).unwrap(), Some(DbValue::Int(v)));
+        }
+    }
+
+    /// A newer memtable's flush completing while an older one is still pending
+    /// must *not* free a slot: retirement is oldest-first, so the newer one stays
+    /// queued (its data durable in an SSTable, but its WAL segment retained)
+    /// until the older gap fills. This is the crash-safety invariant that keeps
+    /// surviving WAL segments a contiguous newest-suffix.
+    #[test]
+    fn newer_flush_does_not_retire_past_older_pending_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone(), 4); // cap = 3
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        assert_eq!(immutable_count(&engine), 2);
+
+        // Run only the newest task (last submitted). Its SSTable becomes durable,
+        // but the older immutable is still Pending, so nothing retires.
+        let newest_task = exec.tasks.lock().unwrap().pop().unwrap();
+        newest_task();
+
+        assert_eq!(
+            immutable_count(&engine),
+            2,
+            "newer flush must not retire while an older one is pending"
+        );
+        assert_eq!(l0_ids(&engine).len(), 1, "newer SSTable is durable");
+        assert_eq!(
+            engine.inner.memset.read().unwrap().immutable.len(),
+            2,
+            "both immutables remain queued until the older one flushes"
+        );
+
+        // Now run the remaining (older) task: it retires, then cascades to the
+        // already-durable newer one. Queue drains fully.
+        exec.run_all();
+        assert_eq!(immutable_count(&engine), 0, "older flush cascades the retire");
+        assert_eq!(l0_ids(&engine).len(), 2);
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+        assert_eq!(engine.get(&DbKey::Int(2)).unwrap(), Some(DbValue::Int(20)));
+    }
+
+    // --- Concurrent flush: shutdown with writers stalled (test set #8) ---------
+
+    /// Shutdown must release *every* writer stalled on backpressure, not just
+    /// one: with the queue full and several writers waiting, the queued flushes
+    /// may never run once shutting down, so each stalled writer must be woken.
+    #[test]
+    fn shutdown_releases_all_writers_stalled_on_backpressure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone(), 4); // cap = 3
+
+        // Fill the three slots; no flush runs.
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
+        assert_eq!(immutable_count(&engine), 3);
+
+        std::thread::scope(|s| {
+            // Three writers all need to seal but the queue is full — all stall.
+            let engine = &engine;
+            let writers: Vec<_> = (4..7)
+                .map(|k| {
+                    s.spawn(move || {
+                        engine.put(DbKey::Int(k), DbValue::Int(k * 10)).unwrap();
+                    })
+                })
+                .collect();
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                writers.iter().all(|w| !w.is_finished()),
+                "all writers should be stalled while the queue is full"
+            );
+
+            // Without waking every stalled writer, some joins would hang forever.
+            engine.shutdown();
+            for w in writers {
+                w.join().unwrap();
+            }
+        });
     }
 }
