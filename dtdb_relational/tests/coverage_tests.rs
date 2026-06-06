@@ -979,6 +979,9 @@ fn test_background_flush_persists_memtables() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let db = Arc::new(Database::open_with_options(db_path.clone(), options).unwrap());

@@ -2711,6 +2711,9 @@ fn opts_with_budget(memory_budget: Option<usize>) -> dtdb_relational::DatabaseOp
         wal_sync_interval_ms: None,
         memory_budget,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     }
 }
 
@@ -2753,6 +2756,9 @@ fn test_cbo_index_selection_by_cardinality() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -2869,6 +2875,9 @@ fn test_cbo_locality_group_pruning_performance() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let (_temp, db, engine) = setup_engine_with_options(options);
@@ -4135,6 +4144,9 @@ fn test_external_sort_basic() {
         wal_sync_interval_ms: None,
         memory_budget: Some(200), // very small budget to force spills
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -4224,6 +4236,9 @@ fn test_external_sort_desc() {
         wal_sync_interval_ms: None,
         memory_budget: Some(200), // force spills
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -4288,6 +4303,9 @@ fn test_external_sort_multi_key() {
         wal_sync_interval_ms: None,
         memory_budget: Some(100), // force spills
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());
@@ -4353,6 +4371,9 @@ fn test_external_sort_empty_and_single() {
         wal_sync_interval_ms: None,
         memory_budget: Some(200),
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let db = Arc::new(Database::open_with_options(db_path, options).unwrap());

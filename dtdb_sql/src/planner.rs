@@ -203,6 +203,15 @@ impl LogicalPlanner {
                                                 "l0_compaction_threshold" => {
                                                     opts.l0_compaction_threshold = Some(val.parse::<usize>().map_err(|e| format!("Invalid l0_compaction_threshold: {}", e))?);
                                                 }
+                                                "l0_slowdown_writes_trigger" => {
+                                                    opts.l0_slowdown_writes_trigger = Some(val.parse::<usize>().map_err(|e| format!("Invalid l0_slowdown_writes_trigger: {}", e))?);
+                                                }
+                                                "l0_stop_writes_trigger" => {
+                                                    opts.l0_stop_writes_trigger = Some(val.parse::<usize>().map_err(|e| format!("Invalid l0_stop_writes_trigger: {}", e))?);
+                                                }
+                                                "l0_slowdown_max_sleep_ms" => {
+                                                    opts.l0_slowdown_max_sleep_ms = Some(val.parse::<usize>().map_err(|e| format!("Invalid l0_slowdown_max_sleep_ms: {}", e))?);
+                                                }
                                                 "sstable_target_size" => {
                                                     opts.sstable_target_size = Some(
                                                         val.parse::<usize>().map_err(|e| {

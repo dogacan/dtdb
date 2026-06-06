@@ -38,6 +38,9 @@ fn get_test_options() -> EngineOptions {
         // One immutable slot keeps these recovery tests' segment counts
         // deterministic; they exercise recovery, not write backpressure.
         max_write_buffer_number: 2,
+        l0_slowdown_writes_trigger: 8,
+        l0_stop_writes_trigger: 16,
+        l0_slowdown_max_sleep_ms: 16,
     }
 }
 

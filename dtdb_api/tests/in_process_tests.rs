@@ -46,6 +46,9 @@ fn test_in_process_client_integration() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
     let create_opt_resp = client.create_db_with_options("db_opt", options).unwrap();
     assert!(create_opt_resp.success);

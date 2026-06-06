@@ -67,6 +67,9 @@ async fn test_wal_size_based_flush() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let create_resp = client
@@ -173,6 +176,9 @@ async fn test_periodic_time_based_flush() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let create_resp = client
@@ -281,6 +287,9 @@ async fn test_manual_rpc_flush() {
         wal_sync_interval_ms: None,
         memory_budget: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        l0_slowdown_writes_trigger: None,
+        l0_stop_writes_trigger: None,
+        l0_slowdown_max_sleep_ms: None,
     };
 
     let create_resp = client

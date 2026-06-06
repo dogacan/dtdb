@@ -127,6 +127,8 @@ fn test_sstable_splitting_by_target_size() {
         max_level: 7,
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        l0_slowdown_writes_trigger: 10,
+        l0_stop_writes_trigger: 16,
         ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
@@ -184,6 +186,8 @@ fn test_tombstone_purging() {
         max_level: 2, // max level is 2
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
+        l0_slowdown_writes_trigger: 10,
+        l0_stop_writes_trigger: 16,
         ..Default::default()
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();

@@ -177,6 +177,8 @@ struct EngineInner {
     /// Lifecycle gate for background work (compaction, periodic WAL sync). See
     /// [`BackgroundGate`].
     background: BackgroundGate,
+    /// Backpressure gate stalling writers when the Level 0 file count is too high.
+    l0_gate: L0WriteStallGate,
 }
 
 /// Tracks in-flight background work so the engine can be *quiesced*.
@@ -270,6 +272,26 @@ impl FlushGate {
                 shutting_down: false,
             }),
             slot_freed: Condvar::new(),
+        }
+    }
+}
+
+struct L0WriteStallGate {
+    state: Mutex<L0WriteStallGateState>,
+    condvar: Condvar,
+}
+
+struct L0WriteStallGateState {
+    shutting_down: bool,
+}
+
+impl L0WriteStallGate {
+    fn new() -> Self {
+        L0WriteStallGate {
+            state: Mutex::new(L0WriteStallGateState {
+                shutting_down: false,
+            }),
+            condvar: Condvar::new(),
         }
     }
 }
@@ -431,13 +453,27 @@ impl EngineInner {
         let options_path = dir_path.join("options.bin");
         let active_options = if options_path.exists() {
             let bytes = fs::read(&options_path)?;
-            postcard::from_bytes::<EngineOptions>(&bytes)?
+            let mut opts = postcard::from_bytes::<EngineOptions>(&bytes)?;
+            if opts.l0_slowdown_writes_trigger < opts.l0_compaction_threshold {
+                opts.l0_slowdown_writes_trigger = opts.l0_compaction_threshold;
+            }
+            if opts.l0_stop_writes_trigger <= opts.l0_slowdown_writes_trigger {
+                opts.l0_stop_writes_trigger = opts.l0_slowdown_writes_trigger + 8;
+            }
+            opts
         } else {
+            let mut opts = options;
+            if opts.l0_slowdown_writes_trigger < opts.l0_compaction_threshold {
+                opts.l0_slowdown_writes_trigger = opts.l0_compaction_threshold;
+            }
+            if opts.l0_stop_writes_trigger <= opts.l0_slowdown_writes_trigger {
+                opts.l0_stop_writes_trigger = opts.l0_slowdown_writes_trigger + 8;
+            }
             // Reject invalid options before persisting them to disk.
-            options.validate()?;
-            let bytes = postcard::to_allocvec(&options)?;
-            crate::atomic_write(&options_path, &bytes, options.fsync_method)?;
-            options
+            opts.validate()?;
+            let bytes = postcard::to_allocvec(&opts)?;
+            crate::atomic_write(&options_path, &bytes, opts.fsync_method)?;
+            opts
         };
         // Re-validate the options actually in effect; this also guards against a
         // corrupted or legacy `options.bin` carrying panic-inducing values.
@@ -673,11 +709,14 @@ impl EngineInner {
             block_cache,
             last_compacted_keys: Mutex::new(std::collections::HashMap::new()),
             background: BackgroundGate::new(),
+            l0_gate: L0WriteStallGate::new(),
         })
     }
 
     pub fn put(self: &Arc<Self>, key: DbKey, value: DbValue) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
+        self.await_l0_limit();
+        self.maybe_slowdown_writes();
 
         let wal_size = {
             let mut wal = self.wal.lock().unwrap();
@@ -706,6 +745,8 @@ impl EngineInner {
 
     pub fn delete(self: &Arc<Self>, key: DbKey) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
+        self.await_l0_limit();
+        self.maybe_slowdown_writes();
 
         let wal_size = {
             let mut wal = self.wal.lock().unwrap();
@@ -734,6 +775,8 @@ impl EngineInner {
         }
 
         let _write_lock = self.write_mutex.lock().unwrap();
+        self.await_l0_limit();
+        self.maybe_slowdown_writes();
 
         let wal_size = {
             let mut wal = self.wal.lock().unwrap();
@@ -1563,6 +1606,7 @@ impl EngineInner {
                 .insert(source_level, max_k.clone());
         }
 
+        self.l0_gate.condvar.notify_all();
         Ok(())
     }
 
@@ -1913,6 +1957,36 @@ impl EngineInner {
         Some(BackgroundGuard { inner: self })
     }
 
+    fn await_l0_limit(&self) {
+        let stop_trigger = self.options.l0_stop_writes_trigger;
+        let mut st = self.l0_gate.state.lock().unwrap();
+        while !st.shutting_down {
+            let l0_count = {
+                let ssts = self.sstables.read().unwrap();
+                ssts.get(&0).map_or(0, |list| list.len())
+            };
+            if l0_count < stop_trigger {
+                break;
+            }
+            st = self.l0_gate.condvar.wait(st).unwrap();
+        }
+    }
+
+    fn maybe_slowdown_writes(&self) {
+        let slowdown_trigger = self.options.l0_slowdown_writes_trigger;
+        let stop_trigger = self.options.l0_stop_writes_trigger;
+        let l0_count = {
+            let ssts = self.sstables.read().unwrap();
+            ssts.get(&0).map_or(0, |list| list.len())
+        };
+
+        if l0_count >= slowdown_trigger && l0_count < stop_trigger {
+            let diff = l0_count - slowdown_trigger;
+            let sleep_ms = (1u64 << diff).min(self.options.l0_slowdown_max_sleep_ms as u64);
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        }
+    }
+
     /// Quiesce all background work: stop scheduling, then block until any task
     /// that had already begun has finished. After this returns, no background
     /// task will touch engine state, so the directory can be safely reopened.
@@ -1930,6 +2004,12 @@ impl EngineInner {
             fg.shutting_down = true;
         }
         self.flush_gate.slot_freed.notify_all();
+
+        {
+            let mut st = self.l0_gate.state.lock().unwrap();
+            st.shutting_down = true;
+        }
+        self.l0_gate.condvar.notify_all();
 
         let mut st = self.background.state.lock().unwrap();
         st.shutting_down = true;
@@ -2797,6 +2877,152 @@ mod tests {
             for w in writers {
                 w.join().unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn test_l0_slowdown_exponential_sleep() {
+        let engine_dir = tempfile::TempDir::new().unwrap();
+        let sst_dir = tempfile::TempDir::new().unwrap();
+        let opts = EngineOptions {
+            l0_compaction_threshold: 2,
+            l0_slowdown_writes_trigger: 2,
+            l0_stop_writes_trigger: 6,
+            l0_slowdown_max_sleep_ms: 16,
+            ..EngineOptions::default()
+        };
+
+        let engine = StorageEngine::open(engine_dir.path(), opts).unwrap();
+        let sst = open_empty_index_sstable(sst_dir.path());
+
+        // 0 L0 files: no slowdown
+        let start = std::time::Instant::now();
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(5));
+
+        // Inject 2 L0 files -> slowdown sleep = 2^0 = 1ms
+        {
+            let mut ssts = engine.inner.sstables.write().unwrap();
+            ssts.insert(0, vec![sst.clone(), sst.clone()]);
+        }
+        let start = std::time::Instant::now();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(1));
+
+        // Inject 4 L0 files -> slowdown sleep = 2^2 = 4ms
+        {
+            let mut ssts = engine.inner.sstables.write().unwrap();
+            ssts.insert(0, vec![sst.clone(), sst.clone(), sst.clone(), sst.clone()]);
+        }
+        let start = std::time::Instant::now();
+        engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(4));
+
+        // Inject 5 L0 files -> slowdown sleep = 2^3 = 8ms
+        {
+            let mut ssts = engine.inner.sstables.write().unwrap();
+            ssts.insert(
+                0,
+                vec![
+                    sst.clone(),
+                    sst.clone(),
+                    sst.clone(),
+                    sst.clone(),
+                    sst.clone(),
+                ],
+            );
+        }
+        let start = std::time::Instant::now();
+        engine.put(DbKey::Int(4), DbValue::Int(40)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(8));
+    }
+
+    #[test]
+    fn test_l0_stop_writes_blocks_writer_until_compaction() {
+        let engine_dir = tempfile::TempDir::new().unwrap();
+        let sst_dir = tempfile::TempDir::new().unwrap();
+        let opts = EngineOptions {
+            l0_compaction_threshold: 2,
+            l0_slowdown_writes_trigger: 2,
+            l0_stop_writes_trigger: 3,
+            ..EngineOptions::default()
+        };
+
+        let engine = StorageEngine::open(engine_dir.path(), opts).unwrap();
+        let sst = open_empty_index_sstable(sst_dir.path());
+
+        // Inject 3 L0 files (reaches stop trigger)
+        {
+            let mut ssts = engine.inner.sstables.write().unwrap();
+            ssts.insert(0, vec![sst.clone(), sst.clone(), sst.clone()]);
+        }
+
+        std::thread::scope(|s| {
+            let engine = &engine;
+            let writer = s.spawn(move || {
+                engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+            });
+
+            // Wait a bit and verify writer is blocked/stalled
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!writer.is_finished());
+
+            // Clear L0 files to simulate compaction completion
+            {
+                let mut ssts = engine.inner.sstables.write().unwrap();
+                ssts.insert(0, vec![]);
+            }
+            engine.inner.l0_gate.condvar.notify_all();
+
+            // The writer should now unblock and finish
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(writer.is_finished());
+            writer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_l0_stop_writes_unblocks_on_shutdown() {
+        let engine_dir = tempfile::TempDir::new().unwrap();
+        let sst_dir = tempfile::TempDir::new().unwrap();
+        let opts = EngineOptions {
+            l0_compaction_threshold: 2,
+            l0_slowdown_writes_trigger: 2,
+            l0_stop_writes_trigger: 3,
+            ..EngineOptions::default()
+        };
+
+        let engine = StorageEngine::open(engine_dir.path(), opts).unwrap();
+        let sst = open_empty_index_sstable(sst_dir.path());
+
+        // Inject 3 L0 files (reaches stop trigger)
+        {
+            let mut ssts = engine.inner.sstables.write().unwrap();
+            ssts.insert(0, vec![sst.clone(), sst.clone(), sst.clone()]);
+        }
+
+        std::thread::scope(|s| {
+            let engine = &engine;
+            let writer = s.spawn(move || {
+                // This will block
+                let _ = engine.put(DbKey::Int(1), DbValue::Int(10));
+            });
+
+            // Wait a bit and verify writer is blocked/stalled
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!writer.is_finished());
+
+            // Shutdown the engine, which must unblock the stalled writer
+            engine.shutdown();
+
+            // The writer should now finish
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(writer.is_finished());
+            writer.join().unwrap();
         });
     }
 }

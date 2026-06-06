@@ -26,6 +26,9 @@ pub struct DatabaseOptions {
     pub analyze_frequency_ms: Option<u64>,
     pub wal_sync_interval_ms: Option<u64>,
     pub memory_budget: Option<usize>,
+    pub l0_slowdown_writes_trigger: Option<usize>,
+    pub l0_stop_writes_trigger: Option<usize>,
+    pub l0_slowdown_max_sleep_ms: Option<usize>,
 }
 ```
 
@@ -45,6 +48,9 @@ pub struct DatabaseOptions {
 | `max_level` | `7` | Hard cap on compaction depth. Beyond this, SSTables stay in `max_level`. |
 | `block_cache_capacity` | `1000` blocks | Process-wide LRU block cache shared across tables in this database. Each entry holds one decompressed block (≈ `block_size_limit` bytes). |
 | `wal_sync_interval_ms` | `None` (sync on every commit) | If set, the WAL fsync is batched to this interval instead of being driven by every transaction commit. Trades durability (up to `interval_ms` of work can be lost on crash) for throughput. |
+| `l0_slowdown_writes_trigger` | `None` (defaults to `8`) | Number of L0 SSTables that initiates write slowdown. |
+| `l0_stop_writes_trigger` | `None` (defaults to `16`) | Number of L0 SSTables that fully stalls writes. |
+| `l0_slowdown_max_sleep_ms` | `None` (defaults to `16`) | Maximum write slowdown sleep duration in milliseconds. |
 
 ### Transaction layer knobs
 
@@ -79,6 +85,9 @@ let options = DatabaseOptions {
     analyze_frequency_ms: Some(60_000),     // refresh stats every 60s
     wal_sync_interval_ms: None,
     memory_budget: None,
+    l0_slowdown_writes_trigger: None,
+    l0_stop_writes_trigger: None,
+    l0_slowdown_max_sleep_ms: None,
 };
 
 let db = Database::open_with_options("/tmp/dtdb-app", options)?;

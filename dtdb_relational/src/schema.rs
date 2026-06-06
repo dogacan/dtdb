@@ -103,6 +103,9 @@ pub struct LocalityGroupOptions {
     pub block_cache_capacity: Option<usize>,
     #[serde(default)]
     pub wal_sync_interval_ms: Option<Option<u64>>,
+    pub l0_slowdown_writes_trigger: Option<usize>,
+    pub l0_stop_writes_trigger: Option<usize>,
+    pub l0_slowdown_max_sleep_ms: Option<usize>,
 }
 
 impl LocalityGroupOptions {
@@ -134,6 +137,15 @@ impl LocalityGroupOptions {
             wal_sync_interval_ms: self
                 .wal_sync_interval_ms
                 .unwrap_or(defaults.wal_sync_interval_ms),
+            l0_slowdown_writes_trigger: self
+                .l0_slowdown_writes_trigger
+                .unwrap_or(defaults.l0_slowdown_writes_trigger),
+            l0_stop_writes_trigger: self
+                .l0_stop_writes_trigger
+                .unwrap_or(defaults.l0_stop_writes_trigger),
+            l0_slowdown_max_sleep_ms: self
+                .l0_slowdown_max_sleep_ms
+                .unwrap_or(defaults.l0_slowdown_max_sleep_ms),
             ..defaults
         }
     }
