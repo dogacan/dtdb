@@ -341,3 +341,78 @@ fn shutdown_drains_periodic_flush_so_late_tick_is_noop() {
         "a periodic flush tick after shutdown must not persist anything"
     );
 }
+
+/// The periodic ANALYZE task must be drained on shutdown just like the flush
+/// task: a tick firing afterward must not run (it would otherwise recompute and
+/// persist statistics for a database being torn down).
+///
+/// Self-evident and deterministic via the analyzed `row_count`: a tick fired
+/// *before* shutdown recomputes it (proving the captured tick is live), while a
+/// tick fired *after* shutdown leaves a table's baseline statistics untouched.
+#[test]
+fn shutdown_drains_periodic_analyze_so_late_tick_is_noop() {
+    let temp_dir = TempDir::new().unwrap();
+    let exec = Arc::new(PeriodicCapture::new());
+    let mut options = test_options();
+    options.analyze_frequency_ms = Some(50);
+    let db = Arc::new(
+        Database::open_with_options_and_executor(temp_dir.path(), options, exec.clone()).unwrap(),
+    );
+
+    // Table "t" with flushed data, so a real ANALYZE moves its row_count off the
+    // (zero) baseline that `create_table` seeds.
+    db.create_table("t", single_int_pk_schema()).unwrap();
+    let t_engine = db
+        .get_table("t")
+        .unwrap()
+        .engines
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    for i in 0..3 {
+        t_engine.put(DbKey::Int(i), DbValue::string("x")).unwrap();
+    }
+    t_engine.flush_memtable().unwrap();
+
+    // Register the periodic ANALYZE schedule (captured by PeriodicCapture).
+    db.start_background_analyze_if_needed(&db);
+
+    let t_row_count = |db: &Database| db.get_table_statistics("t").map(|s| s.row_count);
+    let t_before = t_row_count(&db);
+
+    // Firing the tick *before* shutdown runs ANALYZE, recomputing statistics —
+    // proving the captured tick is live.
+    exec.fire_all_periodics();
+    assert_ne!(
+        t_row_count(&db),
+        t_before,
+        "an ANALYZE tick before shutdown should recompute statistics (row_count)"
+    );
+
+    // Add a second table with data, capture its baseline, then quiesce.
+    db.create_table("u", single_int_pk_schema()).unwrap();
+    let u_engine = db
+        .get_table("u")
+        .unwrap()
+        .engines
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    for i in 0..3 {
+        u_engine.put(DbKey::Int(i), DbValue::string("x")).unwrap();
+    }
+    u_engine.flush_memtable().unwrap();
+    let u_baseline = db.get_table_statistics("u").map(|s| s.row_count);
+    db.shutdown();
+
+    // Firing the tick now must be a no-op: "u" keeps its baseline statistics
+    // because the ANALYZE tick observes the shutdown flag.
+    exec.fire_all_periodics();
+    assert_eq!(
+        db.get_table_statistics("u").map(|s| s.row_count),
+        u_baseline,
+        "a periodic ANALYZE tick after shutdown must not recompute statistics"
+    );
+}
