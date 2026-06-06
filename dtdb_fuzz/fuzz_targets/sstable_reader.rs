@@ -48,7 +48,14 @@ fn build_sstable(path: &std::path::Path, keys: &[i32], lz4: bool) -> dtdb_storag
     sorted.sort_unstable();
     sorted.dedup();
 
-    let mut w = SstableWriter::create(path, 256, compression, sorted.len(), vec![])?;
+    let mut w = SstableWriter::create(
+        path,
+        256,
+        compression,
+        sorted.len(),
+        vec![],
+        dtdb_storage::FsyncMethod::Fsync,
+    )?;
     for k in &sorted {
         w.append(&DbKey::Int(*k as i64), Some(&DbValue::Int(*k as i64 * 7)))?;
     }

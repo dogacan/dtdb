@@ -429,6 +429,7 @@ impl EngineInner {
                     active_options.compression,
                     memtable.len(),
                     vec![],
+                    active_options.fsync_method,
                 )?;
                 for (key, val) in memtable.entries() {
                     writer.append(&key, val.as_ref())?;
@@ -1224,6 +1225,7 @@ impl EngineInner {
                     self.options.compression,
                     expected_entries,
                     target_layout.clone(),
+                    self.options.fsync_method,
                 )?);
                 current_writer_uncompressed_bytes = 0;
             }
@@ -1344,6 +1346,7 @@ impl EngineInner {
             self.options.compression,
             map.len(),
             target_layout,
+            self.options.fsync_method,
         )?;
         for (key, val) in map.iter() {
             writer.append(key, val.as_ref())?;
@@ -1481,6 +1484,7 @@ mod tests {
             CompressionType::Uncompressed,
             0,
             Vec::new(),
+            crate::FsyncMethod::Fsync,
         )
         .unwrap();
         writer.finish().unwrap();
