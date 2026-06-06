@@ -147,6 +147,8 @@ fn engine_with_l1_files(db_path: &std::path::Path) -> StorageEngine {
         sstable_target_size: 1, // force one file per compacted key
         max_level: 4,
         block_cache_capacity: 0,
+        l0_slowdown_writes_trigger: 10,
+        l0_stop_writes_trigger: 16,
         ..base_options()
     };
     let engine = StorageEngine::open(db_path, options).unwrap();
@@ -308,6 +310,8 @@ fn open_with_rewriter(db_path: &std::path::Path) -> StorageEngine {
         l0_compaction_threshold: 10,
         max_level: 4,
         block_cache_capacity: 0,
+        l0_slowdown_writes_trigger: 10,
+        l0_stop_writes_trigger: 16,
         ..base_options()
     };
     let executor: Arc<dyn Executor> = default_executor();

@@ -421,6 +421,9 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
             wal_sync_interval_ms: None,
             memory_budget: None,
             fsync_method: FsyncMethod::default(),
+            l0_slowdown_writes_trigger: None,
+            l0_stop_writes_trigger: None,
+            l0_slowdown_max_sleep_ms: None,
         };
 
         let resp = self.catalog.create_db(db_name, options)?;
@@ -1164,6 +1167,9 @@ mod tests {
             wal_sync_interval_ms: None,
             memory_budget: None,
             fsync_method: dtdb_storage::FsyncMethod::default(),
+            l0_slowdown_writes_trigger: None,
+            l0_stop_writes_trigger: None,
+            l0_slowdown_max_sleep_ms: None,
         };
 
         // 1. Create DB invalid name
@@ -1237,6 +1243,9 @@ mod tests {
             wal_sync_interval_ms: None,
             memory_budget: None,
             fsync_method: dtdb_storage::FsyncMethod::default(),
+            l0_slowdown_writes_trigger: None,
+            l0_stop_writes_trigger: None,
+            l0_slowdown_max_sleep_ms: None,
         };
 
         // 1. DB not found

@@ -336,6 +336,12 @@ pub struct EngineOptions {
     /// memory and more WAL segments to replay after a crash. Must be >= 2.
     #[serde(default = "default_max_write_buffer_number")]
     pub max_write_buffer_number: usize,
+    #[serde(default = "default_l0_slowdown_writes_trigger")]
+    pub l0_slowdown_writes_trigger: usize,
+    #[serde(default = "default_l0_stop_writes_trigger")]
+    pub l0_stop_writes_trigger: usize,
+    #[serde(default = "default_l0_slowdown_max_sleep_ms")]
+    pub l0_slowdown_max_sleep_ms: usize,
 }
 
 /// Default for [`EngineOptions::max_write_buffer_number`]: one active plus three
@@ -344,6 +350,18 @@ pub struct EngineOptions {
 /// stalling, while keeping worst-case memtable memory modest.
 fn default_max_write_buffer_number() -> usize {
     4
+}
+
+fn default_l0_slowdown_writes_trigger() -> usize {
+    8
+}
+
+fn default_l0_stop_writes_trigger() -> usize {
+    16
+}
+
+fn default_l0_slowdown_max_sleep_ms() -> usize {
+    16
 }
 
 impl Default for EngineOptions {
@@ -362,6 +380,9 @@ impl Default for EngineOptions {
             wal_sync_interval_ms: None,
             fsync_method: FsyncMethod::default(),
             max_write_buffer_number: default_max_write_buffer_number(),
+            l0_slowdown_writes_trigger: default_l0_slowdown_writes_trigger(),
+            l0_stop_writes_trigger: default_l0_stop_writes_trigger(),
+            l0_slowdown_max_sleep_ms: default_l0_slowdown_max_sleep_ms(),
         }
     }
 }
@@ -406,6 +427,18 @@ impl EngineOptions {
         require(
             self.l0_compaction_threshold > 0,
             "l0_compaction_threshold must be > 0",
+        )?;
+        require(
+            self.l0_compaction_threshold <= self.l0_slowdown_writes_trigger,
+            "l0_compaction_threshold must be <= l0_slowdown_writes_trigger",
+        )?;
+        require(
+            self.l0_slowdown_writes_trigger < self.l0_stop_writes_trigger,
+            "l0_slowdown_writes_trigger must be < l0_stop_writes_trigger",
+        )?;
+        require(
+            self.l0_slowdown_max_sleep_ms > 0,
+            "l0_slowdown_max_sleep_ms must be > 0",
         )?;
         // Needs at least one active plus one immutable memtable; otherwise the
         // immutable cap (`max_write_buffer_number - 1`) is zero and the write
@@ -716,6 +749,30 @@ mod tests {
             "multiplier too large",
             EngineOptions {
                 level_size_multiplier: MAX_LEVEL_SIZE_MULTIPLIER + 1,
+                ..base()
+            },
+        );
+        reject(
+            "l0_compaction_threshold > l0_slowdown_writes_trigger",
+            EngineOptions {
+                l0_compaction_threshold: 5,
+                l0_slowdown_writes_trigger: 4,
+                l0_stop_writes_trigger: 10,
+                ..base()
+            },
+        );
+        reject(
+            "l0_slowdown_writes_trigger >= l0_stop_writes_trigger",
+            EngineOptions {
+                l0_slowdown_writes_trigger: 10,
+                l0_stop_writes_trigger: 10,
+                ..base()
+            },
+        );
+        reject(
+            "l0_slowdown_max_sleep_ms == 0",
+            EngineOptions {
+                l0_slowdown_max_sleep_ms: 0,
                 ..base()
             },
         );

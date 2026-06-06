@@ -1057,6 +1057,12 @@ pub struct DatabaseOptions {
     pub memory_budget: Option<usize>,
     #[serde(default)]
     pub fsync_method: FsyncMethod,
+    #[serde(default)]
+    pub l0_slowdown_writes_trigger: Option<usize>,
+    #[serde(default)]
+    pub l0_stop_writes_trigger: Option<usize>,
+    #[serde(default)]
+    pub l0_slowdown_max_sleep_ms: Option<usize>,
 }
 
 /// Default background WAL-sync interval (milliseconds) for the internal
@@ -1272,6 +1278,9 @@ impl Database {
                 wal_sync_interval_ms: None,
                 memory_budget: None,
                 fsync_method: FsyncMethod::default(),
+                l0_slowdown_writes_trigger: None,
+                l0_stop_writes_trigger: None,
+                l0_slowdown_max_sleep_ms: None,
             }
         };
         Self::open_with_options_and_executor(dir_path, options, executor)
@@ -1356,7 +1365,9 @@ impl Database {
                             options.wal_sync_interval_ms,
                         ),
                         fsync_method: options.fsync_method,
-                        // Storage default; not yet exposed via DatabaseOptions.
+                        l0_slowdown_writes_trigger: options.l0_slowdown_writes_trigger.unwrap_or(8),
+                        l0_stop_writes_trigger: options.l0_stop_writes_trigger.unwrap_or(16),
+                        l0_slowdown_max_sleep_ms: options.l0_slowdown_max_sleep_ms.unwrap_or(16),
                         ..Default::default()
                     };
 
@@ -1531,7 +1542,9 @@ impl Database {
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
             wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
             fsync_method: self.options.fsync_method,
-            // Storage default; not yet exposed via DatabaseOptions.
+            l0_slowdown_writes_trigger: self.options.l0_slowdown_writes_trigger.unwrap_or(8),
+            l0_stop_writes_trigger: self.options.l0_stop_writes_trigger.unwrap_or(16),
+            l0_slowdown_max_sleep_ms: self.options.l0_slowdown_max_sleep_ms.unwrap_or(16),
             ..Default::default()
         };
 
@@ -2538,7 +2551,9 @@ impl Database {
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
             wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
             fsync_method: self.options.fsync_method,
-            // Storage default; not yet exposed via DatabaseOptions.
+            l0_slowdown_writes_trigger: self.options.l0_slowdown_writes_trigger.unwrap_or(8),
+            l0_stop_writes_trigger: self.options.l0_stop_writes_trigger.unwrap_or(16),
+            l0_slowdown_max_sleep_ms: self.options.l0_slowdown_max_sleep_ms.unwrap_or(16),
             ..Default::default()
         };
 

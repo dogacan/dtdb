@@ -28,6 +28,9 @@ fn main() {
         wal_sync_interval_ms: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
         max_write_buffer_number: 4,
+        l0_slowdown_writes_trigger: 8,
+        l0_stop_writes_trigger: 16,
+        l0_slowdown_max_sleep_ms: 16,
     };
     let engine = match StorageEngine::open(db_path, options) {
         Ok(eng) => eng,
