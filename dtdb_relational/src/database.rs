@@ -1356,6 +1356,8 @@ impl Database {
                             options.wal_sync_interval_ms,
                         ),
                         fsync_method: options.fsync_method,
+                        // Storage default; not yet exposed via DatabaseOptions.
+                        ..Default::default()
                     };
 
                     let mut engines = HashMap::new();
@@ -1529,6 +1531,8 @@ impl Database {
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
             wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
             fsync_method: self.options.fsync_method,
+            // Storage default; not yet exposed via DatabaseOptions.
+            ..Default::default()
         };
 
         let mut engines = HashMap::new();
@@ -2534,6 +2538,8 @@ impl Database {
             block_cache_capacity: self.options.block_cache_capacity.unwrap_or(1000),
             wal_sync_interval_ms: engine_wal_sync_interval(self.options.wal_sync_interval_ms),
             fsync_method: self.options.fsync_method,
+            // Storage default; not yet exposed via DatabaseOptions.
+            ..Default::default()
         };
 
         // 6. Create index directory

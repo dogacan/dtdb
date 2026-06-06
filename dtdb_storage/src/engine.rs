@@ -53,16 +53,6 @@ fn parse_wal_segment_id(path: &Path) -> Option<u64> {
         .ok()
 }
 
-/// Maximum number of immutable (sealed but not-yet-flushed) memtables allowed to
-/// accumulate before writers stall. LevelDB keeps exactly one immutable memtable
-/// and blocks the writer until the in-flight flush finishes; we match that here.
-///
-/// This is the cap that a configurable `max_write_buffer_number` would later
-/// raise (the immutable cap is `max_write_buffer_number - 1`). The machinery —
-/// the `VecDeque` queue and the [`FlushGate`] counter — is already general over
-/// any cap, so raising it is a one-line change rather than a rearchitecture.
-const MAX_IMMUTABLE_MEMTABLES: usize = 1;
-
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
@@ -86,11 +76,9 @@ struct ImmMemtable {
 /// queue mirrors the segments on disk that have not yet been retired.
 ///
 /// A full active memtable is sealed into `immutable` and flushed by a background
-/// task, so writes don't block on flush I/O. The queue is bounded at
-/// [`MAX_IMMUTABLE_MEMTABLES`]; a writer that needs to seal when the queue is
-/// full stalls (see [`FlushGate`]) until a flush drains a slot. With today's cap
-/// of one, `immutable` holds at most a single memtable, but the queue and the
-/// read-side merge are already general over a larger cap.
+/// task, so writes don't block on flush I/O. The queue holds up to
+/// `max_write_buffer_number - 1` memtables; a writer that needs to seal when the
+/// queue is full stalls (see [`FlushGate`]) until a flush drains a slot.
 struct MemSet {
     active: Arc<MemTable>,
     immutable: VecDeque<ImmMemtable>,
@@ -200,10 +188,10 @@ impl Drop for BackgroundGuard<'_> {
 /// `immutable_count` mirrors the length of [`MemSet::immutable`] but lives under
 /// its own mutex so it can pair with a condvar without serializing the read-side
 /// `memset` `RwLock`. A writer that needs to seal a full active memtable blocks
-/// on `slot_freed` until `immutable_count` drops below
-/// [`MAX_IMMUTABLE_MEMTABLES`]; a completing flush decrements the count and wakes
-/// it. This is the LevelDB-style hard stall: writes wait for flushes to catch up
-/// rather than letting the queue (and memory) grow without bound.
+/// on `slot_freed` until `immutable_count` drops below the cap
+/// (`max_write_buffer_number - 1`); a completing flush decrements the count and
+/// wakes it. This is the LevelDB-style hard stall: writes wait for flushes to
+/// catch up rather than letting the queue (and memory) grow without bound.
 struct FlushGate {
     state: Mutex<FlushGateState>,
     /// Signalled when a flush frees an immutable slot, or on shutdown.
@@ -1545,15 +1533,24 @@ impl EngineInner {
         Ok(())
     }
 
+    /// Maximum number of immutable memtables allowed in the queue before writers
+    /// stall: `max_write_buffer_number - 1` (the rest being the one active
+    /// memtable). `saturating_sub` is defensive — `validate` already requires
+    /// `max_write_buffer_number >= 2`, so this is at least 1.
+    fn immutable_cap(&self) -> usize {
+        self.options.max_write_buffer_number.saturating_sub(1)
+    }
+
     /// Block until the immutable queue has room for another sealed memtable
-    /// (fewer than [`MAX_IMMUTABLE_MEMTABLES`]). Returns immediately once the
-    /// engine is shutting down so a stalled writer can't outlive the flusher.
+    /// (fewer than [`Self::immutable_cap`]). Returns immediately once the engine
+    /// is shutting down so a stalled writer can't outlive the flusher.
     ///
     /// Caller holds `write_mutex`; this keeps holding it across the wait, which
     /// is the intended backpressure — every writer stalls until a slot frees.
     fn await_flush_slot(&self) {
+        let cap = self.immutable_cap();
         let mut st = self.flush_gate.state.lock().unwrap();
-        while st.immutable_count >= MAX_IMMUTABLE_MEMTABLES && !st.shutting_down {
+        while st.immutable_count >= cap && !st.shutting_down {
             st = self.flush_gate.slot_freed.wait(st).unwrap();
         }
     }
@@ -2115,20 +2112,26 @@ mod tests {
 
     /// Options whose memtable is so small that any single write overflows it and
     /// triggers a flush, with WAL syncing off so the manual executor stays idle
-    /// until a flush is scheduled.
-    fn tiny_memtable_options() -> EngineOptions {
+    /// until a flush is scheduled. `max_write_buffer_number` sets the immutable
+    /// cap (`max_write_buffer_number - 1`).
+    fn tiny_memtable_options(max_write_buffer_number: usize) -> EngineOptions {
         EngineOptions {
             memtable_size_limit: 5,
             wal_size_limit: 64 * 1024 * 1024,
             wal_sync_interval_ms: None,
+            max_write_buffer_number,
             ..Default::default()
         }
     }
 
-    fn open_manual(dir: &std::path::Path, exec: Arc<ManualExecutor>) -> StorageEngine {
+    fn open_manual(
+        dir: &std::path::Path,
+        exec: Arc<ManualExecutor>,
+        max_write_buffer_number: usize,
+    ) -> StorageEngine {
         StorageEngine::open_with_executor(
             dir,
-            tiny_memtable_options(),
+            tiny_memtable_options(max_write_buffer_number),
             exec,
             Arc::new(crate::PassthroughValueRewriter),
         )
@@ -2152,7 +2155,7 @@ mod tests {
     fn background_flush_is_deferred_and_completes_on_drain() {
         let dir = tempfile::TempDir::new().unwrap();
         let exec = Arc::new(ManualExecutor::new());
-        let engine = open_manual(dir.path(), exec.clone());
+        let engine = open_manual(dir.path(), exec.clone(), 2);
 
         // Overflows the tiny memtable: seals it and schedules a flush, but the
         // ManualExecutor hasn't run anything yet.
@@ -2191,7 +2194,7 @@ mod tests {
     fn backpressure_stalls_writer_until_flush_frees_a_slot() {
         let dir = tempfile::TempDir::new().unwrap();
         let exec = Arc::new(ManualExecutor::new());
-        let engine = open_manual(dir.path(), exec.clone());
+        let engine = open_manual(dir.path(), exec.clone(), 2);
 
         // Fill the only immutable slot (cap = 1); leave the flush un-run.
         engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
@@ -2227,7 +2230,7 @@ mod tests {
     fn shutdown_releases_writer_stalled_on_backpressure() {
         let dir = tempfile::TempDir::new().unwrap();
         let exec = Arc::new(ManualExecutor::new());
-        let engine = open_manual(dir.path(), exec.clone());
+        let engine = open_manual(dir.path(), exec.clone(), 2);
 
         engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
         assert_eq!(immutable_count(&engine), 1);
@@ -2244,5 +2247,54 @@ mod tests {
             engine.shutdown();
             writer.join().unwrap();
         });
+    }
+
+    /// `max_write_buffer_number` raises the cap: with N=4 the write path can seal
+    /// three immutable memtables before it stalls on the fourth, where cap=1
+    /// would stall on the second.
+    #[test]
+    fn larger_cap_buffers_multiple_seals_before_stalling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        // max_write_buffer_number = 4 -> immutable cap = 3.
+        let engine = open_manual(dir.path(), exec.clone(), 4);
+
+        // Three flush-triggering writes fill the three slots without stalling,
+        // even though no flush has run yet.
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
+        assert_eq!(
+            immutable_count(&engine),
+            3,
+            "three slots should fill freely"
+        );
+        assert_eq!(
+            engine.get_statistics().unwrap().num_sstables,
+            0,
+            "no flush has run yet"
+        );
+
+        std::thread::scope(|s| {
+            // The fourth write exceeds the cap and must stall.
+            let writer = s.spawn(|| {
+                engine.put(DbKey::Int(4), DbValue::Int(40)).unwrap();
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !writer.is_finished(),
+                "fourth write should stall at the cap of three"
+            );
+
+            // Draining frees slots and unblocks the writer.
+            exec.run_all();
+            writer.join().unwrap();
+        });
+
+        // All four writes are visible regardless of where they ended up.
+        for (k, v) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            assert_eq!(engine.get(&DbKey::Int(k)).unwrap(), Some(DbValue::Int(v)));
+        }
     }
 }
