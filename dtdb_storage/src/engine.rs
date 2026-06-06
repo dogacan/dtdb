@@ -5,7 +5,7 @@ use crate::snapshot_log::SnapshotLog;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
 use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, StorageError, ValueRewriter};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,9 +57,38 @@ pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
 
+/// A sealed memtable awaiting (or undergoing) flush to L0, paired with the id of
+/// the WAL segment that holds its writes. The segment is retired once the
+/// memtable's data is durable in an SSTable. Cheap to clone (an `Arc` and a
+/// `u64`), so a copy can sit in the queue while another is handed to the flush.
+#[derive(Clone)]
+struct ImmMemtable {
+    table: Arc<MemTable>,
+    wal_id: u64,
+}
+
+/// The in-memory write buffers: one mutable `active` memtable plus a queue of
+/// `immutable` memtables that have been sealed and are awaiting flush to L0.
+///
+/// Writes always land in `active`. Reads merge newest-to-oldest: `active` first,
+/// then `immutable` from front (newest) to back (oldest), then the on-disk
+/// SSTables. Each sealed memtable corresponds to a sealed WAL segment, so the
+/// queue mirrors the segments on disk that have not yet been retired.
+///
+/// Flush is currently synchronous (it runs inline under `write_mutex`), so
+/// `immutable` holds at most one memtable and only transiently — between sealing
+/// the active memtable and the flush completing. The queue nonetheless exists so
+/// the read path already merges over sealed-but-unflushed memtables. Moving the
+/// flush to a background thread (a later change) then needs no read-path work and
+/// only has to let the queue grow up to `max_write_buffer_number - 1`.
+struct MemSet {
+    active: Arc<MemTable>,
+    immutable: VecDeque<ImmMemtable>,
+}
+
 struct EngineInner {
     dir_path: PathBuf,
-    memtable: RwLock<Arc<MemTable>>,
+    memset: RwLock<MemSet>,
     wal: Mutex<Wal>,
     /// Id of the WAL segment that currently backs the active memtable. Updated
     /// under `write_mutex` when a flush rotates to a fresh segment.
@@ -528,7 +557,10 @@ impl EngineInner {
 
         Ok(Self {
             dir_path,
-            memtable: RwLock::new(memtable),
+            memset: RwLock::new(MemSet {
+                active: memtable,
+                immutable: VecDeque::new(),
+            }),
             wal: Mutex::new(wal),
             active_wal_id: AtomicU64::new(active_wal_id),
             next_wal_id: AtomicU64::new(next_wal_id),
@@ -557,17 +589,20 @@ impl EngineInner {
             wal.size()?
         };
 
-        let mem = self.memtable.read().unwrap();
-        mem.put(key, value);
-
+        // Hold the memset read lock only to record the write; drop it before any
+        // flush, which needs the write lock to rotate the active memtable.
+        // `write_mutex` (held for the whole call) keeps the two steps atomic
+        // against other writers.
         let trigger_flush = {
-            let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
+            let memset = self.memset.read().unwrap();
+            memset.active.put(key, value);
+            let mem_full = memset.active.byte_size() >= self.options.memtable_size_limit;
             let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
         };
 
         if trigger_flush {
-            self.flush_memtable_internal(&mem)?;
+            self.flush_memtable_internal()?;
         }
 
         Ok(())
@@ -582,17 +617,16 @@ impl EngineInner {
             wal.size()?
         };
 
-        let mem = self.memtable.read().unwrap();
-        mem.delete(key);
-
         let trigger_flush = {
-            let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
+            let memset = self.memset.read().unwrap();
+            memset.active.delete(key);
+            let mem_full = memset.active.byte_size() >= self.options.memtable_size_limit;
             let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
         };
 
         if trigger_flush {
-            self.flush_memtable_internal(&mem)?;
+            self.flush_memtable_internal()?;
         }
 
         Ok(())
@@ -611,8 +645,9 @@ impl EngineInner {
             wal.size()?
         };
 
-        {
-            let mem = self.memtable.read().unwrap();
+        let trigger_flush = {
+            let memset = self.memset.read().unwrap();
+            let mem = &memset.active;
             for entry in entries {
                 match entry {
                     WalEntry::Put { key, value } => mem.put(key, value),
@@ -620,18 +655,13 @@ impl EngineInner {
                     WalEntry::Batch(_) => {}
                 }
             }
-        }
-
-        let mem = self.memtable.read().unwrap();
-
-        let trigger_flush = {
             let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
             let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
         };
 
         if trigger_flush {
-            self.flush_memtable_internal(&mem)?;
+            self.flush_memtable_internal()?;
         }
 
         Ok(())
@@ -639,9 +669,17 @@ impl EngineInner {
 
     pub fn get(&self, key: &DbKey) -> Result<Option<DbValue>> {
         {
-            let mem = self.memtable.read().unwrap();
-            if let Some(res) = mem.get(key) {
+            // Newest-to-oldest: active memtable, then immutable memtables
+            // (front = newest). A hit — value or tombstone — shadows everything
+            // below it.
+            let memset = self.memset.read().unwrap();
+            if let Some(res) = memset.active.get(key) {
                 return Ok(res);
+            }
+            for imm in &memset.immutable {
+                if let Some(res) = imm.table.get(key) {
+                    return Ok(res);
+                }
             }
         }
 
@@ -720,18 +758,28 @@ impl EngineInner {
         let mut results = vec![None; keys.len()];
         let mut remaining_indices: Vec<usize> = (0..keys.len()).collect();
 
-        // 1. Check Memtable under a single read lock
+        // 1. Check the in-memory buffers under a single read lock, newest-to-
+        // oldest: active memtable first, then immutable memtables (front =
+        // newest). The first buffer to hold a key resolves it (a tombstone
+        // resolves to `None`), so it is removed from the remaining set.
         {
-            let mem = self.memtable.read().unwrap();
-            let mut i = 0;
-            while i < remaining_indices.len() {
-                let idx = remaining_indices[i];
-                let key = &keys[idx];
-                if let Some(res) = mem.get(key) {
-                    results[idx] = res;
-                    remaining_indices.swap_remove(i);
-                } else {
-                    i += 1;
+            let memset = self.memset.read().unwrap();
+            let mems = std::iter::once(memset.active.as_ref())
+                .chain(memset.immutable.iter().map(|imm| imm.table.as_ref()));
+            for mem in mems {
+                if remaining_indices.is_empty() {
+                    break;
+                }
+                let mut i = 0;
+                while i < remaining_indices.len() {
+                    let idx = remaining_indices[i];
+                    let key = &keys[idx];
+                    if let Some(res) = mem.get(key) {
+                        results[idx] = res;
+                        remaining_indices.swap_remove(i);
+                    } else {
+                        i += 1;
+                    }
                 }
             }
         }
@@ -836,8 +884,7 @@ impl EngineInner {
     }
 
     pub fn scan_iter(&self, start: &DbKey, end: &DbKey) -> Result<ScanIterator> {
-        let mem = self.memtable.read().unwrap();
-        let mem_entries = mem.scan_range_raw(start, end);
+        let mem_entries = self.snapshot_mem_range(start, end);
 
         let sstables_map = self.sstables.read().unwrap();
         let mut sst_iters = Vec::new();
@@ -914,13 +961,22 @@ impl EngineInner {
         let mut results = BTreeMap::new();
 
         {
-            let mem = self.memtable.read().unwrap();
-            for (k, v) in mem.scan_range_raw(start, end) {
-                seen.insert(k.clone());
-                if let Some(val) = v
-                    && filter(&k, &val)
-                {
-                    results.insert(k, val);
+            // Newest-to-oldest across the in-memory buffers: active memtable,
+            // then immutable memtables (front = newest). `seen.insert` returns
+            // false once a key has been resolved by a newer buffer, so older
+            // copies — including tombstones that must still shadow the SSTables
+            // below — are recorded once and never overwritten.
+            let memset = self.memset.read().unwrap();
+            let mems = std::iter::once(memset.active.as_ref())
+                .chain(memset.immutable.iter().map(|imm| imm.table.as_ref()));
+            for mem in mems {
+                for (k, v) in mem.scan_range_raw(start, end) {
+                    if seen.insert(k.clone())
+                        && let Some(val) = v
+                        && filter(&k, &val)
+                    {
+                        results.insert(k, val);
+                    }
                 }
             }
         }
@@ -992,8 +1048,7 @@ impl EngineInner {
 
     pub fn flush_memtable(self: &Arc<Self>) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
-        let mem = self.memtable.read().unwrap();
-        self.flush_memtable_internal(&mem)?;
+        self.flush_memtable_internal()?;
         Ok(())
     }
 
@@ -1001,8 +1056,7 @@ impl EngineInner {
         // 1. Flush active memtable to disk first so all data is in SSTables (holds write_mutex).
         {
             let _write_lock = self.write_mutex.lock().unwrap();
-            let mem = self.memtable.read().unwrap();
-            self.flush_memtable_internal_no_trigger(&mem)?;
+            self.flush_memtable_internal_no_trigger()?;
         }
 
         // 2. Run compaction synchronously
@@ -1035,7 +1089,7 @@ impl EngineInner {
 
     pub fn get_statistics(&self) -> Result<StorageEngineStatistics> {
         let sstables_guard = self.sstables.read().unwrap();
-        let memtable_guard = self.memtable.read().unwrap();
+        let memset_guard = self.memset.read().unwrap();
 
         let mut num_sstables = 0;
         let mut total_sstable_size = 0;
@@ -1054,8 +1108,19 @@ impl EngineInner {
             }
         }
 
-        let (memtable_entries, memtable_tombstones) = memtable_guard.entry_counts();
-        let memtable_uncompressed_bytes = memtable_guard.byte_size() as u64;
+        // Account for every resident buffer: the active memtable plus any
+        // immutable memtables still awaiting flush.
+        let mut memtable_entries = 0;
+        let mut memtable_tombstones = 0;
+        let mut memtable_uncompressed_bytes = 0u64;
+        for mem in std::iter::once(memset_guard.active.as_ref())
+            .chain(memset_guard.immutable.iter().map(|imm| imm.table.as_ref()))
+        {
+            let (entries, tombstones) = mem.entry_counts();
+            memtable_entries += entries;
+            memtable_tombstones += tombstones;
+            memtable_uncompressed_bytes += mem.byte_size() as u64;
+        }
 
         Ok(StorageEngineStatistics {
             num_sstables,
@@ -1397,17 +1462,94 @@ impl EngineInner {
         Ok(())
     }
 
-    fn flush_memtable_internal(self: &Arc<Self>, mem: &MemTable) -> Result<()> {
-        self.flush_memtable_internal_no_trigger(mem)?;
+    fn flush_memtable_internal(self: &Arc<Self>) -> Result<()> {
+        self.flush_memtable_internal_no_trigger()?;
         self.trigger_compaction();
         Ok(())
     }
 
-    fn flush_memtable_internal_no_trigger(&self, mem: &MemTable) -> Result<()> {
-        let map = mem.map.read().unwrap();
-        if map.is_empty() {
+    /// Synchronously flush the active memtable to L0: seal it into the immutable
+    /// queue (rotating to a fresh active memtable and WAL segment), then write it
+    /// out and retire its segment. A no-op when the active memtable is empty.
+    ///
+    /// Caller must hold `write_mutex`.
+    fn flush_memtable_internal_no_trigger(&self) -> Result<()> {
+        let Some(imm) = self.seal_active()? else {
             return Ok(());
+        };
+        self.flush_immutable(&imm)
+    }
+
+    /// Seal the active memtable: move it into the immutable queue (newest at the
+    /// front) and install a fresh, empty active memtable backed by a new WAL
+    /// segment so subsequent writes have somewhere to go. Returns the sealed
+    /// memtable paired with its WAL-segment id, or `None` if the active memtable
+    /// was empty (nothing to seal).
+    ///
+    /// Caller must hold `write_mutex`, which serializes sealing against writers
+    /// and against other seals.
+    ///
+    /// Durability note: the freshly created WAL segment's directory entry is
+    /// *not* fsynced here. In the synchronous flush path the immediately
+    /// following [`Self::flush_immutable`] issues one directory fsync covering
+    /// both this segment's creation and the old segment's removal, and no write
+    /// can reach the new segment in between because the caller holds
+    /// `write_mutex`. A background flush (a later change) that lets writes flow to
+    /// the new segment before the old one is retired must fsync the directory
+    /// here, at seal time.
+    fn seal_active(&self) -> Result<Option<ImmMemtable>> {
+        // Fast path: an empty active memtable means an empty WAL segment too —
+        // nothing to seal or flush.
+        if self.memset.read().unwrap().active.is_empty() {
+            return Ok(None);
         }
+
+        let sealed_wal_id = self.active_wal_id.load(Ordering::SeqCst);
+        let new_wal_id = self.get_next_wal_id();
+        let new_wal_path = wal_segment_path(&self.dir_path, new_wal_id);
+        let new_wal = Wal::open(
+            &new_wal_path,
+            self.options.wal_sync_interval_ms,
+            self.options.fsync_method,
+        )?;
+
+        // Redirect new writes to the fresh segment, then seal the active memtable
+        // and swap in an empty one. Readers never touch the WAL and writers are
+        // excluded by `write_mutex`, so the order of these two swaps is
+        // immaterial to anyone observing the engine.
+        {
+            let mut wal_guard = self.wal.lock().unwrap();
+            *wal_guard = new_wal;
+        }
+        self.active_wal_id.store(new_wal_id, Ordering::SeqCst);
+
+        let sealed = {
+            let mut memset = self.memset.write().unwrap();
+            let table = std::mem::replace(&mut memset.active, Arc::new(MemTable::new()));
+            let imm = ImmMemtable {
+                table,
+                wal_id: sealed_wal_id,
+            };
+            // The queue keeps its own handle (front = newest) so readers merge
+            // over the sealed memtable until the flush removes it; the returned
+            // clone shares the same `Arc`, so both observe the same data.
+            memset.immutable.push_front(imm.clone());
+            imm
+        };
+        Ok(Some(sealed))
+    }
+
+    /// Flush a sealed memtable to a new L0 SSTable, record it in the manifest,
+    /// retire the WAL segment that backed it, and drop it from the immutable
+    /// queue.
+    ///
+    /// Crash-safe by ordering: the SSTable and its manifest edit are made durable
+    /// before the WAL segment is deleted, so a crash mid-flush leaves the segment
+    /// on disk and recovery replays it idempotently into a fresh SSTable. The
+    /// single directory fsync below also makes durable the new segment created by
+    /// the preceding [`Self::seal_active`].
+    fn flush_immutable(&self, imm: &ImmMemtable) -> Result<()> {
+        let entries = imm.table.entries();
 
         let next_id = self.get_next_id();
         let sst_path = self.dir_path.join(format!("L0_{:05}.sst", next_id));
@@ -1417,15 +1559,14 @@ impl EngineInner {
             &sst_path,
             self.options.block_size_limit,
             self.options.compression,
-            map.len(),
+            entries.len(),
             target_layout,
             self.options.fsync_method,
         )?;
-        for (key, val) in map.iter() {
+        for (key, val) in &entries {
             writer.append(key, val.as_ref())?;
         }
         writer.finish()?;
-        drop(map);
 
         // Record the newly flushed SSTable in the manifest.
         self.manifest
@@ -1442,35 +1583,42 @@ impl EngineInner {
             ssts.entry(0).or_default().insert(0, Arc::new(reader));
         }
 
-        // Rotate the WAL: the flushed memtable's data is now durably in the
-        // SSTable above, so its segment can be retired. Open a fresh segment for
-        // subsequent writes, swap it in, then delete the old one. Crash between
-        // the two leaves the (now-redundant) old segment on disk; recovery
-        // replays it idempotently into a new SSTable, so no data is lost.
-        let old_wal_id = self.active_wal_id.load(Ordering::SeqCst);
-        let new_wal_id = self.get_next_wal_id();
-        let new_wal_path = wal_segment_path(&self.dir_path, new_wal_id);
-        let new_wal = Wal::open(
-            &new_wal_path,
-            self.options.wal_sync_interval_ms,
-            self.options.fsync_method,
-        )?;
-
-        {
-            let mut wal_guard = self.wal.lock().unwrap();
-            *wal_guard = new_wal;
-        }
-        self.active_wal_id.store(new_wal_id, Ordering::SeqCst);
-
-        let old_wal_path = wal_segment_path(&self.dir_path, old_wal_id);
+        // The sealed memtable's data is now durably in the SSTable above, so its
+        // WAL segment can be retired. A crash before this point leaves the
+        // segment on disk; recovery replays it idempotently into a new SSTable.
+        let old_wal_path = wal_segment_path(&self.dir_path, imm.wal_id);
         fs::remove_file(&old_wal_path)?;
-        // One directory fsync makes both the new segment's creation and the old
-        // segment's removal durable before any new write reaches the new
-        // segment (the caller still holds `write_mutex`).
-        crate::fsync_parent_dir(&new_wal_path, self.options.fsync_method)?;
-        mem.clear();
+        // One directory fsync makes both the old segment's removal and the new
+        // segment's creation (in `seal_active`) durable.
+        crate::fsync_parent_dir(&old_wal_path, self.options.fsync_method)?;
+
+        // Drop the flushed memtable from the immutable queue. Matching on the WAL
+        // id (unique and monotonic) removes exactly this entry.
+        {
+            let mut memset = self.memset.write().unwrap();
+            memset.immutable.retain(|m| m.wal_id != imm.wal_id);
+        }
 
         Ok(())
+    }
+
+    /// Snapshot the `[start, end]` range of every in-memory buffer (the active
+    /// memtable plus any immutable memtables) into one sorted vector, keeping the
+    /// newest value (or tombstone) per key. Seeds the scan merge with a stable
+    /// view of the memtables whose internal precedence is already resolved.
+    fn snapshot_mem_range(&self, start: &DbKey, end: &DbKey) -> Vec<(DbKey, Option<DbValue>)> {
+        let memset = self.memset.read().unwrap();
+        // Iterate newest-to-oldest and keep the first value seen per key, so the
+        // newest write wins. The BTreeMap yields the result already sorted.
+        let mut merged: BTreeMap<DbKey, Option<DbValue>> = BTreeMap::new();
+        for mem in std::iter::once(memset.active.as_ref())
+            .chain(memset.immutable.iter().map(|imm| imm.table.as_ref()))
+        {
+            for (k, v) in mem.scan_range_raw(start, end) {
+                merged.entry(k).or_insert(v);
+            }
+        }
+        merged.into_iter().collect()
     }
 
     /// Begin a background-task region. Returns a guard that marks the task as
@@ -1616,5 +1764,158 @@ mod tests {
                 .scan_iter(&DbKey::Int(i64::MIN), &DbKey::Int(i64::MAX))
                 .map(|_| ()),
         );
+    }
+
+    /// Options that never auto-flush, so a test controls memtable rotation
+    /// explicitly via `seal_active`/`flush_immutable`.
+    fn no_autoflush_options() -> EngineOptions {
+        EngineOptions {
+            memtable_size_limit: 64 * 1024 * 1024,
+            wal_size_limit: 64 * 1024 * 1024,
+            ..Default::default()
+        }
+    }
+
+    fn collect_scan(engine: &StorageEngine, lo: i64, hi: i64) -> Vec<(DbKey, DbValue)> {
+        let mut it = engine.scan_iter(&DbKey::Int(lo), &DbKey::Int(hi)).unwrap();
+        let mut out = Vec::new();
+        while let Some(pair) = it.next().unwrap() {
+            out.push(pair);
+        }
+        out
+    }
+
+    /// After sealing the active memtable, its data must remain visible to every
+    /// read path from the immutable queue, and writes to the fresh active
+    /// memtable (overwrites and tombstones) must take precedence over the sealed
+    /// copy.
+    #[test]
+    fn sealed_memtable_is_readable_with_active_precedence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(dir.path(), no_autoflush_options()).unwrap();
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
+
+        // Seal without flushing: the three keys move to the immutable queue and
+        // the active memtable is reset.
+        let imm = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
+        {
+            let memset = engine.inner.memset.read().unwrap();
+            assert_eq!(memset.immutable.len(), 1);
+            assert!(memset.active.is_empty());
+        }
+
+        // Layer fresh writes over the sealed snapshot: overwrite 2, delete 3,
+        // leave 1 untouched (served from the immutable memtable).
+        engine.put(DbKey::Int(2), DbValue::Int(222)).unwrap();
+        engine.delete(DbKey::Int(3)).unwrap();
+
+        // get: 1 from immutable, 2 from active (newest), 3 shadowed by tombstone.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+        assert_eq!(engine.get(&DbKey::Int(2)).unwrap(), Some(DbValue::Int(222)));
+        assert_eq!(engine.get(&DbKey::Int(3)).unwrap(), None);
+
+        // multi_get resolves the same precedence in one pass.
+        let got = engine
+            .multi_get(&[DbKey::Int(1), DbKey::Int(2), DbKey::Int(3)])
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![Some(DbValue::Int(10)), Some(DbValue::Int(222)), None]
+        );
+
+        // Both scan paths merge the two memtables, drop the tombstoned key, and
+        // keep the active overwrite.
+        let expected = vec![
+            (DbKey::Int(1), DbValue::Int(10)),
+            (DbKey::Int(2), DbValue::Int(222)),
+        ];
+        assert_eq!(collect_scan(&engine, i64::MIN, i64::MAX), expected);
+        let mut filtered = engine
+            .inner
+            .filtered_scan(&DbKey::Int(i64::MIN), &DbKey::Int(i64::MAX), |_, _| true)
+            .unwrap();
+        filtered.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(filtered, expected);
+
+        // Keep `imm` alive until here so the queue entry it mirrors is not the
+        // only owner being dropped early.
+        drop(imm);
+    }
+
+    /// Flushing a sealed memtable persists it to an L0 SSTable, retires its WAL
+    /// segment, empties the immutable queue, and leaves every key readable from
+    /// disk.
+    #[test]
+    fn flush_immutable_persists_and_empties_queue() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(dir.path(), no_autoflush_options()).unwrap();
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+
+        let imm = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
+        let sealed_wal = wal_segment_path(dir.path(), imm.wal_id);
+        assert!(sealed_wal.exists(), "sealed WAL segment should be on disk");
+
+        engine.inner.flush_immutable(&imm).unwrap();
+
+        // Queue drained, segment retired, data durable in an SSTable.
+        assert!(engine.inner.memset.read().unwrap().immutable.is_empty());
+        assert!(
+            !sealed_wal.exists(),
+            "flushed WAL segment should be removed"
+        );
+        let stats = engine.get_statistics().unwrap();
+        assert!(stats.num_sstables >= 1);
+        assert_eq!(stats.memtable_entries, 0);
+
+        // Reads now come from the SSTable.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+        assert_eq!(engine.get(&DbKey::Int(2)).unwrap(), Some(DbValue::Int(20)));
+        assert_eq!(
+            collect_scan(&engine, i64::MIN, i64::MAX),
+            vec![
+                (DbKey::Int(1), DbValue::Int(10)),
+                (DbKey::Int(2), DbValue::Int(20)),
+            ]
+        );
+    }
+
+    /// `get_statistics` must count entries resident in immutable memtables, not
+    /// just the active one.
+    #[test]
+    fn statistics_include_immutable_memtables() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(dir.path(), no_autoflush_options()).unwrap();
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+        let imm = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
+        // A fresh write lands in the new active memtable while the sealed one
+        // still holds two entries.
+        engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
+
+        let stats = engine.get_statistics().unwrap();
+        assert_eq!(
+            stats.memtable_entries, 3,
+            "two sealed + one active entry must all be counted"
+        );
+
+        drop(imm);
     }
 }
