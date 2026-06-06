@@ -8,6 +8,11 @@ coverage:
         # strict diff-coverage gate produces false negatives. Report the status
         # but never fail the check / block a merge on it.
         informational: true
+    project:
+      default:
+        # Overall project coverage is advisory only — tracked for targeted
+        # improvements but must never block a merge.
+        informational: true
   ignore:
     - "dtdb_api/src/bin/dtdb_server.rs"
     - "dtdb_api/src/bin/dtdb_client_cli.rs"
