@@ -88,16 +88,15 @@ fn test_atomic_sstable_write() {
 
     // 1. Start writing but crash (drop without finish)
     {
-        let mut writer =
-            SstableWriter::create(
-                &sst_path,
-                100,
-                CompressionType::Uncompressed,
-                1,
-                vec![],
-                dtdb_storage::FsyncMethod::Fsync,
-            )
-            .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            100,
+            CompressionType::Uncompressed,
+            1,
+            vec![],
+            dtdb_storage::FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer.append(&k_int(1), Some(&v_str("apple"))).unwrap();
         // Dropped here, simulated crash
     }
@@ -111,16 +110,15 @@ fn test_atomic_sstable_write() {
 
     // 2. Write and successfully finish
     {
-        let mut writer =
-            SstableWriter::create(
-                &sst_path,
-                100,
-                CompressionType::Uncompressed,
-                1,
-                vec![],
-                dtdb_storage::FsyncMethod::Fsync,
-            )
-            .unwrap();
+        let mut writer = SstableWriter::create(
+            &sst_path,
+            100,
+            CompressionType::Uncompressed,
+            1,
+            vec![],
+            dtdb_storage::FsyncMethod::Fsync,
+        )
+        .unwrap();
         writer.append(&k_int(1), Some(&v_str("apple"))).unwrap();
         writer.finish().unwrap();
     }
@@ -142,13 +140,9 @@ fn test_compaction_crash_garbage_collection() {
         engine.flush_memtable().unwrap();
         engine.put(k_int(2), v_str("banana")).unwrap();
         engine.flush_memtable().unwrap();
-        // The second flush crosses l0_compaction_threshold (2), so it kicks off
-        // a *background* L0->L1 compaction that deletes the L0 SSTables. Drain
-        // it synchronously before dropping the engine: there is no graceful
-        // shutdown that joins background compaction, so otherwise that thread
-        // can still be deleting files while we reopen below, racing the reopen's
-        // SSTable discovery (a registered file vanishes mid-open -> ENOENT).
-        engine.compact().unwrap();
+        // Dropping the engine quiesces any background compaction the second
+        // flush kicked off (l0_compaction_threshold = 2), so it can't still be
+        // deleting files when we reopen below.
     }
 
     // Verify sstable files exist on disk
@@ -411,4 +405,102 @@ fn shutdown_waits_for_in_flight_compaction() {
     let reopened = StorageEngine::open(temp_dir.path(), options).unwrap();
     assert_eq!(reopened.get(&k_int(1)).unwrap(), Some(v_str("apple")));
     assert_eq!(reopened.get(&k_int(2)).unwrap(), Some(v_str("banana")));
+}
+
+fn wal_segment_path(dir: &std::path::Path, id: u64) -> std::path::PathBuf {
+    dir.join(format!("wal_{id:020}.wal"))
+}
+
+fn list_wal_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut segs: Vec<std::path::PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "wal")
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with("wal_"))
+        })
+        .collect();
+    segs.sort();
+    segs
+}
+
+// Several WAL segments left on disk (as a multi-memtable engine or a crash
+// mid-rotation would leave them) must all be replayed oldest-first on open, so
+// the newest write of each key wins. The replayed segments are then retired and
+// a single fresh active segment is opened past every id seen.
+#[test]
+fn test_recovery_replays_multiple_wal_segments_in_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let options = get_test_options();
+
+    // Older segment (lower id): establishes k1, k2.
+    {
+        let mut wal = Wal::open(
+            &wal_segment_path(temp_dir.path(), 5),
+            None,
+            options.fsync_method,
+        )
+        .unwrap();
+        wal.append_put(&k_int(1), &v_str("old")).unwrap();
+        wal.append_put(&k_int(2), &v_str("keep")).unwrap();
+    }
+    // Newer segment (higher id): overrides k1, adds k4.
+    {
+        let mut wal = Wal::open(
+            &wal_segment_path(temp_dir.path(), 9),
+            None,
+            options.fsync_method,
+        )
+        .unwrap();
+        wal.append_put(&k_int(1), &v_str("new")).unwrap();
+        wal.append_put(&k_int(4), &v_str("four")).unwrap();
+    }
+
+    {
+        let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
+        // Newer segment wins for the overlapping key.
+        assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_str("new")));
+        assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_str("keep")));
+        assert_eq!(engine.get(&k_int(4)).unwrap(), Some(v_str("four")));
+        assert_eq!(engine.get(&k_int(3)).unwrap(), None);
+    }
+
+    // The two replayed segments are gone; exactly one fresh active segment
+    // remains, numbered past the highest id seen (9 -> 10).
+    let segments = list_wal_segments(temp_dir.path());
+    assert_eq!(segments.len(), 1, "expected one fresh active segment");
+    assert_eq!(segments[0], wal_segment_path(temp_dir.path(), 10));
+    assert!(
+        Wal::recover(&segments[0]).unwrap().is_empty(),
+        "fresh active segment should hold no records"
+    );
+}
+
+// A pre-segmentation `active.wal` must still be recovered (replayed before any
+// numbered segment) so existing directories migrate transparently.
+#[test]
+fn test_recovery_migrates_legacy_active_wal() {
+    let temp_dir = TempDir::new().unwrap();
+    let options = get_test_options();
+
+    {
+        let mut wal = Wal::open(
+            &temp_dir.path().join("active.wal"),
+            None,
+            options.fsync_method,
+        )
+        .unwrap();
+        wal.append_put(&k_int(1), &v_str("legacy")).unwrap();
+    }
+
+    {
+        let engine = StorageEngine::open(temp_dir.path(), options).unwrap();
+        assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_str("legacy")));
+    }
+
+    // Legacy file retired; a numbered active segment now exists.
+    assert!(!temp_dir.path().join("active.wal").exists());
+    assert_eq!(list_wal_segments(temp_dir.path()).len(), 1);
 }
