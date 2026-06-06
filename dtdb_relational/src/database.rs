@@ -9,7 +9,7 @@ use dtdb_storage::{
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 /// A single relational-layer mutation: an insert/update (`Put`) or a delete.
 ///
@@ -1124,6 +1124,87 @@ pub struct Database {
     /// the database cancels them.
     background_analyze_handle: Mutex<Option<PeriodicHandle>>,
     background_flush_handle: Mutex<Option<PeriodicHandle>>,
+    /// Lifecycle gate for this database's *own* periodic background tasks
+    /// (ANALYZE, memtable flush). See [`BackgroundGate`].
+    background: BackgroundGate,
+}
+
+/// Tracks in-flight database-level background work (periodic ANALYZE and
+/// memtable flush) so [`Database::shutdown`] can *drain* it, not merely cancel
+/// the schedule.
+///
+/// Cancelling a [`PeriodicHandle`] stops the scheduler from submitting further
+/// ticks, but a tick already submitted to (or running on) the shared executor
+/// keeps going — and those ticks write to disk (a flush persists an SSTable; an
+/// ANALYZE persists statistics). If such a tick runs while the database
+/// directory is being removed, it resurrects files under the dropped path.
+///
+/// The executor is shared across databases and has no per-database drain, so
+/// this gate provides that scope, mirroring the storage engine's own gate.
+/// [`BackgroundGate::quiesce`] flips `shutting_down` and blocks until every tick
+/// that had already begun finishes; any tick that had not yet begun observes
+/// the flag (via [`BackgroundGate::enter`]) and returns without doing work.
+struct BackgroundGate {
+    state: Mutex<BackgroundGateState>,
+    /// Signalled when `active` reaches zero so `quiesce` can wake.
+    idle: Condvar,
+}
+
+struct BackgroundGateState {
+    /// Number of background ticks that have begun and not yet finished.
+    active: usize,
+    /// Once set, no new tick is allowed to begin.
+    shutting_down: bool,
+}
+
+impl BackgroundGate {
+    fn new() -> Self {
+        BackgroundGate {
+            state: Mutex::new(BackgroundGateState {
+                active: 0,
+                shutting_down: false,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+
+    /// Begin a background tick, or return `None` if the database is shutting
+    /// down — in which case the caller must do nothing. The returned guard
+    /// marks the tick as in-flight until dropped (panic-safe).
+    fn enter(&self) -> Option<BackgroundGuard<'_>> {
+        let mut st = self.state.lock().unwrap();
+        if st.shutting_down {
+            return None;
+        }
+        st.active += 1;
+        Some(BackgroundGuard { gate: self })
+    }
+
+    /// Mark the database as shutting down and block until every in-flight tick
+    /// has finished. Idempotent.
+    fn quiesce(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.shutting_down = true;
+        while st.active > 0 {
+            st = self.idle.wait(st).unwrap();
+        }
+    }
+}
+
+/// RAII guard decrementing the in-flight tick count on drop, waking
+/// [`BackgroundGate::quiesce`] at zero.
+struct BackgroundGuard<'a> {
+    gate: &'a BackgroundGate,
+}
+
+impl Drop for BackgroundGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.gate.state.lock().unwrap();
+        st.active -= 1;
+        if st.active == 0 {
+            self.gate.idle.notify_all();
+        }
+    }
 }
 
 impl Database {
@@ -1379,6 +1460,7 @@ impl Database {
             stats_versions: RwLock::new(HashMap::new()),
             background_analyze_handle: Mutex::new(None),
             background_flush_handle: Mutex::new(None),
+            background: BackgroundGate::new(),
         };
 
         db.recover_transactions()?;
@@ -1545,13 +1627,23 @@ impl Database {
     /// [`StorageEngine::shutdown`] is a shared-reference operation — unlike
     /// relying on the engine `Arc` reaching its last reference on drop.
     pub fn shutdown(&self) {
-        // Stop this database's own periodic schedules first so no further
-        // ANALYZE/flush ticks are submitted.
+        // 1. Quiesce this database's own periodic tasks: flip the shutting-down
+        //    flag and wait for any in-flight ANALYZE/flush tick to finish. After
+        //    this, no such tick is running or will begin, so none will persist
+        //    statistics or SSTables (and a flush tick can no longer submit fresh
+        //    compaction).
+        self.background.quiesce();
+
+        // 2. Cancel the periodic schedules so the scheduler stops submitting
+        //    ticks (dropping the handle cancels it). The gate above already
+        //    makes any straggler tick a no-op; this stops the wasted submits.
         *self.background_analyze_handle.lock().unwrap() = None;
         *self.background_flush_handle.lock().unwrap() = None;
 
-        // Then quiesce every per-table / per-index storage engine, draining any
-        // in-flight compaction.
+        // 3. Quiesce every per-table / per-index storage engine, draining any
+        //    in-flight compaction (and the engine's own background WAL sync).
+        //    Done after step 1 so a compaction submitted by a just-finished
+        //    flush tick is still caught and waited on here.
         let tables = self.tables.read().unwrap();
         for table in tables.values() {
             for engine in table.engines.values() {
@@ -2637,6 +2729,12 @@ impl Database {
                 let Some(db) = weak_db.upgrade() else {
                     return;
                 };
+                // Don't begin (and let `shutdown` wait for us if we have) once
+                // the database is quiescing, so a late tick can't write stats
+                // under a directory being removed.
+                let Some(_bg) = db.background.enter() else {
+                    return;
+                };
                 let i = tx_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let tx_id = 1_000_000_000_000 + i;
                 let tx = Transaction::new_with_isolation(
@@ -2668,6 +2766,12 @@ impl Database {
             Priority::High,
             Box::new(move || {
                 let Some(db) = weak_db.upgrade() else {
+                    return;
+                };
+                // Skip (and let `shutdown` wait for an in-flight tick) once the
+                // database is quiescing, so a late flush can't persist an
+                // SSTable under a directory being removed.
+                let Some(_bg) = db.background.enter() else {
                     return;
                 };
                 for table_name in db.list_tables() {
