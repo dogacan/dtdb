@@ -61,6 +61,58 @@ impl Executor for ManualExecutor {
     }
 }
 
+/// An [`Executor`] that *captures* periodic tasks (returning a real, cancelable
+/// handle obtained from an [`InlineExecutor`] with an effectively-infinite
+/// interval, so the inline scheduler never fires them) and lets a test fire each
+/// tick by hand. One-shot submits (compaction) are simply stored.
+struct PeriodicCapture {
+    inline: InlineExecutor,
+    periodics: Mutex<Vec<Arc<dyn Fn() + Send + Sync + 'static>>>,
+}
+
+impl PeriodicCapture {
+    fn new() -> Self {
+        PeriodicCapture {
+            inline: InlineExecutor,
+            periodics: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Invoke every captured periodic tick once, simulating the scheduler firing
+    /// them.
+    fn fire_all_periodics(&self) {
+        let tasks = self.periodics.lock().unwrap().clone();
+        for task in tasks {
+            task();
+        }
+    }
+}
+
+impl Executor for PeriodicCapture {
+    fn submit(
+        &self,
+        _priority: Priority,
+        _key: Option<CoalesceKey>,
+        _task: Box<dyn FnOnce() + Send + 'static>,
+    ) {
+        // One-shot work (e.g. compaction) is irrelevant to this test; drop it.
+    }
+
+    fn submit_periodic(
+        &self,
+        _every: Duration,
+        priority: Priority,
+        task: Box<dyn Fn() + Send + Sync + 'static>,
+    ) -> PeriodicHandle {
+        let task: Arc<dyn Fn() + Send + Sync + 'static> = Arc::from(task);
+        self.periodics.lock().unwrap().push(task.clone());
+        // Hand back a real handle, but on an interval long enough that the inline
+        // scheduler never fires it during the test — we drive ticks manually.
+        self.inline
+            .submit_periodic(Duration::from_secs(3600), priority, Box::new(move || task()))
+    }
+}
+
 fn single_int_pk_schema() -> Schema {
     Schema::new(vec![
         Column {
@@ -87,12 +139,16 @@ fn single_int_pk_schema() -> Schema {
 }
 
 fn test_options() -> DatabaseOptions {
+    options_with_flush_interval(None)
+}
+
+fn options_with_flush_interval(flush_interval_ms: Option<u64>) -> DatabaseOptions {
     DatabaseOptions {
         compression: CompressionType::Uncompressed,
         memtable_size_limit: 1024,
         block_size_limit: 64,
         wal_size_limit: 1024 * 1024,
-        flush_interval_ms: None,
+        flush_interval_ms,
         l0_compaction_threshold: Some(2),
         sstable_target_size: Some(1024),
         base_level_size_limit: Some(10 * 1024),
@@ -222,5 +278,60 @@ fn drop_table_quiesces_engine_and_leaves_no_orphan_files() {
     assert!(
         sst_files(temp_dir.path()).is_empty(),
         "no SSTable files should remain after dropping the table"
+    );
+}
+
+/// `Database::shutdown()` must *drain* the database's own periodic tasks, not
+/// merely cancel their schedule. After shutdown, a periodic flush tick that
+/// fires must do nothing — otherwise it would persist an SSTable under a
+/// database directory that is being removed.
+///
+/// Deterministic: `PeriodicCapture` lets the test fire the flush tick by hand
+/// instead of waiting on a scheduler.
+#[test]
+fn shutdown_drains_periodic_flush_so_late_tick_is_noop() {
+    let temp_dir = TempDir::new().unwrap();
+    let exec = Arc::new(PeriodicCapture::new());
+    let db = Arc::new(
+        Database::open_with_options_and_executor(
+            temp_dir.path(),
+            options_with_flush_interval(Some(50)),
+            exec.clone(),
+        )
+        .unwrap(),
+    );
+
+    db.create_table("t", single_int_pk_schema()).unwrap();
+    // Register the periodic flush schedule (captured by PeriodicCapture).
+    db.start_background_flush_if_needed(&db);
+
+    let table = db.get_table("t").unwrap();
+    let engine = table.engines.values().next().unwrap().clone();
+
+    // Put a row into the memtable (not yet flushed to an SSTable).
+    engine.put(DbKey::Int(1), DbValue::string("apple")).unwrap();
+    assert!(sst_files(temp_dir.path()).is_empty());
+
+    // Sanity: firing the flush tick *before* shutdown does real work — it
+    // persists the memtable as an SSTable. This proves the captured tick is live.
+    exec.fire_all_periodics();
+    let after_first_tick = sst_files(temp_dir.path());
+    assert_eq!(
+        after_first_tick.len(),
+        1,
+        "a flush tick before shutdown should persist one SSTable, got {after_first_tick:?}"
+    );
+
+    // Stage more unflushed data, then quiesce the database.
+    engine.put(DbKey::Int(2), DbValue::string("banana")).unwrap();
+    db.shutdown();
+
+    // Firing the flush tick now must be a no-op: the database is quiescing, so
+    // no new SSTable is written under the (about-to-be-removed) directory.
+    exec.fire_all_periodics();
+    assert_eq!(
+        sst_files(temp_dir.path()),
+        after_first_tick,
+        "a periodic flush tick after shutdown must not persist anything"
     );
 }
