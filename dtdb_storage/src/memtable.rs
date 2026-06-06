@@ -84,6 +84,53 @@ impl MemTable {
         }
     }
 
+    /// Applies a batch of operations to the MemTable under a single write lock.
+    pub fn apply_batch(&self, entries: Vec<crate::wal::WalEntry>) {
+        let mut map = self.map.write().unwrap();
+        let mut size_delta = 0isize;
+
+        for ent in entries {
+            match ent {
+                crate::wal::WalEntry::Put { key, value } => {
+                    let key_size = key.byte_size();
+                    let new_val_size = value.byte_size();
+                    let old = map.insert(key, Some(value));
+                    match old {
+                        Some(old_val) => {
+                            let old_val_size = option_value_byte_size(&old_val);
+                            size_delta += new_val_size as isize - old_val_size as isize;
+                        }
+                        None => {
+                            size_delta += (key_size + new_val_size) as isize;
+                        }
+                    }
+                }
+                crate::wal::WalEntry::Delete { key } => {
+                    let key_size = key.byte_size();
+                    let old = map.insert(key, None);
+                    match old {
+                        Some(old_val) => {
+                            let old_val_size = option_value_byte_size(&old_val);
+                            size_delta += 1isize - old_val_size as isize;
+                        }
+                        None => {
+                            size_delta += (key_size + 1) as isize;
+                        }
+                    }
+                }
+                crate::wal::WalEntry::Batch(_) => {}
+            }
+        }
+
+        if size_delta >= 0 {
+            self.size_bytes
+                .fetch_add(size_delta as usize, Ordering::Relaxed);
+        } else {
+            self.size_bytes
+                .fetch_sub((-size_delta) as usize, Ordering::Relaxed);
+        }
+    }
+
     /// Fetches a value from the MemTable.
     ///
     /// Returns:
