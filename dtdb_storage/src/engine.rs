@@ -1850,8 +1850,7 @@ impl EngineInner {
             // Stop at the first immutable whose SSTable is not yet durable: we
             // must not retire past it, or a crash would strand an older live
             // segment behind a retired newer one.
-            let durable =
-                matches!(*oldest.flush.state.lock().unwrap(), SlotState::Completed);
+            let durable = matches!(*oldest.flush.state.lock().unwrap(), SlotState::Completed);
             if !durable {
                 break;
             }
@@ -2689,7 +2688,10 @@ mod tests {
             });
 
             std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(!writer.is_finished(), "fourth write should stall at the cap");
+            assert!(
+                !writer.is_finished(),
+                "fourth write should stall at the cap"
+            );
 
             // Completing just the oldest flush frees one slot — enough to admit
             // the stalled writer, which then seals its own memtable (back to 3).
@@ -2700,7 +2702,11 @@ mod tests {
         // One SSTable on disk (the one flush we ran); the queue is full again
         // because the woken writer sealed a fresh immutable.
         assert_eq!(l0_ids(&engine).len(), 1, "only one flush should have run");
-        assert_eq!(immutable_count(&engine), 3, "woken writer refilled the slot");
+        assert_eq!(
+            immutable_count(&engine),
+            3,
+            "woken writer refilled the slot"
+        );
 
         for (k, v) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
             assert_eq!(engine.get(&DbKey::Int(k)).unwrap(), Some(DbValue::Int(v)));
@@ -2742,7 +2748,11 @@ mod tests {
         // Now run the remaining (older) task: it retires, then cascades to the
         // already-durable newer one. Queue drains fully.
         exec.run_all();
-        assert_eq!(immutable_count(&engine), 0, "older flush cascades the retire");
+        assert_eq!(
+            immutable_count(&engine),
+            0,
+            "older flush cascades the retire"
+        );
         assert_eq!(l0_ids(&engine).len(), 2);
         assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
         assert_eq!(engine.get(&DbKey::Int(2)).unwrap(), Some(DbValue::Int(20)));
