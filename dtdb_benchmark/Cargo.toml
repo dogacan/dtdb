@@ -26,7 +26,7 @@ futures-util = { workspace = true, optional = true }
 # Gated behind the `compare-rocksdb` feature to avoid compiler toolchain dependencies by default.
 # postcard is the byte serializer the bench feeds to RocksDB (which stores raw bytes),
 # mirroring the serialization dtdb_storage does internally.
-rocksdb = { version = "0.21.0", default-features = false, features = ["lz4"], optional = true }
+rocksdb = { version = "0.24.0", default-features = false, features = ["lz4"], optional = true }
 postcard = { workspace = true, optional = true }
 
 [features]
