@@ -118,6 +118,58 @@ impl FlushSlot {
     }
 }
 
+struct WriteQueue {
+    tasks: VecDeque<Arc<WriteTask>>,
+    writing: bool,
+}
+
+struct WriteTask {
+    state: Mutex<WriteTaskState>,
+    condvar: Condvar,
+}
+
+struct WriteTaskState {
+    batch: Vec<WalEntry>,
+    done: bool,
+    result: Result<()>,
+}
+
+fn apply_entry(mem: &MemTable, ent: WalEntry) {
+    match ent {
+        WalEntry::Put { key, value } => mem.put(key, value),
+        WalEntry::Delete { key } => mem.delete(key),
+        WalEntry::Batch(_) => {}
+    }
+}
+
+fn apply_entry_recursive(mem: &MemTable, ent: WalEntry) {
+    match ent {
+        WalEntry::Put { key, value } => mem.put(key, value),
+        WalEntry::Delete { key } => mem.delete(key),
+        WalEntry::Batch(sub) => {
+            for e in sub {
+                apply_entry_recursive(mem, e);
+            }
+        }
+    }
+}
+
+fn clone_result(res: &Result<()>) -> Result<()> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => Err(match e {
+            StorageError::Io(err) => {
+                StorageError::Io(std::io::Error::new(err.kind(), err.to_string()))
+            }
+            StorageError::Serialization(err) => StorageError::Serialization(err.clone()),
+            StorageError::Compression(s) => StorageError::Compression(s.clone()),
+            StorageError::Corruption(s) => StorageError::Corruption(s.clone()),
+            StorageError::AlreadyExists(s) => StorageError::AlreadyExists(s.clone()),
+            StorageError::InvalidOptions(s) => StorageError::InvalidOptions(s.clone()),
+        }),
+    }
+}
+
 /// The in-memory write buffers: one mutable `active` memtable plus a queue of
 /// `immutable` memtables that have been sealed and are awaiting flush to L0.
 ///
@@ -179,6 +231,7 @@ struct EngineInner {
     background: BackgroundGate,
     /// Backpressure gate stalling writers when the Level 0 file count is too high.
     l0_gate: L0WriteStallGate,
+    write_queue: Mutex<WriteQueue>,
 }
 
 /// Tracks in-flight background work so the engine can be *quiesced*.
@@ -591,22 +644,6 @@ impl EngineInner {
             }
         }
 
-        // 2. Recover from the WAL. Data lives in numbered segments
-        // (`wal_<id>.wal`), one per memtable, plus an optional pre-segmentation
-        // `active.wal`. Replay them oldest-first into a single memtable so the
-        // newest write of each key wins, then flush the result to one SSTable.
-        fn apply_entry(mem: &MemTable, ent: WalEntry) {
-            match ent {
-                WalEntry::Put { key, value } => mem.put(key, value),
-                WalEntry::Delete { key } => mem.delete(key),
-                WalEntry::Batch(sub) => {
-                    for e in sub {
-                        apply_entry(mem, e);
-                    }
-                }
-            }
-        }
-
         let mut segments: Vec<(u64, PathBuf)> = Vec::new();
         let mut max_wal_id: Option<u64> = None;
         for entry in fs::read_dir(&dir_path)? {
@@ -630,7 +667,7 @@ impl EngineInner {
         let memtable = Arc::new(MemTable::new());
         for path in &replay_paths {
             for entry in Wal::recover(path)? {
-                apply_entry(&memtable, entry);
+                apply_entry_recursive(&memtable, entry);
             }
         }
 
@@ -710,89 +747,88 @@ impl EngineInner {
             last_compacted_keys: Mutex::new(std::collections::HashMap::new()),
             background: BackgroundGate::new(),
             l0_gate: L0WriteStallGate::new(),
+            write_queue: Mutex::new(WriteQueue {
+                tasks: VecDeque::new(),
+                writing: false,
+            }),
         })
     }
 
-    pub fn put(self: &Arc<Self>, key: DbKey, value: DbValue) -> Result<()> {
-        let _write_lock = self.write_mutex.lock().unwrap();
-        self.await_l0_limit();
-        self.maybe_slowdown_writes();
+    fn execute_write(self: &Arc<Self>, batch: Vec<WalEntry>) -> Result<()> {
+        let task = Arc::new(WriteTask {
+            state: Mutex::new(WriteTaskState {
+                batch,
+                done: false,
+                result: Ok(()),
+            }),
+            condvar: Condvar::new(),
+        });
 
-        let wal_size = {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append_put(&key, &value)?;
-            wal.size()?
-        };
+        let mut queue = self.write_queue.lock().unwrap();
+        queue.tasks.push_back(task.clone());
 
-        // Hold the memset read lock only to record the write; drop it before any
-        // flush, which needs the write lock to rotate the active memtable.
-        // `write_mutex` (held for the whole call) keeps the two steps atomic
-        // against other writers.
-        let trigger_flush = {
-            let memset = self.memset.read().unwrap();
-            memset.active.put(key, value);
-            let mem_full = memset.active.byte_size() >= self.options.memtable_size_limit;
-            let wal_full = wal_size as usize >= self.options.wal_size_limit;
-            mem_full || wal_full
-        };
-
-        if trigger_flush {
-            self.flush_active_in_background()?;
+        while !task.state.lock().unwrap().done
+            && !(queue.tasks.front().map_or(false, |f| Arc::ptr_eq(f, &task)) && !queue.writing)
+        {
+            queue = task.condvar.wait(queue).unwrap();
         }
 
-        Ok(())
+        if task.state.lock().unwrap().done {
+            return clone_result(&task.state.lock().unwrap().result);
+        }
+
+        // Leader path: claim writing and collect all queued tasks
+        queue.writing = true;
+        let mut tasks_to_commit = Vec::new();
+        while let Some(t) = queue.tasks.pop_front() {
+            tasks_to_commit.push(t);
+        }
+
+        drop(queue);
+
+        // Merge batches from all coalesced tasks
+        let mut merged_entries = Vec::new();
+        for t in &tasks_to_commit {
+            let mut state = t.state.lock().unwrap();
+            merged_entries.append(&mut state.batch);
+        }
+
+        let write_result = self.write_coalesced_batch(merged_entries);
+
+        // Mark all tasks as done and propagate result
+        for t in &tasks_to_commit {
+            let mut state = t.state.lock().unwrap();
+            state.done = true;
+            state.result = clone_result(&write_result);
+            t.condvar.notify_one();
+        }
+
+        // Release writing state and wake up the next leader if any
+        let mut queue = self.write_queue.lock().unwrap();
+        queue.writing = false;
+        if let Some(next_leader) = queue.tasks.front() {
+            next_leader.condvar.notify_one();
+        }
+
+        write_result
     }
 
-    pub fn delete(self: &Arc<Self>, key: DbKey) -> Result<()> {
+    fn write_coalesced_batch(self: &Arc<Self>, merged_entries: Vec<WalEntry>) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
         self.await_l0_limit();
         self.maybe_slowdown_writes();
 
         let wal_size = {
             let mut wal = self.wal.lock().unwrap();
-            wal.append_delete(&key)?;
-            wal.size()?
-        };
-
-        let trigger_flush = {
-            let memset = self.memset.read().unwrap();
-            memset.active.delete(key);
-            let mem_full = memset.active.byte_size() >= self.options.memtable_size_limit;
-            let wal_full = wal_size as usize >= self.options.wal_size_limit;
-            mem_full || wal_full
-        };
-
-        if trigger_flush {
-            self.flush_active_in_background()?;
-        }
-
-        Ok(())
-    }
-
-    pub fn write_batch(self: &Arc<Self>, entries: Vec<WalEntry>) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let _write_lock = self.write_mutex.lock().unwrap();
-        self.await_l0_limit();
-        self.maybe_slowdown_writes();
-
-        let wal_size = {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append_batch(&entries)?;
+            wal.append_batch(&merged_entries)?;
             wal.size()?
         };
 
         let trigger_flush = {
             let memset = self.memset.read().unwrap();
             let mem = &memset.active;
-            for entry in entries {
-                match entry {
-                    WalEntry::Put { key, value } => mem.put(key, value),
-                    WalEntry::Delete { key } => mem.delete(key),
-                    WalEntry::Batch(_) => {}
-                }
+            for entry in merged_entries {
+                apply_entry(mem, entry);
             }
             let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
             let wal_full = wal_size as usize >= self.options.wal_size_limit;
@@ -804,6 +840,21 @@ impl EngineInner {
         }
 
         Ok(())
+    }
+
+    pub fn put(self: &Arc<Self>, key: DbKey, value: DbValue) -> Result<()> {
+        self.execute_write(vec![WalEntry::Put { key, value }])
+    }
+
+    pub fn delete(self: &Arc<Self>, key: DbKey) -> Result<()> {
+        self.execute_write(vec![WalEntry::Delete { key }])
+    }
+
+    pub fn write_batch(self: &Arc<Self>, entries: Vec<WalEntry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.execute_write(entries)
     }
 
     pub fn get(&self, key: &DbKey) -> Result<Option<DbValue>> {
