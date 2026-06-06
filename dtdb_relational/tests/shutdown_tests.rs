@@ -108,8 +108,11 @@ impl Executor for PeriodicCapture {
         self.periodics.lock().unwrap().push(task.clone());
         // Hand back a real handle, but on an interval long enough that the inline
         // scheduler never fires it during the test — we drive ticks manually.
-        self.inline
-            .submit_periodic(Duration::from_secs(3600), priority, Box::new(move || task()))
+        self.inline.submit_periodic(
+            Duration::from_secs(3600),
+            priority,
+            Box::new(move || task()),
+        )
     }
 }
 
@@ -196,12 +199,9 @@ fn collect_sst(dir: &Path, out: &mut Vec<String>) {
 fn shutdown_quiesces_engines_so_queued_compaction_is_noop() {
     let temp_dir = TempDir::new().unwrap();
     let exec = Arc::new(ManualExecutor::new());
-    let db = Database::open_with_options_and_executor(
-        temp_dir.path(),
-        test_options(),
-        exec.clone(),
-    )
-    .unwrap();
+    let db =
+        Database::open_with_options_and_executor(temp_dir.path(), test_options(), exec.clone())
+            .unwrap();
 
     db.create_table("t", single_int_pk_schema()).unwrap();
     let table = db.get_table("t").unwrap();
@@ -212,7 +212,9 @@ fn shutdown_quiesces_engines_so_queued_compaction_is_noop() {
     // background compaction — which the ManualExecutor only stores.
     engine.put(DbKey::Int(1), DbValue::string("apple")).unwrap();
     engine.flush_memtable().unwrap();
-    engine.put(DbKey::Int(2), DbValue::string("banana")).unwrap();
+    engine
+        .put(DbKey::Int(2), DbValue::string("banana"))
+        .unwrap();
     engine.flush_memtable().unwrap();
 
     assert!(
@@ -222,7 +224,10 @@ fn shutdown_quiesces_engines_so_queued_compaction_is_noop() {
 
     // Snapshot the SSTable set while the compaction has not run.
     let before = sst_files(temp_dir.path());
-    assert!(before.len() >= 2, "expected at least two L0 SSTables, got {before:?}");
+    assert!(
+        before.len() >= 2,
+        "expected at least two L0 SSTables, got {before:?}"
+    );
 
     // Quiesce the database, then release the queued compaction. Because every
     // engine is now shutting down, the compaction must observe the flag and
@@ -244,12 +249,9 @@ fn shutdown_quiesces_engines_so_queued_compaction_is_noop() {
 fn drop_table_quiesces_engine_and_leaves_no_orphan_files() {
     let temp_dir = TempDir::new().unwrap();
     let exec = Arc::new(ManualExecutor::new());
-    let db = Database::open_with_options_and_executor(
-        temp_dir.path(),
-        test_options(),
-        exec.clone(),
-    )
-    .unwrap();
+    let db =
+        Database::open_with_options_and_executor(temp_dir.path(), test_options(), exec.clone())
+            .unwrap();
 
     db.create_table("t", single_int_pk_schema()).unwrap();
     let table = db.get_table("t").unwrap();
@@ -257,7 +259,9 @@ fn drop_table_quiesces_engine_and_leaves_no_orphan_files() {
 
     engine.put(DbKey::Int(1), DbValue::string("apple")).unwrap();
     engine.flush_memtable().unwrap();
-    engine.put(DbKey::Int(2), DbValue::string("banana")).unwrap();
+    engine
+        .put(DbKey::Int(2), DbValue::string("banana"))
+        .unwrap();
     engine.flush_memtable().unwrap();
     assert!(exec.pending() >= 1);
 
@@ -323,7 +327,9 @@ fn shutdown_drains_periodic_flush_so_late_tick_is_noop() {
     );
 
     // Stage more unflushed data, then quiesce the database.
-    engine.put(DbKey::Int(2), DbValue::string("banana")).unwrap();
+    engine
+        .put(DbKey::Int(2), DbValue::string("banana"))
+        .unwrap();
     db.shutdown();
 
     // Firing the flush tick now must be a no-op: the database is quiescing, so
