@@ -441,7 +441,7 @@ fn test_recovery_replays_multiple_wal_segments_in_order() {
     // Older segment (lower id): establishes k1, k2.
     {
         let mut wal = Wal::open(
-            &wal_segment_path(temp_dir.path(), 5),
+            wal_segment_path(temp_dir.path(), 5),
             None,
             options.fsync_method,
         )
@@ -452,7 +452,7 @@ fn test_recovery_replays_multiple_wal_segments_in_order() {
     // Newer segment (higher id): overrides k1, adds k4.
     {
         let mut wal = Wal::open(
-            &wal_segment_path(temp_dir.path(), 9),
+            wal_segment_path(temp_dir.path(), 9),
             None,
             options.fsync_method,
         )
@@ -490,7 +490,7 @@ fn test_recovery_migrates_legacy_active_wal() {
 
     {
         let mut wal = Wal::open(
-            &temp_dir.path().join("active.wal"),
+            temp_dir.path().join("active.wal"),
             None,
             options.fsync_method,
         )
