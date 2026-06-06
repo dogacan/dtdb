@@ -1383,7 +1383,7 @@ impl EngineInner {
         }
 
         fs::rename(&temp_wal_path, &wal_path)?;
-        crate::fsync_parent_dir(&wal_path)?;
+        crate::fsync_parent_dir(&wal_path, self.options.fsync_method)?;
         mem.clear();
 
         Ok(())

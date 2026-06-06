@@ -476,10 +476,14 @@ impl From<rust_decimal::Decimal> for DbValue {
 /// is durable across crashes on filesystems (ext4 data=ordered, XFS, ZFS, many
 /// network FSes) that don't otherwise guarantee directory-entry persistence.
 ///
+/// `method` selects the fsync strength (matching the file-data sync of the
+/// rename it makes durable), so a store configured for plain `fsync` does not
+/// silently pay `F_FULLFSYNC` on the directory.
+///
 /// Best-effort: on Windows there is no equivalent and we treat the call as a
 /// no-op; everywhere else we silently ignore EINVAL from filesystems whose
 /// directory fds can't be fsynced.
-pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
+pub fn fsync_parent_dir(path: &std::path::Path, method: FsyncMethod) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -492,7 +496,7 @@ pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
     #[cfg(not(windows))]
     {
         match std::fs::File::open(parent) {
-            Ok(dir) => match dir.sync_all() {
+            Ok(dir) => match sync_file(&dir, method) {
                 Ok(()) => Ok(()),
                 // EINVAL (22) — some filesystems (e.g. certain FUSE backends)
                 // don't allow fsync on a directory fd. Treat as best-effort.
@@ -504,7 +508,7 @@ pub fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let _ = parent;
+        let _ = (parent, method);
         Ok(())
     }
 }
@@ -540,7 +544,7 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8], fsync_method: FsyncMet
         sync_file(&file, fsync_method)?;
     }
     std::fs::rename(&tmp_path, path)?;
-    fsync_parent_dir(path)?;
+    fsync_parent_dir(path, fsync_method)?;
     Ok(())
 }
 
@@ -714,9 +718,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("manifest.bin");
         std::fs::write(&path, b"data").unwrap();
-        fsync_parent_dir(&path).expect("fsync of parent dir should succeed");
+        fsync_parent_dir(&path, FsyncMethod::Fsync).expect("fsync of parent dir should succeed");
         // No parent — should be a no-op rather than an error.
-        fsync_parent_dir(std::path::Path::new("")).expect("empty path should be a no-op");
+        fsync_parent_dir(std::path::Path::new(""), FsyncMethod::Fsync)
+            .expect("empty path should be a no-op");
     }
 
     #[test]
@@ -762,7 +767,7 @@ mod tests {
         // A bare filename has an empty ("") parent, which the helper maps to
         // ".". This exercises the empty-parent branch without a crash test.
         // The current directory always exists, so the fsync should succeed.
-        fsync_parent_dir(std::path::Path::new("some_relative_file.bin"))
+        fsync_parent_dir(std::path::Path::new("some_relative_file.bin"), FsyncMethod::Fsync)
             .expect("relative path should fsync the current directory");
     }
 

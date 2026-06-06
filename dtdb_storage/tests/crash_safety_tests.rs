@@ -142,6 +142,13 @@ fn test_compaction_crash_garbage_collection() {
         engine.flush_memtable().unwrap();
         engine.put(k_int(2), v_str("banana")).unwrap();
         engine.flush_memtable().unwrap();
+        // The second flush crosses l0_compaction_threshold (2), so it kicks off
+        // a *background* L0->L1 compaction that deletes the L0 SSTables. Drain
+        // it synchronously before dropping the engine: there is no graceful
+        // shutdown that joins background compaction, so otherwise that thread
+        // can still be deleting files while we reopen below, racing the reopen's
+        // SSTable discovery (a registered file vanishes mid-open -> ENOENT).
+        engine.compact().unwrap();
     }
 
     // Verify sstable files exist on disk
