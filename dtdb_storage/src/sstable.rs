@@ -68,16 +68,22 @@ pub struct SstableWriter {
     max_key: Option<DbKey>,
     bloom_filter: Option<crate::bloom::BloomFilter>,
     layout: Vec<u8>,
+    fsync_method: crate::FsyncMethod,
 }
 
 impl SstableWriter {
     /// Creates a new SstableWriter writing to the file at the given path.
+    ///
+    /// `fsync_method` selects how the finished file is flushed to disk in
+    /// [`Self::finish`]; pass the owning engine's configured method so SSTable
+    /// durability matches the rest of the store (WAL, manifest, metadata).
     pub fn create(
         path: impl AsRef<Path>,
         block_size_limit: usize,
         compression: CompressionType,
         expected_entries: usize,
         layout: Vec<u8>,
+        fsync_method: crate::FsyncMethod,
     ) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let mut temp_path = final_path.clone();
@@ -113,6 +119,7 @@ impl SstableWriter {
             max_key: None,
             bloom_filter,
             layout,
+            fsync_method,
         })
     }
 
@@ -243,7 +250,7 @@ impl SstableWriter {
         file.write_all(&index_checksum.to_le_bytes())?;
         file.write_all(MAGIC_NUMBER)?;
 
-        file.sync_all()?;
+        crate::sync_file(&file, self.fsync_method)?;
         drop(file);
 
         // Rename the temporary file atomically to final path

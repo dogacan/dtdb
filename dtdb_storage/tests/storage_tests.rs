@@ -91,7 +91,8 @@ fn test_sstable_write_read() {
     // Write to SSTable with small block size (e.g. 50 bytes) to force block splitting
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 50, CompressionType::Lz4, 4, vec![]).unwrap();
+            SstableWriter::create(&sst_path, 50, CompressionType::Lz4, 4, vec![], FsyncMethod::Fsync)
+                .unwrap();
         writer.append(&k_int(1), Some(&v_int(10))).unwrap();
         writer.append(&k_int(2), Some(&v_int(20))).unwrap();
         writer.append(&k_int(3), None).unwrap(); // Tombstone
@@ -700,7 +701,8 @@ fn test_sstable_block_checksum_detects_bitrot() {
 
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![]).unwrap();
+            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![], FsyncMethod::Fsync)
+                .unwrap();
         for i in 0..16 {
             writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
         }
@@ -750,7 +752,8 @@ fn test_sstable_index_checksum_detects_corruption() {
 
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![]).unwrap();
+            SstableWriter::create(&sst_path, 64, CompressionType::Lz4, 4, vec![], FsyncMethod::Fsync)
+                .unwrap();
         for i in 0..16 {
             writer.append(&k_int(i), Some(&v_int(i * 10))).unwrap();
         }
@@ -1230,8 +1233,15 @@ fn test_sstable_write_read_various_types() {
 
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 1024, CompressionType::Uncompressed, 5, vec![])
-                .unwrap();
+            SstableWriter::create(
+                &sst_path,
+                1024,
+                CompressionType::Uncompressed,
+                5,
+                vec![],
+                FsyncMethod::Fsync,
+            )
+            .unwrap();
         writer
             .append(&k_int(1), Some(&DbValue::Bool(true)))
             .unwrap();
@@ -1487,7 +1497,8 @@ fn test_sstable_empty_reads_return_nothing() {
     // Finish a writer without appending anything: the index ends up empty.
     {
         let writer =
-            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 0, vec![]).unwrap();
+            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 0, vec![], FsyncMethod::Fsync)
+                .unwrap();
         writer.finish().unwrap();
     }
 
@@ -1512,8 +1523,15 @@ fn test_sstable_get_key_below_first_block_misses() {
 
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 4096, CompressionType::Uncompressed, 3, vec![])
-                .unwrap();
+            SstableWriter::create(
+                &sst_path,
+                4096,
+                CompressionType::Uncompressed,
+                3,
+                vec![],
+                FsyncMethod::Fsync,
+            )
+            .unwrap();
         writer.append(&k_int(10), Some(&v_int(100))).unwrap();
         writer.append(&k_int(20), Some(&v_int(200))).unwrap();
         writer.append(&k_int(30), Some(&v_int(300))).unwrap();
@@ -1536,7 +1554,8 @@ fn test_sstable_create_path_without_extension() {
 
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 1, vec![]).unwrap();
+            SstableWriter::create(&sst_path, 4096, CompressionType::Lz4, 1, vec![], FsyncMethod::Fsync)
+                .unwrap();
         writer.append(&k_int(1), Some(&v_int(42))).unwrap();
         writer.finish().unwrap();
     }
@@ -1556,7 +1575,8 @@ fn test_sstable_scan_stops_before_blocks_past_end() {
     // early `break` in the scan loop.
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 1, CompressionType::Uncompressed, 5, vec![]).unwrap();
+            SstableWriter::create(&sst_path, 1, CompressionType::Uncompressed, 5, vec![], FsyncMethod::Fsync)
+                .unwrap();
         for i in 1..=5 {
             writer.append(&k_int(i * 10), Some(&v_int(i * 10))).unwrap();
         }

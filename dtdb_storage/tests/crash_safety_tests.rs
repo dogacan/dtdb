@@ -89,8 +89,15 @@ fn test_atomic_sstable_write() {
     // 1. Start writing but crash (drop without finish)
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 100, CompressionType::Uncompressed, 1, vec![])
-                .unwrap();
+            SstableWriter::create(
+                &sst_path,
+                100,
+                CompressionType::Uncompressed,
+                1,
+                vec![],
+                dtdb_storage::FsyncMethod::Fsync,
+            )
+            .unwrap();
         writer.append(&k_int(1), Some(&v_str("apple"))).unwrap();
         // Dropped here, simulated crash
     }
@@ -105,8 +112,15 @@ fn test_atomic_sstable_write() {
     // 2. Write and successfully finish
     {
         let mut writer =
-            SstableWriter::create(&sst_path, 100, CompressionType::Uncompressed, 1, vec![])
-                .unwrap();
+            SstableWriter::create(
+                &sst_path,
+                100,
+                CompressionType::Uncompressed,
+                1,
+                vec![],
+                dtdb_storage::FsyncMethod::Fsync,
+            )
+            .unwrap();
         writer.append(&k_int(1), Some(&v_str("apple"))).unwrap();
         writer.finish().unwrap();
     }
