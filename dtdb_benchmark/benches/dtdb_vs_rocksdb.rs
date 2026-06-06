@@ -300,6 +300,81 @@ mod imp {
         g.finish();
     }
 
+    fn bench_put_random_heavy_concurrent(c: &mut Criterion) {
+        let mut g = c.benchmark_group("dtdb_vs_rocksdb/put_random_heavy_concurrent");
+        g.throughput(Throughput::Elements(HEAVY_WRITE_OPS as u64));
+        let random_keys = shuffled_indices(HEAVY_WRITE_OPS);
+        const THREADS: usize = 4;
+
+        g.bench_function("dtdb_storage", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let engine = StorageEngine::open(tmp.path(), heavy_options()).unwrap();
+                    (tmp, engine)
+                },
+                |(_tmp, engine)| {
+                    std::thread::scope(|s| {
+                        let chunk_size = HEAVY_WRITE_OPS / THREADS;
+                        for t in 0..THREADS {
+                            let engine = &engine;
+                            let random_keys = &random_keys;
+                            s.spawn(move || {
+                                let start = t * chunk_size;
+                                let end = if t == THREADS - 1 {
+                                    HEAVY_WRITE_OPS
+                                } else {
+                                    (t + 1) * chunk_size
+                                };
+                                for i in start..end {
+                                    let idx = random_keys[i];
+                                    engine.put(make_key(idx), make_value(idx)).unwrap();
+                                }
+                            });
+                        }
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("rocksdb", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let (opts, cache) = rocksdb_heavy_options();
+                    let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
+                    (tmp, db, opts, cache)
+                },
+                |(_tmp, db, _opts, _cache)| {
+                    std::thread::scope(|s| {
+                        let chunk_size = HEAVY_WRITE_OPS / THREADS;
+                        for t in 0..THREADS {
+                            let db = &db;
+                            let random_keys = &random_keys;
+                            s.spawn(move || {
+                                let start = t * chunk_size;
+                                let end = if t == THREADS - 1 {
+                                    HEAVY_WRITE_OPS
+                                } else {
+                                    (t + 1) * chunk_size
+                                };
+                                for i in start..end {
+                                    let idx = random_keys[i];
+                                    let k = serialize_key(&make_key(idx));
+                                    let v = serialize_value(&make_value(idx));
+                                    db.put(k, v).unwrap();
+                                }
+                            });
+                        }
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        g.finish();
+    }
+
     fn bench_write_batch(c: &mut Criterion) {
         let mut g = c.benchmark_group("dtdb_vs_rocksdb/write_batch");
         g.throughput(Throughput::Elements(WRITE_OPS as u64));
@@ -526,6 +601,7 @@ mod imp {
         bench_put_sequential(&mut c);
         bench_put_random(&mut c);
         bench_put_random_heavy(&mut c);
+        bench_put_random_heavy_concurrent(&mut c);
         bench_write_batch(&mut c);
         bench_delete(&mut c);
         bench_reads(&mut c);
