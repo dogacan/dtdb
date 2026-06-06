@@ -134,14 +134,6 @@ struct WriteTaskState {
     result: Result<()>,
 }
 
-fn apply_entry(mem: &MemTable, ent: WalEntry) {
-    match ent {
-        WalEntry::Put { key, value } => mem.put(key, value),
-        WalEntry::Delete { key } => mem.delete(key),
-        WalEntry::Batch(_) => {}
-    }
-}
-
 fn apply_entry_recursive(mem: &MemTable, ent: WalEntry) {
     match ent {
         WalEntry::Put { key, value } => mem.put(key, value),
@@ -768,7 +760,7 @@ impl EngineInner {
         queue.tasks.push_back(task.clone());
 
         while !task.state.lock().unwrap().done
-            && !(queue.tasks.front().map_or(false, |f| Arc::ptr_eq(f, &task)) && !queue.writing)
+            && (!queue.tasks.front().is_some_and(|f| Arc::ptr_eq(f, &task)) || queue.writing)
         {
             queue = task.condvar.wait(queue).unwrap();
         }
@@ -827,9 +819,7 @@ impl EngineInner {
         let trigger_flush = {
             let memset = self.memset.read().unwrap();
             let mem = &memset.active;
-            for entry in merged_entries {
-                apply_entry(mem, entry);
-            }
+            mem.apply_batch(merged_entries);
             let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
             let wal_full = wal_size as usize >= self.options.wal_size_limit;
             mem_full || wal_full
