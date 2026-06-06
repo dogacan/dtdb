@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StorageEngineStatistics {
@@ -52,6 +52,68 @@ struct EngineInner {
     wal_sync_handle: Mutex<Option<PeriodicHandle>>,
     block_cache: Option<Arc<crate::BlockCache>>,
     last_compacted_keys: Mutex<std::collections::HashMap<usize, DbKey>>,
+    /// Lifecycle gate for background work (compaction, periodic WAL sync). See
+    /// [`BackgroundGate`].
+    background: BackgroundGate,
+}
+
+/// Tracks in-flight background work so the engine can be *quiesced*.
+///
+/// Background compaction is submitted to a process-wide, shared [`Executor`]
+/// (see [`crate::default_executor`]) and captures an `Arc<EngineInner>`, so it
+/// keeps running after the public [`StorageEngine`] handle is dropped. Because
+/// compaction deletes SSTable files after recording manifest edits, a task
+/// still running when the directory is reopened (or otherwise expected to be
+/// quiesced) can delete a manifest-registered file out from under the new
+/// open's SSTable discovery, surfacing as a spurious ENOENT.
+///
+/// The executor is shared across engines and exposes no per-engine drain, so
+/// this gate provides that scope. [`EngineInner::quiesce`] flips
+/// `shutting_down` and blocks until every task that had already begun finishes;
+/// any task that had *not* yet begun observes the flag (via
+/// [`EngineInner::enter_background`]) and returns without touching engine state.
+/// Together these guarantee that once `quiesce` returns, no background task will
+/// mutate engine state — including deleting files.
+struct BackgroundGate {
+    state: Mutex<BackgroundState>,
+    /// Signalled when `active` reaches zero so `quiesce` can wake.
+    idle: Condvar,
+}
+
+struct BackgroundState {
+    /// Number of background tasks that have begun and not yet finished.
+    active: usize,
+    /// Once set, no new background task is allowed to begin.
+    shutting_down: bool,
+}
+
+impl BackgroundGate {
+    fn new() -> Self {
+        BackgroundGate {
+            state: Mutex::new(BackgroundState {
+                active: 0,
+                shutting_down: false,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+}
+
+/// RAII guard marking a background task as in-flight. Decrements the active
+/// count on drop (panic-safe), waking [`EngineInner::quiesce`] when it reaches
+/// zero. Obtained from [`EngineInner::enter_background`].
+struct BackgroundGuard<'a> {
+    inner: &'a EngineInner,
+}
+
+impl Drop for BackgroundGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.inner.background.state.lock().unwrap();
+        st.active -= 1;
+        if st.active == 0 {
+            self.inner.background.idle.notify_all();
+        }
+    }
 }
 
 impl StorageEngine {
@@ -87,10 +149,15 @@ impl StorageEngine {
                 std::time::Duration::from_millis(ms),
                 Priority::Normal,
                 Box::new(move || {
-                    if let Some(engine) = inner_weak.upgrade()
-                        && let Err(e) = engine.sync_wal()
-                    {
-                        tracing::error!(error = ?e, "background WAL sync failed");
+                    if let Some(engine) = inner_weak.upgrade() {
+                        // Honor shutdown: skip the sync once quiescing so no
+                        // background task touches engine state after shutdown.
+                        let Some(_bg) = engine.enter_background() else {
+                            return;
+                        };
+                        if let Err(e) = engine.sync_wal() {
+                            tracing::error!(error = ?e, "background WAL sync failed");
+                        }
                     }
                 }),
             );
@@ -166,6 +233,29 @@ impl StorageEngine {
 
     pub fn get_statistics(&self) -> Result<StorageEngineStatistics> {
         self.inner.get_statistics()
+    }
+
+    /// Quiesce the engine: stop scheduling background work and block until any
+    /// in-flight background compaction (or WAL sync) has finished. After this
+    /// returns, no background task will touch engine state — in particular,
+    /// none will delete SSTable files — so the directory can be safely reopened
+    /// or removed.
+    ///
+    /// Idempotent, and also run automatically when the engine is dropped. Call
+    /// it explicitly when you need the quiesced state *before* dropping the last
+    /// handle (e.g. just before reopening the same directory).
+    pub fn shutdown(&self) {
+        self.inner.quiesce();
+    }
+}
+
+impl Drop for StorageEngine {
+    /// Quiesce on drop so a background compaction can never outlive the public
+    /// handle and race a subsequent reopen of the same directory. Runs only
+    /// when the last `StorageEngine` is dropped (the type is not `Clone`;
+    /// shared owners use `Arc<StorageEngine>`).
+    fn drop(&mut self) {
+        self.inner.quiesce();
     }
 }
 
@@ -384,6 +474,7 @@ impl EngineInner {
             wal_sync_handle: Mutex::new(None),
             block_cache,
             last_compacted_keys: Mutex::new(std::collections::HashMap::new()),
+            background: BackgroundGate::new(),
         })
     }
 
@@ -1295,7 +1386,42 @@ impl EngineInner {
         Ok(())
     }
 
+    /// Begin a background-task region. Returns a guard that marks the task as
+    /// in-flight (decrementing on drop), or `None` if the engine is shutting
+    /// down — in which case the caller MUST return without touching engine
+    /// state. See [`BackgroundGate`].
+    fn enter_background(&self) -> Option<BackgroundGuard<'_>> {
+        let mut st = self.background.state.lock().unwrap();
+        if st.shutting_down {
+            return None;
+        }
+        st.active += 1;
+        Some(BackgroundGuard { inner: self })
+    }
+
+    /// Quiesce all background work: stop scheduling, then block until any task
+    /// that had already begun has finished. After this returns, no background
+    /// task will touch engine state, so the directory can be safely reopened.
+    /// Idempotent.
+    fn quiesce(&self) {
+        // Cancel the periodic WAL-sync schedule so no further ticks are
+        // submitted (dropping the handle cancels it).
+        *self.wal_sync_handle.lock().unwrap() = None;
+
+        let mut st = self.background.state.lock().unwrap();
+        st.shutting_down = true;
+        while st.active > 0 {
+            st = self.background.idle.wait(st).unwrap();
+        }
+    }
+
     fn trigger_compaction(self: &Arc<Self>) {
+        // Don't schedule new compaction once the engine is shutting down; a task
+        // submitted now would only no-op (see the `enter_background` guard
+        // below), and skipping the submit keeps the executor queue clean.
+        if self.background.state.lock().unwrap().shutting_down {
+            return;
+        }
         let inner = self.clone();
         // Coalesce per engine: at most one compaction runs at a time, and a
         // request arriving mid-run schedules exactly one trailing re-run. This
@@ -1306,6 +1432,14 @@ impl EngineInner {
             Priority::High,
             Some(key),
             Box::new(move || {
+                // Register as in-flight so `quiesce` joins us; bail without
+                // touching state if the engine was shut down between submit and
+                // execution (e.g. the public handle was dropped). This is what
+                // prevents a stray compaction from deleting files after the
+                // engine is considered closed.
+                let Some(_bg) = inner.enter_background() else {
+                    return;
+                };
                 let _compaction_lock = inner.compaction_mutex.lock().unwrap();
                 if let Err(e) = inner.compact_if_needed_locked() {
                     tracing::error!(error = ?e, "background compaction failed");
