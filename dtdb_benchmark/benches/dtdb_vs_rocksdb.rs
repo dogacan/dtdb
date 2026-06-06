@@ -326,8 +326,7 @@ mod imp {
                                 } else {
                                     (t + 1) * chunk_size
                                 };
-                                for i in start..end {
-                                    let idx = random_keys[i];
+                                for &idx in &random_keys[start..end] {
                                     engine.put(make_key(idx), make_value(idx)).unwrap();
                                 }
                             });
@@ -359,8 +358,7 @@ mod imp {
                                 } else {
                                     (t + 1) * chunk_size
                                 };
-                                for i in start..end {
-                                    let idx = random_keys[i];
+                                for &idx in &random_keys[start..end] {
                                     let k = serialize_key(&make_key(idx));
                                     let v = serialize_value(&make_value(idx));
                                     db.put(k, v).unwrap();
@@ -623,8 +621,7 @@ mod imp {
                                 } else {
                                     (t + 1) * chunk_size
                                 };
-                                for i in start..end {
-                                    let idx = random_keys[i];
+                                for &idx in &random_keys[start..end] {
                                     engine.put(make_key(idx), make_value(idx)).unwrap();
                                 }
                             });
@@ -666,8 +663,7 @@ mod imp {
                                 } else {
                                     (t + 1) * chunk_size
                                 };
-                                for i in start..end {
-                                    let idx = random_keys[i];
+                                for &idx in &random_keys[start..end] {
                                     let k = serialize_key(&make_key(idx));
                                     let v = serialize_value(&make_value(idx));
                                     db.put(k, v).unwrap();
@@ -723,8 +719,7 @@ mod imp {
                                 } else {
                                     (t + 1) * chunk_size
                                 };
-                                for i in start..end {
-                                    let idx = random_keys[i];
+                                for &idx in &random_keys[start..end] {
                                     let _ = engine.get(&make_key(idx)).unwrap();
                                 }
                             });
@@ -772,8 +767,7 @@ mod imp {
                                 } else {
                                     (t + 1) * chunk_size
                                 };
-                                for i in start..end {
-                                    let idx = random_keys[i];
+                                for &idx in &random_keys[start..end] {
                                     let k = serialize_key(&make_key(idx));
                                     let _ = db.get(k).unwrap();
                                 }

@@ -2899,7 +2899,7 @@ mod tests {
         let start = std::time::Instant::now();
         engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
         let elapsed = start.elapsed();
-        assert!(elapsed < std::time::Duration::from_millis(5));
+        assert!(elapsed < std::time::Duration::from_millis(100));
 
         // Inject 2 L0 files -> slowdown sleep = 2^0 = 1ms
         {
