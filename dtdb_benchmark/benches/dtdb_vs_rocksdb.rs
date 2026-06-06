@@ -596,12 +596,216 @@ mod imp {
         g.finish();
     }
 
+    fn bench_mixed_write_heavy(c: &mut Criterion) {
+        let mut g = c.benchmark_group("dtdb_vs_rocksdb/mixed_write_heavy");
+        g.throughput(Throughput::Elements(HEAVY_WRITE_OPS as u64));
+        let random_keys = shuffled_indices(HEAVY_WRITE_OPS);
+        const WRITERS: usize = 4;
+
+        g.bench_function("dtdb_storage", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let engine = StorageEngine::open(tmp.path(), heavy_options()).unwrap();
+                    (tmp, engine)
+                },
+                |(_tmp, engine)| {
+                    std::thread::scope(|s| {
+                        let chunk_size = HEAVY_WRITE_OPS / WRITERS;
+                        // Spawn writers
+                        for t in 0..WRITERS {
+                            let engine = &engine;
+                            let random_keys = &random_keys;
+                            s.spawn(move || {
+                                let start = t * chunk_size;
+                                let end = if t == WRITERS - 1 {
+                                    HEAVY_WRITE_OPS
+                                } else {
+                                    (t + 1) * chunk_size
+                                };
+                                for i in start..end {
+                                    let idx = random_keys[i];
+                                    engine.put(make_key(idx), make_value(idx)).unwrap();
+                                }
+                            });
+                        }
+                        // Spawn 1 reader
+                        let engine = &engine;
+                        let random_keys = &random_keys;
+                        s.spawn(move || {
+                            for i in 0..chunk_size {
+                                let idx = random_keys[i % HEAVY_WRITE_OPS];
+                                let _ = engine.get(&make_key(idx)).unwrap();
+                            }
+                        });
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("rocksdb", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let (opts, cache) = rocksdb_heavy_options();
+                    let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
+                    (tmp, db, opts, cache)
+                },
+                |(_tmp, db, _opts, _cache)| {
+                    std::thread::scope(|s| {
+                        let chunk_size = HEAVY_WRITE_OPS / WRITERS;
+                        // Spawn writers
+                        for t in 0..WRITERS {
+                            let db = &db;
+                            let random_keys = &random_keys;
+                            s.spawn(move || {
+                                let start = t * chunk_size;
+                                let end = if t == WRITERS - 1 {
+                                    HEAVY_WRITE_OPS
+                                } else {
+                                    (t + 1) * chunk_size
+                                };
+                                for i in start..end {
+                                    let idx = random_keys[i];
+                                    let k = serialize_key(&make_key(idx));
+                                    let v = serialize_value(&make_value(idx));
+                                    db.put(k, v).unwrap();
+                                }
+                            });
+                        }
+                        // Spawn 1 reader
+                        let db = &db;
+                        let random_keys = &random_keys;
+                        s.spawn(move || {
+                            for i in 0..chunk_size {
+                                let idx = random_keys[i % HEAVY_WRITE_OPS];
+                                let k = serialize_key(&make_key(idx));
+                                let _ = db.get(k).unwrap();
+                            }
+                        });
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        g.finish();
+    }
+
+    fn bench_mixed_read_heavy(c: &mut Criterion) {
+        let mut g = c.benchmark_group("dtdb_vs_rocksdb/mixed_read_heavy");
+        g.throughput(Throughput::Elements(HEAVY_WRITE_OPS as u64));
+        let random_keys = shuffled_indices(HEAVY_WRITE_OPS);
+        const READERS: usize = 4;
+
+        g.bench_function("dtdb_storage", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let engine = StorageEngine::open(tmp.path(), heavy_options()).unwrap();
+                    // Pre-populate so that reads actually find keys
+                    for i in 0..HEAVY_WRITE_OPS {
+                        engine.put(make_key(i), make_value(i)).unwrap();
+                    }
+                    (tmp, engine)
+                },
+                |(_tmp, engine)| {
+                    std::thread::scope(|s| {
+                        let chunk_size = HEAVY_WRITE_OPS / READERS;
+                        // Spawn readers
+                        for t in 0..READERS {
+                            let engine = &engine;
+                            let random_keys = &random_keys;
+                            s.spawn(move || {
+                                let start = t * chunk_size;
+                                let end = if t == READERS - 1 {
+                                    HEAVY_WRITE_OPS
+                                } else {
+                                    (t + 1) * chunk_size
+                                };
+                                for i in start..end {
+                                    let idx = random_keys[i];
+                                    let _ = engine.get(&make_key(idx)).unwrap();
+                                }
+                            });
+                        }
+                        // Spawn 1 writer
+                        let engine = &engine;
+                        let random_keys = &random_keys;
+                        s.spawn(move || {
+                            for i in 0..chunk_size {
+                                let idx = random_keys[i % HEAVY_WRITE_OPS];
+                                engine.put(make_key(idx), make_value(idx + 1000)).unwrap();
+                            }
+                        });
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_function("rocksdb", |b| {
+            b.iter_batched(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let (opts, cache) = rocksdb_heavy_options();
+                    let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
+                    // Pre-populate
+                    for i in 0..HEAVY_WRITE_OPS {
+                        let k = serialize_key(&make_key(i));
+                        let v = serialize_value(&make_value(i));
+                        db.put(k, v).unwrap();
+                    }
+                    (tmp, db, opts, cache)
+                },
+                |(_tmp, db, _opts, _cache)| {
+                    std::thread::scope(|s| {
+                        let chunk_size = HEAVY_WRITE_OPS / READERS;
+                        // Spawn readers
+                        for t in 0..READERS {
+                            let db = &db;
+                            let random_keys = &random_keys;
+                            s.spawn(move || {
+                                let start = t * chunk_size;
+                                let end = if t == READERS - 1 {
+                                    HEAVY_WRITE_OPS
+                                } else {
+                                    (t + 1) * chunk_size
+                                };
+                                for i in start..end {
+                                    let idx = random_keys[i];
+                                    let k = serialize_key(&make_key(idx));
+                                    let _ = db.get(k).unwrap();
+                                }
+                            });
+                        }
+                        // Spawn 1 writer
+                        let db = &db;
+                        let random_keys = &random_keys;
+                        s.spawn(move || {
+                            for i in 0..chunk_size {
+                                let idx = random_keys[i % HEAVY_WRITE_OPS];
+                                let k = serialize_key(&make_key(idx));
+                                let v = serialize_value(&make_value(idx + 1000));
+                                db.put(k, v).unwrap();
+                            }
+                        });
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        g.finish();
+    }
+
     pub fn run() {
         let mut c = Criterion::default().configure_from_args();
         bench_put_sequential(&mut c);
         bench_put_random(&mut c);
         bench_put_random_heavy(&mut c);
         bench_put_random_heavy_concurrent(&mut c);
+        bench_mixed_write_heavy(&mut c);
+        bench_mixed_read_heavy(&mut c);
         bench_write_batch(&mut c);
         bench_delete(&mut c);
         bench_reads(&mut c);
