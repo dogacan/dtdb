@@ -92,7 +92,6 @@ fn run(label: &'static str, opts: EngineOptions, keys: &[usize], threads: usize)
         std::thread::scope(|s| {
             for (t, durs) in thread_durations.iter_mut().enumerate() {
                 let engine = &engine;
-                let keys = keys;
                 s.spawn(move || {
                     let start_idx = t * keys_per_thread;
                     let end_idx = if t == threads - 1 {
@@ -101,8 +100,7 @@ fn run(label: &'static str, opts: EngineOptions, keys: &[usize], threads: usize)
                         (t + 1) * keys_per_thread
                     };
                     durs.reserve(end_idx - start_idx);
-                    for i in start_idx..end_idx {
-                        let val_idx = keys[i];
+                    for &val_idx in &keys[start_idx..end_idx] {
                         let t0 = Instant::now();
                         engine.put(make_key(val_idx), make_value(val_idx)).unwrap();
                         durs.push(t0.elapsed().as_nanos() as u64);

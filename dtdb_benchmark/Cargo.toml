@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "dtdb_vs_rocksdb"
 harness = false
+
+[[bench]]
+name = "write_parallel"
+harness = false
