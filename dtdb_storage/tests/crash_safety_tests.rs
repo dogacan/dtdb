@@ -1,8 +1,15 @@
 use dtdb_storage::sstable::SstableWriter;
 use dtdb_storage::wal::{Wal, WalEntry};
-use dtdb_storage::{CompressionType, DbKey, DbValue, EngineOptions, StorageEngine};
+use dtdb_storage::{
+    CoalesceKey, CompressionType, DbKey, DbValue, EngineOptions, Executor, InlineExecutor,
+    PassthroughValueRewriter, PeriodicHandle, Priority, Result, StorageEngine, ValueRewriter,
+};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 // Helper to create keys and values
@@ -155,4 +162,232 @@ fn test_compaction_crash_garbage_collection() {
             "Garbage SSTable file was not cleaned up!"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Engine shutdown / quiescence
+// ---------------------------------------------------------------------------
+
+/// Sorted list of `*.sst` file names in `dir` (the engine's on-disk SSTable
+/// set), so a test can assert the set is unchanged without depending on fsync
+/// timing.
+fn list_sst_files(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".sst"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// An [`Executor`] that *stores* submitted one-shot tasks instead of running
+/// them, so a test can deterministically control when (and whether) background
+/// compaction executes — no threads, no timing. Periodic work is delegated to
+/// an [`InlineExecutor`] (unused here since these tests disable WAL syncing).
+struct ManualExecutor {
+    tasks: Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    inline: InlineExecutor,
+}
+
+impl ManualExecutor {
+    fn new() -> Self {
+        ManualExecutor {
+            tasks: Mutex::new(Vec::new()),
+            inline: InlineExecutor,
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.tasks.lock().unwrap().len()
+    }
+
+    /// Run every stored task, draining the queue.
+    fn run_all(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for task in tasks {
+            task();
+        }
+    }
+}
+
+impl Executor for ManualExecutor {
+    fn submit(
+        &self,
+        _priority: Priority,
+        _key: Option<CoalesceKey>,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) {
+        self.tasks.lock().unwrap().push(task);
+    }
+
+    fn submit_periodic(
+        &self,
+        every: Duration,
+        priority: Priority,
+        task: Box<dyn Fn() + Send + Sync + 'static>,
+    ) -> PeriodicHandle {
+        self.inline.submit_periodic(every, priority, task)
+    }
+}
+
+/// After `shutdown()`, a background compaction that was already submitted (but
+/// had not yet begun) must not run against the engine — otherwise it could
+/// delete manifest-registered SSTable files out from under a concurrent reopen,
+/// surfacing as a spurious ENOENT. Fully deterministic: the `ManualExecutor`
+/// only runs the queued compaction *after* we shut down.
+#[test]
+fn shutdown_prevents_queued_compaction_from_touching_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let options = get_test_options(); // l0_compaction_threshold = 2, no WAL sync
+
+    let exec = Arc::new(ManualExecutor::new());
+    let engine = StorageEngine::open_with_executor(
+        temp_dir.path(),
+        options,
+        exec.clone(),
+        Arc::new(PassthroughValueRewriter),
+    )
+    .unwrap();
+
+    // Two flushes reach l0_compaction_threshold, so a background compaction is
+    // submitted — but the ManualExecutor only stores it; nothing runs yet.
+    engine.put(k_int(1), v_str("apple")).unwrap();
+    engine.flush_memtable().unwrap();
+    engine.put(k_int(2), v_str("banana")).unwrap();
+    engine.flush_memtable().unwrap();
+
+    assert!(
+        exec.pending() >= 1,
+        "expected a background compaction to be queued after crossing the L0 threshold"
+    );
+
+    // Snapshot the SSTable set while compaction has not run.
+    let ssts_before = list_sst_files(temp_dir.path());
+    assert!(!ssts_before.is_empty());
+
+    // Quiesce, then release the queued compaction. It must observe the shutdown
+    // flag and return without creating or deleting any SSTable.
+    engine.shutdown();
+    exec.run_all();
+
+    let ssts_after = list_sst_files(temp_dir.path());
+    assert_eq!(
+        ssts_before, ssts_after,
+        "a compaction submitted before shutdown must not mutate state afterward"
+    );
+
+    // The directory is consistent: reopening sees every registered file.
+    drop(engine);
+    let reopened = StorageEngine::open(temp_dir.path(), options).unwrap();
+    assert_eq!(reopened.get(&k_int(1)).unwrap(), Some(v_str("apple")));
+    assert_eq!(reopened.get(&k_int(2)).unwrap(), Some(v_str("banana")));
+}
+
+/// A [`ValueRewriter`] that blocks the first value it rewrites until released,
+/// letting a test hold a compaction *in flight* at a deterministic point (no
+/// fsync/sleep timing). Compaction only invokes the rewriter on a layout
+/// mismatch, so the test arranges one.
+struct BlockingRewriter {
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    fired: AtomicBool,
+}
+
+impl ValueRewriter for BlockingRewriter {
+    fn rewrite(&self, _src: &[u8], _dst: &[u8], value: &DbValue) -> Result<DbValue> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            // Signal that a compaction is now in flight, then block.
+            if let Some(tx) = self.started.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let (lock, cv) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+        }
+        Ok(value.clone())
+    }
+}
+
+/// `shutdown()` must *wait* for an in-flight compaction to finish — not return
+/// while a worker is still mutating engine state. We pin a compaction inside the
+/// rewriter, call `shutdown()` on another thread, and prove it cannot return
+/// until we release the compaction. Deterministic: while the compaction is
+/// parked the in-flight count is non-zero, so `quiesce` provably blocks.
+#[test]
+fn shutdown_waits_for_in_flight_compaction() {
+    let temp_dir = TempDir::new().unwrap();
+    let options = get_test_options(); // l0_compaction_threshold = 2
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let rewriter = Arc::new(BlockingRewriter {
+        started: Mutex::new(Some(started_tx)),
+        release: release.clone(),
+        fired: AtomicBool::new(false),
+    });
+
+    // InlineExecutor runs each submitted compaction on its own thread, so the
+    // compaction runs concurrently with our shutdown call.
+    let engine = Arc::new(
+        StorageEngine::open_with_executor(
+            temp_dir.path(),
+            options,
+            Arc::new(InlineExecutor),
+            rewriter,
+        )
+        .unwrap(),
+    );
+
+    // First SSTable is written with the default (empty) layout.
+    engine.put(k_int(1), v_str("apple")).unwrap();
+    engine.flush_memtable().unwrap();
+
+    // Switch the target layout so compacting the first SSTable forces a rewrite
+    // (and thus blocks inside BlockingRewriter).
+    engine.set_target_layout(vec![1]);
+
+    // Second flush crosses the L0 threshold and triggers background compaction.
+    engine.put(k_int(2), v_str("banana")).unwrap();
+    engine.flush_memtable().unwrap();
+
+    // Wait until a compaction is parked in the rewriter (in flight).
+    started_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("a background compaction should have started rewriting");
+
+    // Call shutdown() on another thread; it must block while compaction runs.
+    let returned = Arc::new(AtomicBool::new(false));
+    let join = {
+        let engine = engine.clone();
+        let returned = returned.clone();
+        std::thread::spawn(move || {
+            engine.shutdown();
+            returned.store(true, Ordering::SeqCst);
+        })
+    };
+
+    // The compaction is still parked (in-flight count > 0), so shutdown cannot
+    // have returned yet. This holds regardless of thread scheduling.
+    assert!(
+        !returned.load(Ordering::SeqCst),
+        "shutdown() returned while a compaction was still in flight"
+    );
+
+    // Release the compaction; shutdown must now complete.
+    {
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    join.join().unwrap();
+    assert!(returned.load(Ordering::SeqCst));
+
+    // The compaction ran to completion and the engine is consistent on reopen.
+    drop(engine);
+    let reopened = StorageEngine::open(temp_dir.path(), options).unwrap();
+    assert_eq!(reopened.get(&k_int(1)).unwrap(), Some(v_str("apple")));
+    assert_eq!(reopened.get(&k_int(2)).unwrap(), Some(v_str("banana")));
 }
