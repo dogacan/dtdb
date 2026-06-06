@@ -107,12 +107,33 @@ fn test_write_batch_triggers_flush_when_memtable_full() {
         ])
         .unwrap();
 
-    // The batch overflowed the memtable, so it should have been flushed to an
-    // SSTable; the data must still be readable from disk.
-    let stats = engine.get_statistics().unwrap();
-    assert!(stats.num_sstables >= 1, "expected a flush, got {stats:?}");
+    // The batch overflowed the memtable, so it is sealed and flushed in the
+    // background. The data stays readable the whole time (served from the
+    // immutable memtable until the flush lands it in an SSTable).
     assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_int(1)));
     assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_int(2)));
+
+    // The background flush eventually produces an L0 SSTable.
+    let flushed = wait_until(std::time::Duration::from_secs(5), || {
+        engine.get_statistics().unwrap().num_sstables >= 1
+    });
+    assert!(flushed, "expected a background flush to produce an SSTable");
+    assert_eq!(engine.get(&k_int(1)).unwrap(), Some(v_int(1)));
+    assert_eq!(engine.get(&k_int(2)).unwrap(), Some(v_int(2)));
+}
+
+/// Polls `cond` until it returns true or `timeout` elapses. Returns whether the
+/// condition was met. Used to await background work (e.g. an async flush) without
+/// a fixed sleep.
+fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    cond()
 }
 
 /// Builds an engine whose data is spread across L1 with several
