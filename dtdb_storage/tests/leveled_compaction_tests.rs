@@ -17,6 +17,20 @@ fn v_str(val: &str) -> DbValue {
     DbValue::string(val)
 }
 
+/// Polls `cond` until it returns true or `timeout` elapses; returns whether it
+/// was met. Used to await background work (flushes and compaction now run
+/// asynchronously) without a fixed sleep.
+fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    cond()
+}
+
 // Helper to count SSTable files in a directory that belong to a specific level
 fn count_sst_files_at_level(dir: &std::path::Path, target_level: usize) -> usize {
     let mut count = 0;
@@ -62,9 +76,16 @@ fn test_l0_to_l1_auto_compaction() {
     };
     let engine = StorageEngine::open(&db_path, options).unwrap();
 
-    // 1. Write first key -> triggers 1st L0 flush (L0 file count = 1)
+    // 1. Write first key -> triggers the 1st L0 flush, which runs in the
+    // background. Below the threshold (2), so no compaction follows and L0
+    // settles at one file.
     engine.put(k_int(1), v_str("val1")).unwrap();
-    assert_eq!(count_sst_files_at_level(&db_path, 0), 1);
+    assert!(
+        wait_until(std::time::Duration::from_secs(2), || {
+            count_sst_files_at_level(&db_path, 0) == 1
+        }),
+        "first background flush did not produce an L0 file"
+    );
     assert_eq!(count_sst_files_at_level(&db_path, 1), 0);
 
     // 2. Write second key -> triggers 2nd L0 flush. Since threshold = 2,
@@ -173,9 +194,15 @@ fn test_tombstone_purging() {
     assert_eq!(count_sst_files_at_level(&db_path, 0), 0);
     assert_eq!(count_sst_files_at_level(&db_path, 1), 1);
 
-    // Write a delete tombstone for the key, which flushes to L0
+    // Write a delete tombstone for the key, which is sealed and flushed to L0 in
+    // the background.
     engine.delete(k_int(1)).unwrap();
-    assert_eq!(count_sst_files_at_level(&db_path, 0), 1);
+    assert!(
+        wait_until(std::time::Duration::from_secs(2), || {
+            count_sst_files_at_level(&db_path, 0) == 1
+        }),
+        "tombstone background flush did not produce an L0 file"
+    );
 
     // Run compaction again. Since target level is Level 1, and there are no files in level > 1 (max level is 2, level 2 is empty),
     // the tombstone can be purged!

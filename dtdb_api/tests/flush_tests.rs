@@ -108,8 +108,21 @@ async fn test_wal_size_based_flush() {
         }
     }
 
-    // Verify that the WAL size limit check triggered an automatic flush and created an SSTable file
-    assert_eq!(count_sst_files(&table_dir), 1);
+    // The WAL-size check triggered an automatic flush, which now runs in the
+    // background. Poll (rather than sleeping a fixed amount) for the SSTable to
+    // land.
+    let mut flushed = false;
+    for _ in 0..80 {
+        if count_sst_files(&table_dir) == 1 {
+            flushed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        flushed,
+        "expected the WAL-size-triggered flush to create an SSTable"
+    );
 
     server_handle.abort();
 }

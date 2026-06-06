@@ -53,6 +53,16 @@ fn parse_wal_segment_id(path: &Path) -> Option<u64> {
         .ok()
 }
 
+/// Maximum number of immutable (sealed but not-yet-flushed) memtables allowed to
+/// accumulate before writers stall. LevelDB keeps exactly one immutable memtable
+/// and blocks the writer until the in-flight flush finishes; we match that here.
+///
+/// This is the cap that a configurable `max_write_buffer_number` would later
+/// raise (the immutable cap is `max_write_buffer_number - 1`). The machinery —
+/// the `VecDeque` queue and the [`FlushGate`] counter — is already general over
+/// any cap, so raising it is a one-line change rather than a rearchitecture.
+const MAX_IMMUTABLE_MEMTABLES: usize = 1;
+
 pub struct StorageEngine {
     inner: Arc<EngineInner>,
 }
@@ -75,12 +85,12 @@ struct ImmMemtable {
 /// SSTables. Each sealed memtable corresponds to a sealed WAL segment, so the
 /// queue mirrors the segments on disk that have not yet been retired.
 ///
-/// Flush is currently synchronous (it runs inline under `write_mutex`), so
-/// `immutable` holds at most one memtable and only transiently — between sealing
-/// the active memtable and the flush completing. The queue nonetheless exists so
-/// the read path already merges over sealed-but-unflushed memtables. Moving the
-/// flush to a background thread (a later change) then needs no read-path work and
-/// only has to let the queue grow up to `max_write_buffer_number - 1`.
+/// A full active memtable is sealed into `immutable` and flushed by a background
+/// task, so writes don't block on flush I/O. The queue is bounded at
+/// [`MAX_IMMUTABLE_MEMTABLES`]; a writer that needs to seal when the queue is
+/// full stalls (see [`FlushGate`]) until a flush drains a slot. With today's cap
+/// of one, `immutable` holds at most a single memtable, but the queue and the
+/// read-side merge are already general over a larger cap.
 struct MemSet {
     active: Arc<MemTable>,
     immutable: VecDeque<ImmMemtable>,
@@ -100,6 +110,14 @@ struct EngineInner {
     sstables: RwLock<BTreeMap<usize, Vec<Arc<SstableReader>>>>,
     options: EngineOptions,
     write_mutex: Mutex<()>,
+    /// Serializes flushing the immutable queue to L0. Held for the whole drain,
+    /// so at most one flusher runs at a time: flushes complete in seal order
+    /// (keeping L0 newest-first under front-insert) and a background drain can't
+    /// double-flush an immutable that a synchronous `flush`/`compact` is also
+    /// draining.
+    flush_lock: Mutex<()>,
+    /// Backpressure gate stalling writers when the immutable queue is full.
+    flush_gate: FlushGate,
     compaction_mutex: Mutex<()>,
     /// The active-SSTable set, persisted as a snapshot + edit log. The mutex
     /// serializes manifest updates (and provides the `&mut` the log needs).
@@ -173,6 +191,42 @@ impl Drop for BackgroundGuard<'_> {
         st.active -= 1;
         if st.active == 0 {
             self.inner.background.idle.notify_all();
+        }
+    }
+}
+
+/// Write-path backpressure for the immutable-memtable queue.
+///
+/// `immutable_count` mirrors the length of [`MemSet::immutable`] but lives under
+/// its own mutex so it can pair with a condvar without serializing the read-side
+/// `memset` `RwLock`. A writer that needs to seal a full active memtable blocks
+/// on `slot_freed` until `immutable_count` drops below
+/// [`MAX_IMMUTABLE_MEMTABLES`]; a completing flush decrements the count and wakes
+/// it. This is the LevelDB-style hard stall: writes wait for flushes to catch up
+/// rather than letting the queue (and memory) grow without bound.
+struct FlushGate {
+    state: Mutex<FlushGateState>,
+    /// Signalled when a flush frees an immutable slot, or on shutdown.
+    slot_freed: Condvar,
+}
+
+struct FlushGateState {
+    /// Immutable memtables sealed but not yet flushed. Incremented when an active
+    /// memtable is sealed, decremented when its flush completes.
+    immutable_count: usize,
+    /// Set during quiesce so a stalled writer stops waiting and lets shutdown
+    /// proceed instead of blocking forever on a flush that will never run.
+    shutting_down: bool,
+}
+
+impl FlushGate {
+    fn new() -> Self {
+        FlushGate {
+            state: Mutex::new(FlushGateState {
+                immutable_count: 0,
+                shutting_down: false,
+            }),
+            slot_freed: Condvar::new(),
         }
     }
 }
@@ -567,6 +621,8 @@ impl EngineInner {
             sstables: RwLock::new(sstables_map),
             options: active_options,
             write_mutex: Mutex::new(()),
+            flush_lock: Mutex::new(()),
+            flush_gate: FlushGate::new(),
             compaction_mutex: Mutex::new(()),
             manifest: Mutex::new(manifest),
             next_sst_id: AtomicU64::new(max_id + 1),
@@ -602,7 +658,7 @@ impl EngineInner {
         };
 
         if trigger_flush {
-            self.flush_memtable_internal()?;
+            self.flush_active_in_background()?;
         }
 
         Ok(())
@@ -626,7 +682,7 @@ impl EngineInner {
         };
 
         if trigger_flush {
-            self.flush_memtable_internal()?;
+            self.flush_active_in_background()?;
         }
 
         Ok(())
@@ -661,7 +717,7 @@ impl EngineInner {
         };
 
         if trigger_flush {
-            self.flush_memtable_internal()?;
+            self.flush_active_in_background()?;
         }
 
         Ok(())
@@ -1047,17 +1103,25 @@ impl EngineInner {
     }
 
     pub fn flush_memtable(self: &Arc<Self>) -> Result<()> {
-        let _write_lock = self.write_mutex.lock().unwrap();
-        self.flush_memtable_internal()?;
+        // Seal under the write lock, then drain synchronously so the data is on
+        // disk by the time this returns (callers rely on that). Draining also
+        // sweeps up any immutable still queued from a background flush.
+        {
+            let _write_lock = self.write_mutex.lock().unwrap();
+            self.seal_active()?;
+        }
+        self.flush_pending()?;
+        self.trigger_compaction();
         Ok(())
     }
 
     pub fn compact(self: &Arc<Self>) -> Result<()> {
-        // 1. Flush active memtable to disk first so all data is in SSTables (holds write_mutex).
+        // 1. Flush active memtable to disk first so all data is in SSTables.
         {
             let _write_lock = self.write_mutex.lock().unwrap();
-            self.flush_memtable_internal_no_trigger()?;
+            self.seal_active()?;
         }
+        self.flush_pending()?;
 
         // 2. Run compaction synchronously
         let _compaction_lock = self.compaction_mutex.lock().unwrap();
@@ -1462,22 +1526,82 @@ impl EngineInner {
         Ok(())
     }
 
-    fn flush_memtable_internal(self: &Arc<Self>) -> Result<()> {
-        self.flush_memtable_internal_no_trigger()?;
-        self.trigger_compaction();
+    /// Write-path flush: rotate the full active memtable into the immutable
+    /// queue and hand it to a background drain, instead of writing it out inline.
+    /// First applies backpressure so a slow flush can't let the queue grow
+    /// without bound.
+    ///
+    /// Caller must hold `write_mutex`.
+    fn flush_active_in_background(self: &Arc<Self>) -> Result<()> {
+        // Block (still holding `write_mutex`, so all writers stall together)
+        // until the immutable queue has a free slot.
+        self.await_flush_slot();
+        // Seal the active memtable into the queue, then kick a background drain.
+        // `seal_active` returns `None` only if the active memtable was empty,
+        // which a just-triggered flush won't be — guard anyway.
+        if self.seal_active()?.is_some() {
+            self.schedule_flush();
+        }
         Ok(())
     }
 
-    /// Synchronously flush the active memtable to L0: seal it into the immutable
-    /// queue (rotating to a fresh active memtable and WAL segment), then write it
-    /// out and retire its segment. A no-op when the active memtable is empty.
+    /// Block until the immutable queue has room for another sealed memtable
+    /// (fewer than [`MAX_IMMUTABLE_MEMTABLES`]). Returns immediately once the
+    /// engine is shutting down so a stalled writer can't outlive the flusher.
     ///
-    /// Caller must hold `write_mutex`.
-    fn flush_memtable_internal_no_trigger(&self) -> Result<()> {
-        let Some(imm) = self.seal_active()? else {
-            return Ok(());
-        };
-        self.flush_immutable(&imm)
+    /// Caller holds `write_mutex`; this keeps holding it across the wait, which
+    /// is the intended backpressure — every writer stalls until a slot frees.
+    fn await_flush_slot(&self) {
+        let mut st = self.flush_gate.state.lock().unwrap();
+        while st.immutable_count >= MAX_IMMUTABLE_MEMTABLES && !st.shutting_down {
+            st = self.flush_gate.slot_freed.wait(st).unwrap();
+        }
+    }
+
+    /// Drain the immutable queue to L0, oldest first, until it is empty.
+    ///
+    /// Holds [`Self::flush_lock`] for the whole drain, so flushes are serialized:
+    /// they complete in seal order (keeping L0 newest-first under front-insert)
+    /// and a background drain never races a synchronous `flush`/`compact` into
+    /// double-flushing the same immutable. Shared by both the background flush
+    /// task and the synchronous `flush_memtable`/`compact` paths.
+    fn flush_pending(&self) -> Result<()> {
+        let _flush_lock = self.flush_lock.lock().unwrap();
+        loop {
+            // Re-read the back (oldest) each iteration: a concurrent seal may have
+            // appended a newer memtable to the front while we flushed.
+            let imm = self.memset.read().unwrap().immutable.back().cloned();
+            let Some(imm) = imm else { break };
+            self.flush_immutable(&imm)?;
+        }
+        Ok(())
+    }
+
+    /// Schedule a background task to drain the immutable queue, then kick
+    /// compaction (L0 will have grown). Coalesced per engine, like compaction, so
+    /// overlapping triggers collapse into at most one running drain plus one
+    /// trailing re-run.
+    fn schedule_flush(self: &Arc<Self>) {
+        if self.background.state.lock().unwrap().shutting_down {
+            return;
+        }
+        let inner = self.clone();
+        let key = CoalesceKey::new(format!("flush:{}", self.dir_path.display()));
+        self.executor.submit(
+            Priority::High,
+            Some(key),
+            Box::new(move || {
+                // Register as in-flight so `quiesce` joins us; bail without
+                // touching state if the engine shut down between submit and run.
+                let Some(_bg) = inner.enter_background() else {
+                    return;
+                };
+                if let Err(e) = inner.flush_pending() {
+                    tracing::error!(error = ?e, "background flush failed");
+                }
+                inner.trigger_compaction();
+            }),
+        );
     }
 
     /// Seal the active memtable: move it into the immutable queue (newest at the
@@ -1488,15 +1612,6 @@ impl EngineInner {
     ///
     /// Caller must hold `write_mutex`, which serializes sealing against writers
     /// and against other seals.
-    ///
-    /// Durability note: the freshly created WAL segment's directory entry is
-    /// *not* fsynced here. In the synchronous flush path the immediately
-    /// following [`Self::flush_immutable`] issues one directory fsync covering
-    /// both this segment's creation and the old segment's removal, and no write
-    /// can reach the new segment in between because the caller holds
-    /// `write_mutex`. A background flush (a later change) that lets writes flow to
-    /// the new segment before the old one is retired must fsync the directory
-    /// here, at seal time.
     fn seal_active(&self) -> Result<Option<ImmMemtable>> {
         // Fast path: an empty active memtable means an empty WAL segment too —
         // nothing to seal or flush.
@@ -1512,6 +1627,12 @@ impl EngineInner {
             self.options.wal_sync_interval_ms,
             self.options.fsync_method,
         )?;
+        // Make the new segment's directory entry durable *now*, before any write
+        // reaches it. The flush that retires the old segment runs in the
+        // background, so unlike a fully synchronous flush we can't defer this to
+        // the old segment's removal: a crash could otherwise lose the new
+        // segment's directory entry along with every write logged to it.
+        crate::fsync_parent_dir(&new_wal_path, self.options.fsync_method)?;
 
         // Redirect new writes to the fresh segment, then seal the active memtable
         // and swap in an empty one. Readers never touch the WAL and writers are
@@ -1536,6 +1657,8 @@ impl EngineInner {
             memset.immutable.push_front(imm.clone());
             imm
         };
+        // Account for the newly occupied immutable slot so backpressure sees it.
+        self.flush_gate.state.lock().unwrap().immutable_count += 1;
         Ok(Some(sealed))
     }
 
@@ -1545,9 +1668,10 @@ impl EngineInner {
     ///
     /// Crash-safe by ordering: the SSTable and its manifest edit are made durable
     /// before the WAL segment is deleted, so a crash mid-flush leaves the segment
-    /// on disk and recovery replays it idempotently into a fresh SSTable. The
-    /// single directory fsync below also makes durable the new segment created by
-    /// the preceding [`Self::seal_active`].
+    /// on disk and recovery replays it idempotently into a fresh SSTable.
+    ///
+    /// Run only via [`Self::flush_pending`], which holds [`Self::flush_lock`], so
+    /// flushes are serialized and never double-flush an immutable.
     fn flush_immutable(&self, imm: &ImmMemtable) -> Result<()> {
         let entries = imm.table.entries();
 
@@ -1588,8 +1712,8 @@ impl EngineInner {
         // segment on disk; recovery replays it idempotently into a new SSTable.
         let old_wal_path = wal_segment_path(&self.dir_path, imm.wal_id);
         fs::remove_file(&old_wal_path)?;
-        // One directory fsync makes both the old segment's removal and the new
-        // segment's creation (in `seal_active`) durable.
+        // Make the segment's removal durable. (The new segment's creation was
+        // already fsynced in `seal_active`.)
         crate::fsync_parent_dir(&old_wal_path, self.options.fsync_method)?;
 
         // Drop the flushed memtable from the immutable queue. Matching on the WAL
@@ -1598,6 +1722,15 @@ impl EngineInner {
             let mut memset = self.memset.write().unwrap();
             memset.immutable.retain(|m| m.wal_id != imm.wal_id);
         }
+
+        // Free the immutable slot and wake any writer stalled on backpressure.
+        // Done after the dequeue above so a woken writer never observes more
+        // immutables than the count claims.
+        {
+            let mut st = self.flush_gate.state.lock().unwrap();
+            st.immutable_count = st.immutable_count.saturating_sub(1);
+        }
+        self.flush_gate.slot_freed.notify_all();
 
         Ok(())
     }
@@ -1642,6 +1775,15 @@ impl EngineInner {
         // Cancel the periodic WAL-sync schedule so no further ticks are
         // submitted (dropping the handle cancels it).
         *self.wal_sync_handle.lock().unwrap() = None;
+
+        // Release any writer stalled on backpressure: a flush that would have
+        // freed its slot may now no-op (shutting down), so without this the
+        // writer could wait forever and the process couldn't drain.
+        {
+            let mut fg = self.flush_gate.state.lock().unwrap();
+            fg.shutting_down = true;
+        }
+        self.flush_gate.slot_freed.notify_all();
 
         let mut st = self.background.state.lock().unwrap();
         st.shutting_down = true;
@@ -1917,5 +2059,190 @@ mod tests {
         );
 
         drop(imm);
+    }
+
+    /// An [`Executor`] that *stores* submitted tasks instead of running them, so
+    /// a test drives the background flush (and compaction) deterministically via
+    /// `run_all`. Periodic work is delegated to an [`InlineExecutor`] (unused —
+    /// these tests disable WAL syncing).
+    struct ManualExecutor {
+        tasks: Mutex<Vec<crate::executor::Task>>,
+        inline: crate::InlineExecutor,
+    }
+
+    impl ManualExecutor {
+        fn new() -> Self {
+            ManualExecutor {
+                tasks: Mutex::new(Vec::new()),
+                inline: crate::InlineExecutor,
+            }
+        }
+
+        fn pending(&self) -> usize {
+            self.tasks.lock().unwrap().len()
+        }
+
+        /// Run every currently-stored task. Tasks submitted *during* a run (e.g. a
+        /// flush scheduling compaction, or a woken writer scheduling its own
+        /// flush) are left for a later `run_all`.
+        fn run_all(&self) {
+            let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+            for task in tasks {
+                task();
+            }
+        }
+    }
+
+    impl Executor for ManualExecutor {
+        fn submit(
+            &self,
+            _priority: Priority,
+            _key: Option<CoalesceKey>,
+            task: crate::executor::Task,
+        ) {
+            self.tasks.lock().unwrap().push(task);
+        }
+
+        fn submit_periodic(
+            &self,
+            every: std::time::Duration,
+            priority: Priority,
+            task: Box<dyn Fn() + Send + Sync + 'static>,
+        ) -> PeriodicHandle {
+            self.inline.submit_periodic(every, priority, task)
+        }
+    }
+
+    /// Options whose memtable is so small that any single write overflows it and
+    /// triggers a flush, with WAL syncing off so the manual executor stays idle
+    /// until a flush is scheduled.
+    fn tiny_memtable_options() -> EngineOptions {
+        EngineOptions {
+            memtable_size_limit: 5,
+            wal_size_limit: 64 * 1024 * 1024,
+            wal_sync_interval_ms: None,
+            ..Default::default()
+        }
+    }
+
+    fn open_manual(dir: &std::path::Path, exec: Arc<ManualExecutor>) -> StorageEngine {
+        StorageEngine::open_with_executor(
+            dir,
+            tiny_memtable_options(),
+            exec,
+            Arc::new(crate::PassthroughValueRewriter),
+        )
+        .unwrap()
+    }
+
+    fn immutable_count(engine: &StorageEngine) -> usize {
+        engine
+            .inner
+            .flush_gate
+            .state
+            .lock()
+            .unwrap()
+            .immutable_count
+    }
+
+    /// A write-path flush is deferred to a background task: the active memtable is
+    /// sealed immediately (data readable from the immutable queue) but the SSTable
+    /// only appears once the background drain runs, which then empties the queue.
+    #[test]
+    fn background_flush_is_deferred_and_completes_on_drain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone());
+
+        // Overflows the tiny memtable: seals it and schedules a flush, but the
+        // ManualExecutor hasn't run anything yet.
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+
+        assert_eq!(
+            immutable_count(&engine),
+            1,
+            "active memtable should be sealed"
+        );
+        assert!(
+            exec.pending() >= 1,
+            "a background flush should be scheduled"
+        );
+        assert_eq!(
+            engine.get_statistics().unwrap().num_sstables,
+            0,
+            "the flush must not have run yet"
+        );
+        // Served from the immutable memtable in the meantime.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+
+        // Run the background flush.
+        exec.run_all();
+
+        assert_eq!(immutable_count(&engine), 0, "the slot should be freed");
+        assert!(engine.inner.memset.read().unwrap().immutable.is_empty());
+        assert_eq!(engine.get_statistics().unwrap().num_sstables, 1);
+        // Now served from the SSTable.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+    }
+
+    /// With the single immutable slot full and no flush run, a second
+    /// flush-triggering write must stall until a flush frees the slot.
+    #[test]
+    fn backpressure_stalls_writer_until_flush_frees_a_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone());
+
+        // Fill the only immutable slot (cap = 1); leave the flush un-run.
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        assert_eq!(immutable_count(&engine), 1);
+
+        std::thread::scope(|s| {
+            // This write needs to seal, but the queue is full — it must block.
+            let writer = s.spawn(|| {
+                engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+            });
+
+            // Let it reach the backpressure wait, then confirm it is still stuck.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !writer.is_finished(),
+                "writer should stall while the immutable queue is full"
+            );
+
+            // Draining the queue frees a slot and must unblock the writer.
+            exec.run_all();
+            writer.join().unwrap();
+        });
+
+        // Both writes are durable/visible regardless of where they now live.
+        assert_eq!(engine.get(&DbKey::Int(1)).unwrap(), Some(DbValue::Int(10)));
+        assert_eq!(engine.get(&DbKey::Int(2)).unwrap(), Some(DbValue::Int(20)));
+    }
+
+    /// Shutting down must release a writer stalled on backpressure rather than
+    /// hang: the queued flush that would free its slot may never run once the
+    /// engine is shutting down.
+    #[test]
+    fn shutdown_releases_writer_stalled_on_backpressure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exec = Arc::new(ManualExecutor::new());
+        let engine = open_manual(dir.path(), exec.clone());
+
+        engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
+        assert_eq!(immutable_count(&engine), 1);
+
+        std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!writer.is_finished(), "writer should be stalled");
+
+            // Without waking stalled writers, this would block forever.
+            engine.shutdown();
+            writer.join().unwrap();
+        });
     }
 }
