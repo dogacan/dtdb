@@ -327,6 +327,23 @@ pub struct EngineOptions {
     pub wal_sync_interval_ms: Option<u64>,
     #[serde(default)]
     pub fsync_method: FsyncMethod,
+    /// Total number of memtables: one active plus up to
+    /// `max_write_buffer_number - 1` immutable (sealed, awaiting flush). A full
+    /// active memtable is sealed and flushed in the background; the write path
+    /// can get this many memtables ahead of the flusher before it stalls. Larger
+    /// values absorb bigger write bursts at the cost of up to
+    /// `max_write_buffer_number * memtable_size_limit` of resident memtable
+    /// memory and more WAL segments to replay after a crash. Must be >= 2.
+    #[serde(default = "default_max_write_buffer_number")]
+    pub max_write_buffer_number: usize,
+}
+
+/// Default for [`EngineOptions::max_write_buffer_number`]: one active plus three
+/// immutable memtables. LevelDB allows a single immutable; a few more give the
+/// write path room to stay ahead of the background flush during bursts without
+/// stalling, while keeping worst-case memtable memory modest.
+fn default_max_write_buffer_number() -> usize {
+    4
 }
 
 impl Default for EngineOptions {
@@ -340,10 +357,11 @@ impl Default for EngineOptions {
             sstable_target_size: 2 * 1024 * 1024,
             base_level_size_limit: 10 * 1024 * 1024,
             level_size_multiplier: 10,
-            max_level: 7,
             block_cache_capacity: 1000,
+            max_level: 7,
             wal_sync_interval_ms: None,
             fsync_method: FsyncMethod::default(),
+            max_write_buffer_number: default_max_write_buffer_number(),
         }
     }
 }
@@ -388,6 +406,13 @@ impl EngineOptions {
         require(
             self.l0_compaction_threshold > 0,
             "l0_compaction_threshold must be > 0",
+        )?;
+        // Needs at least one active plus one immutable memtable; otherwise the
+        // immutable cap (`max_write_buffer_number - 1`) is zero and the write
+        // path would stall forever waiting for a slot that can never open.
+        require(
+            self.max_write_buffer_number >= 2,
+            "max_write_buffer_number must be >= 2",
         )?;
 
         // Level sizing bounds. `level_size_multiplier` feeds a `pow()` over the

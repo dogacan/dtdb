@@ -35,6 +35,9 @@ fn get_test_options() -> EngineOptions {
         block_cache_capacity: 1000,
         wal_sync_interval_ms: None,
         fsync_method: dtdb_storage::FsyncMethod::default(),
+        // One immutable slot keeps these recovery tests' segment counts
+        // deterministic; they exercise recovery, not write backpressure.
+        max_write_buffer_number: 2,
     }
 }
 
