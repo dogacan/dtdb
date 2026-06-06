@@ -171,6 +171,12 @@ impl DatabaseCatalog {
         };
 
         if let Some(db_state) = state {
+            // Quiesce all storage engines before deleting the directory. This
+            // drains any in-flight background compaction so it can't write
+            // SSTables into the tree while (or after) `remove_dir_all` walks it,
+            // which would otherwise race the removal and leave orphaned files
+            // under the dropped database's path.
+            db_state.database.shutdown();
             drop(db_state);
 
             let db_path = self.data_dir.join(db_name);

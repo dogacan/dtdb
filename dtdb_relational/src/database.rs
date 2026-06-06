@@ -1534,6 +1534,35 @@ impl Database {
         Ok(())
     }
 
+    /// Quiesce every storage engine backing this database: stop scheduling
+    /// background work and wait for any in-flight compaction (or WAL sync) to
+    /// finish. After this returns, no background task will create or delete
+    /// SSTable files, so the database directory can be removed without a late
+    /// compaction racing the removal and leaving orphaned files behind.
+    ///
+    /// Idempotent. Crucially, this quiesces the engines even while other handles
+    /// still hold `Arc<StorageEngine>` clones (e.g. an in-flight request), since
+    /// [`StorageEngine::shutdown`] is a shared-reference operation — unlike
+    /// relying on the engine `Arc` reaching its last reference on drop.
+    pub fn shutdown(&self) {
+        // Stop this database's own periodic schedules first so no further
+        // ANALYZE/flush ticks are submitted.
+        *self.background_analyze_handle.lock().unwrap() = None;
+        *self.background_flush_handle.lock().unwrap() = None;
+
+        // Then quiesce every per-table / per-index storage engine, draining any
+        // in-flight compaction.
+        let tables = self.tables.read().unwrap();
+        for table in tables.values() {
+            for engine in table.engines.values() {
+                engine.shutdown();
+            }
+            for engine in table.index_engines.values() {
+                engine.shutdown();
+            }
+        }
+    }
+
     /// Drops a relational table.
     ///
     /// Removes table metadata from the catalog, drops the storage engine reference,
@@ -1546,6 +1575,18 @@ impl Database {
         let table = tables_guard
             .remove(name)
             .ok_or_else(|| RelationalError::TableNotFound(name.to_string()))?;
+
+        // Quiesce the table's storage engines *before* touching files on disk.
+        // A background compaction holds its own `Arc` to the engine and would
+        // otherwise keep running (the `Table` we just removed may not be the
+        // last reference), potentially writing SSTables into the directory we
+        // are about to rename/remove and leaving orphans behind.
+        for engine in table.engines.values() {
+            engine.shutdown();
+        }
+        for engine in table.index_engines.values() {
+            engine.shutdown();
+        }
 
         // Explicitly drop table handles to close open files.
         drop(table);
