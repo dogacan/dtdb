@@ -3,6 +3,7 @@
 use dtdb_api::proto::execute_query_response::Payload;
 use futures_util::StreamExt;
 use std::sync::Arc;
+use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tonic::Status;
 
@@ -11,8 +12,8 @@ use tonic::Status;
 /// Spawning one multi-threaded runtime per client wastes a full scheduler
 /// (worker threads + IO driver) per handle, so all clients share one.
 fn global_runtime() -> Result<Arc<Runtime>, String> {
-    static RUNTIME: std::sync::Mutex<Option<Arc<Runtime>>> = std::sync::Mutex::new(None);
-    let mut guard = RUNTIME.lock().unwrap();
+    static RUNTIME: Mutex<Option<Arc<Runtime>>> = Mutex::new(None);
+    let mut guard = RUNTIME.lock();
     if let Some(rt) = &*guard {
         return Ok(rt.clone());
     }
@@ -348,8 +349,8 @@ impl CxxClient {
         let db_name = db_name.to_string();
 
         type TerminalSender =
-            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>;
-        let terminal_sender: Arc<TerminalSender> = Arc::new(std::sync::Mutex::new(None));
+            Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>;
+        let terminal_sender: Arc<TerminalSender> = Arc::new(Mutex::new(None));
         let terminal_sender_clone = terminal_sender.clone();
 
         match &self.client {
@@ -368,11 +369,11 @@ impl CxxClient {
                                     let _ = resp_tx.send(mapped);
                                 }
                                 TxRequest::Commit { resp_tx } => {
-                                    *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                    *terminal_sender_clone.lock() = Some(resp_tx);
                                     return Ok(());
                                 }
                                 TxRequest::Rollback { resp_tx } => {
-                                    *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                    *terminal_sender_clone.lock() = Some(resp_tx);
                                     return Err(Status::aborted("Rollback requested"));
                                 }
                             }
@@ -380,7 +381,7 @@ impl CxxClient {
                         Err(Status::aborted("Transaction handle dropped"))
                     });
 
-                    let mut guard = terminal_sender.lock().unwrap();
+                    let mut guard = terminal_sender.lock();
                     if let Some(resp_tx) = guard.take() {
                         let mapped = match res {
                             Ok(_) => Ok(()),
@@ -432,11 +433,11 @@ impl CxxClient {
                                         let _ = resp_tx.send(mapped);
                                     }
                                     TxRequest::Commit { resp_tx } => {
-                                        *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                        *terminal_sender_clone.lock() = Some(resp_tx);
                                         return Ok(());
                                     }
                                     TxRequest::Rollback { resp_tx } => {
-                                        *terminal_sender_clone.lock().unwrap() = Some(resp_tx);
+                                        *terminal_sender_clone.lock() = Some(resp_tx);
                                         return Err(tonic::Status::aborted("Rollback requested"));
                                     }
                                 }
@@ -445,7 +446,7 @@ impl CxxClient {
                         })
                         .await;
 
-                    let mut guard = terminal_sender.lock().unwrap();
+                    let mut guard = terminal_sender.lock();
                     if let Some(resp_tx) = guard.take() {
                         let mapped = match res {
                             Ok(_) => Ok(()),
