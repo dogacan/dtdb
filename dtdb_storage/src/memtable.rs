@@ -85,11 +85,18 @@ impl MemTable {
     }
 
     /// Applies a batch of operations to the MemTable under a single write lock.
-    pub fn apply_batch(&self, entries: Vec<crate::wal::WalEntry>) {
+    pub fn apply_batch(&self, mut entries: Vec<crate::wal::WalEntry>) {
+        self.apply_drain(&mut entries);
+    }
+
+    /// Like [`apply_batch`](Self::apply_batch) but drains the caller's `Vec`,
+    /// moving each entry's value into the map without cloning and leaving the
+    /// `Vec` empty (capacity retained) so the caller can reuse the allocation.
+    pub fn apply_drain(&self, entries: &mut Vec<crate::wal::WalEntry>) {
         let mut map = self.map.write().unwrap();
         let mut size_delta = 0isize;
 
-        for ent in entries {
+        for ent in entries.drain(..) {
             match ent {
                 crate::wal::WalEntry::Put { key, value } => {
                     let key_size = key.byte_size();

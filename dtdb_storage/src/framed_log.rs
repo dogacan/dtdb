@@ -79,6 +79,10 @@ pub struct FramedLog<E> {
     /// Total bytes in the file, including the header. Tracked in memory so the
     /// write hot path can make flush decisions without an `fstat` per append.
     size_bytes: u64,
+    /// Reusable serialization buffer for [`append`](Self::append): holds
+    /// `[len][checksum][payload]` so a record can be framed and written with a
+    /// single `write` and zero per-append heap allocation.
+    scratch: Vec<u8>,
     _marker: PhantomData<fn() -> E>,
 }
 
@@ -121,24 +125,35 @@ impl<E: DeserializeOwned> FramedLog<E> {
             sync_interval_ms,
             fsync_method,
             size_bytes,
+            scratch: Vec::new(),
             _marker: PhantomData,
         })
     }
 
     /// Appends one record and (depending on sync policy) forces it to disk.
     pub fn append<S: Serialize>(&mut self, entry: &S) -> Result<()> {
-        let bytes = postcard::to_allocvec(entry)?;
-        let len = bytes.len() as u32;
-        let checksum = compute_checksum(&bytes);
+        // Frame `[len][checksum][payload]` into a reusable scratch buffer and
+        // emit it with a single `write`. Serializing the payload after an 8-byte
+        // header placeholder, then backfilling len + checksum, keeps the whole
+        // record contiguous with no per-append heap allocation.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.extend_from_slice(&[0u8; 8]); // placeholder for len + checksum
+        // On a serialization error `self.scratch` is left empty; it simply
+        // re-grows on the next append.
+        let mut scratch = postcard::to_extend(entry, scratch)?;
 
-        // Single buffered write of len + checksum + payload to avoid syscalls.
-        let mut buffer = Vec::with_capacity(8 + bytes.len());
-        buffer.extend_from_slice(&len.to_le_bytes());
-        buffer.extend_from_slice(&checksum.to_le_bytes());
-        buffer.extend_from_slice(&bytes);
+        let payload_len = (scratch.len() - 8) as u32;
+        let checksum = compute_checksum(&scratch[8..]);
+        scratch[0..4].copy_from_slice(&payload_len.to_le_bytes());
+        scratch[4..8].copy_from_slice(&checksum.to_le_bytes());
 
-        self.file.write_all(&buffer)?;
-        self.size_bytes += buffer.len() as u64;
+        let write_res = self.file.write_all(&scratch);
+        let record_len = scratch.len() as u64;
+        scratch.clear();
+        self.scratch = scratch; // return the buffer for reuse
+        write_res?;
+        self.size_bytes += record_len;
 
         // Per-append fsync unless a non-zero sync interval defers it to a
         // periodic background sync (see `sync_all`).

@@ -134,6 +134,59 @@ struct WriteTaskState {
     result: Result<()>,
 }
 
+thread_local! {
+    /// Per-thread cache of one idle [`WriteTask`], reused across writes so the
+    /// steady-state put path performs no per-write `Arc`/`Vec` allocation. A
+    /// task is only returned here when its `Arc` is uniquely owned (see
+    /// [`release_task`]), so reuse never races another holder.
+    static WRITE_TASK_POOL: std::cell::RefCell<Option<Arc<WriteTask>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Reusable scratch the leader collects coalesced tasks into.
+    static LEADER_TASKS: std::cell::RefCell<Vec<Arc<WriteTask>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Reusable scratch the leader merges all tasks' entries into before the
+    /// single WAL append + memtable apply.
+    static LEADER_MERGED: std::cell::RefCell<Vec<WalEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Obtain a fresh-stated [`WriteTask`], reusing this thread's pooled one if
+/// available (its `batch` allocation is retained) or allocating a new one.
+fn acquire_task() -> Arc<WriteTask> {
+    WRITE_TASK_POOL.with(|p| {
+        if let Some(task) = p.borrow_mut().take() {
+            // Uniquely owned (only pooled at strong_count == 1), so this lock is
+            // uncontended; reset the state for the new write.
+            let mut state = task.state.lock().unwrap();
+            state.batch.clear();
+            state.done = false;
+            state.result = Ok(());
+            drop(state);
+            task
+        } else {
+            Arc::new(WriteTask {
+                state: Mutex::new(WriteTaskState {
+                    batch: Vec::new(),
+                    done: false,
+                    result: Ok(()),
+                }),
+                condvar: Condvar::new(),
+            })
+        }
+    })
+}
+
+/// Return a task to this thread's pool, but only if it is now uniquely owned —
+/// otherwise another thread (a leader still holding it in its commit set) could
+/// observe a reset mid-flight, so we simply drop it.
+fn release_task(task: Arc<WriteTask>) {
+    if Arc::strong_count(&task) == 1 {
+        WRITE_TASK_POOL.with(|p| {
+            *p.borrow_mut() = Some(task);
+        });
+    }
+}
+
 fn apply_entry_recursive(mem: &MemTable, ent: WalEntry) {
     match ent {
         WalEntry::Put { key, value } => mem.put(key, value),
@@ -746,15 +799,12 @@ impl EngineInner {
         })
     }
 
-    fn execute_write(self: &Arc<Self>, batch: Vec<WalEntry>) -> Result<()> {
-        let task = Arc::new(WriteTask {
-            state: Mutex::new(WriteTaskState {
-                batch,
-                done: false,
-                result: Ok(()),
-            }),
-            condvar: Condvar::new(),
-        });
+    /// Enqueue a write and run the leader/follower coalescing protocol. `fill`
+    /// populates the (reused, empty) batch buffer of this thread's pooled task,
+    /// avoiding an allocation per write for the entries themselves.
+    fn execute_write(self: &Arc<Self>, fill: impl FnOnce(&mut Vec<WalEntry>)) -> Result<()> {
+        let task = acquire_task();
+        fill(&mut task.state.lock().unwrap().batch);
 
         let mut queue = self.write_queue.lock().unwrap();
         queue.tasks.push_back(task.clone());
@@ -766,26 +816,21 @@ impl EngineInner {
         }
 
         if task.state.lock().unwrap().done {
-            return clone_result(&task.state.lock().unwrap().result);
+            let result = clone_result(&task.state.lock().unwrap().result);
+            release_task(task);
+            return result;
         }
 
-        // Leader path: claim writing and collect all queued tasks
+        // Leader path: claim writing and collect all queued tasks into a reused
+        // buffer.
         queue.writing = true;
-        let mut tasks_to_commit = Vec::new();
+        let mut tasks_to_commit = LEADER_TASKS.with(|c| std::mem::take(&mut *c.borrow_mut()));
         while let Some(t) = queue.tasks.pop_front() {
             tasks_to_commit.push(t);
         }
-
         drop(queue);
 
-        // Merge batches from all coalesced tasks
-        let mut merged_entries = Vec::new();
-        for t in &tasks_to_commit {
-            let mut state = t.state.lock().unwrap();
-            merged_entries.append(&mut state.batch);
-        }
-
-        let write_result = self.write_coalesced_batch(merged_entries);
+        let write_result = self.commit_coalesced(&tasks_to_commit);
 
         // Mark all tasks as done and propagate result
         for t in &tasks_to_commit {
@@ -801,30 +846,56 @@ impl EngineInner {
         if let Some(next_leader) = queue.tasks.front() {
             next_leader.condvar.notify_one();
         }
+        drop(queue);
+
+        // Drop our references to the committed tasks (so our own becomes
+        // uniquely owned and poolable) and return the buffer for reuse.
+        tasks_to_commit.clear();
+        LEADER_TASKS.with(|c| *c.borrow_mut() = tasks_to_commit);
+        release_task(task);
 
         write_result
     }
 
-    fn write_coalesced_batch(self: &Arc<Self>, merged_entries: Vec<WalEntry>) -> Result<()> {
+    /// Write all coalesced tasks' entries as one WAL batch and apply them to the
+    /// active memtable. Drains each task's `batch` into a reused merge buffer,
+    /// so neither the merge nor the memtable apply allocates.
+    fn commit_coalesced(self: &Arc<Self>, tasks: &[Arc<WriteTask>]) -> Result<()> {
         let _write_lock = self.write_mutex.lock().unwrap();
         self.await_l0_limit();
         self.maybe_slowdown_writes();
 
-        let wal_size = {
+        let mut merged = LEADER_MERGED.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        merged.clear();
+        for t in tasks {
+            let mut state = t.state.lock().unwrap();
+            merged.append(&mut state.batch);
+        }
+
+        let wal_result = (|| -> Result<u64> {
             let mut wal = self.wal.lock().unwrap();
-            wal.append_batch(&merged_entries)?;
-            wal.size()?
+            wal.append_batch(&merged)?;
+            wal.size()
+        })();
+
+        let trigger_flush = match wal_result {
+            Ok(wal_size) => {
+                let memset = self.memset.read().unwrap();
+                let mem = &memset.active;
+                mem.apply_drain(&mut merged);
+                let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
+                let wal_full = wal_size as usize >= self.options.wal_size_limit;
+                mem_full || wal_full
+            }
+            Err(_) => false,
         };
 
-        let trigger_flush = {
-            let memset = self.memset.read().unwrap();
-            let mem = &memset.active;
-            mem.apply_batch(merged_entries);
-            let mem_full = mem.byte_size() >= self.options.memtable_size_limit;
-            let wal_full = wal_size as usize >= self.options.wal_size_limit;
-            mem_full || wal_full
-        };
+        // `merged` is now empty (drained on success, or holding the failed
+        // entries which we discard on error); return its allocation for reuse.
+        merged.clear();
+        LEADER_MERGED.with(|c| *c.borrow_mut() = merged);
 
+        wal_result?;
         if trigger_flush {
             self.flush_active_in_background()?;
         }
@@ -833,18 +904,18 @@ impl EngineInner {
     }
 
     pub fn put(self: &Arc<Self>, key: DbKey, value: DbValue) -> Result<()> {
-        self.execute_write(vec![WalEntry::Put { key, value }])
+        self.execute_write(|batch| batch.push(WalEntry::Put { key, value }))
     }
 
     pub fn delete(self: &Arc<Self>, key: DbKey) -> Result<()> {
-        self.execute_write(vec![WalEntry::Delete { key }])
+        self.execute_write(|batch| batch.push(WalEntry::Delete { key }))
     }
 
-    pub fn write_batch(self: &Arc<Self>, entries: Vec<WalEntry>) -> Result<()> {
+    pub fn write_batch(self: &Arc<Self>, mut entries: Vec<WalEntry>) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        self.execute_write(entries)
+        self.execute_write(|batch| batch.append(&mut entries))
     }
 
     pub fn get(&self, key: &DbKey) -> Result<Option<DbValue>> {
