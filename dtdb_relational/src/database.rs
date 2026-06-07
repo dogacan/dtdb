@@ -6,10 +6,11 @@ use dtdb_storage::{
     CompressionType, DbKey, DbValue, EngineOptions, Executor, FramedLog, FsyncMethod, LogFormat,
     PeriodicHandle, Priority, StorageEngine, WalEntry,
 };
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::Arc;
 
 /// A single relational-layer mutation: an insert/update (`Put`) or a delete.
 ///
@@ -1178,7 +1179,7 @@ impl BackgroundGate {
     /// down — in which case the caller must do nothing. The returned guard
     /// marks the tick as in-flight until dropped (panic-safe).
     fn enter(&self) -> Option<BackgroundGuard<'_>> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if st.shutting_down {
             return None;
         }
@@ -1189,10 +1190,10 @@ impl BackgroundGate {
     /// Mark the database as shutting down and block until every in-flight tick
     /// has finished. Idempotent.
     fn quiesce(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         st.shutting_down = true;
         while st.active > 0 {
-            st = self.idle.wait(st).unwrap();
+            self.idle.wait(&mut st);
         }
     }
 }
@@ -1205,7 +1206,7 @@ struct BackgroundGuard<'a> {
 
 impl Drop for BackgroundGuard<'_> {
     fn drop(&mut self) {
-        let mut st = self.gate.state.lock().unwrap();
+        let mut st = self.gate.state.lock();
         st.active -= 1;
         if st.active == 0 {
             self.gate.idle.notify_all();
@@ -1240,7 +1241,6 @@ impl Database {
     pub fn stats_version(&self, table_name: &str) -> u64 {
         self.stats_versions
             .read()
-            .unwrap()
             .get(table_name)
             .copied()
             .unwrap_or(0)
@@ -1485,8 +1485,8 @@ impl Database {
         // recovery would leave it pointing below the recovered max, causing the
         // very next allocation to collide with an existing row.
         {
-            let mut seqs = db.auto_increment_sequences.lock().unwrap();
-            let tables_guard = db.tables.read().unwrap();
+            let mut seqs = db.auto_increment_sequences.lock();
+            let tables_guard = db.tables.read();
             for (name, table) in tables_guard.iter() {
                 if let Some(max_val) = table.max_auto_increment_value() {
                     seqs.insert(name.clone(), max_val + 1);
@@ -1504,7 +1504,7 @@ impl Database {
             db.options.fsync_method,
         )
         .map_err(RelationalError::Storage)?;
-        *db.transaction_log.lock().unwrap() = Some(log);
+        *db.transaction_log.lock() = Some(log);
 
         Ok(db)
     }
@@ -1513,7 +1513,7 @@ impl Database {
     ///
     /// Creates the directory, writes the schema file, and initializes the storage engine.
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
         if tables_guard.contains_key(name) {
             return Err(RelationalError::TableAlreadyExists(name.to_string()));
         }
@@ -1590,7 +1590,7 @@ impl Database {
         };
 
         {
-            let mut stats_guard = self.statistics.write().unwrap();
+            let mut stats_guard = self.statistics.write();
             stats_guard.insert(name.to_string(), initial_stats.clone());
         }
 
@@ -1623,7 +1623,7 @@ impl Database {
         );
 
         if has_auto_inc {
-            let mut seqs = self.auto_increment_sequences.lock().unwrap();
+            let mut seqs = self.auto_increment_sequences.lock();
             seqs.insert(name.to_string(), 1);
         }
 
@@ -1654,14 +1654,14 @@ impl Database {
         // 2. Cancel the periodic schedules so the scheduler stops submitting
         //    ticks (dropping the handle cancels it). The gate above already
         //    makes any straggler tick a no-op; this stops the wasted submits.
-        *self.background_analyze_handle.lock().unwrap() = None;
-        *self.background_flush_handle.lock().unwrap() = None;
+        *self.background_analyze_handle.lock() = None;
+        *self.background_flush_handle.lock() = None;
 
         // 3. Quiesce every per-table / per-index storage engine, draining any
         //    in-flight compaction (and the engine's own background WAL sync).
         //    Done after step 1 so a compaction submitted by a just-finished
         //    flush tick is still caught and waited on here.
-        let tables = self.tables.read().unwrap();
+        let tables = self.tables.read();
         for table in tables.values() {
             for engine in table.engines.values() {
                 engine.shutdown();
@@ -1677,7 +1677,7 @@ impl Database {
     /// Removes table metadata from the catalog, drops the storage engine reference,
     /// and deletes the table directory on disk.
     pub fn drop_table(&self, name: &str) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
 
         // Remove the table from catalog mapping.
         // This drops our `Table` instance, dropping the `Arc<StorageEngine>`.
@@ -1701,14 +1701,14 @@ impl Database {
         drop(table);
 
         {
-            let mut stats_guard = self.statistics.write().unwrap();
+            let mut stats_guard = self.statistics.write();
             stats_guard.remove(name);
         }
         {
             // Forget the stats epoch so a future table reusing this name starts
             // fresh; any plan referencing the old table is already invalidated
             // by the schema_version bump below.
-            let mut versions = self.stats_versions.write().unwrap();
+            let mut versions = self.stats_versions.write();
             versions.remove(name);
         }
 
@@ -1719,7 +1719,7 @@ impl Database {
         // Same pattern in `create_index` and `drop_index`.
         loop {
             let has_active_readers = {
-                let access = self.active_table_access.lock().unwrap();
+                let access = self.active_table_access.lock();
                 access.get(name).is_some_and(|readers| !readers.is_empty())
             };
             if !has_active_readers {
@@ -1748,7 +1748,7 @@ impl Database {
             fs::remove_dir_all(temp_table_path)?;
 
             // Clean up the tracking entry.
-            let mut access = self.active_table_access.lock().unwrap();
+            let mut access = self.active_table_access.lock();
             access.remove(name);
         }
 
@@ -1772,7 +1772,7 @@ impl Database {
     fn wait_for_table_quiescent(&self, table_name: &str) {
         loop {
             let has_active_readers = {
-                let access = self.active_table_access.lock().unwrap();
+                let access = self.active_table_access.lock();
                 access
                     .get(table_name)
                     .is_some_and(|readers| !readers.is_empty())
@@ -1795,7 +1795,7 @@ impl Database {
     /// The column's `id` is assigned here from the schema's monotonic
     /// `next_column_id`; any id on the passed-in `Column` is ignored.
     pub fn alter_table_add_column(&self, table_name: &str, mut column: Column) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
         let table_arc = tables_guard
             .get_mut(table_name)
             .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
@@ -1876,7 +1876,7 @@ impl Database {
         old_name: &str,
         new_name: &str,
     ) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
         let table_arc = tables_guard
             .get_mut(table_name)
             .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
@@ -1930,7 +1930,7 @@ impl Database {
     /// new layout on read (ignoring the dropped column ID). Compaction will
     /// physically erase the dropped column values over time.
     pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
         let table_arc = tables_guard
             .get_mut(table_name)
             .ok_or_else(|| RelationalError::TableNotFound(table_name.to_string()))?;
@@ -1992,7 +1992,7 @@ impl Database {
 
     /// Generates and returns the next auto-increment sequence ID for a table.
     pub fn next_sequence_value(&self, table_name: &str) -> Result<i64> {
-        let mut seqs = self.auto_increment_sequences.lock().unwrap();
+        let mut seqs = self.auto_increment_sequences.lock();
         if let Some(val) = seqs.get_mut(table_name) {
             let next = *val;
             *val += 1;
@@ -2008,7 +2008,7 @@ impl Database {
 
     /// Updates the auto-increment sequence to be at least `val + 1`.
     pub fn update_sequence_value(&self, table_name: &str, val: i64) -> Result<()> {
-        let mut seqs = self.auto_increment_sequences.lock().unwrap();
+        let mut seqs = self.auto_increment_sequences.lock();
         if let Some(current) = seqs.get_mut(table_name) {
             if val >= *current {
                 *current = val + 1;
@@ -2021,7 +2021,7 @@ impl Database {
 
     /// Fetches a cloneable table handle from the database.
     pub fn get_table(&self, name: &str) -> Result<Arc<Table>> {
-        let tables_guard = self.tables.read().unwrap();
+        let tables_guard = self.tables.read();
         tables_guard
             .get(name)
             .cloned()
@@ -2030,12 +2030,12 @@ impl Database {
 
     /// List all loaded table names.
     pub fn list_tables(&self) -> Vec<String> {
-        let tables_guard = self.tables.read().unwrap();
+        let tables_guard = self.tables.read();
         tables_guard.keys().cloned().collect()
     }
 
     fn append_record(&self, record: &TransactionRecord) -> Result<()> {
-        let mut log_guard = self.transaction_log.lock().unwrap();
+        let mut log_guard = self.transaction_log.lock();
         if let Some(ref mut log) = *log_guard {
             // The log is opened with a `None` sync interval, so this append
             // fsyncs before returning.
@@ -2045,7 +2045,7 @@ impl Database {
     }
 
     pub fn write_transaction_record(&self, record: &TransactionRecord) -> Result<()> {
-        let mut active = self.active_transactions.lock().unwrap();
+        let mut active = self.active_transactions.lock();
         if let TransactionRecord::Prepared { tx_id, .. } = record {
             active.insert(*tx_id);
         }
@@ -2056,7 +2056,7 @@ impl Database {
 
     pub fn commit_transaction(&self, tx_id: u64) -> Result<()> {
         let no_active = {
-            let mut active = self.active_transactions.lock().unwrap();
+            let mut active = self.active_transactions.lock();
             active.remove(&tx_id);
             active.is_empty()
         };
@@ -2079,7 +2079,7 @@ impl Database {
 
     /// Returns the current size of the transaction log in bytes.
     fn transaction_log_len(&self) -> Result<u64> {
-        let log_guard = self.transaction_log.lock().unwrap();
+        let log_guard = self.transaction_log.lock();
         match *log_guard {
             Some(ref log) => Ok(log.size()),
             None => Ok(0),
@@ -2089,7 +2089,7 @@ impl Database {
     /// Fsyncs every table/index storage engine's WAL, making all applied
     /// mutations durable in the engines themselves.
     fn sync_all_table_engines(&self) -> Result<()> {
-        let tables = self.tables.read().unwrap();
+        let tables = self.tables.read();
         for table in tables.values() {
             table.sync_all_engines()?;
         }
@@ -2109,7 +2109,7 @@ impl Database {
     /// the engines — which would otherwise let the truncation drop a durable
     /// transaction. Use this for an explicit flush (e.g. clean shutdown).
     pub fn checkpoint(&self) -> Result<()> {
-        let _commit_guard = self.commit_history.write().unwrap();
+        let _commit_guard = self.commit_history.write();
         self.checkpoint_locked()
     }
 
@@ -2121,7 +2121,7 @@ impl Database {
         self.sync_all_table_engines()?;
 
         // 2. The log's redo records are now redundant — discard them.
-        let mut log_guard = self.transaction_log.lock().unwrap();
+        let mut log_guard = self.transaction_log.lock();
         if let Some(ref mut log) = *log_guard {
             log.reset().map_err(RelationalError::Storage)?;
         }
@@ -2206,7 +2206,7 @@ impl Database {
     }
 
     pub fn has_active_transactions(&self) -> bool {
-        !self.occ_active_transactions.lock().unwrap().is_empty()
+        !self.occ_active_transactions.lock().is_empty()
     }
 
     pub fn global_commit_version(&self) -> u64 {
@@ -2215,17 +2215,17 @@ impl Database {
     }
 
     pub fn register_transaction(&self, tx_id: u64) -> u64 {
-        let _history_lock = self.commit_history.read().unwrap();
+        let _history_lock = self.commit_history.read();
         let version = self
             .global_commit_version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let mut active = self.occ_active_transactions.lock().unwrap();
+        let mut active = self.occ_active_transactions.lock();
         active.insert(tx_id, version);
         version
     }
 
     pub fn register_table_access(&self, table_name: &str, tx_id: u64) {
-        let mut access = self.active_table_access.lock().unwrap();
+        let mut access = self.active_table_access.lock();
         access
             .entry(table_name.to_string())
             .or_default()
@@ -2234,7 +2234,7 @@ impl Database {
 
     pub fn unregister_transaction(&self, tx_id: u64) {
         let min_start_version = {
-            let mut active = self.occ_active_transactions.lock().unwrap();
+            let mut active = self.occ_active_transactions.lock();
             active.remove(&tx_id);
             active.values().copied().min()
         };
@@ -2245,11 +2245,11 @@ impl Database {
         });
 
         {
-            let mut history = self.commit_history.write().unwrap();
+            let mut history = self.commit_history.write();
             history.retain(|r| r.commit_version >= min_version);
         }
 
-        let mut access = self.active_table_access.lock().unwrap();
+        let mut access = self.active_table_access.lock();
         for readers in access.values_mut() {
             readers.remove(&tx_id);
         }
@@ -2268,7 +2268,7 @@ impl Database {
         F: FnOnce() -> Result<()>,
     {
         let snapshot_max_version = {
-            let history = self.commit_history.read().unwrap();
+            let history = self.commit_history.read();
 
             // 1. Perform validation against history for commits > start_version
             for record in history.iter() {
@@ -2329,12 +2329,12 @@ impl Database {
 
         // Get pruning limit version before write-locking commit_history to prevent deadlock
         let min_start_version = {
-            let active = self.occ_active_transactions.lock().unwrap();
+            let active = self.occ_active_transactions.lock();
             active.values().copied().min()
         };
 
         // Phase 2: Acquire write lock, perform delta validation, increment, append and prune
-        let mut history = self.commit_history.write().unwrap();
+        let mut history = self.commit_history.write();
 
         // Perform delta validation against history for commits > snapshot_max_version
         for record in history.iter() {
@@ -2415,7 +2415,7 @@ impl Database {
         read_set: &HashMap<String, HashSet<dtdb_storage::DbKey>>,
         scan_ranges: &HashMap<String, Vec<(dtdb_storage::DbKey, dtdb_storage::DbKey)>>,
     ) -> Result<()> {
-        let history = self.commit_history.read().unwrap();
+        let history = self.commit_history.read();
 
         for record in history.iter() {
             if record.commit_version > start_version {
@@ -2463,7 +2463,7 @@ impl Database {
         index_type: IndexType,
         tokenizer: Option<String>,
     ) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
 
         // 1. Check table existence
         let table_arc = tables_guard
@@ -2572,7 +2572,7 @@ impl Database {
         // 8. Wait until all active transactions accessing this table have finished (matching DDL behavior)
         loop {
             let has_active_readers = {
-                let access = self.active_table_access.lock().unwrap();
+                let access = self.active_table_access.lock();
                 access
                     .get(table_name)
                     .is_some_and(|readers| !readers.is_empty())
@@ -2668,7 +2668,7 @@ impl Database {
 
     /// Drops a secondary index from a table.
     pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let mut tables_guard = self.tables.write().unwrap();
+        let mut tables_guard = self.tables.write();
 
         let table_arc = tables_guard
             .get_mut(table_name)
@@ -2696,7 +2696,7 @@ impl Database {
         // 3. Wait for active readers of the table
         loop {
             let has_active_readers = {
-                let access = self.active_table_access.lock().unwrap();
+                let access = self.active_table_access.lock();
                 access
                     .get(table_name)
                     .is_some_and(|readers| !readers.is_empty())
@@ -2728,7 +2728,7 @@ impl Database {
     }
 
     pub fn commit_history_len(&self) -> usize {
-        self.commit_history.read().unwrap().len()
+        self.commit_history.read().len()
     }
 
     /// Triggers background stats collection if options specify it and it hasn't been started.
@@ -2736,7 +2736,7 @@ impl Database {
         let Some(ms) = self.options.analyze_frequency_ms else {
             return;
         };
-        let mut guard = self.background_analyze_handle.lock().unwrap();
+        let mut guard = self.background_analyze_handle.lock();
         if guard.is_some() {
             return;
         }
@@ -2777,7 +2777,7 @@ impl Database {
         let Some(ms) = self.options.flush_interval_ms else {
             return;
         };
-        let mut guard = self.background_flush_handle.lock().unwrap();
+        let mut guard = self.background_flush_handle.lock();
         if guard.is_some() {
             return;
         }
@@ -2926,10 +2926,10 @@ impl Database {
 
         // 4. Update in-memory cache and persist to file under catalog read lock
         // to prevent race with drop_table rename.
-        let tables_guard = self.tables.read().unwrap();
+        let tables_guard = self.tables.read();
         if tables_guard.contains_key(table_name) {
             let changed = {
-                let mut stats_guard = self.statistics.write().unwrap();
+                let mut stats_guard = self.statistics.write();
                 // Only the cost inputs matter for plan validity, so compare
                 // against the previous stats and treat a first-ever analyze
                 // (no prior entry) as a change too.
@@ -2942,7 +2942,7 @@ impl Database {
             // so a periodic background ANALYZE that recomputes identical stats
             // does not needlessly invalidate cached plans.
             if changed {
-                let mut versions = self.stats_versions.write().unwrap();
+                let mut versions = self.stats_versions.write();
                 *versions.entry(table_name.to_string()).or_insert(0) += 1;
             }
 
@@ -2968,7 +2968,7 @@ impl Database {
 
     /// Returns the cached statistics for a table if they exist.
     pub fn get_table_statistics(&self, table_name: &str) -> Option<TableStatistics> {
-        let stats_guard = self.statistics.read().unwrap();
+        let stats_guard = self.statistics.read();
         stats_guard.get(table_name).cloned()
     }
 }
@@ -3154,7 +3154,7 @@ mod tests {
             let db = Arc::new(Database::open(temp_dir.path()).unwrap());
 
             // Acquire lock in main thread so Thread A blocks at min_start_version calculation
-            let occ_guard = db.occ_active_transactions.lock().unwrap();
+            let occ_guard = db.occ_active_transactions.lock();
 
             let db_clone = db.clone();
             let t1_clone = t1.clone();
@@ -3178,7 +3178,7 @@ mod tests {
 
             // Main thread appends conflicting record directly to history
             {
-                let mut history = db.commit_history.write().unwrap();
+                let mut history = db.commit_history.write();
                 let commit_version = db
                     .global_commit_version
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3206,7 +3206,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let db = Arc::new(Database::open(temp_dir.path()).unwrap());
 
-            let occ_guard = db.occ_active_transactions.lock().unwrap();
+            let occ_guard = db.occ_active_transactions.lock();
 
             let db_clone = db.clone();
             let t1_clone = t1.clone();
@@ -3226,7 +3226,7 @@ mod tests {
 
             // Main thread appends conflicting record (writing key 2) directly to history
             {
-                let mut history = db.commit_history.write().unwrap();
+                let mut history = db.commit_history.write();
                 let commit_version = db
                     .global_commit_version
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3253,7 +3253,7 @@ mod tests {
             let temp_dir = tempfile::TempDir::new().unwrap();
             let db = Arc::new(Database::open(temp_dir.path()).unwrap());
 
-            let occ_guard = db.occ_active_transactions.lock().unwrap();
+            let occ_guard = db.occ_active_transactions.lock();
 
             let db_clone = db.clone();
             let t1_clone = t1.clone();
@@ -3278,7 +3278,7 @@ mod tests {
 
             // Main thread appends conflicting record (writing key 5 inside range [1, 10]) directly to history
             {
-                let mut history = db.commit_history.write().unwrap();
+                let mut history = db.commit_history.write();
                 let commit_version = db
                     .global_commit_version
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

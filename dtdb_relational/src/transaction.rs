@@ -2,8 +2,9 @@ use crate::database::{Database, Table, TransactionRecord};
 use crate::error::{RelationalError, Result};
 use crate::row::Row;
 use dtdb_storage::{DbKey, DbValue, WalEntry};
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum IsolationLevel {
@@ -107,19 +108,19 @@ impl Transaction {
 
     fn get_table(&self, table_name: &str) -> Result<Arc<Table>> {
         {
-            let cache = self.cached_tables.lock().unwrap();
+            let cache = self.cached_tables.lock();
             if let Some(t) = cache.get(table_name) {
                 return Ok(t.clone());
             }
         }
         let table = self.database.get_table(table_name)?;
         {
-            let mut accessed = self.accessed_tables.lock().unwrap();
+            let mut accessed = self.accessed_tables.lock();
             if accessed.insert(table_name.to_string()) {
                 self.database.register_table_access(table_name, self.tx_id);
             }
         }
-        let mut cache = self.cached_tables.lock().unwrap();
+        let mut cache = self.cached_tables.lock();
         cache
             .entry(table_name.to_string())
             .or_insert_with(|| table.clone());
@@ -137,7 +138,7 @@ impl Transaction {
         table.schema.validate_key(&key, &row)?;
 
         // Insert into transaction buffer.
-        let mut buffer = self.write_buffer.lock().unwrap();
+        let mut buffer = self.write_buffer.lock();
         buffer
             .entry(table_name.to_string())
             .or_default()
@@ -154,7 +155,7 @@ impl Transaction {
         table.schema.validate_key_only(&key)?;
 
         // Insert a deletion tombstone (None) into transaction buffer.
-        let mut buffer = self.write_buffer.lock().unwrap();
+        let mut buffer = self.write_buffer.lock();
         buffer
             .entry(table_name.to_string())
             .or_default()
@@ -182,7 +183,7 @@ impl Transaction {
 
         // 1. Check transaction write buffer.
         {
-            let buffer = self.write_buffer.lock().unwrap();
+            let buffer = self.write_buffer.lock();
             if let Some(table_buffer) = buffer.get(table_name)
                 && let Some(buffered_val) = table_buffer.get(key)
             {
@@ -195,7 +196,7 @@ impl Transaction {
         if self.isolation_level == IsolationLevel::SnapshotIsolation
             || self.isolation_level == IsolationLevel::RepeatableRead
         {
-            let mut read_set = self.read_set.lock().unwrap();
+            let mut read_set = self.read_set.lock();
             read_set
                 .entry(table_name.to_string())
                 .or_default()
@@ -218,7 +219,7 @@ impl Transaction {
 
         // 1. Check transaction write buffer.
         {
-            let buffer = self.write_buffer.lock().unwrap();
+            let buffer = self.write_buffer.lock();
             if let Some(table_buffer) = buffer.get(table_name) {
                 for (i, key) in keys.iter().enumerate() {
                     if let Some(buffered_val) = table_buffer.get(key) {
@@ -244,7 +245,7 @@ impl Transaction {
         if self.isolation_level == IsolationLevel::SnapshotIsolation
             || self.isolation_level == IsolationLevel::RepeatableRead
         {
-            let mut read_set = self.read_set.lock().unwrap();
+            let mut read_set = self.read_set.lock();
             let entry = read_set.entry(table_name.to_string()).or_default();
             for key in &storage_keys {
                 entry.insert(key.clone());
@@ -292,7 +293,7 @@ impl Transaction {
 
         // Track the scan range.
         if self.isolation_level == IsolationLevel::SnapshotIsolation {
-            let mut scan_ranges = self.scan_ranges.lock().unwrap();
+            let mut scan_ranges = self.scan_ranges.lock();
             scan_ranges
                 .entry(table_name.to_string())
                 .or_default()
@@ -305,7 +306,7 @@ impl Transaction {
 
         // 1. Merge transaction write-buffer entries.
         {
-            let buffer = self.write_buffer.lock().unwrap();
+            let buffer = self.write_buffer.lock();
             if let Some(table_buffer) = buffer.get(table_name) {
                 for (k, v) in table_buffer {
                     if k >= start && k <= end {
@@ -326,7 +327,7 @@ impl Transaction {
         // mutex (and re-hashing the table name) on every row.
         let track_reads = self.isolation_level == IsolationLevel::SnapshotIsolation
             || self.isolation_level == IsolationLevel::RepeatableRead;
-        let mut read_set_guard = track_reads.then(|| self.read_set.lock().unwrap());
+        let mut read_set_guard = track_reads.then(|| self.read_set.lock());
         let mut table_reads = read_set_guard
             .as_mut()
             .map(|rs| rs.entry(table_name.to_string()).or_default());
@@ -359,7 +360,7 @@ impl Transaction {
 
         // Track the scan range.
         if self.isolation_level == IsolationLevel::SnapshotIsolation {
-            let mut scan_ranges = self.scan_ranges.lock().unwrap();
+            let mut scan_ranges = self.scan_ranges.lock();
             scan_ranges
                 .entry(table_name.to_string())
                 .or_default()
@@ -369,7 +370,7 @@ impl Transaction {
         // 1. Snapshot and sort write-buffer entries in [start, end] range
         let mut write_buffer_entries = Vec::new();
         {
-            let buffer = self.write_buffer.lock().unwrap();
+            let buffer = self.write_buffer.lock();
             if let Some(table_buffer) = buffer.get(table_name) {
                 for (k, v) in table_buffer {
                     if k >= start && k <= end {
@@ -465,7 +466,7 @@ impl Transaction {
 
         // Track the scan range for the index
         if self.isolation_level == IsolationLevel::SnapshotIsolation {
-            let mut scan_ranges = self.scan_ranges.lock().unwrap();
+            let mut scan_ranges = self.scan_ranges.lock();
             scan_ranges
                 .entry(format!("{}.index.{}", table_name, index_name))
                 .or_default()
@@ -499,7 +500,7 @@ impl Transaction {
         }
 
         // 3. Scan the transaction `write_buffer` for any matching rows not already resolved by index scan
-        let buffer = self.write_buffer.lock().unwrap();
+        let buffer = self.write_buffer.lock();
         if let Some(table_buffer) = buffer.get(table_name) {
             for (pk, row_opt) in table_buffer {
                 if resolved_pks.contains(pk) {
@@ -700,7 +701,7 @@ impl Transaction {
 
         // 3. Scan the transaction `write_buffer` for any matching rows not already resolved by index scan,
         // and remove any rows that have been deleted in this transaction.
-        let buffer = self.write_buffer.lock().unwrap();
+        let buffer = self.write_buffer.lock();
         if let Some(table_buffer) = buffer.get(table_name) {
             rows.retain(|row| {
                 if let Ok(pk) = table.schema.extract_primary_key(row)
@@ -754,7 +755,7 @@ impl Transaction {
                 let end_bound = DbKey::composite(vec![DbKey::string(tok.clone()), max_pk.clone()]);
 
                 if self.isolation_level == IsolationLevel::SnapshotIsolation {
-                    let mut scan_ranges = self.scan_ranges.lock().unwrap();
+                    let mut scan_ranges = self.scan_ranges.lock();
                     scan_ranges
                         .entry(format!("{}.index.{}", table_name, index_name))
                         .or_default()
@@ -826,7 +827,7 @@ impl Transaction {
                     ]);
 
                     if self.isolation_level == IsolationLevel::SnapshotIsolation {
-                        let mut scan_ranges = self.scan_ranges.lock().unwrap();
+                        let mut scan_ranges = self.scan_ranges.lock();
                         scan_ranges
                             .entry(format!("{}.index.{}", table_name, index_name))
                             .or_default()
@@ -854,7 +855,7 @@ impl Transaction {
                         DbKey::composite(vec![DbKey::string(tok.clone()), max_pk.clone()]);
 
                     if self.isolation_level == IsolationLevel::SnapshotIsolation {
-                        let mut scan_ranges = self.scan_ranges.lock().unwrap();
+                        let mut scan_ranges = self.scan_ranges.lock();
                         scan_ranges
                             .entry(format!("{}.index.{}", table_name, index_name))
                             .or_default()
@@ -964,7 +965,7 @@ impl Transaction {
 
     /// Commits all buffered mutations in this transaction to the tables.
     pub fn commit(&self) -> Result<()> {
-        let mut buffer = self.write_buffer.lock().unwrap();
+        let mut buffer = self.write_buffer.lock();
 
         // 1. Group all buffered mutations by table as WalEntry batches and TableWriteEntry batches.
         let mut table_batches = HashMap::new();
@@ -1097,8 +1098,8 @@ impl Transaction {
 
         // Validate transaction using OCC
         {
-            let read_set = self.read_set.lock().unwrap();
-            let scan_ranges = self.scan_ranges.lock().unwrap();
+            let read_set = self.read_set.lock();
+            let scan_ranges = self.scan_ranges.lock();
             if !write_keys.is_empty() {
                 self.database.validate_and_commit(
                     self.tx_id,
@@ -1141,7 +1142,7 @@ impl Transaction {
 
     /// Discards all buffered mutations.
     pub fn rollback(&self) -> Result<()> {
-        let mut buffer = self.write_buffer.lock().unwrap();
+        let mut buffer = self.write_buffer.lock();
         buffer.clear();
         Ok(())
     }
@@ -1249,7 +1250,7 @@ impl TransactionScanIterator {
 
 impl TransactionScanIterator {
     fn publish_read_key(&self, key: DbKey) {
-        let mut read_set = self.read_set.lock().unwrap();
+        let mut read_set = self.read_set.lock();
         // Avoid cloning `table_name` on every row: after the first key the
         // table's entry already exists, so `get_mut` hits the common path with
         // no allocation; only the first key pays for the inserted entry.

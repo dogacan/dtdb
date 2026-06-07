@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 /// A sound compilation of a LIKE pattern into index tokens, produced by a
 /// tokenizer that can accelerate LIKE (see [`Tokenizer::plan_like`]).
@@ -112,13 +113,13 @@ fn default_tokenizers() -> HashMap<String, Arc<dyn Tokenizer>> {
 /// Retrieve a registered tokenizer by name.
 pub fn get_tokenizer(name: &str) -> Option<Arc<dyn Tokenizer>> {
     let map = GLOBAL_TOKENIZERS.get_or_init(|| RwLock::new(default_tokenizers()));
-    map.read().unwrap().get(name).cloned()
+    map.read().get(name).cloned()
 }
 
 /// Register a custom tokenizer.
 pub fn register_global_tokenizer(name: &str, tokenizer: Arc<dyn Tokenizer>) {
     let map = GLOBAL_TOKENIZERS.get_or_init(|| RwLock::new(default_tokenizers()));
-    map.write().unwrap().insert(name.to_string(), tokenizer);
+    map.write().insert(name.to_string(), tokenizer);
 }
 
 #[cfg(test)]
