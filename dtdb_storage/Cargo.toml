@@ -12,6 +12,8 @@ xxhash-rust = { version = "0.8", features = ["xxh32", "xxh3"] }
 tracing = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+parking_lot = { workspace = true }
+
 
 
 [dev-dependencies]

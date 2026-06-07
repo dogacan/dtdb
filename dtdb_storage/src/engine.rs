@@ -5,11 +5,12 @@ use crate::snapshot_log::SnapshotLog;
 use crate::sstable::{SstableReader, SstableWriter};
 use crate::wal::{Wal, WalEntry};
 use crate::{DbKey, DbValue, EngineOptions, Result, ScanIterator, StorageError, ValueRewriter};
+use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StorageEngineStatistics {
@@ -157,7 +158,7 @@ fn acquire_task() -> Arc<WriteTask> {
         if let Some(task) = p.borrow_mut().take() {
             // Uniquely owned (only pooled at strong_count == 1), so this lock is
             // uncontended; reset the state for the new write.
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.state.lock();
             state.batch.clear();
             state.done = false;
             state.result = Ok(());
@@ -330,7 +331,7 @@ struct BackgroundGuard<'a> {
 
 impl Drop for BackgroundGuard<'_> {
     fn drop(&mut self) {
-        let mut st = self.inner.background.state.lock().unwrap();
+        let mut st = self.inner.background.state.lock();
         st.active -= 1;
         if st.active == 0 {
             self.inner.background.idle.notify_all();
@@ -439,7 +440,7 @@ impl StorageEngine {
                     }
                 }),
             );
-            *inner.wal_sync_handle.lock().unwrap() = Some(handle);
+            *inner.wal_sync_handle.lock() = Some(handle);
         }
 
         Ok(Self { inner })
@@ -804,19 +805,19 @@ impl EngineInner {
     /// avoiding an allocation per write for the entries themselves.
     fn execute_write(self: &Arc<Self>, fill: impl FnOnce(&mut Vec<WalEntry>)) -> Result<()> {
         let task = acquire_task();
-        fill(&mut task.state.lock().unwrap().batch);
+        fill(&mut task.state.lock().batch);
 
-        let mut queue = self.write_queue.lock().unwrap();
+        let mut queue = self.write_queue.lock();
         queue.tasks.push_back(task.clone());
 
-        while !task.state.lock().unwrap().done
+        while !task.state.lock().done
             && (!queue.tasks.front().is_some_and(|f| Arc::ptr_eq(f, &task)) || queue.writing)
         {
-            queue = task.condvar.wait(queue).unwrap();
+            task.condvar.wait(&mut queue);
         }
 
-        if task.state.lock().unwrap().done {
-            let result = clone_result(&task.state.lock().unwrap().result);
+        if task.state.lock().done {
+            let result = clone_result(&task.state.lock().result);
             release_task(task);
             return result;
         }
@@ -834,14 +835,14 @@ impl EngineInner {
 
         // Mark all tasks as done and propagate result
         for t in &tasks_to_commit {
-            let mut state = t.state.lock().unwrap();
+            let mut state = t.state.lock();
             state.done = true;
             state.result = clone_result(&write_result);
             t.condvar.notify_one();
         }
 
         // Release writing state and wake up the next leader if any
-        let mut queue = self.write_queue.lock().unwrap();
+        let mut queue = self.write_queue.lock();
         queue.writing = false;
         if let Some(next_leader) = queue.tasks.front() {
             next_leader.condvar.notify_one();
@@ -861,19 +862,19 @@ impl EngineInner {
     /// active memtable. Drains each task's `batch` into a reused merge buffer,
     /// so neither the merge nor the memtable apply allocates.
     fn commit_coalesced(self: &Arc<Self>, tasks: &[Arc<WriteTask>]) -> Result<()> {
-        let _write_lock = self.write_mutex.lock().unwrap();
+        let _write_lock = self.write_mutex.lock();
         self.await_l0_limit();
         self.maybe_slowdown_writes();
 
         let mut merged = LEADER_MERGED.with(|c| std::mem::take(&mut *c.borrow_mut()));
         merged.clear();
         for t in tasks {
-            let mut state = t.state.lock().unwrap();
+            let mut state = t.state.lock();
             merged.append(&mut state.batch);
         }
 
         let wal_result = (|| -> Result<u64> {
-            let mut wal = self.wal.lock().unwrap();
+            let mut wal = self.wal.lock();
             wal.append_batch(&merged)?;
             wal.size()
         })();
@@ -1302,7 +1303,7 @@ impl EngineInner {
         // disk by the time this returns (callers rely on that). Draining also
         // sweeps up any immutable still queued from a background flush.
         {
-            let _write_lock = self.write_mutex.lock().unwrap();
+            let _write_lock = self.write_mutex.lock();
             self.seal_active()?;
         }
         self.flush_pending()?;
@@ -1313,13 +1314,13 @@ impl EngineInner {
     pub fn compact(self: &Arc<Self>) -> Result<()> {
         // 1. Flush active memtable to disk first so all data is in SSTables.
         {
-            let _write_lock = self.write_mutex.lock().unwrap();
+            let _write_lock = self.write_mutex.lock();
             self.seal_active()?;
         }
         self.flush_pending()?;
 
         // 2. Run compaction synchronously
-        let _compaction_lock = self.compaction_mutex.lock().unwrap();
+        let _compaction_lock = self.compaction_mutex.lock();
 
         let has_l0 = {
             let sstables = self.sstables.read().unwrap();
@@ -1335,7 +1336,7 @@ impl EngineInner {
     }
 
     pub fn compact_if_needed(&self) -> Result<()> {
-        let _lock = self.compaction_mutex.lock().unwrap();
+        let _lock = self.compaction_mutex.lock();
         self.compact_if_needed_locked()
     }
 
@@ -1453,12 +1454,7 @@ impl EngineInner {
             } else if let Some(list) = sstables_guard.get(&source_level)
                 && !list.is_empty()
             {
-                let last_compacted = self
-                    .last_compacted_keys
-                    .lock()
-                    .unwrap()
-                    .get(&source_level)
-                    .cloned();
+                let last_compacted = self.last_compacted_keys.lock().get(&source_level).cloned();
                 let selected = if let Some(ref last_key) = last_compacted {
                     list.iter()
                         .find(|sst| sst.first_key().is_some_and(|fk| fk > last_key))
@@ -1674,7 +1670,7 @@ impl EngineInner {
                     id: f.id,
                 });
             }
-            self.manifest.lock().unwrap().append_batch(edits)?;
+            self.manifest.lock().append_batch(edits)?;
         }
 
         // 4. Update the active sstables map
@@ -1714,7 +1710,6 @@ impl EngineInner {
             let max_k = last_file.last_key();
             self.last_compacted_keys
                 .lock()
-                .unwrap()
                 .insert(source_level, max_k.clone());
         }
 
@@ -1758,9 +1753,9 @@ impl EngineInner {
     /// is the intended backpressure — every writer stalls until a slot frees.
     fn await_flush_slot(&self) {
         let cap = self.immutable_cap();
-        let mut st = self.flush_gate.state.lock().unwrap();
+        let mut st = self.flush_gate.state.lock();
         while st.immutable_count >= cap && !st.shutting_down {
-            st = self.flush_gate.slot_freed.wait(st).unwrap();
+            self.flush_gate.slot_freed.wait(&mut st);
         }
     }
 
@@ -1791,7 +1786,7 @@ impl EngineInner {
     /// coalesces. The [`FlushSlot`] is the real guard against double I/O — the
     /// coalesce key only avoids a redundant queued task.
     fn schedule_flush_imm(self: &Arc<Self>, imm: ImmMemtable) {
-        if self.background.state.lock().unwrap().shutting_down {
+        if self.background.state.lock().shutting_down {
             return;
         }
         let inner = self.clone();
@@ -1852,7 +1847,7 @@ impl EngineInner {
         // excluded by `write_mutex`, so the order of these two swaps is
         // immaterial to anyone observing the engine.
         {
-            let mut wal_guard = self.wal.lock().unwrap();
+            let mut wal_guard = self.wal.lock();
             *wal_guard = new_wal;
         }
         self.active_wal_id.store(new_wal_id, Ordering::SeqCst);
@@ -1873,7 +1868,7 @@ impl EngineInner {
             imm
         };
         // Account for the newly occupied immutable slot so backpressure sees it.
-        self.flush_gate.state.lock().unwrap().immutable_count += 1;
+        self.flush_gate.state.lock().immutable_count += 1;
         Ok(Some(sealed))
     }
 
@@ -1892,12 +1887,12 @@ impl EngineInner {
         // in the queue awaiting in-order WAL retirement, so even a waiter falls
         // through to `retire_durable_prefix` below to help the queue drain.
         let we_own = {
-            let mut state = imm.flush.state.lock().unwrap();
+            let mut state = imm.flush.state.lock();
             loop {
                 match *state {
                     SlotState::Completed => break false,
                     SlotState::InFlight => {
-                        state = imm.flush.done.wait(state).unwrap();
+                        imm.flush.done.wait(&mut state);
                     }
                     SlotState::Pending => {
                         *state = SlotState::InFlight;
@@ -1914,7 +1909,7 @@ impl EngineInner {
             // retirement: nothing new became durable.
             let result = self.write_immutable_sstable(imm);
             {
-                let mut state = imm.flush.state.lock().unwrap();
+                let mut state = imm.flush.state.lock();
                 *state = if result.is_ok() {
                     SlotState::Completed
                 } else {
@@ -1963,13 +1958,10 @@ impl EngineInner {
         // Record the newly flushed SSTable in the manifest. AddSstable edits form
         // a set, so recording them out of id order across concurrent flushers is
         // fine.
-        self.manifest
-            .lock()
-            .unwrap()
-            .append(ManifestEdit::AddSstable {
-                level: 0,
-                id: sst_id,
-            })?;
+        self.manifest.lock().append(ManifestEdit::AddSstable {
+            level: 0,
+            id: sst_id,
+        })?;
 
         let reader = SstableReader::open(&sst_path, sst_id, 0, self.block_cache.clone())?;
         {
@@ -1996,7 +1988,7 @@ impl EngineInner {
     /// (via [`Self::write_immutable_sstable`]) before its segment is deleted here,
     /// so a crash mid-retire leaves the segment on disk and recovery replays it.
     fn retire_durable_prefix(&self) -> Result<()> {
-        let _retire_lock = self.retire_mutex.lock().unwrap();
+        let _retire_lock = self.retire_mutex.lock();
         loop {
             // The oldest immutable is at the back. Peek it without holding the
             // write lock across the (slow) fsync below.
@@ -2006,7 +1998,7 @@ impl EngineInner {
             // Stop at the first immutable whose SSTable is not yet durable: we
             // must not retire past it, or a crash would strand an older live
             // segment behind a retired newer one.
-            let durable = matches!(*oldest.flush.state.lock().unwrap(), SlotState::Completed);
+            let durable = matches!(*oldest.flush.state.lock(), SlotState::Completed);
             if !durable {
                 break;
             }
@@ -2029,7 +2021,7 @@ impl EngineInner {
             // after the dequeue so a woken writer never observes more immutables
             // than the count claims.
             {
-                let mut st = self.flush_gate.state.lock().unwrap();
+                let mut st = self.flush_gate.state.lock();
                 st.immutable_count = st.immutable_count.saturating_sub(1);
             }
             self.flush_gate.slot_freed.notify_all();
@@ -2061,7 +2053,7 @@ impl EngineInner {
     /// down — in which case the caller MUST return without touching engine
     /// state. See [`BackgroundGate`].
     fn enter_background(&self) -> Option<BackgroundGuard<'_>> {
-        let mut st = self.background.state.lock().unwrap();
+        let mut st = self.background.state.lock();
         if st.shutting_down {
             return None;
         }
@@ -2071,7 +2063,7 @@ impl EngineInner {
 
     fn await_l0_limit(&self) {
         let stop_trigger = self.options.l0_stop_writes_trigger;
-        let mut st = self.l0_gate.state.lock().unwrap();
+        let mut st = self.l0_gate.state.lock();
         while !st.shutting_down {
             let l0_count = {
                 let ssts = self.sstables.read().unwrap();
@@ -2080,7 +2072,7 @@ impl EngineInner {
             if l0_count < stop_trigger {
                 break;
             }
-            st = self.l0_gate.condvar.wait(st).unwrap();
+            self.l0_gate.condvar.wait(&mut st);
         }
     }
 
@@ -2106,27 +2098,27 @@ impl EngineInner {
     fn quiesce(&self) {
         // Cancel the periodic WAL-sync schedule so no further ticks are
         // submitted (dropping the handle cancels it).
-        *self.wal_sync_handle.lock().unwrap() = None;
+        *self.wal_sync_handle.lock() = None;
 
         // Release any writer stalled on backpressure: a flush that would have
         // freed its slot may now no-op (shutting down), so without this the
         // writer could wait forever and the process couldn't drain.
         {
-            let mut fg = self.flush_gate.state.lock().unwrap();
+            let mut fg = self.flush_gate.state.lock();
             fg.shutting_down = true;
         }
         self.flush_gate.slot_freed.notify_all();
 
         {
-            let mut st = self.l0_gate.state.lock().unwrap();
+            let mut st = self.l0_gate.state.lock();
             st.shutting_down = true;
         }
         self.l0_gate.condvar.notify_all();
 
-        let mut st = self.background.state.lock().unwrap();
+        let mut st = self.background.state.lock();
         st.shutting_down = true;
         while st.active > 0 {
-            st = self.background.idle.wait(st).unwrap();
+            self.background.idle.wait(&mut st);
         }
     }
 
@@ -2134,7 +2126,7 @@ impl EngineInner {
         // Don't schedule new compaction once the engine is shutting down; a task
         // submitted now would only no-op (see the `enter_background` guard
         // below), and skipping the submit keeps the executor queue clean.
-        if self.background.state.lock().unwrap().shutting_down {
+        if self.background.state.lock().shutting_down {
             return;
         }
         let inner = self.clone();
@@ -2155,7 +2147,7 @@ impl EngineInner {
                 let Some(_bg) = inner.enter_background() else {
                     return;
                 };
-                let _compaction_lock = inner.compaction_mutex.lock().unwrap();
+                let _compaction_lock = inner.compaction_mutex.lock();
                 if let Err(e) = inner.compact_if_needed_locked() {
                     tracing::error!(error = ?e, "background compaction failed");
                 }
@@ -2164,7 +2156,7 @@ impl EngineInner {
     }
 
     pub fn sync_wal(&self) -> Result<()> {
-        let wal = self.wal.lock().unwrap();
+        let wal = self.wal.lock();
         wal.sync_all()?;
         Ok(())
     }
@@ -2417,14 +2409,14 @@ mod tests {
         }
 
         fn pending(&self) -> usize {
-            self.tasks.lock().unwrap().len()
+            self.tasks.lock().len()
         }
 
         /// Run every currently-stored task. Tasks submitted *during* a run (e.g. a
         /// flush scheduling compaction, or a woken writer scheduling its own
         /// flush) are left for a later `run_all`.
         fn run_all(&self) {
-            let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+            let tasks = std::mem::take(&mut *self.tasks.lock());
             for task in tasks {
                 task();
             }
@@ -2436,7 +2428,7 @@ mod tests {
         /// id ordering must tolerate. Tasks submitted during the run are left for
         /// later.
         fn run_reversed(&self) {
-            let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+            let mut tasks = std::mem::take(&mut *self.tasks.lock());
             tasks.reverse();
             for task in tasks {
                 task();
@@ -2448,7 +2440,7 @@ mod tests {
         /// whose retirement frees a backpressure slot.
         fn run_one(&self) {
             let task = {
-                let mut tasks = self.tasks.lock().unwrap();
+                let mut tasks = self.tasks.lock();
                 if tasks.is_empty() {
                     None
                 } else {
@@ -2468,7 +2460,7 @@ mod tests {
             _key: Option<CoalesceKey>,
             task: crate::executor::Task,
         ) {
-            self.tasks.lock().unwrap().push(task);
+            self.tasks.lock().push(task);
         }
 
         fn submit_periodic(
@@ -2510,13 +2502,7 @@ mod tests {
     }
 
     fn immutable_count(engine: &StorageEngine) -> usize {
-        engine
-            .inner
-            .flush_gate
-            .state
-            .lock()
-            .unwrap()
-            .immutable_count
+        engine.inner.flush_gate.state.lock().immutable_count
     }
 
     /// The ids of the L0 SSTables in list order. The read paths require this to be
@@ -2922,7 +2908,7 @@ mod tests {
 
         // Run only the newest task (last submitted). Its SSTable becomes durable,
         // but the older immutable is still Pending, so nothing retires.
-        let newest_task = exec.tasks.lock().unwrap().pop().unwrap();
+        let newest_task = exec.tasks.lock().pop().unwrap();
         newest_task();
 
         assert_eq!(
