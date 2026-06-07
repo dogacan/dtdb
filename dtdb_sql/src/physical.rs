@@ -286,7 +286,8 @@ impl PhysicalOperator for PhysicalFilter {
     ) -> Result<Box<dyn Iterator<Item = Result<Row, String>> + Send>, String> {
         let child_iter = self.source.execute(tx, params)?;
         let child_schema = self.source.schema().clone();
-        let predicate = self.predicate.clone();
+        let mut predicate = self.predicate.clone();
+        predicate.substitute_params(params)?;
 
         struct FilterIterator {
             iter: Box<dyn Iterator<Item = Result<Row, String>> + Send>,
@@ -365,7 +366,10 @@ impl PhysicalOperator for PhysicalProjection {
     ) -> Result<Box<dyn Iterator<Item = Result<Row, String>> + Send>, String> {
         let child_iter = self.source.execute(tx, params)?;
         let child_schema = self.source.schema().clone();
-        let expressions = self.expressions.clone();
+        let mut expressions = self.expressions.clone();
+        for expr in &mut expressions {
+            expr.substitute_params(params)?;
+        }
 
         struct ProjectionIterator {
             iter: Box<dyn Iterator<Item = Result<Row, String>> + Send>,
@@ -574,7 +578,10 @@ impl PhysicalOperator for PhysicalSort {
         let child_iter = self.source.execute(tx, params)?;
         let child_schema = self.source.schema().clone();
         let directions = self.directions();
-        let keys = self.keys.clone();
+        let mut keys = self.keys.clone();
+        for (expr, _) in &mut keys {
+            expr.substitute_params(params)?;
+        }
         let temp_dir = self.temp_dir.clone();
         let memory_budget = self.memory_budget;
 

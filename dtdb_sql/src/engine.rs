@@ -1,5 +1,5 @@
 use crate::expr::{Expr, Operator};
-use crate::logical::{AggregateExpr, JoinType, LogicalPlan, format_logical_plan};
+use crate::logical::{AggregateExpr, JoinType, LogicalPlan, PlanKey, format_logical_plan};
 use crate::optimizer::Optimizer;
 use crate::physical::{
     PhysicalCrossJoin, PhysicalDistinct, PhysicalFilter, PhysicalFullTextScan,
@@ -168,9 +168,11 @@ enum PreparedPlan {
 /// runs it many times with fresh bindings, skipping the parse (always) and the
 /// logical planning (when the plan could be cached). Optimization and physical
 /// execution still run on every call.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedStatement {
     plan: PreparedPlan,
+    cached_physical: Option<Arc<dyn PhysicalOperator>>,
+    optimized_point_get_plan: Option<LogicalPlan>,
     sql: String,
     /// Catalog version this statement's cached [`PreparedPlan::Planned`] was
     /// built against. A cached logical plan resolves table and column
@@ -182,12 +184,40 @@ pub struct PreparedStatement {
     catalog_version: u64,
 }
 
+impl std::fmt::Debug for PreparedStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedStatement")
+            .field("plan", &self.plan)
+            .field("sql", &self.sql)
+            .field("catalog_version", &self.catalog_version)
+            .field(
+                "cached_physical",
+                &self.cached_physical.as_ref().map(|_| "..."),
+            )
+            .field("optimized_point_get_plan", &self.optimized_point_get_plan)
+            .finish()
+    }
+}
+
 impl PreparedStatement {
     /// The original SQL text this statement was prepared from.
     pub fn sql(&self) -> &str {
         &self.sql
     }
 }
+
+type CachedPlanTuple = (
+    PreparedPlan,
+    Option<Arc<dyn PhysicalOperator>>,
+    Option<LogicalPlan>,
+);
+
+type CachedPlanEntry = (
+    PreparedPlan,
+    Option<Arc<dyn PhysicalOperator>>,
+    Option<LogicalPlan>,
+    u64,
+);
 
 /// SqlEngine orchestrates the parser, logical planner, optimizer, and physical execution pipeline.
 pub struct SqlEngine {
@@ -198,12 +228,7 @@ pub struct SqlEngine {
     /// valid; planning is intentionally NOT cached here, so each execution still
     /// resolves against the current schema.
     parse_cache: Mutex<LruCache<String, Arc<Statement>>>,
-    /// Caches symbolic (unoptimized) logical plans keyed on the preprocessed SQL
-    /// text, so re-preparing or executing the same statement template bypasses
-    /// parsing and logical planning. Optimization is deliberately *not* cached: it
-    /// runs per execution, after parameters are substituted, so value-dependent
-    /// rules (e.g. prefix/infix `LIKE` index selection) can see concrete bindings.
-    plan_cache: RwLock<LruCache<String, (PreparedPlan, u64)>>,
+    plan_cache: RwLock<LruCache<String, CachedPlanEntry>>,
 }
 
 impl SqlEngine {
@@ -292,12 +317,14 @@ impl SqlEngine {
         // 1. Check if the pre-optimized plan is in the cache and matches the current schema version.
         {
             let mut cache = self.plan_cache.write();
-            if let Some((plan, catalog_version)) = cache
+            if let Some((plan, cached_physical, optimized_point_get_plan, catalog_version)) = cache
                 .get(&preprocessed)
-                .filter(|(_, cv)| *cv == schema_version)
+                .filter(|(_, _, _, cv)| *cv == schema_version)
             {
                 return Ok(PreparedStatement {
                     plan: plan.clone(),
+                    cached_physical: cached_physical.clone(),
+                    optimized_point_get_plan: optimized_point_get_plan.clone(),
                     sql: sql.to_string(),
                     catalog_version: *catalog_version,
                 });
@@ -326,14 +353,43 @@ impl SqlEngine {
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
+        let mut cached_physical = None;
+        let mut optimized_point_get_plan = None;
+        if let PreparedPlan::Planned(ref planned) = plan
+            && let SqlStatement::Query(logical_plan) = planned.as_ref()
+        {
+            let optimized = Optimizer::new(self.database.clone()).optimize(logical_plan.clone());
+            if is_point_get_symbolic(&optimized) {
+                optimized_point_get_plan = Some(optimized);
+            } else if !is_value_dependent(logical_plan, &self.database) {
+                let mut cols = HashSet::new();
+                optimized.collect_columns(&mut cols);
+                let cols_vec: Vec<String> = cols.into_iter().collect();
+                if let Ok(physical_op) = self.compile_physical(&optimized, Some(&cols_vec)) {
+                    cached_physical = Some(Arc::from(physical_op));
+                }
+            }
+        }
+
         // Cache the newly planned statement in the registry.
         {
             let mut cache = self.plan_cache.write();
-            cache.insert(preprocessed, (plan.clone(), schema_version), 1);
+            cache.insert(
+                preprocessed,
+                (
+                    plan.clone(),
+                    cached_physical.clone(),
+                    optimized_point_get_plan.clone(),
+                    schema_version,
+                ),
+                1,
+            );
         }
 
         Ok(PreparedStatement {
             plan,
+            cached_physical,
+            optimized_point_get_plan,
             sql: sql.to_string(),
             catalog_version: schema_version,
         })
@@ -347,7 +403,10 @@ impl SqlEngine {
     /// [`PreparedPlan::Planned`] is rebuilt for this call only; the cached plan
     /// itself is not refreshed (`prepared` is shared and immutable), so the
     /// next execution will re-plan again until the statement is re-prepared.
-    fn refreshed_plan(&self, prepared: &PreparedStatement) -> Result<Option<PreparedPlan>, String> {
+    fn refreshed_plan(
+        &self,
+        prepared: &PreparedStatement,
+    ) -> Result<Option<CachedPlanTuple>, String> {
         // The Ast fallback already re-plans against the live catalog on every
         // execution, so only a cached Planned variant can go stale.
         if !matches!(prepared.plan, PreparedPlan::Planned(_))
@@ -362,11 +421,15 @@ impl SqlEngine {
         // 1. Check if another thread has already cached the fresh plan
         {
             let mut cache = self.plan_cache.write();
-            if let Some((plan, _)) = cache
+            if let Some((plan, cached_physical, optimized_point_get_plan, _)) = cache
                 .get(&preprocessed)
-                .filter(|(_, cv)| *cv == schema_version)
+                .filter(|(_, _, _, cv)| *cv == schema_version)
             {
-                return Ok(Some(plan.clone()));
+                return Ok(Some((
+                    plan.clone(),
+                    cached_physical.clone(),
+                    optimized_point_get_plan.clone(),
+                )));
             }
         }
 
@@ -382,13 +445,40 @@ impl SqlEngine {
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
+        let mut cached_physical = None;
+        let mut optimized_point_get_plan = None;
+        if let PreparedPlan::Planned(ref planned) = plan
+            && let SqlStatement::Query(logical_plan) = planned.as_ref()
+        {
+            let optimized = Optimizer::new(self.database.clone()).optimize(logical_plan.clone());
+            if is_point_get_symbolic(&optimized) {
+                optimized_point_get_plan = Some(optimized);
+            } else if !is_value_dependent(logical_plan, &self.database) {
+                let mut cols = HashSet::new();
+                optimized.collect_columns(&mut cols);
+                let cols_vec: Vec<String> = cols.into_iter().collect();
+                if let Ok(physical_op) = self.compile_physical(&optimized, Some(&cols_vec)) {
+                    cached_physical = Some(Arc::from(physical_op));
+                }
+            }
+        }
+
         // Cache the newly refreshed plan in the registry.
         {
             let mut cache = self.plan_cache.write();
-            cache.insert(preprocessed, (plan.clone(), schema_version), 1);
+            cache.insert(
+                preprocessed,
+                (
+                    plan.clone(),
+                    cached_physical.clone(),
+                    optimized_point_get_plan.clone(),
+                    schema_version,
+                ),
+                1,
+            );
         }
 
-        Ok(Some(plan))
+        Ok(Some((plan, cached_physical, optimized_point_get_plan)))
     }
 
     /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
@@ -402,8 +492,35 @@ impl SqlEngine {
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
         let refreshed = self.refreshed_plan(prepared)?;
-        match refreshed.as_ref().unwrap_or(&prepared.plan) {
+        let (plan_to_use, cached_physical, optimized_point_get_plan) = match &refreshed {
+            Some((plan, cached, opt_pg)) => (plan, cached, opt_pg),
+            None => (
+                &prepared.plan,
+                &prepared.cached_physical,
+                &prepared.optimized_point_get_plan,
+            ),
+        };
+
+        match plan_to_use {
             PreparedPlan::Planned(planned) => {
+                if let Some(opt_plan) = optimized_point_get_plan
+                    && let Some(result) = self.execute_point_get(opt_plan, tx, params)?
+                {
+                    return Ok(result);
+                }
+
+                if let Some(physical_op) = cached_physical {
+                    let query_iter = physical_op.execute(tx, params)?;
+                    let mut results = Vec::new();
+                    for row_res in query_iter {
+                        results.push(row_res?);
+                    }
+                    return Ok(ExecutionResult::Select {
+                        schema: physical_op.schema().clone(),
+                        rows: results,
+                    });
+                }
+
                 let mut planned = (**planned).clone();
                 planned.substitute_params(params)?;
                 let optimized = self.optimize_planned(planned);
@@ -423,8 +540,31 @@ impl SqlEngine {
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionStreamingResult, String> {
         let refreshed = self.refreshed_plan(prepared)?;
-        match refreshed.as_ref().unwrap_or(&prepared.plan) {
+        let (plan_to_use, cached_physical, optimized_point_get_plan) = match &refreshed {
+            Some((plan, cached, opt_pg)) => (plan, cached, opt_pg),
+            None => (
+                &prepared.plan,
+                &prepared.cached_physical,
+                &prepared.optimized_point_get_plan,
+            ),
+        };
+
+        match plan_to_use {
             PreparedPlan::Planned(planned) => {
+                if let Some(opt_plan) = optimized_point_get_plan
+                    && let Some(result) = self.execute_point_get(opt_plan, tx, params)?
+                {
+                    return Ok(ExecutionStreamingResult::Complete(result));
+                }
+
+                if let Some(physical_op) = cached_physical {
+                    let iterator = physical_op.execute(tx, params)?;
+                    return Ok(ExecutionStreamingResult::Streaming {
+                        schema: physical_op.schema().clone(),
+                        iterator,
+                    });
+                }
+
                 let mut planned = (**planned).clone();
                 planned.substitute_params(params)?;
                 let optimized = self.optimize_planned(planned);
@@ -1979,6 +2119,432 @@ fn preprocess_sql(sql: &str) -> String {
     sql.to_string()
 }
 
+fn expr_has_parameter(expr: &Expr) -> bool {
+    match expr {
+        Expr::Parameter(_) => true,
+        Expr::BinaryOp { left, right, .. } => expr_has_parameter(left) || expr_has_parameter(right),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand.as_ref().is_some_and(|op| expr_has_parameter(op))
+                || conditions.iter().any(expr_has_parameter)
+                || results.iter().any(expr_has_parameter)
+                || else_result
+                    .as_ref()
+                    .is_some_and(|el| expr_has_parameter(el))
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_has_parameter),
+        Expr::Not(inner) | Expr::IsNull(inner) => expr_has_parameter(inner),
+        Expr::InList { expr, list } => {
+            expr_has_parameter(expr) || list.iter().any(expr_has_parameter)
+        }
+        Expr::ScalarSubquery(subquery) | Expr::Exists { subquery, .. } => {
+            logical_plan_has_parameter(subquery)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_has_parameter(expr) || logical_plan_has_parameter(subquery)
+        }
+        Expr::Cast { expr, .. } => expr_has_parameter(expr),
+        _ => false,
+    }
+}
+
+fn logical_plan_has_parameter(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { range, .. } | LogicalPlan::IndexScan { range, .. } => {
+            range.as_ref().is_some_and(|(start, end)| {
+                matches!(start, PlanKey::Parameter(_)) || matches!(end, PlanKey::Parameter(_))
+            })
+        }
+        LogicalPlan::FullTextScan { .. } => false,
+        LogicalPlan::Filter { source, predicate } => {
+            expr_has_parameter(predicate) || logical_plan_has_parameter(source)
+        }
+        LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } => expressions.iter().any(expr_has_parameter) || logical_plan_has_parameter(source),
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            expr_has_parameter(condition)
+                || logical_plan_has_parameter(left)
+                || logical_plan_has_parameter(right)
+        }
+        LogicalPlan::Aggregate {
+            source,
+            group_by,
+            aggrs,
+            ..
+        } => {
+            group_by.iter().any(expr_has_parameter)
+                || aggrs
+                    .iter()
+                    .any(|agg| expr_has_parameter(aggregate_expr_ref(agg)))
+                || logical_plan_has_parameter(source)
+        }
+        LogicalPlan::Sort { source, keys } => {
+            keys.iter().any(|(expr, _)| expr_has_parameter(expr))
+                || logical_plan_has_parameter(source)
+        }
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => {
+            limit.as_ref().is_some_and(expr_has_parameter)
+                || offset.as_ref().is_some_and(expr_has_parameter)
+                || logical_plan_has_parameter(source)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            logical_plan_has_parameter(left) || logical_plan_has_parameter(right)
+        }
+        LogicalPlan::Distinct { source } => logical_plan_has_parameter(source),
+    }
+}
+
+fn has_parameterized_like(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: Operator::Like,
+            right,
+        } => expr_has_parameter(left) || expr_has_parameter(right),
+        Expr::BinaryOp { left, right, .. } => {
+            has_parameterized_like(left) || has_parameterized_like(right)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|op| has_parameterized_like(op))
+                || conditions.iter().any(has_parameterized_like)
+                || results.iter().any(has_parameterized_like)
+                || else_result
+                    .as_ref()
+                    .is_some_and(|el| has_parameterized_like(el))
+        }
+        Expr::Function { args, .. } => args.iter().any(has_parameterized_like),
+        Expr::Not(inner) | Expr::IsNull(inner) => has_parameterized_like(inner),
+        Expr::InList { expr, list } => {
+            has_parameterized_like(expr) || list.iter().any(has_parameterized_like)
+        }
+        Expr::ScalarSubquery(subquery) | Expr::Exists { subquery, .. } => {
+            logical_plan_has_parameterized_like(subquery)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            has_parameterized_like(expr) || logical_plan_has_parameterized_like(subquery)
+        }
+        Expr::Cast { expr, .. } => has_parameterized_like(expr),
+        _ => false,
+    }
+}
+
+fn logical_plan_has_parameterized_like(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::FullTextScan { .. } => false,
+        LogicalPlan::Filter { source, predicate } => {
+            has_parameterized_like(predicate) || logical_plan_has_parameterized_like(source)
+        }
+        LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } => {
+            expressions.iter().any(has_parameterized_like)
+                || logical_plan_has_parameterized_like(source)
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            has_parameterized_like(condition)
+                || logical_plan_has_parameterized_like(left)
+                || logical_plan_has_parameterized_like(right)
+        }
+        LogicalPlan::Aggregate {
+            source,
+            group_by,
+            aggrs,
+            ..
+        } => {
+            group_by.iter().any(has_parameterized_like)
+                || aggrs
+                    .iter()
+                    .any(|agg| has_parameterized_like(aggregate_expr_ref(agg)))
+                || logical_plan_has_parameterized_like(source)
+        }
+        LogicalPlan::Sort { source, keys } => {
+            keys.iter().any(|(expr, _)| has_parameterized_like(expr))
+                || logical_plan_has_parameterized_like(source)
+        }
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => {
+            limit.as_ref().is_some_and(has_parameterized_like)
+                || offset.as_ref().is_some_and(has_parameterized_like)
+                || logical_plan_has_parameterized_like(source)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            logical_plan_has_parameterized_like(left) || logical_plan_has_parameterized_like(right)
+        }
+        LogicalPlan::Distinct { source } => logical_plan_has_parameterized_like(source),
+    }
+}
+
+fn column_has_skewed_stats(table_name: &str, col_name: &str, database: &Database) -> bool {
+    let Ok(table) = database.get_table(table_name) else {
+        return false;
+    };
+    let schema = &table.schema;
+    let Some(stats) = database.get_table_statistics(table_name) else {
+        return false;
+    };
+    for index in &schema.indexes {
+        if index
+            .columns
+            .iter()
+            .any(|c| dtdb_relational::column_names_match(c, col_name))
+            && stats
+                .index_stats
+                .get(&index.name)
+                .is_some_and(|idx_stats| !idx_stats.most_common.is_empty())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_column_skewed(col_name: &str, tables: &HashSet<String>, database: &Database) -> bool {
+    let col_part = col_name.split('.').next_back().unwrap_or(col_name);
+    for table_name in tables {
+        if column_has_skewed_stats(table_name, col_part, database) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_scanned_tables(plan: &LogicalPlan, tables: &mut HashSet<String>) {
+    match plan {
+        LogicalPlan::Scan { table_name, .. }
+        | LogicalPlan::IndexScan { table_name, .. }
+        | LogicalPlan::FullTextScan { table_name, .. } => {
+            tables.insert(table_name.clone());
+        }
+        LogicalPlan::Filter { source, .. } => collect_scanned_tables(source, tables),
+        LogicalPlan::Projection { source, .. } => collect_scanned_tables(source, tables),
+        LogicalPlan::Join { left, right, .. } => {
+            collect_scanned_tables(left, tables);
+            collect_scanned_tables(right, tables);
+        }
+        LogicalPlan::Aggregate { source, .. } => collect_scanned_tables(source, tables),
+        LogicalPlan::Sort { source, .. } => collect_scanned_tables(source, tables),
+        LogicalPlan::Limit { source, .. } => collect_scanned_tables(source, tables),
+        LogicalPlan::SetOp { left, right, .. } => {
+            collect_scanned_tables(left, tables);
+            collect_scanned_tables(right, tables);
+        }
+        LogicalPlan::Distinct { source } => collect_scanned_tables(source, tables),
+    }
+}
+
+fn has_parameterized_comparison_on_skewed(
+    expr: &Expr,
+    tables: &HashSet<String>,
+    database: &Database,
+) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if matches!(
+                op,
+                Operator::Eq
+                    | Operator::Lt
+                    | Operator::Gt
+                    | Operator::LtEq
+                    | Operator::GtEq
+                    | Operator::NotEq
+            ) {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(name, _), Expr::Parameter(_))
+                    | (Expr::Parameter(_), Expr::Column(name, _))
+                        if is_column_skewed(name, tables, database) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            has_parameterized_comparison_on_skewed(left, tables, database)
+                || has_parameterized_comparison_on_skewed(right, tables, database)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|op| has_parameterized_comparison_on_skewed(op, tables, database))
+                || conditions
+                    .iter()
+                    .any(|c| has_parameterized_comparison_on_skewed(c, tables, database))
+                || results
+                    .iter()
+                    .any(|r| has_parameterized_comparison_on_skewed(r, tables, database))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|el| has_parameterized_comparison_on_skewed(el, tables, database))
+        }
+        Expr::Function { args, .. } => args
+            .iter()
+            .any(|arg| has_parameterized_comparison_on_skewed(arg, tables, database)),
+        Expr::Not(inner) | Expr::IsNull(inner) => {
+            has_parameterized_comparison_on_skewed(inner, tables, database)
+        }
+        Expr::InList { expr, list } => {
+            has_parameterized_comparison_on_skewed(expr, tables, database)
+                || list
+                    .iter()
+                    .any(|item| has_parameterized_comparison_on_skewed(item, tables, database))
+        }
+        Expr::ScalarSubquery(subquery) | Expr::Exists { subquery, .. } => {
+            logical_plan_has_parameterized_comparison_on_skewed(subquery, tables, database)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            has_parameterized_comparison_on_skewed(expr, tables, database)
+                || logical_plan_has_parameterized_comparison_on_skewed(subquery, tables, database)
+        }
+        Expr::Cast { expr, .. } => has_parameterized_comparison_on_skewed(expr, tables, database),
+        _ => false,
+    }
+}
+
+fn logical_plan_has_parameterized_comparison_on_skewed(
+    plan: &LogicalPlan,
+    tables: &HashSet<String>,
+    database: &Database,
+) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::FullTextScan { .. } => false,
+        LogicalPlan::Filter { source, predicate } => {
+            has_parameterized_comparison_on_skewed(predicate, tables, database)
+                || logical_plan_has_parameterized_comparison_on_skewed(source, tables, database)
+        }
+        LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } => {
+            expressions
+                .iter()
+                .any(|e| has_parameterized_comparison_on_skewed(e, tables, database))
+                || logical_plan_has_parameterized_comparison_on_skewed(source, tables, database)
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            has_parameterized_comparison_on_skewed(condition, tables, database)
+                || logical_plan_has_parameterized_comparison_on_skewed(left, tables, database)
+                || logical_plan_has_parameterized_comparison_on_skewed(right, tables, database)
+        }
+        LogicalPlan::Aggregate {
+            source,
+            group_by,
+            aggrs,
+            ..
+        } => {
+            group_by
+                .iter()
+                .any(|g| has_parameterized_comparison_on_skewed(g, tables, database))
+                || aggrs.iter().any(|agg| {
+                    has_parameterized_comparison_on_skewed(
+                        aggregate_expr_ref(agg),
+                        tables,
+                        database,
+                    )
+                })
+                || logical_plan_has_parameterized_comparison_on_skewed(source, tables, database)
+        }
+        LogicalPlan::Sort { source, keys } => {
+            keys.iter()
+                .any(|(expr, _)| has_parameterized_comparison_on_skewed(expr, tables, database))
+                || logical_plan_has_parameterized_comparison_on_skewed(source, tables, database)
+        }
+        LogicalPlan::Limit {
+            source,
+            limit,
+            offset,
+        } => {
+            limit
+                .as_ref()
+                .is_some_and(|l| has_parameterized_comparison_on_skewed(l, tables, database))
+                || offset
+                    .as_ref()
+                    .is_some_and(|o| has_parameterized_comparison_on_skewed(o, tables, database))
+                || logical_plan_has_parameterized_comparison_on_skewed(source, tables, database)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            logical_plan_has_parameterized_comparison_on_skewed(left, tables, database)
+                || logical_plan_has_parameterized_comparison_on_skewed(right, tables, database)
+        }
+        LogicalPlan::Distinct { source } => {
+            logical_plan_has_parameterized_comparison_on_skewed(source, tables, database)
+        }
+    }
+}
+
+fn is_value_dependent(plan: &LogicalPlan, database: &Database) -> bool {
+    if logical_plan_has_parameterized_like(plan) {
+        return true;
+    }
+    let mut tables = HashSet::new();
+    collect_scanned_tables(plan, &mut tables);
+    logical_plan_has_parameterized_comparison_on_skewed(plan, &tables, database)
+}
+
+fn is_point_get_symbolic(plan: &LogicalPlan) -> bool {
+    let (_, after_proj) = match plan {
+        LogicalPlan::Projection { source, .. } => ((), source.as_ref()),
+        other => ((), other),
+    };
+    let (_, after_filter) = match after_proj {
+        LogicalPlan::Filter { source, .. } => ((), source.as_ref()),
+        other => ((), other),
+    };
+    match after_filter {
+        LogicalPlan::Scan {
+            range: Some((start, end)),
+            ..
+        } => start == end,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2029,5 +2595,70 @@ mod tests {
         // A bound parameter whose type cannot be a key.
         let err = PlanKey::Parameter("f".into()).resolve(&params).unwrap_err();
         assert!(err.contains("Unsupported key parameter type"), "got: {err}");
+    }
+
+    #[test]
+    fn test_value_dependency_and_point_get_plan_caching() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(temp.path()).unwrap());
+        let engine = SqlEngine::new(db.clone());
+
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT)",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // 1. Value-independent query: should cache the physical plan.
+        let stmt_ind = engine
+            .prepare("SELECT name FROM users WHERE age = :age")
+            .unwrap();
+        assert!(stmt_ind.cached_physical.is_some());
+        assert!(stmt_ind.optimized_point_get_plan.is_none());
+
+        // Verify executing works.
+        let tx_run = Transaction::new(2, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("age".to_string(), DbValue::Int(25));
+        let res = engine
+            .execute_prepared(&stmt_ind, &tx_run, &params)
+            .unwrap();
+        assert!(matches!(res, ExecutionResult::Select { .. }));
+
+        // 2. Value-dependent query (parameterized LIKE): should NOT cache the physical plan.
+        let stmt_dep = engine
+            .prepare("SELECT name FROM users WHERE name LIKE :pattern")
+            .unwrap();
+        assert!(stmt_dep.cached_physical.is_none());
+        assert!(stmt_dep.optimized_point_get_plan.is_none());
+
+        let mut params_like = std::collections::HashMap::new();
+        params_like.insert(
+            "pattern".to_string(),
+            DbValue::string("%Alice%".to_string()),
+        );
+        let res_like = engine
+            .execute_prepared(&stmt_dep, &tx_run, &params_like)
+            .unwrap();
+        assert!(matches!(res_like, ExecutionResult::Select { .. }));
+
+        // 3. Point-get query (parameterized PK): should cache optimized_point_get_plan.
+        let stmt_pg = engine
+            .prepare("SELECT name, age FROM users WHERE id = :id")
+            .unwrap();
+        assert!(stmt_pg.optimized_point_get_plan.is_some());
+        // For point-gets, it does not cache the general physical Volcano plan because it executes the fast-path.
+        assert!(stmt_pg.cached_physical.is_none());
+
+        let mut params_pg = std::collections::HashMap::new();
+        params_pg.insert("id".to_string(), DbValue::Int(10));
+        let res_pg = engine
+            .execute_prepared(&stmt_pg, &tx_run, &params_pg)
+            .unwrap();
+        assert!(matches!(res_pg, ExecutionResult::Select { .. }));
+        tx_run.commit().unwrap();
     }
 }
