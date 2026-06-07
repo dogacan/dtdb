@@ -1,3 +1,4 @@
+use crate::engine::resolve_count_expr;
 use crate::expr::{Expr, compare_values};
 use crate::logical::{AggregateExpr, FtsQuery, JoinType, PlanKey, SetOpType};
 use crate::spill::{self, KWayMerge, Run};
@@ -417,15 +418,6 @@ impl PhysicalOperator for PhysicalProjection {
 // ==========================================
 // 4. Limit Physical Operator
 // ==========================================
-fn resolve_count_expr(expr: &Expr, params: &HashMap<String, DbValue>) -> Result<usize, String> {
-    let mut expr = expr.clone();
-    expr.substitute_params(params)?;
-    match expr.eval(&Row::new(Vec::new()), &Schema::new(Vec::new()))? {
-        DbValue::Int(v) if v >= 0 => Ok(v as usize),
-        DbValue::Int(v) => Err(format!("LIMIT/OFFSET must be non-negative, got {v}")),
-        other => Err(format!("LIMIT/OFFSET must be an integer, got {other:?}")),
-    }
-}
 
 pub struct PhysicalLimit {
     source: Box<dyn PhysicalOperator>,
