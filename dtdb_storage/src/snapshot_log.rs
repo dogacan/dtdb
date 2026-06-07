@@ -82,12 +82,22 @@ impl<S: Snapshotable> SnapshotLog<S> {
                 }
             }
 
-            let log = FramedLog::open(log_path(&dir, generation), log_format, None, fsync_method)?;
+            // Treat opening as a compaction (generation rollover) to ensure that the
+            // old generation log file (which has been closed) is never opened for write again.
+            let new_gen = generation + 1;
+            atomic_write(
+                &snapshot_path(&dir, new_gen),
+                &postcard::to_allocvec(&state)?,
+                fsync_method,
+            )?;
+            let log = FramedLog::open(log_path(&dir, new_gen), log_format, None, fsync_method)?;
+            write_current(&current_path, new_gen, fsync_method)?;
+
             let this = Self {
                 dir,
                 state,
                 log,
-                generation,
+                generation: new_gen,
                 log_format,
                 fsync_method,
                 compact_threshold_bytes,
@@ -305,7 +315,7 @@ mod tests {
         log.append(SetEdit::Remove(10)).unwrap();
         drop(log);
         let reopened = open(&dir, NO_AUTO_COMPACT);
-        assert_eq!(reopened.generation, 1);
+        assert_eq!(reopened.generation, 2);
         assert_eq!(reopened.state().values, HashSet::from([20]));
     }
 
