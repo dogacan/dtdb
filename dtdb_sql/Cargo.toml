@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 regex = "1.12"
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+parking_lot = { workspace = true }
 
 
 [dev-dependencies]

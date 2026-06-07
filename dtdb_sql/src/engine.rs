@@ -16,7 +16,8 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
 
 /// Capacity (in entries) of the per-engine parsed-statement cache. SQL text is
 /// typically a small, fixed set of templates (the user-facing `sql_query!`
@@ -244,12 +245,12 @@ impl SqlEngine {
 
     /// Returns the number of cached plans in the registry.
     pub fn plan_cache_len(&self) -> usize {
-        self.plan_cache.read().unwrap().len()
+        self.plan_cache.read().len()
     }
 
     /// Returns true if the plan cache is empty.
     pub fn plan_cache_is_empty(&self) -> bool {
-        self.plan_cache.read().unwrap().is_empty()
+        self.plan_cache.read().is_empty()
     }
 
     /// Optimizes a freshly planned statement, optimizing the embedded query for
@@ -281,7 +282,7 @@ impl SqlEngine {
     /// Validates the single-statement constraint exactly as the uncached path.
     fn cached_parse(&self, preprocessed: String) -> Result<Arc<Statement>, String> {
         {
-            let mut cache = self.parse_cache.lock().unwrap();
+            let mut cache = self.parse_cache.lock();
             if let Some(stmt) = cache.get(&preprocessed) {
                 return Ok(stmt.clone());
             }
@@ -302,7 +303,7 @@ impl SqlEngine {
             );
         }
         let stmt = Arc::new(statements.remove(0));
-        let mut cache = self.parse_cache.lock().unwrap();
+        let mut cache = self.parse_cache.lock();
         cache.insert(preprocessed, stmt.clone(), 1);
         Ok(stmt)
     }
@@ -318,7 +319,7 @@ impl SqlEngine {
 
         // 1. Check if the pre-optimized plan is in the cache and matches the current schema version.
         {
-            let mut cache = self.plan_cache.write().unwrap();
+            let mut cache = self.plan_cache.write();
             if let Some((plan, catalog_version)) = cache
                 .get(&preprocessed)
                 .filter(|(_, cv)| *cv == schema_version)
@@ -355,7 +356,7 @@ impl SqlEngine {
 
         // Cache the newly planned statement in the registry.
         {
-            let mut cache = self.plan_cache.write().unwrap();
+            let mut cache = self.plan_cache.write();
             cache.insert(preprocessed, (plan.clone(), schema_version), 1);
         }
 
@@ -388,7 +389,7 @@ impl SqlEngine {
 
         // 1. Check if another thread has already cached the fresh plan
         {
-            let mut cache = self.plan_cache.write().unwrap();
+            let mut cache = self.plan_cache.write();
             if let Some((plan, _)) = cache
                 .get(&preprocessed)
                 .filter(|(_, cv)| *cv == schema_version)
@@ -411,7 +412,7 @@ impl SqlEngine {
 
         // Cache the newly refreshed plan in the registry.
         {
-            let mut cache = self.plan_cache.write().unwrap();
+            let mut cache = self.plan_cache.write();
             cache.insert(preprocessed, (plan.clone(), schema_version), 1);
         }
 

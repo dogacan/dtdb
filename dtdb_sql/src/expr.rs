@@ -1053,13 +1053,13 @@ fn like_match(text: &str, pattern: &str) -> bool {
 }
 
 fn compiled_like_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
-    use std::sync::{Arc, OnceLock, RwLock};
-    static CACHE: OnceLock<RwLock<std::collections::HashMap<String, Arc<regex::Regex>>>> =
+    use std::sync::{Arc, OnceLock};
+    static CACHE: OnceLock<parking_lot::RwLock<std::collections::HashMap<String, Arc<regex::Regex>>>> =
         OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
     // Fast path: cached hit.
-    if let Some(re) = cache.read().ok().and_then(|g| g.get(pattern).cloned()) {
+    if let Some(re) = cache.read().get(pattern).cloned() {
         return Some(re);
     }
 
@@ -1068,7 +1068,8 @@ fn compiled_like_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
         Ok(r) => Arc::new(r),
         Err(_) => return None,
     };
-    if let Ok(mut g) = cache.write() {
+    {
+        let mut g = cache.write();
         // Bound cache size to avoid unbounded memory growth from adversarial
         // workloads that issue many distinct patterns.
         if g.len() >= 1024 {
