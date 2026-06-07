@@ -538,6 +538,46 @@ impl Drop for StorageEngine {
     }
 }
 
+/// Merges two sorted memtable vectors newest-to-oldest, keeping the first (newest)
+/// value seen per key and discarding older duplicates. Runs in linear O(N) time.
+fn merge_sorted_mem_vectors(
+    newest: Vec<(DbKey, Option<DbValue>)>,
+    oldest: Vec<(DbKey, Option<DbValue>)>,
+) -> Vec<(DbKey, Option<DbValue>)> {
+    let mut res = Vec::with_capacity(newest.len() + oldest.len());
+    let mut it_n = newest.into_iter().peekable();
+    let mut it_o = oldest.into_iter().peekable();
+
+    while it_n.peek().is_some() || it_o.peek().is_some() {
+        match (it_n.peek(), it_o.peek()) {
+            (Some(n), Some(o)) => {
+                match n.0.cmp(&o.0) {
+                    std::cmp::Ordering::Less => {
+                        res.push(it_n.next().unwrap());
+                    }
+                    std::cmp::Ordering::Greater => {
+                        res.push(it_o.next().unwrap());
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Keys are equal. Since `newest` contains newer writes,
+                        // keep it and discard the `oldest` copy.
+                        res.push(it_n.next().unwrap());
+                        let _ = it_o.next();
+                    }
+                }
+            }
+            (Some(_), None) => {
+                res.push(it_n.next().unwrap());
+            }
+            (None, Some(_)) => {
+                res.push(it_o.next().unwrap());
+            }
+            (None, None) => break,
+        }
+    }
+    res
+}
+
 impl EngineInner {
     pub fn open(
         dir_path: impl AsRef<Path>,
@@ -2054,49 +2094,7 @@ impl EngineInner {
         }
         merged
     }
-}
 
-/// Merges two sorted memtable vectors newest-to-oldest, keeping the first (newest)
-/// value seen per key and discarding older duplicates. Runs in linear O(N) time.
-fn merge_sorted_mem_vectors(
-    newest: Vec<(DbKey, Option<DbValue>)>,
-    oldest: Vec<(DbKey, Option<DbValue>)>,
-) -> Vec<(DbKey, Option<DbValue>)> {
-    let mut res = Vec::with_capacity(newest.len() + oldest.len());
-    let mut it_n = newest.into_iter().peekable();
-    let mut it_o = oldest.into_iter().peekable();
-
-    while it_n.peek().is_some() || it_o.peek().is_some() {
-        match (it_n.peek(), it_o.peek()) {
-            (Some(n), Some(o)) => {
-                match n.0.cmp(&o.0) {
-                    std::cmp::Ordering::Less => {
-                        res.push(it_n.next().unwrap());
-                    }
-                    std::cmp::Ordering::Greater => {
-                        res.push(it_o.next().unwrap());
-                    }
-                    std::cmp::Ordering::Equal => {
-                        // Keys are equal. Since `newest` contains newer writes,
-                        // keep it and discard the `oldest` copy.
-                        res.push(it_n.next().unwrap());
-                        let _ = it_o.next();
-                    }
-                }
-            }
-            (Some(_), None) => {
-                res.push(it_n.next().unwrap());
-            }
-            (None, Some(_)) => {
-                res.push(it_o.next().unwrap());
-            }
-            (None, None) => break,
-        }
-    }
-    res
-}
-
-impl EngineInner {
     /// Begin a background-task region. Returns a guard that marks the task as
     /// in-flight (decrementing on drop), or `None` if the engine is shutting
     /// down — in which case the caller MUST return without touching engine
@@ -3175,48 +3173,37 @@ mod tests {
 
     #[test]
     fn test_snapshot_mem_range_multiple_memtables() {
-        let engine_dir = tempfile::TempDir::new().unwrap();
-        let engine = StorageEngine::open(engine_dir.path(), EngineOptions::default()).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = StorageEngine::open(dir.path(), no_autoflush_options()).unwrap();
 
         // 1. Write initial values (will end up in the oldest immutable memtable)
         engine.put(DbKey::Int(1), DbValue::Int(10)).unwrap();
         engine.put(DbKey::Int(2), DbValue::Int(20)).unwrap();
         engine.put(DbKey::Int(3), DbValue::Int(30)).unwrap();
 
-        // Seal active memtable into an immutable memtable
-        {
-            let mut memset = engine.inner.memset.write().unwrap();
-            let table = std::mem::replace(&mut memset.active, Arc::new(MemTable::new()));
-            memset.immutable.push_front(ImmMemtable {
-                table,
-                wal_id: 0,
-                sst_id: 0,
-                flush: Arc::new(FlushSlot::new()),
-            });
-        }
+        // Seal via the real engine path — rotates the WAL and assigns proper ids.
+        let _imm1 = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
 
         // 2. Write second round of values (will end up in a newer immutable memtable)
         engine.put(DbKey::Int(2), DbValue::Int(22)).unwrap(); // update key 2
         engine.delete(DbKey::Int(3)).unwrap(); // delete key 3 (tombstone)
         engine.put(DbKey::Int(4), DbValue::Int(40)).unwrap(); // new key 4
 
-        // Seal active memtable into a second immutable memtable
-        {
-            let mut memset = engine.inner.memset.write().unwrap();
-            let table = std::mem::replace(&mut memset.active, Arc::new(MemTable::new()));
-            memset.immutable.push_front(ImmMemtable {
-                table,
-                wal_id: 1,
-                sst_id: 1,
-                flush: Arc::new(FlushSlot::new()),
-            });
-        }
+        // Seal again.
+        let _imm2 = engine
+            .inner
+            .seal_active()
+            .unwrap()
+            .expect("active was non-empty");
 
         // 3. Write final values (will end up in the active memtable)
         engine.put(DbKey::Int(1), DbValue::Int(11)).unwrap(); // update key 1
         engine.put(DbKey::Int(5), DbValue::Int(50)).unwrap(); // new key 5
 
-        // Let's call scan_range_raw or snapshot_mem_range and verify
         let start = DbKey::Int(0);
         let end = DbKey::Int(10);
         let merged = engine.inner.snapshot_mem_range(&start, &end);
