@@ -1,10 +1,10 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::RwLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_core::Stream;
 use futures_util::StreamExt;

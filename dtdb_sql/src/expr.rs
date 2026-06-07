@@ -1054,8 +1054,9 @@ fn like_match(text: &str, pattern: &str) -> bool {
 
 fn compiled_like_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
     use std::sync::{Arc, OnceLock};
-    static CACHE: OnceLock<parking_lot::RwLock<std::collections::HashMap<String, Arc<regex::Regex>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        parking_lot::RwLock<std::collections::HashMap<String, Arc<regex::Regex>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
     // Fast path: cached hit.

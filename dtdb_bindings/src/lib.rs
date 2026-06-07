@@ -2,8 +2,8 @@
 
 use dtdb_api::proto::execute_query_response::Payload;
 use futures_util::StreamExt;
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tonic::Status;
 
@@ -348,8 +348,7 @@ impl CxxClient {
         let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<TxRequest>(32);
         let db_name = db_name.to_string();
 
-        type TerminalSender =
-            Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>;
+        type TerminalSender = Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>;
         let terminal_sender: Arc<TerminalSender> = Arc::new(Mutex::new(None));
         let terminal_sender_clone = terminal_sender.clone();
 

@@ -12,11 +12,11 @@ use crate::physical::{
 use crate::planner::{LogicalPlanner, SqlStatement};
 use dtdb_relational::{DataType, Database, Row, Schema, Transaction};
 use dtdb_storage::{DbKey, DbValue, LruCache};
+use parking_lot::{Mutex, RwLock};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashSet;
-use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
 /// Capacity (in entries) of the per-engine parsed-statement cache. SQL text is
