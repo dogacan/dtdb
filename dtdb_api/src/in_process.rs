@@ -111,9 +111,9 @@ impl InProcessClient {
                     inner: QueryResultInner::Complete(result),
                 })
             }
-            ExecutionStreamingResult::Streaming { schema, operator } => Ok(InProcessQueryResult {
+            ExecutionStreamingResult::Streaming { schema, iterator } => Ok(InProcessQueryResult {
                 inner: QueryResultInner::Streaming(RowIterator {
-                    physical_op: operator,
+                    execution_iter: iterator,
                     tx: Some(tx),
                     schema,
                 }),
@@ -195,10 +195,10 @@ impl<'a> InProcessTransactionClient<'a> {
             ExecutionStreamingResult::Complete(result) => Ok(InProcessQueryResult {
                 inner: QueryResultInner::Complete(result),
             }),
-            ExecutionStreamingResult::Streaming { schema, operator } => {
+            ExecutionStreamingResult::Streaming { schema, iterator } => {
                 Ok(InProcessQueryResult {
                     inner: QueryResultInner::Streaming(RowIterator {
-                        physical_op: operator,
+                        execution_iter: iterator,
                         tx: None, // Transaction is managed externally
                         schema,
                     }),
@@ -267,7 +267,7 @@ impl Iterator for InProcessQueryResult {
 }
 
 pub struct RowIterator {
-    physical_op: Box<dyn dtdb_sql::PhysicalOperator>,
+    execution_iter: Box<dyn Iterator<Item = Result<Row, String>> + Send>,
     tx: Option<Transaction>,
     schema: Schema,
 }
@@ -282,9 +282,9 @@ impl Iterator for RowIterator {
     type Item = Result<Row, Status>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.physical_op.next() {
-            Ok(Some(row)) => Some(Ok(row)),
-            Ok(None) => {
+        match self.execution_iter.next() {
+            Some(Ok(row)) => Some(Ok(row)),
+            None => {
                 if let Some(tx) = self.tx.take() {
                     let commit_res = tx.commit();
                     if let Err(e) = commit_res {
@@ -293,7 +293,7 @@ impl Iterator for RowIterator {
                 }
                 None
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 if let Some(tx) = self.tx.take() {
                     let _ = tx.rollback();
                 }

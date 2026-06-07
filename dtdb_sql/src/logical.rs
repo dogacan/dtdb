@@ -17,6 +17,31 @@ pub enum PlanKey {
     Parameter(String),
 }
 
+impl PlanKey {
+    pub fn resolve(
+        &self,
+        params: &std::collections::HashMap<String, dtdb_storage::DbValue>,
+    ) -> Result<dtdb_storage::DbKey, String> {
+        match self {
+            PlanKey::Value(v) => Ok(v.clone()),
+            PlanKey::Parameter(name) => {
+                let val = params
+                    .get(name)
+                    .ok_or_else(|| format!("Unbound parameter: {}", name))?;
+                match val {
+                    dtdb_storage::DbValue::Int(v) => Ok(dtdb_storage::DbKey::Int(*v)),
+                    dtdb_storage::DbValue::String(s) => Ok(dtdb_storage::DbKey::String(s.clone())),
+                    dtdb_storage::DbValue::Date(d) => Ok(dtdb_storage::DbKey::Date(*d)),
+                    dtdb_storage::DbValue::Time(t) => Ok(dtdb_storage::DbKey::Time(*t)),
+                    dtdb_storage::DbValue::Timestamp(ts) => Ok(dtdb_storage::DbKey::Timestamp(*ts)),
+                    dtdb_storage::DbValue::Decimal(dec) => Ok(dtdb_storage::DbKey::Decimal(*dec)),
+                    _ => Err(format!("Unsupported key parameter type for {}", name)),
+                }
+            }
+        }
+    }
+}
+
 /// The query a [`LogicalPlan::FullTextScan`] resolves against a FULLTEXT index.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum FtsQuery {

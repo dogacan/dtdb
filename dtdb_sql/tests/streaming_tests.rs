@@ -23,10 +23,10 @@ fn setup_engine() -> (TempDir, Arc<Database>, SqlEngine) {
 /// Drains a streaming operator into a Vec of rows for assertions.
 fn drain(result: ExecutionStreamingResult) -> (Vec<Vec<DbValue>>, bool) {
     match result {
-        ExecutionStreamingResult::Streaming { mut operator, .. } => {
+        ExecutionStreamingResult::Streaming { iterator, .. } => {
             let mut rows = Vec::new();
-            while let Some(row) = operator.next().unwrap() {
-                rows.push(row.values);
+            for row in iterator {
+                rows.push(row.unwrap().values);
             }
             (rows, true)
         }

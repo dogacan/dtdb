@@ -257,7 +257,7 @@ struct HeapEntry<P> {
     sort_keys: Vec<DbValue>,
     payload: P,
     run_index: usize,
-    directions: std::rc::Rc<Vec<bool>>,
+    directions: std::sync::Arc<Vec<bool>>,
 }
 
 impl<P> Ord for HeapEntry<P> {
@@ -292,7 +292,7 @@ const MAX_FANIN: usize = 64;
 pub struct KWayMerge<P> {
     heap: BinaryHeap<HeapEntry<P>>,
     runs: Vec<Run<P>>,
-    directions: std::rc::Rc<Vec<bool>>,
+    directions: std::sync::Arc<Vec<bool>>,
 }
 
 impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
@@ -309,7 +309,7 @@ impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
         temp_dir: &Path,
         prefix: &str,
     ) -> Result<Self, String> {
-        let directions = std::rc::Rc::new(directions);
+        let directions = std::sync::Arc::new(directions);
 
         while runs.len() > MAX_FANIN {
             let mut next_runs = Vec::with_capacity(runs.len() / MAX_FANIN + 1);
@@ -330,7 +330,7 @@ impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
     }
 
     /// Opens every run and primes the merge heap. Assumes `runs.len() <= MAX_FANIN`.
-    fn prime(mut runs: Vec<Run<P>>, directions: std::rc::Rc<Vec<bool>>) -> Result<Self, String> {
+    fn prime(mut runs: Vec<Run<P>>, directions: std::sync::Arc<Vec<bool>>) -> Result<Self, String> {
         let mut heap = BinaryHeap::new();
 
         for (idx, run) in runs.iter_mut().enumerate() {
@@ -340,7 +340,7 @@ impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
                     sort_keys,
                     payload,
                     run_index: idx,
-                    directions: std::rc::Rc::clone(&directions),
+                    directions: std::sync::Arc::clone(&directions),
                 });
             }
         }
@@ -371,7 +371,7 @@ impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
                 sort_keys,
                 payload,
                 run_index: run_idx,
-                directions: std::rc::Rc::clone(&self.directions),
+                directions: std::sync::Arc::clone(&self.directions),
             });
         }
 
@@ -384,11 +384,11 @@ impl<P: Serialize + DeserializeOwned> KWayMerge<P> {
 /// the merge finishes. Used by `KWayMerge::new` to cascade-reduce a large fan-in.
 fn merge_chunk<P: Serialize + DeserializeOwned>(
     chunk: Vec<Run<P>>,
-    directions: &std::rc::Rc<Vec<bool>>,
+    directions: &std::sync::Arc<Vec<bool>>,
     temp_dir: &Path,
     prefix: &str,
 ) -> Result<Run<P>, String> {
-    let mut merger = KWayMerge::prime(chunk, std::rc::Rc::clone(directions))?;
+    let mut merger = KWayMerge::prime(chunk, std::sync::Arc::clone(directions))?;
 
     let path = next_run_path(temp_dir, prefix);
     let file =
@@ -425,7 +425,7 @@ fn merge_chunk<P: Serialize + DeserializeOwned>(
 mod tests {
     use super::*;
     use dtdb_storage::DbValue;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     #[test]
     fn test_type_rank_and_total_compare() {
@@ -571,24 +571,24 @@ mod tests {
 
     #[test]
     fn test_heap_entry_eq() {
-        let directions = Rc::new(vec![true]);
+        let directions = Arc::new(vec![true]);
         let e1 = HeapEntry {
             sort_keys: vec![DbValue::Int(10)],
             payload: "p1",
             run_index: 0,
-            directions: Rc::clone(&directions),
+            directions: Arc::clone(&directions),
         };
         let e2 = HeapEntry {
             sort_keys: vec![DbValue::Int(10)],
             payload: "p2",
             run_index: 1,
-            directions: Rc::clone(&directions),
+            directions: Arc::clone(&directions),
         };
         let e3 = HeapEntry {
             sort_keys: vec![DbValue::Int(20)],
             payload: "p1",
             run_index: 0,
-            directions: Rc::clone(&directions),
+            directions: Arc::clone(&directions),
         };
 
         assert!(e1 == e2);

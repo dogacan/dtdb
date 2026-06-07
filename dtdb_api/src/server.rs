@@ -491,7 +491,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                 },
                 Ok(dtdb_sql::ExecutionStreamingResult::Streaming {
                     schema,
-                    mut operator,
+                    mut iterator,
                 }) => {
                     let mut responses = Vec::new();
                     let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
@@ -501,8 +501,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                         )),
                     });
                     loop {
-                        match operator.next() {
-                            Ok(Some(row)) => {
+                        match iterator.next() {
+                            Some(Ok(row)) => {
                                 let values = row
                                     .values
                                     .iter()
@@ -527,8 +527,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                     ),
                                 });
                             }
-                            Ok(None) => break,
-                            Err(e) => {
+                            None => break,
+                            Some(Err(e)) => {
                                 let _ = tx.rollback();
                                 return Err((false, e));
                             }
@@ -767,7 +767,7 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                     let responses = crate::server::execution_result_to_responses(result);
                                     (tx, sql_engine, Ok(responses))
                                 }
-                                Ok(dtdb_sql::ExecutionStreamingResult::Streaming { schema, mut operator }) => {
+                                Ok(dtdb_sql::ExecutionStreamingResult::Streaming { schema, mut iterator }) => {
                                     let mut responses = Vec::new();
                                     let column_names = schema.columns.iter().map(|col| col.name.clone()).collect();
                                     responses.push(ExecuteQueryResponse {
@@ -776,8 +776,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                         )),
                                     });
                                     loop {
-                                        match operator.next() {
-                                            Ok(Some(row)) => {
+                                        match iterator.next() {
+                                            Some(Ok(row)) => {
                                                 let values = row
                                                     .values
                                                     .iter()
@@ -800,8 +800,8 @@ impl DuctTapeDbService for DuctTapeDbServiceImpl {
                                                     })),
                                                 });
                                             }
-                                            Ok(None) => break,
-                                            Err(e) => {
+                                            None => break,
+                                            Some(Err(e)) => {
                                                 return (tx, sql_engine, Err(e));
                                             }
                                         }
