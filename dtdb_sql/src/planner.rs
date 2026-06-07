@@ -65,6 +65,53 @@ pub enum SqlStatement {
     },
 }
 
+impl SqlStatement {
+    /// Recursively replaces every [`Expr::Parameter`] in the statement with its
+    /// bound value from `params`.
+    pub fn substitute_params(
+        &mut self,
+        params: &std::collections::HashMap<String, dtdb_storage::DbValue>,
+    ) -> Result<(), String> {
+        match self {
+            SqlStatement::CreateTable { .. } | SqlStatement::DropTable { .. } => Ok(()),
+            SqlStatement::Insert { rows, .. } => {
+                for row in rows {
+                    for expr in row {
+                        expr.substitute_params(params)?;
+                    }
+                }
+                Ok(())
+            }
+            SqlStatement::InsertSelect { query, .. } => query.substitute_params(params),
+            SqlStatement::Delete { filter, .. } => {
+                if let Some(pred) = filter {
+                    pred.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            SqlStatement::Update {
+                assignments,
+                filter,
+                ..
+            } => {
+                for (_, expr) in assignments {
+                    expr.substitute_params(params)?;
+                }
+                if let Some(pred) = filter {
+                    pred.substitute_params(params)?;
+                }
+                Ok(())
+            }
+            SqlStatement::Query(plan) => plan.substitute_params(params),
+            SqlStatement::Explain(plan) => plan.substitute_params(params),
+            SqlStatement::CreateIndex { .. }
+            | SqlStatement::DropIndex { .. }
+            | SqlStatement::AlterTable { .. }
+            | SqlStatement::Analyze { .. } => Ok(()),
+        }
+    }
+}
+
 /// A single `ALTER TABLE` alteration. Phase 1 supports the lazy, metadata-only
 /// operations; `DROP COLUMN` and `ALTER COLUMN` are deferred (see ADR 0003).
 #[derive(Debug, Clone)]

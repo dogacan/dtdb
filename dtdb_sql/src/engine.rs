@@ -350,7 +350,7 @@ impl SqlEngine {
         // placeholders in INSERT ... VALUES, which the planner materializes to
         // values), fall back to caching the AST and binding on each execution.
         let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-            Ok(planned) => PreparedPlan::Planned(Box::new(self.optimize_planned(planned))),
+            Ok(planned) => PreparedPlan::Planned(Box::new(planned)),
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
@@ -406,7 +406,7 @@ impl SqlEngine {
             .ok_or_else(|| "No SQL statements found".to_string())?;
 
         let plan = match LogicalPlanner::new(self.database.clone()).plan(&statement) {
-            Ok(planned) => PreparedPlan::Planned(Box::new(self.optimize_planned(planned))),
+            Ok(planned) => PreparedPlan::Planned(Box::new(planned)),
             Err(_) => PreparedPlan::Ast(Box::new(statement)),
         };
 
@@ -431,7 +431,12 @@ impl SqlEngine {
     ) -> Result<ExecutionResult, String> {
         let refreshed = self.refreshed_plan(prepared)?;
         match refreshed.as_ref().unwrap_or(&prepared.plan) {
-            PreparedPlan::Planned(planned) => self.execute_planned(planned, tx, params),
+            PreparedPlan::Planned(planned) => {
+                let mut planned = (**planned).clone();
+                planned.substitute_params(params)?;
+                let optimized = self.optimize_planned(planned);
+                self.execute_planned(&optimized, tx, params)
+            }
             PreparedPlan::Ast(statement) => {
                 self.execute_statement((**statement).clone(), tx, params)
             }
@@ -447,7 +452,12 @@ impl SqlEngine {
     ) -> Result<ExecutionStreamingResult, String> {
         let refreshed = self.refreshed_plan(prepared)?;
         match refreshed.as_ref().unwrap_or(&prepared.plan) {
-            PreparedPlan::Planned(planned) => self.execute_planned_streaming(planned, tx, params),
+            PreparedPlan::Planned(planned) => {
+                let mut planned = (**planned).clone();
+                planned.substitute_params(params)?;
+                let optimized = self.optimize_planned(planned);
+                self.execute_planned_streaming(&optimized, tx, params)
+            }
             PreparedPlan::Ast(statement) => {
                 self.execute_statement_streaming((**statement).clone(), tx, params)
             }
@@ -622,7 +632,8 @@ impl SqlEngine {
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionResult, String> {
-        let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
+        let mut planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
+        planned_stmt.substitute_params(params)?;
         let optimized = self.optimize_planned(planned_stmt);
         self.execute_planned(&optimized, tx, params)
     }
@@ -634,7 +645,8 @@ impl SqlEngine {
         tx: &Transaction,
         params: &std::collections::HashMap<String, DbValue>,
     ) -> Result<ExecutionStreamingResult, String> {
-        let planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
+        let mut planned_stmt = LogicalPlanner::new(self.database.clone()).plan(&statement)?;
+        planned_stmt.substitute_params(params)?;
         let optimized = self.optimize_planned(planned_stmt);
         self.execute_planned_streaming(&optimized, tx, params)
     }

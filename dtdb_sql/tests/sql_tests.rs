@@ -7756,3 +7756,182 @@ fn test_composite_secondary_index_bugs() {
         tx.commit().unwrap();
     }
 }
+
+#[test]
+fn test_parameter_binding_optimizations() {
+    let (_temp, db, engine) = setup_engine();
+
+    // 1. Create table and indexes.
+    {
+        let tx = Transaction::new(1, db.clone());
+        engine
+            .execute(
+                "CREATE TABLE items (id INT PRIMARY KEY, val INT, name STRING, body STRING)",
+                &tx,
+            )
+            .unwrap();
+        engine
+            .execute("CREATE INDEX items_val ON items (val)", &tx)
+            .unwrap();
+        engine
+            .execute("CREATE INDEX items_name ON items (name)", &tx)
+            .unwrap();
+        engine
+            .execute(
+                "CREATE FULLTEXT INDEX items_body ON items (body) USING trigram",
+                &tx,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 2. Insert some rows so statistics can be analyzed for full-text search.
+    {
+        let tx = Transaction::new(2, db.clone());
+        for i in 1..=20i64 {
+            let body = if i == 7 {
+                "rare zebra word"
+            } else {
+                "common normal text word"
+            };
+            engine
+                .execute(
+                    &format!(
+                        "INSERT INTO items (id, val, name, body) VALUES ({i}, {}, 'name{}', '{body}')",
+                        i * 10,
+                        i
+                    ),
+                    &tx,
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        db.get_table("items").unwrap().flush_memtable().unwrap();
+    }
+
+    // 3. Analyze the table to generate statistics for full-text search index matching.
+    {
+        let tx = Transaction::new(3, db.clone());
+        engine.execute("ANALYZE items", &tx).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // 4. Verify B-tree IndexScan for prefix LIKE on name column (e.g. name LIKE 'name1%')
+    // using direct query execution parameter binding.
+    {
+        let tx = Transaction::new(4, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("pattern".to_string(), DbValue::string("name1%"));
+        let res = engine
+            .execute_with_params(
+                "EXPLAIN SELECT id FROM items WHERE name LIKE @pattern",
+                &tx,
+                &params,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        let plan_str = match res {
+            ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
+                DbValue::String(s) => s.to_string(),
+                _ => panic!("Expected string plan"),
+            },
+            _ => panic!("Expected Select result"),
+        };
+        assert!(
+            plan_str.contains("PhysicalIndexScan"),
+            "Expected prefix query to use IndexScan. Plan:\n{}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("items_name"),
+            "Expected IndexScan to be on items_name index. Plan:\n{}",
+            plan_str
+        );
+    }
+
+    // 5. Verify FullTextScan for infix LIKE on body column (e.g. body LIKE '%zebra%')
+    // using direct query execution parameter binding.
+    {
+        let tx = Transaction::new(5, db.clone());
+        let mut params = std::collections::HashMap::new();
+        params.insert("pattern".to_string(), DbValue::string("%zebra%"));
+        let res = engine
+            .execute_with_params(
+                "EXPLAIN SELECT id FROM items WHERE body LIKE @pattern",
+                &tx,
+                &params,
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        let plan_str = match res {
+            ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
+                DbValue::String(s) => s.to_string(),
+                _ => panic!("Expected string plan"),
+            },
+            _ => panic!("Expected Select result"),
+        };
+        assert!(
+            plan_str.contains("PhysicalFullTextScan"),
+            "Expected infix query to use FullTextScan. Plan:\n{}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("zebra"),
+            "Expected FullTextScan to match zebra. Plan:\n{}",
+            plan_str
+        );
+    }
+
+    // 6. Verify identical behavior for prepared statements.
+    {
+        let tx = Transaction::new(6, db.clone());
+        let stmt_prefix = engine
+            .prepare("EXPLAIN SELECT id FROM items WHERE name LIKE @pattern")
+            .unwrap();
+        let stmt_infix = engine
+            .prepare("EXPLAIN SELECT id FROM items WHERE body LIKE @pattern")
+            .unwrap();
+
+        let mut params_prefix = std::collections::HashMap::new();
+        params_prefix.insert("pattern".to_string(), DbValue::string("name1%"));
+        let res_prefix = engine
+            .execute_prepared(&stmt_prefix, &tx, &params_prefix)
+            .unwrap();
+
+        let mut params_infix = std::collections::HashMap::new();
+        params_infix.insert("pattern".to_string(), DbValue::string("%zebra%"));
+        let res_infix = engine
+            .execute_prepared(&stmt_infix, &tx, &params_infix)
+            .unwrap();
+
+        tx.commit().unwrap();
+
+        let plan_prefix = match res_prefix {
+            ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
+                DbValue::String(s) => s.to_string(),
+                other => panic!("Expected string plan, got {:?}", other),
+            },
+            _ => panic!("Expected Select"),
+        };
+        assert!(
+            plan_prefix.contains("PhysicalIndexScan"),
+            "Expected prepared prefix query to use IndexScan. Plan:\n{}",
+            plan_prefix
+        );
+
+        let plan_infix = match res_infix {
+            ExecutionResult::Select { rows, .. } => match &rows[0].values[0] {
+                DbValue::String(s) => s.to_string(),
+                other => panic!("Expected string plan, got {:?}", other),
+            },
+            _ => panic!("Expected Select"),
+        };
+        assert!(
+            plan_infix.contains("PhysicalFullTextScan"),
+            "Expected prepared infix query to use FullTextScan. Plan:\n{}",
+            plan_infix
+        );
+    }
+}
