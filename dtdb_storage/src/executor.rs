@@ -22,9 +22,10 @@
 //! floor). Dropping the executor is the single, deterministic shutdown path:
 //! the scheduler stops, the queue drains, and every thread is joined.
 
+use parking_lot::{Condvar, Mutex};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -178,7 +179,7 @@ struct PoolShared {
 
 impl PoolShared {
     fn submit(&self, priority: Priority, key: Option<CoalesceKey>, task: Task) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if st.shutting_down {
             return;
         }
@@ -218,7 +219,7 @@ impl PoolShared {
         key: CoalesceKey,
         task: Arc<dyn Fn() + Send + Sync + 'static>,
     ) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if st.shutting_down || st.coalesce.contains_key(&key) {
             return;
         }
@@ -246,7 +247,7 @@ fn worker_loop(shared: Arc<PoolShared>) {
     loop {
         // Dequeue the next task (or exit once the queue is drained at shutdown).
         let queued = {
-            let mut st = shared.state.lock().unwrap();
+            let mut st = shared.state.lock();
             loop {
                 if let Some(qt) = st.heap.pop() {
                     if let Some(k) = &qt.key
@@ -259,7 +260,7 @@ fn worker_loop(shared: Arc<PoolShared>) {
                 if st.shutting_down {
                     return;
                 }
-                st = shared.cv.wait(st).unwrap();
+                shared.cv.wait(&mut st);
             }
         };
 
@@ -268,7 +269,7 @@ fn worker_loop(shared: Arc<PoolShared>) {
 
         // Coalescing follow-up: re-enqueue the latest pending task, if any.
         if let Some(k) = queued.key {
-            let mut st = shared.state.lock().unwrap();
+            let mut st = shared.state.lock();
             if let Some(slot) = st.coalesce.get_mut(&k) {
                 if let Some(pending) = slot.pending.take() {
                     slot.running = false;
@@ -348,7 +349,7 @@ impl Scheduler {
         let cancelled = Arc::new(AtomicBool::new(false));
         let task: Arc<dyn Fn() + Send + Sync + 'static> = Arc::from(task);
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock();
             let id = st.next_id;
             st.next_id += 1;
             st.heap.push(ScheduledTick {
@@ -370,7 +371,7 @@ impl Scheduler {
 
 fn scheduler_loop(scheduler: Arc<Scheduler>) {
     loop {
-        let mut st = scheduler.state.lock().unwrap();
+        let mut st = scheduler.state.lock();
         if st.shutting_down {
             return;
         }
@@ -387,7 +388,7 @@ fn scheduler_loop(scheduler: Arc<Scheduler>) {
         let now = Instant::now();
         match st.heap.peek().map(|t| t.next_fire) {
             None => {
-                let _guard = scheduler.cv.wait(st).unwrap();
+                scheduler.cv.wait(&mut st);
             }
             Some(next_fire) if next_fire <= now => {
                 let mut tick = st.heap.pop().unwrap();
@@ -406,7 +407,7 @@ fn scheduler_loop(scheduler: Arc<Scheduler>) {
             }
             Some(next_fire) => {
                 let timeout = next_fire.saturating_duration_since(now);
-                let _guard = scheduler.cv.wait_timeout(st, timeout).unwrap();
+                scheduler.cv.wait_for(&mut st, timeout);
             }
         }
     }
@@ -533,14 +534,14 @@ impl Executor for ThreadPoolExecutor {
 impl Drop for ThreadPoolExecutor {
     fn drop(&mut self) {
         // 1. Stop the scheduler first so no further ticks are submitted.
-        self.scheduler.state.lock().unwrap().shutting_down = true;
+        self.scheduler.state.lock().shutting_down = true;
         self.scheduler.cv.notify_all();
         if let Some(handle) = self.scheduler_thread.take() {
             let _ = handle.join();
         }
 
         // 2. Let workers drain the remaining queue, then exit, and join them.
-        self.shared.state.lock().unwrap().shutting_down = true;
+        self.shared.state.lock().shutting_down = true;
         self.shared.cv.notify_all();
         for handle in self.workers.drain(..) {
             let _ = handle.join();
