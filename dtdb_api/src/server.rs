@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -61,7 +62,7 @@ impl DatabaseCatalog {
     }
 
     fn restore_databases(&self) -> Result<(), String> {
-        let mut dbs = self.databases.write().unwrap();
+        let mut dbs = self.databases.write();
         for entry in fs::read_dir(&self.data_dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
@@ -93,7 +94,7 @@ impl DatabaseCatalog {
     }
 
     pub fn get_db_and_engine(&self, db_name: &str) -> Option<(Arc<Database>, Arc<SqlEngine>)> {
-        let dbs = self.databases.read().unwrap();
+        let dbs = self.databases.read();
         dbs.get(db_name)
             .map(|state| (state.database.clone(), state.sql_engine.clone()))
     }
@@ -112,7 +113,7 @@ impl DatabaseCatalog {
             return Err(Status::invalid_argument("Database name cannot be empty"));
         }
 
-        let mut dbs = self.databases.write().unwrap();
+        let mut dbs = self.databases.write();
         if dbs.contains_key(db_name) {
             return Ok(CreateDbResponse {
                 success: false,
@@ -154,7 +155,7 @@ impl DatabaseCatalog {
         }
 
         let state = {
-            let mut dbs = self.databases.write().unwrap();
+            let mut dbs = self.databases.write();
             if let Some(true) = dbs
                 .get(db_name)
                 .map(|s| s.database.has_active_transactions())
@@ -211,7 +212,7 @@ impl DatabaseCatalog {
         }
 
         let database = {
-            let dbs = self.databases.read().unwrap();
+            let dbs = self.databases.read();
             if let Some(state) = dbs.get(db_name) {
                 state.database.clone()
             } else {
