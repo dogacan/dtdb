@@ -101,6 +101,9 @@ add a new numbered ADR when making a comparable decision.
 
 * **No DDL in Transactions**: DDL statements (e.g., `CREATE TABLE`, `DROP TABLE`) are **strictly prohibited** within transactions. This is a primary architectural constraint.
 * **Single-Statement Executions**: Standard query execution (`execute()`) rejects queries with multiple semicolon-separated statements. Multi-statement execution must be routed through the transaction API (`run_in_transaction` or gRPC transaction stream).
+* **Append-Only & Write-Once Persistence**: All database file writes must be strictly append-only. Once a file is closed, it must never be opened for write again. In-place file truncation (e.g., `set_len(0)` or `reset()`) is strictly prohibited. To clear/recycle logs or metadata:
+  * For WAL segments and manifest logs (`log.<gen>`), roll over to a fresh numbered/generation segment and delete the old closed file.
+  * For transaction logs (`transactions.log`), close the file descriptor, delete the old file from disk, and recreate it at the same path.
 
 ---
 
