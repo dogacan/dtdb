@@ -2122,8 +2122,22 @@ impl Database {
 
         // 2. The log's redo records are now redundant — discard them.
         let mut log_guard = self.transaction_log.lock();
-        if let Some(ref mut log) = *log_guard {
-            log.reset().map_err(RelationalError::Storage)?;
+        if log_guard.is_some() {
+            // Drop the log handle to close the file descriptor.
+            *log_guard = None;
+
+            // Delete the old transaction log file.
+            let _ = fs::remove_file(&self.transaction_log_path);
+
+            // Recreate/open a fresh transaction log file.
+            let log = FramedLog::open(
+                &self.transaction_log_path,
+                TXN_LOG_FORMAT,
+                None,
+                self.options.fsync_method,
+            )
+            .map_err(RelationalError::Storage)?;
+            *log_guard = Some(log);
         }
         Ok(())
     }
