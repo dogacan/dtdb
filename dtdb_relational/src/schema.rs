@@ -268,6 +268,9 @@ impl Schema {
     /// pure tail-extend; rows already at full width are returned untouched. See
     /// ADR 0003.
     pub fn reconcile_row(&self, row: Row) -> Row {
+        if row.values.len() == self.columns.len() {
+            return row;
+        }
         let mut columns = Vec::with_capacity(row.values.len());
         for i in 0..row.values.len() {
             if let Some(col) = self.columns.get(i) {

@@ -229,8 +229,11 @@ pub struct SqlEngine {
     /// valid; planning is intentionally NOT cached here, so each execution still
     /// resolves against the current schema.
     parse_cache: Mutex<LruCache<String, Arc<Statement>>>,
-    /// Caches pre-optimized logical plans keyed on the preprocessed SQL text,
-    /// so re-preparing or executing the same statement template bypasses planning/optimization.
+    /// Caches symbolic (unoptimized) logical plans keyed on the preprocessed SQL
+    /// text, so re-preparing or executing the same statement template bypasses
+    /// parsing and logical planning. Optimization is deliberately *not* cached: it
+    /// runs per execution, after parameters are substituted, so value-dependent
+    /// rules (e.g. prefix/infix `LIKE` index selection) can see concrete bindings.
     plan_cache: RwLock<LruCache<String, (PreparedPlan, u64)>>,
 }
 
@@ -421,8 +424,8 @@ impl SqlEngine {
 
     /// Executes a previously [`prepare`](Self::prepare)d statement within `tx`,
     /// binding `params`. Reuses the cached parse, and — when the plan was
-    /// cacheable — the cached logical plan, substituting the bound values into
-    /// it during physical compilation.
+    /// cacheable — the cached symbolic logical plan, into which it substitutes the
+    /// bound values before optimizing and compiling for this execution.
     pub fn execute_prepared(
         &self,
         prepared: &PreparedStatement,
