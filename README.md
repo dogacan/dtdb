@@ -4,7 +4,7 @@
 [![CI](https://github.com/dogacan/dtdb/actions/workflows/rust.yml/badge.svg)](https://github.com/dogacan/dtdb/actions/workflows/rust.yml)
 [![dependency status](https://deps.rs/repo/github/dogacan/dtdb/status.svg)](https://deps.rs/repo/github/dogacan/dtdb)
 
-**DuctTapeDB** is a from-scratch relational database written in Rust. It prioritizes clean abstractions, highly readable code, and simplicity over high performance and absolute reliability.
+**DuctTapeDB** is a from-scratch relational database written in Rust.
 
 ---
 
