@@ -9,7 +9,7 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -127,11 +127,17 @@ struct WriteQueue {
 struct WriteTask {
     state: Mutex<WriteTaskState>,
     condvar: Condvar,
+    /// Whether this task's write has been committed. The sole source of truth
+    /// for completion: followers read it (spin path: lock-free; park path: under
+    /// the queue lock) and the leader publishes it with Release ordering, which
+    /// pairs with followers' Acquire load to make the `state.result` write
+    /// visible. The leader sets it + notifies under the queue lock so the
+    /// predicate-mutation and wakeup are serialized against a follower parking.
+    done: AtomicBool,
 }
 
 struct WriteTaskState {
     batch: Vec<WalEntry>,
-    done: bool,
     result: Result<()>,
 }
 
@@ -160,18 +166,18 @@ fn acquire_task() -> Arc<WriteTask> {
             // uncontended; reset the state for the new write.
             let mut state = task.state.lock();
             state.batch.clear();
-            state.done = false;
             state.result = Ok(());
             drop(state);
+            task.done.store(false, Ordering::Relaxed);
             task
         } else {
             Arc::new(WriteTask {
                 state: Mutex::new(WriteTaskState {
                     batch: Vec::new(),
-                    done: false,
                     result: Ok(()),
                 }),
                 condvar: Condvar::new(),
+                done: AtomicBool::new(false),
             })
         }
     })
@@ -850,13 +856,42 @@ impl EngineInner {
         let mut queue = self.write_queue.lock();
         queue.tasks.push_back(task.clone());
 
-        while !task.state.lock().done
+        // Spin briefly before committing to a kernel park, but only when we are
+        // a follower (a commit is already in flight and we're not at the front).
+        // If we're immediately leader-eligible we skip the spin entirely — there
+        // is nothing to wait for and the extra mutex drop/reacquire would be pure
+        // overhead on uncontended single-threaded writes.
+        //
+        // parking_lot's Condvar has no built-in spin phase, so without this
+        // every follower pays a full kernel round-trip even for sub-µs waits.
+        //
+        // The spin can't lose a wakeup: it's pure optimization layered on top of
+        // the park loop below. After spinning we re-acquire the queue lock and
+        // re-check `done` there, against which the leader publishes `done` (also
+        // under the queue lock). So we either observe `done` and skip the wait,
+        // or we park and the leader's later notify — serialized after our
+        // registration by that same lock — wakes us.
+        let is_follower = queue.writing
+            || !queue.tasks.front().is_some_and(|f| Arc::ptr_eq(f, &task));
+        if is_follower {
+            drop(queue);
+            const SPIN_LIMIT: u32 = 200;
+            for _ in 0..SPIN_LIMIT {
+                if task.done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            queue = self.write_queue.lock();
+        }
+
+        while !task.done.load(Ordering::Acquire)
             && (!queue.tasks.front().is_some_and(|f| Arc::ptr_eq(f, &task)) || queue.writing)
         {
             task.condvar.wait(&mut queue);
         }
 
-        if task.state.lock().done {
+        if task.done.load(Ordering::Acquire) {
             let result = clone_result(&task.state.lock().result);
             release_task(task);
             return result;
@@ -873,16 +908,20 @@ impl EngineInner {
 
         let write_result = self.commit_coalesced(&tasks_to_commit);
 
-        // Mark all tasks as done and propagate result
+        // Publish results and wake followers, then clear `writing` and wake the
+        // next leader — all under the queue lock. Holding the queue lock here is
+        // what makes the wakeup correct: a follower checks `done` and parks on
+        // its condvar under this same lock, so serializing the `done` store +
+        // `notify_one` against it closes the lost-wakeup window (a follower can't
+        // read `done == false` and then park between our store and our notify).
+        // `result` is written under the per-task `state` lock; the Release store
+        // of `done` pairs with the follower's Acquire load to make it visible.
+        let mut queue = self.write_queue.lock();
         for t in &tasks_to_commit {
-            let mut state = t.state.lock();
-            state.done = true;
-            state.result = clone_result(&write_result);
+            t.state.lock().result = clone_result(&write_result);
+            t.done.store(true, Ordering::Release);
             t.condvar.notify_one();
         }
-
-        // Release writing state and wake up the next leader if any
-        let mut queue = self.write_queue.lock();
         queue.writing = false;
         if let Some(next_leader) = queue.tasks.front() {
             next_leader.condvar.notify_one();
