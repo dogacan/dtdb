@@ -67,6 +67,21 @@ impl Wal {
         self.log.append(&WalEntryRef::Batch(entries))
     }
 
+    /// Build a complete framed WAL record from `entries` into `buf` (cleared
+    /// first) and return it. Call in writer threads before joining the
+    /// group-commit queue so the leader can use [`Wal::append_prebuilt_bytes`]
+    /// and skip re-serializing the merged batch.
+    pub fn build_frame(entries: &[WalEntry], buf: Vec<u8>) -> Result<Vec<u8>> {
+        crate::framed_log::build_frame(&WalEntryRef::Batch(entries), buf)
+    }
+
+    /// Write a buffer of one or more concatenated pre-built frames (each from
+    /// [`Wal::build_frame`]) in a single `write()` + fsync. Used by the
+    /// group-commit leader.
+    pub fn append_prebuilt_bytes(&mut self, framed: &[u8]) -> Result<()> {
+        self.log.append_prebuilt_bytes(framed)
+    }
+
     /// Explicitly flushes WAL buffers to disk. Used for periodic background
     /// syncing when a non-zero sync interval is configured.
     pub fn sync_all(&self) -> Result<()> {

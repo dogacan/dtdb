@@ -130,6 +130,23 @@ impl<E: DeserializeOwned> FramedLog<E> {
         })
     }
 
+    /// Write a buffer that already holds one or more complete pre-built frames
+    /// (each produced by [`build_frame`]) in a single `write()` call, then
+    /// fsync. The caller owns framing and concatenation; this only does the
+    /// write, the in-memory size bookkeeping, and the sync — so the common
+    /// single-frame case incurs no copy here at all.
+    pub fn append_prebuilt_bytes(&mut self, framed: &[u8]) -> Result<()> {
+        if framed.is_empty() {
+            return Ok(());
+        }
+        (&self.file).write_all(framed)?;
+        self.size_bytes += framed.len() as u64;
+        if self.sync_interval_ms.is_none() || self.sync_interval_ms == Some(0) {
+            crate::sync_file(&self.file, self.fsync_method)?;
+        }
+        Ok(())
+    }
+
     /// Appends one record and (depending on sync policy) forces it to disk.
     pub fn append<S: Serialize>(&mut self, entry: &S) -> Result<()> {
         // Frame `[len][checksum][payload]` into a reusable scratch buffer and
@@ -324,6 +341,22 @@ fn validate_header(path: &Path, format: LogFormat) -> Result<()> {
 
 pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
     xxhash_rust::xxh32::xxh32(data, 0)
+}
+
+/// Serialize `entry` into a complete framed record (`[len][checksum][payload]`)
+/// and return the buffer. `buf` is the reusable backing allocation (cleared on
+/// entry); on serialization error the returned `Err` carries the reason and `buf`
+/// is consumed. Called by writer threads to pre-serialize their WAL entry before
+/// joining the group-commit queue so the leader can skip serialization entirely.
+pub fn build_frame<S: Serialize>(entry: &S, mut buf: Vec<u8>) -> Result<Vec<u8>> {
+    buf.clear();
+    buf.extend_from_slice(&[0u8; 8]);
+    let mut buf = postcard::to_extend(entry, buf)?;
+    let payload_len = (buf.len() - 8) as u32;
+    let checksum = compute_checksum(&buf[8..]);
+    buf[0..4].copy_from_slice(&payload_len.to_le_bytes());
+    buf[4..8].copy_from_slice(&checksum.to_le_bytes());
+    Ok(buf)
 }
 
 #[cfg(test)]

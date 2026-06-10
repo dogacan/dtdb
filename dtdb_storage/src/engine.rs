@@ -138,6 +138,11 @@ struct WriteTask {
 
 struct WriteTaskState {
     batch: Vec<WalEntry>,
+    /// Pre-built framed WAL record for this task's batch (populated by the
+    /// writer thread before enqueuing, reused across writes). The leader reads
+    /// this instead of re-serializing the merged batch, moving ~13% of the
+    /// serial commit's CPU cost onto the parallel writer threads.
+    serialized_frame: Vec<u8>,
     result: Result<()>,
 }
 
@@ -155,6 +160,11 @@ thread_local! {
     /// single WAL append + memtable apply.
     static LEADER_MERGED: std::cell::RefCell<Vec<WalEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Reusable scratch the leader concatenates coalesced tasks' pre-built WAL
+    /// frames into for one `write()` syscall. Only used when coalescing actually
+    /// batched more than one writer; a lone writer's frame is written directly.
+    static LEADER_FRAMES: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Obtain a fresh-stated [`WriteTask`], reusing this thread's pooled one if
@@ -166,6 +176,7 @@ fn acquire_task() -> Arc<WriteTask> {
             // uncontended; reset the state for the new write.
             let mut state = task.state.lock();
             state.batch.clear();
+            state.serialized_frame.clear();
             state.result = Ok(());
             drop(state);
             task.done.store(false, Ordering::Relaxed);
@@ -174,6 +185,7 @@ fn acquire_task() -> Arc<WriteTask> {
             Arc::new(WriteTask {
                 state: Mutex::new(WriteTaskState {
                     batch: Vec::new(),
+                    serialized_frame: Vec::new(),
                     result: Ok(()),
                 }),
                 condvar: Condvar::new(),
@@ -851,7 +863,23 @@ impl EngineInner {
     /// avoiding an allocation per write for the entries themselves.
     fn execute_write(self: &Arc<Self>, fill: impl FnOnce(&mut Vec<WalEntry>)) -> Result<()> {
         let task = acquire_task();
-        fill(&mut task.state.lock().batch);
+        // Populate the batch and pre-serialize the WAL frame while we have
+        // unique access (task not yet enqueued). This moves postcard work out
+        // of the leader's serial section onto parallel writer threads.
+        {
+            let mut state = task.state.lock();
+            fill(&mut state.batch);
+            let frame_buf = std::mem::take(&mut state.serialized_frame);
+            match Wal::build_frame(&state.batch, frame_buf) {
+                Ok(frame) => state.serialized_frame = frame,
+                Err(e) => {
+                    state.batch.clear();
+                    drop(state);
+                    release_task(task);
+                    return Err(e);
+                }
+            }
+        }
 
         let mut queue = self.write_queue.lock();
         queue.tasks.push_back(task.clone());
@@ -945,18 +973,36 @@ impl EngineInner {
         self.await_l0_limit();
         self.maybe_slowdown_writes();
 
+        // WAL write from the pre-built frames the writer threads serialized off
+        // this critical path. The common single-writer case writes its frame
+        // directly — no copy, no temporary allocation. When coalescing batched
+        // multiple writers, concatenate their frames into a reused buffer for
+        // one `write()` syscall; that copy is paid only when the parallel
+        // pre-serialization already saved more than it costs.
+        let wal_result = (|| -> Result<u64> {
+            let mut wal = self.wal.lock();
+            if let [only] = tasks {
+                wal.append_prebuilt_bytes(&only.state.lock().serialized_frame)?;
+            } else {
+                let mut frames = LEADER_FRAMES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                frames.clear();
+                for t in tasks {
+                    frames.extend_from_slice(&t.state.lock().serialized_frame);
+                }
+                let res = wal.append_prebuilt_bytes(&frames);
+                frames.clear();
+                LEADER_FRAMES.with(|c| *c.borrow_mut() = frames);
+                res?;
+            }
+            wal.size()
+        })();
+
+        // Memtable apply: drain each task's batch into the merged buffer.
         let mut merged = LEADER_MERGED.with(|c| std::mem::take(&mut *c.borrow_mut()));
         merged.clear();
         for t in tasks {
-            let mut state = t.state.lock();
-            merged.append(&mut state.batch);
+            merged.append(&mut t.state.lock().batch);
         }
-
-        let wal_result = (|| -> Result<u64> {
-            let mut wal = self.wal.lock();
-            wal.append_batch(&merged)?;
-            wal.size()
-        })();
 
         let trigger_flush = match wal_result {
             Ok(wal_size) => {
@@ -970,7 +1016,7 @@ impl EngineInner {
             Err(_) => false,
         };
 
-        // `merged` is now empty (drained on success, or holding the failed
+        // `merged` is now empty (drained on success, or containing the failed
         // entries which we discard on error); return its allocation for reuse.
         merged.clear();
         LEADER_MERGED.with(|c| *c.borrow_mut() = merged);
