@@ -899,8 +899,8 @@ impl EngineInner {
         // under the queue lock). So we either observe `done` and skip the wait,
         // or we park and the leader's later notify — serialized after our
         // registration by that same lock — wakes us.
-        let is_follower = queue.writing
-            || !queue.tasks.front().is_some_and(|f| Arc::ptr_eq(f, &task));
+        let is_follower =
+            queue.writing || !queue.tasks.front().is_some_and(|f| Arc::ptr_eq(f, &task));
         if is_follower {
             drop(queue);
             const SPIN_LIMIT: u32 = 200;
