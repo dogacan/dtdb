@@ -1074,10 +1074,7 @@ impl PhysicalOperator for PhysicalSortMergeJoin {
                     let mut emits: Vec<Row> = Vec::new();
                     {
                         let (left, right) = self.streams.as_mut().unwrap();
-                        let lkey = match left.peek_key() {
-                            Some(k) => k.clone(),
-                            None => return None,
-                        };
+                        let lkey = left.peek_key()?.clone();
 
                         // NULL keys never join; left-outer still emits the padded left row.
                         if lkey[0] == DbValue::Null {

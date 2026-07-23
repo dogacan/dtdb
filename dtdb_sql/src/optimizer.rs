@@ -1024,9 +1024,7 @@ impl Optimizer {
 
     pub(crate) fn get_plan_sort_key(plan: &LogicalPlan) -> Option<String> {
         match plan {
-            LogicalPlan::Scan {
-                schema, range: _, ..
-            } => schema
+            LogicalPlan::Scan { schema, .. } => schema
                 .primary_key_index()
                 .map(|pk_idx| schema.columns[pk_idx].name.clone()),
             LogicalPlan::IndexScan {
