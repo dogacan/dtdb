@@ -1,27 +1,54 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Given `current_exe` path of a test binary, walk up to find the cargo profile directory
+/// (e.g., `target/debug`, `target/release`, `target/x86_64-unknown-linux-gnu/debug`).
+fn find_profile_dir(current_exe: &Path) -> PathBuf {
+    let mut curr = current_exe.to_path_buf();
+    while let Some(parent) = curr.parent().map(|p| p.to_path_buf()) {
+        if matches!(
+            curr.file_name().and_then(|n| n.to_str()),
+            Some("deps" | "build" | "examples")
+        ) {
+            return parent;
+        }
+        curr = parent;
+    }
+    current_exe
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| current_exe.to_path_buf())
+}
+
 fn ensure_static_lib(profile_dir: &Path, workspace_root: &Path) {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
     cmd.arg("build").arg("-p").arg("dtdb_bindings");
 
     // Detect profile (debug vs release)
-    let is_release = profile_dir.ends_with("release");
+    let is_release = profile_dir
+        .file_name()
+        .map(|n| n.to_str() == Some("release"))
+        .unwrap_or(false)
+        || profile_dir.ends_with("release");
     if is_release {
         cmd.arg("--release");
     }
 
-    // Detect target triple
-    let parent = profile_dir.parent().unwrap();
-    if parent.file_name().map(|n| n.to_str()) != Some(Some("target")) {
-        // Parent directory is target triple folder or custom target-dir
-        if let Some(target_triple) = parent.file_name().and_then(|n| n.to_str()) {
-            if target_triple == "llvm-cov-target" {
-                cmd.arg("--target-dir").arg(parent);
-            } else {
-                cmd.arg("--target").arg(target_triple);
+    // Detect target triple or custom target-dir
+    if let Some(parent) = profile_dir.parent() {
+        let parent_name = parent.file_name().and_then(|n| n.to_str());
+        if parent_name == Some("llvm-cov-target") {
+            cmd.arg("--target-dir").arg(parent);
+        } else if let Some(target_triple) = parent_name.filter(|&n| n != "target") {
+            if let Some(grandparent) = parent
+                .parent()
+                .filter(|gp| gp.file_name().and_then(|n| n.to_str()) == Some("llvm-cov-target"))
+            {
+                cmd.arg("--target-dir").arg(grandparent);
             }
+            cmd.arg("--target").arg(target_triple);
         }
     }
 
@@ -62,14 +89,10 @@ fn test_cpp_bridge_smoke() {
 
     // 2. Locate the target profile directory containing libdtdb_bindings.a
     let current_exe = std::env::current_exe().expect("current exe path");
-    let profile_dir = current_exe
-        .parent()
-        .expect("deps dir")
-        .parent()
-        .expect("profile dir");
+    let profile_dir = find_profile_dir(&current_exe);
 
     // Ensure the static library is built for this profile/target
-    ensure_static_lib(profile_dir, workspace_root);
+    ensure_static_lib(&profile_dir, workspace_root);
 
     let lib_path = profile_dir.join("libdtdb_bindings.a");
     assert!(
@@ -79,22 +102,20 @@ fn test_cpp_bridge_smoke() {
     );
 
     // 3. Locate the cxxbridge directory
-    // We try both workspace_root/target/cxxbridge and profile_dir/../cxxbridge (if target-specific)
+    // We try workspace_root/target/cxxbridge or search upward from profile_dir
     let mut cxxbridge_dir = workspace_root.join("target/cxxbridge");
     if !cxxbridge_dir.exists() {
-        // Fallback to profile_dir/../../cxxbridge (since profile_dir might be target/debug or target/triple/debug)
-        let mut p = profile_dir.to_path_buf();
-        while p.file_name().map(|n| n.to_str()) != Some(Some("target")) && p.parent().is_some() {
-            p.pop();
-        }
-        if p.join("cxxbridge").exists() {
-            cxxbridge_dir = p.join("cxxbridge");
-        } else {
-            // Find target/.../cxxbridge in profile_dir parent
-            let parent = profile_dir.parent().unwrap();
-            let alt_cxx = parent.join("cxxbridge");
-            if alt_cxx.exists() {
-                cxxbridge_dir = alt_cxx;
+        let mut curr = profile_dir.to_path_buf();
+        loop {
+            let candidate = curr.join("cxxbridge");
+            if candidate.exists() {
+                cxxbridge_dir = candidate;
+                break;
+            }
+            if let Some(parent) = curr.parent() {
+                curr = parent.to_path_buf();
+            } else {
+                break;
             }
         }
     }
