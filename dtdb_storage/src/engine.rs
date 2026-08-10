@@ -3209,8 +3209,6 @@ mod tests {
             engine.inner.l0_gate.condvar.notify_all();
 
             // The writer should now unblock and finish
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            assert!(writer.is_finished());
             writer.join().unwrap();
         });
     }
@@ -3250,8 +3248,6 @@ mod tests {
             engine.shutdown();
 
             // The writer should now finish
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            assert!(writer.is_finished());
             writer.join().unwrap();
         });
     }

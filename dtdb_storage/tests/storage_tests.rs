@@ -282,9 +282,13 @@ fn test_engine_compaction() {
         };
         let engine = StorageEngine::open(&db_path, options).unwrap();
         engine.put(k_int(1), v_str("v1_old")).unwrap(); // Flushes
+        engine.flush_memtable().unwrap();
         engine.put(k_int(1), v_str("v1_new")).unwrap(); // Flushes
+        engine.flush_memtable().unwrap();
         engine.put(k_int(2), v_str("v2")).unwrap(); // Flushes
+        engine.flush_memtable().unwrap();
         engine.delete(k_int(2)).unwrap(); // Flushes
+        engine.flush_memtable().unwrap();
 
         // Verify we have multiple SST files on disk
         let mut sst_count = 0;
